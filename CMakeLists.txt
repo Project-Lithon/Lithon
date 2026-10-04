@@ -93,6 +93,13 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|X86_64)$")
     target_include_directories(optimize_accum_test PUBLIC src src/jit)
     add_test(NAME optimize_accum_test COMMAND optimize_accum_test)
 
+    # 3.1: float reassociation under --ffast-math-equivalent. Separate from
+    # optimize_accum_test because the two passes disagree with the interpreter
+    # for different reasons and neither may regress into doing so silently.
+    add_executable(optimize_ffast_test src/jit/optimize_ffast_test.cpp src/ir/text_parser.cpp)
+    target_include_directories(optimize_ffast_test PUBLIC src src/jit)
+    add_test(NAME optimize_ffast_test COMMAND optimize_ffast_test)
+
     # host_format_double is the single function both the JIT (called by
     # emitted code) and the interpreter use to render a double, so it is the
     # one place where CPython's repr rules can be pinned directly. The

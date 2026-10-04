@@ -177,7 +177,9 @@ Lithon is purpose-built for low-latency tasks where Python traditionally relies 
 - [ ] **Phase III: Systems & Hardware Integration (V3)**
   - Direct `syscall` (`0x0F 0x05`) instruction emission from Python syntax.
   - Zero-copy C pointer exposure and raw memory array mutation.
-  - AVX2 / SIMD vectorization for parallel list processing.
+  - AVX2 / SIMD vectorization for parallel list processing (blocked: `1.3`
+    VEX *encoding* is not built — `x86_encoder.h` emits no VEX-prefixed opcode
+    yet, so there is nothing for a YMM instruction to sit on).
 
 ---
 
@@ -201,6 +203,7 @@ fails when it regresses — not merely present.*
 | Liveness + register allocation | Shipped | `liveness_test`, `regalloc_test` |
 | IR text format | Shipped | `src/ir/text_parser.cpp` — no Python dependency in the engine |
 | Function calls, recursion, TCO | Shipped | `compile_module_call_test`, `fib_test`; self-tail-calls become loops, O(1) stack |
+| Float reassociation, opt-in | Shipped, **off by default** | `optimize_ffast_test`; `--ffast-math-equivalent` is the only way to enable it and no other flag implies it. Pins that the flag-off build stays bit-identical to the interpreter, and that enabling it really does move the answer (`2.0` → `1.0`) rather than only claiming to |
 | Bitwise ops and shifts | Shipped | `& \| ^ << >>`, int-only; `check_encoder_vs_as.py` proves all 5 encodings against GNU as, `typecheck_test` pins the static rules, `tests/programs/bitwise.py` is a pure CPython-agreement test |
 
 ### Optimization pipeline (this is the active work)
@@ -215,10 +218,28 @@ rather than assumed.
 | Callee-saved borrowing — temps live across a call borrow a callee-saved register instead of the stack | `register_alloc.h` | **fib 1.063×** |
 | Shared virtual-temp liveness — one `VirtualTemps` set, excluded *before* live ranges are computed | `liveness.h` | correctness, not speed |
 | `fold_constants`, `eliminate_dead_code`, `convert_self_tail_calls` | `optimize.h` | bundled, not isolated |
+| `reassociate_float_adds` — rotate single-use float add chains to shorten the dependency chain | `optimize.h` | **opt-in only** (`--ffast-math-equivalent`); **not bit-exact** — `print(1e16 + -1e16 + 1.0 + 1.0)` goes from `2.0` to `1.0`. Off by default; the default build stays bit-identical to the interpreter. Fires 0 times on the typed corpus — no chains there yet |
 | `mem2reg` + SSA copy resolution (`--ssa`) | `ssa.h` | correctness, not speed — removes 29 loads / 20 stores on `tests/typed_regression/if_expr.py` |
 
 Measured on an Intel i3-3110M (Sandy Bridge), 12 interleaved rounds, CPU-time
 clock, one pinned core. See [Testing](#-testing) to reproduce them yourself.
+
+### Language and hardware phases, tracked
+
+The phases below are specced and sequenced; this table is the honest status,
+including the ones that are blocked and the two dependency questions that were
+checked rather than assumed.
+
+| Phase | What it adds | Status |
+| :--- | :--- | :--- |
+| 3.1 | `--ffast-math-equivalent` — float add reassociation, opt-in only | **Done.** Off by default; the default build is bit-identical to the interpreter. Fires 0 times on the typed corpus, so it is ready rather than earning |
+| Float **return values** | Fixed | `Op::Return` materialised every result into RAX and `Op::Call` captured every result from RAX, but a `float[64]` return travels in XMM0 under both SysV and Win64. Calling such a function printed `0.0` and then a *different* near-zero denormal on each call, because the caller reinterpreted whatever stale bits sat in RAX as a double. Both halves needed fixing: the callee has to publish the double into XMM0 (`abi::kFloatArgReg`) and the caller has to capture the result through the float result path rather than RAX. Fixing only the caller side left the callee publishing nothing. Covered by `tests/programs/float_return.py` and `tests/typed_regression/float_return.py`; mutating either half makes the native tier diff fail (39/41) |
+| Float **arguments** | Fixed | A `float[64]` parameter arrives in XMM0/XMM1 on both ABIs, never in a GP register, but the prologue spilled every parameter from `abi::kArgRegs[i]` and no `kFloatArgRegs` array existed at all. `def ident(x: float[64]) -> float[64]: return x` returned `0.0` for an argument of `9.75`, and passed *different* denormals on different runs because the slot held whatever unrelated integer bits were lying around. Passing a float and ignoring it happened to work, which is why nothing caught it. Three fixes: add `abi::kFloatArgRegs`; marshal float arguments into XMM at the call site; spill them with `movsd` in the prologue. Float parameters are also kept out of the allocator's promotion pass, since a promoted parameter would be copied from a GP register. For an **unannotated** float parameter the declared type is empty and tells the prologue nothing, so parameter kinds are now also inferred from call sites (`infer_param_kinds`, the same fixpoint `infer_value_kinds` runs), with the declared type taking precedence and `Unknown` falling back to the GP path. Covered by `tests/programs/float_return.py` (unannotated, also checked against real CPython) and `tests/typed_regression/float_return.py` (annotated); mutating the call-site marshalling, the prologue spill, or the inference each makes the native tier diff fail |
+| 4.1 | `list[T, N]` — recursive `LType`, `Index`/`IndexStore`/`Len`, strided rbp addressing, static-only capacity overflow | **Type layer done, codegen pending.** `LType` carries an element type, `list[T,N]`/`tuple[T,N]`/`ptr[T]` round-trip through the IR text format, and the shape rules and rendering are pinned in `typecheck_test`. `Index`/`IndexStore`/`Len` and rbp strided addressing are not built yet, so no container can actually be constructed
+| 4.2 | `tuple[T, N]` — same layout, fixed length, homogeneous and immutable (`IndexStore` into a tuple is a compile-time RCR error) | Pending, needs 4.1 |
+| 4.3 | `dict[K, V, N]` — open addressing into a fixed table | Pending, needs 4.1. **`str` keys are blocked**: `str` is type-checked as an allowed kind but has no storage and no codegen, so `dict[str, V, N]` cannot be built until a `str` storage phase exists. `dict[int, V, N]` and `dict[bool, V, N]` need only an identity/mix hash |
+| 4.4 | `ptr[T]` — `addressof`/`valueof`, `_`-prefix naming enforced at name and type together, element-scaled arithmetic lowered in the frontend to existing `Add`/`Mul` | Pending, needs 4.1 (the recursive `LType` fits `ptr` directly). Dangling pointers are out of scope by design |
+| 4.5 | SIMD auto-vectorization and reduction | **Blocked.** 1.2 CPUID detection and 1.4 accumulator unrolling both exist, but 1.3 VEX encoding does not — `x86_encoder.h` emits no VEX-prefixed opcode, so there is nothing for a YMM instruction to build on |
 
 ### The SSA pipeline, phase by phase
 
@@ -497,6 +518,53 @@ that is the property everything else is measured against:
   `setcc` + `AND setnp` rather than a parity branch: `0F 9A` is a byte-for-byte
   collision between `jp rel32` and `setp r/m8`, so a parity `Jcc` is not
   encodable here.
+- **`--ffast-math-equivalent` trades the last bit for a shorter dependency
+  chain, and is never applied without being asked for.** Reassociating float
+  addition is not an optimisation in the sense every other pass here is. FP
+  addition is not associative: `(a+b)+c` and `a+(b+c)` are the same real number
+  and, in general, different doubles. So this pass gives up a proven property —
+  bit-exact agreement with the interpreter, which is what the entire test gate
+  measures against — and the only thing that makes it acceptable is that it is
+  off by default, is implied by no other flag, and is named after the thing it
+  does rather than after a speedup. Integer arithmetic gets no such pass and
+  needs none: integer addition is associative *and* exact, so regrouping it would
+  be free and pointless.
+
+  What it does, where an add's left operand is itself a single-use add:
+
+  ```
+  %t = add %p, %q        %u = add %t, %r     ->    %u = add %p, %new
+                                                 %new = add %q, %r
+  ```
+
+  which drops one level off the chain; repeated, a left-leaning spine of N
+  dependent adds becomes a tree closer to depth log₂(N).
+
+  **The tradeoff, measured, not asserted.** With `a=1e16, b=-1e16, c=1.0, d=1.0`
+  and `print(a + b + c + d)`:
+
+  | | result |
+  |---|---|
+  | interpreter | `2.0` |
+  | native, flag off | `2.0` |
+  | native, `--ffast-math-equivalent` | `1.0` |
+
+  Left-associated, `((1e16 + -1e16) + 1) + 1` is `2.0`. Reassociated,
+  `1e16 + ((-1e16 + 1) + 1)` is `1.0` — and not by one ULP: `1e16` has a ULP of
+  2, so the `1.0` in `-1e16 + 1` is rounded away entirely and the answer moves
+  by a whole unit. Anyone turning the flag on should read that table first.
+  `optimize_ffast_test` pins all of it, including that the flag-off build still
+  returns `2.0`; mutating the flag gate, the single-use guard, or the
+  declaration of the float values the pass invents each break a check.
+
+  **Honest size of the win: zero rotations across the typed regression corpus.**
+  The pass works — the table above is real output — but nothing in that corpus
+  presents a chain. Its float work is accumulator reductions, which after
+  `mem2reg` are one add per iteration rather than a left-leaning spine, and
+  `fold_constants` runs first, so a chain of literals has already become one
+  constant by the time this pass sees it. So the value of this today is that the
+  flag exists, is honestly labelled, and is ready — not that it is earning
+  anything on the current programs.
 - **A float live across a call spills.** Every XMM in the temp pool is
   caller-saved on both ABIs, and `host_format_double` is an ordinary C function
   that clobbers all of them, so leaving a float in one across a `call print`

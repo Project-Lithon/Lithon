@@ -65,7 +65,22 @@ enum class Op : uint8_t {
     Branch,
     Jump,
 
-    Phi
+    Phi,
+
+    // 4.1. Container access. All three name the container VARIABLE in
+    // `name` rather than taking a register, because the address is not the
+    // value: a list lives in a run of frame slots and only the variable knows
+    // where that run starts. `args` therefore holds the operands.
+    //
+    //   Index      args = {index}                 result = element
+    //   IndexStore args = {index, value}          no result
+    //   Len        args = {}                      result = capacity
+    //
+    // Len takes no operand and is not a runtime load: N is part of the type,
+    // so `len(xs)` is a compile-time constant and is folded to one.
+    Index,
+    IndexStore,
+    Len
 };
 
 using ValueId = uint32_t;
@@ -79,8 +94,20 @@ struct Instr {
     int64_t int_imm = 0;
     double float_imm = 0.0;
     std::string name;
-    std::string type_kind;   // "int" | "float" | "str" | "bool" | "" (none)
-    int type_width = -1;      // bit width/byte capacity; -1 for bool or "none"
+    std::string type_kind;   // "int" | "float" | "str" | "bool" | "list" | "" (none)
+    int type_width = -1;      // bit width; for "list" this is the CAPACITY, not a width
+
+    // 4.1. The element type of a container, so `list[int[64], 10]` survives the
+    // round trip through the text format. `type_kind`/`type_width` alone can
+    // only say "list of 10" -- not what is IN it -- and the whole point of a
+    // typed container is that `list[int[64]]` and `list[float[64]]` are
+    // different types that must not be interchanged.
+    //
+    // Kept flat rather than as a recursive node because every existing reader of
+    // type_kind stays correct and untouched: a scalar simply leaves these empty,
+    // which is exactly the state it was already in.
+    std::string type_elem_kind;   // element kind for list/tuple/ptr; "" when not a container
+    int type_elem_width = -1;     // element width; -1 when absent
 };
 
 struct BasicBlock {

@@ -32,6 +32,18 @@ inline uint8_t rex(bool w, Reg reg_field, Reg rm_field) {
                                 (reg_is_extended(rm_field) ? 1 : 0));
 }
 
+// 4.1. The SIB form needs the REX.X bit, which the two-field rex() above has no
+// place for: X extends the SIB.index field, not ModRM.rm. Without it, an index
+// in r8..r15 addresses the low three bits and the upper five are read as the
+// next instruction -- a silent, wildly out-of-range address rather than a
+// decoding failure, so this bit is load-bearing for any index above rbx.
+inline uint8_t rex3(bool w, Reg reg_field, Reg index_field, Reg base_field) {
+    return static_cast<uint8_t>(0x40 | (w ? 8 : 0) |
+                                (reg_is_extended(reg_field) ? 4 : 0) |
+                                (reg_is_extended(index_field) ? 2 : 0) |
+                                (reg_is_extended(base_field) ? 1 : 0));
+}
+
 using CodeBuffer = std::vector<uint8_t>;
 
 inline void emit_u8(CodeBuffer& buf, uint8_t byte) {
@@ -330,6 +342,50 @@ inline void emit_load_rbp_offset(CodeBuffer& buf, Reg dst, int32_t offset) {
     emit_disp32_le(buf, offset);
 }
 
+// 4.1. Scaled-index forms of the two above: [rbp + disp + index*8]. A list
+// element lives at base + i*8, so with a RUNNING index the address cannot be a
+// constant displacement -- it needs a SIB byte.
+//
+// The SIB always carries a displacement even when the index is 0, because
+// mod=00 with base=RBP (101) means RIP-relative on x86-64, not [rbp+0]. Using
+// mod=10 unconditionally sidesteps that special case rather than branching on
+// it, at the cost of four bytes.
+//
+// scale=10 (x8) matches kSlotSize: every element occupies one 8-byte frame
+// slot, so a list of int, float, or bool elements has the same stride. That is
+// a property of THIS frame layout, not of the language -- a narrower element
+// type does not get a narrower slot, because registers and the slot cursor are
+// both 64 bits wide.
+// SS is 00=x1, 01=x2, 10=x4, 11=x8. Writing 2 here silently emits x4 -- caught
+// by tools/check_encoder_vs_as.py disagreeing with GNU as on the *4 vs *8
+// operand text, which is a better bug report than the wrong answer at runtime
+// would have been.
+constexpr uint8_t kSibScale8 = 3 << 6;   // SS=11 -> scale factor 8
+
+inline void emit_sib_tail(CodeBuffer& buf, Reg data_reg, Reg index_reg) {
+    // ModRM: mod=10 (disp32), reg=data_reg, r/m=100 (SIB follows)
+    emit_u8(buf, static_cast<uint8_t>(0x80 | (reg_low3(data_reg) << 3) | 0x4));
+    // SIB: scale=x8, index=index_reg, base=RBP
+    emit_u8(buf, static_cast<uint8_t>(kSibScale8 | (reg_low3(index_reg) << 3) |
+                                      reg_low3(Reg::RBP)));
+}
+
+// mov dst, [rbp + disp + index*8]
+inline void emit_load_rbp_scaled(CodeBuffer& buf, Reg dst, Reg index_reg, int32_t disp) {
+    emit_u8(buf, rex3(true, dst, index_reg, Reg::RBP));
+    emit_u8(buf, 0x8B);
+    emit_sib_tail(buf, dst, index_reg);
+    emit_disp32_le(buf, disp);
+}
+
+// mov [rbp + disp + index*8], src
+inline void emit_store_rbp_scaled(CodeBuffer& buf, Reg src, Reg index_reg, int32_t disp) {
+    emit_u8(buf, rex3(true, src, index_reg, Reg::RBP));
+    emit_u8(buf, 0x89);
+    emit_sib_tail(buf, src, index_reg);
+    emit_disp32_le(buf, disp);
+}
+
 // push reg / pop reg. Encoding: [41] 50+r / [41] 58+r.
 inline void emit_push_reg(CodeBuffer& buf, Reg reg) {
     if (reg_is_extended(reg)) emit_u8(buf, 0x41);
@@ -555,7 +611,25 @@ enum class Xmm : uint8_t { XMM0 = 0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7,
                            none = 0xFF };
 
 inline uint8_t xmm_low3(Xmm r) { return static_cast<uint8_t>(static_cast<uint8_t>(r) & 7); }
-inline bool xmm_is_extended(Xmm r) { return static_cast<uint8_t>(r) >= 8; }
+inline bool xmm_is_extended(Xmm r) {
+    // Xmm::none is 0xFF, so a bare `>= 8` said TRUE for it -- and rex_sse(x) with
+    // a memory rm operand defaults rm to none. That set a spurious REX.B, which
+    // does not just waste a prefix bit: it reinterprets the base register, so
+    // [rbp+disp] was fetched from [r13+disp]. A wild address, i.e. SIGBUS.
+    return static_cast<uint8_t>(r) >= 8;
+}
+
+// The SSE scaled forms need REX.R for an extended XMM reg field and REX.X for
+// an extended index SIMULTANEOUSLY, and must emit the prefix whenever EITHER is
+// extended -- an earlier version emitted it only for the XMM, so an index in
+// r8..r15 lost its X bit and addressed the low three bits of the register. That
+// is not a decoding failure; it reads a wildly out-of-frame address and faults.
+inline uint8_t rex3_xmm(Xmm reg_field, Reg index_field) {
+    return static_cast<uint8_t>(0x40 | 8 |
+                                (xmm_is_extended(reg_field) ? 4 : 0) |
+                                (reg_is_extended(index_field) ? 2 : 0));
+}
+
 
 // REX for an SSE instruction, given the register that lands in ModRM.reg
 // and, when ModRM.rm is a register rather than memory, the one in rm.
@@ -701,6 +775,32 @@ inline void emit_movsd_xmm_xmm(CodeBuffer& buf, Xmm dst, Xmm src) {
 // movsd xmm, [rbp + disp32] -- load a double from a frame slot. The XMM
 // counterpart of emit_load_rbp_offset: same rbp-relative addressing, F2
 // 0F 10 /r with ModRM(mod=10, reg=dst, rm=RBP).
+// 4.1. Scaled-index forms of the two movsd helpers below, for a
+// list[float[64]] element. The r/m field selects SIB (100) and the base is
+// still RBP, so -- exactly as in the integer pair -- mod=10 is used
+// unconditionally to sidestep the "mod=00 + base=RBP means RIP-relative" rule.
+inline void emit_movsd_xmm_rbp_scaled(CodeBuffer& buf, Xmm dst, Reg index_reg, int32_t disp) {
+    emit_u8(buf, rex3_xmm(dst, index_reg));
+    emit_u8(buf, 0xF2);
+    emit_u8(buf, 0x0F);
+    emit_u8(buf, 0x10);
+    emit_u8(buf, static_cast<uint8_t>(0x80 | (xmm_low3(dst) << 3) | 0x4));
+    emit_u8(buf, static_cast<uint8_t>(kSibScale8 | (reg_low3(index_reg) << 3) |
+                                      reg_low3(Reg::RBP)));
+    emit_disp32_le(buf, disp);
+}
+
+inline void emit_movsd_rbp_scaled(CodeBuffer& buf, Xmm src, Reg index_reg, int32_t disp) {
+    emit_u8(buf, rex3_xmm(src, index_reg));
+    emit_u8(buf, 0xF2);
+    emit_u8(buf, 0x0F);
+    emit_u8(buf, 0x11);
+    emit_u8(buf, static_cast<uint8_t>(0x80 | (xmm_low3(src) << 3) | 0x4));
+    emit_u8(buf, static_cast<uint8_t>(kSibScale8 | (reg_low3(index_reg) << 3) |
+                                      reg_low3(Reg::RBP)));
+    emit_disp32_le(buf, disp);
+}
+
 inline void emit_movsd_xmm_rbp(CodeBuffer& buf, Xmm dst, int32_t offset) {
     if (xmm_is_extended(dst)) emit_u8(buf, rex_sse(dst));
     emit_u8(buf, 0xF2);

@@ -90,6 +90,11 @@ struct CompileOptions {
     // the 1-element/cycle limit, so splitting only adds the exit sum. Opt in
     // with --accum-unroll; it is aimed at long-latency (float) accumulators.
     int accum_unroll = 1;
+    // 3.1. Reassociate float addition. OFF by default and never implied by any
+    // other flag: FP addition is not associative, so this makes a compiled
+    // program's float results differ from the interpreter's in the last bit.
+    // Integer arithmetic is unaffected -- it is already exact and associative.
+    bool ffast_math_equivalent = false;
     bool promote_registers = true; // keep hot variables in registers
     // Let a temporary that is live across a call borrow a callee-saved
     // register no promoted variable is using, instead of living on the stack.
@@ -141,6 +146,9 @@ struct CompiledModule {
     // incoming edge's `mov` had no work left to do. Distinct from
     // phis_forwarded above, which counts copies that never came into being.
     size_t phi_copies_coalesced = 0;
+    // 3.1. Float add chains rotated under --ffast-math-equivalent. Reported so
+    // the flag's effect is visible; it is zero unless that flag was passed.
+    size_t float_adds_reassociated = 0;
 };
 
 namespace detail {
@@ -451,6 +459,7 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
     size_t phi_copies_total = 0;
     size_t phis_forwarded = 0;
     size_t phi_copies_coalesced = 0;
+    size_t float_adds_reassociated = 0;
 
     struct PendingCallPatch {
         JumpPatch patch;
@@ -484,6 +493,11 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
     // "print() FORMATTING" note above the class comment block for why
     // this stays valid after each function's private copy is folded/DCE'd.
     const std::vector<std::vector<Kind>> module_kinds = infer_value_kinds(module);
+    // Same fixpoint, read for parameter kinds rather than value kinds. An
+    // unannotated `float` parameter is indistinguishable from an `int` one by
+    // declaration alone, so the prologue would spill it from a GP argument
+    // register while the caller had correctly put the double in XMM.
+    const std::vector<std::vector<Kind>> module_param_kinds = infer_param_kinds(module);
 
     for (size_t fn_index = 0; fn_index < module.functions.size(); ++fn_index) {
         const Function& original_fn = module.functions[fn_index];
@@ -525,8 +539,16 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
             OptimizePasses passes;
             passes.strength_reduce = options.strength_reduce;
             passes.accum_unroll = options.accum_unroll;
+            passes.ffast_math_equivalent = options.ffast_math_equivalent;
             OptimizeStats stats = optimize_function(fn, passes, &is_float_kinds);
-            for (lithon::ir::ValueId id : stats.accum_float_values) {
+            float_adds_reassociated += static_cast<size_t>(stats.float_adds_reassociated);
+            // One loop over both lists: every ValueId a pass invented has to be
+            // declared a double here, or codegen runs it through the integer add
+            // path and emits garbage instead of a different rounding.
+            std::vector<lithon::ir::ValueId> declared_floats = stats.accum_float_values;
+            declared_floats.insert(declared_floats.end(), stats.reassoc_float_values.begin(),
+                                   stats.reassoc_float_values.end());
+            for (lithon::ir::ValueId id : declared_floats) {
                 if (id >= value_kinds.size()) value_kinds.resize(id + 1, Kind::Unknown);
                 value_kinds[id] = Kind::Float;
                 is_float_kinds.resize(value_kinds.size(), false);
@@ -534,8 +556,10 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
             }
         }
 
-        PromotionMap promoted = options.promote_registers ? select_promoted_variables(fn)
-                                                           : PromotionMap{};
+        PromotionMap promoted =
+            options.promote_registers
+                ? select_promoted_variables(fn, module_param_kinds[fn_index])
+                : PromotionMap{};
 
         // A promoted variable lives in a general-purpose register, which
         // cannot hold a double. select_promoted_variables is float-blind --
@@ -708,6 +732,35 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
         // so reusing the division string here would show up as a diff.
         auto emit_int_zero_modulo_trap = [&]() {
             emit_host_error_trap("error: interpreter: modulo by zero\n");
+        };
+
+        // 4.1. Bounds check for a container access whose index is not a
+        // compile-time constant. Only a literal index is validated by the
+        // typechecker; a computed one could be negative or >= capacity, and
+        // the access is `[rbp + disp + idx*8]` -- so an unchecked index reads or
+        // writes arbitrary frame memory, the return address included. Two
+        // signed compares rather than one unsigned one: Less/GreaterEq are
+        // genuine Jcc bytes, whereas the unsigned Below in Cond is a SETcc
+        // opcode and handing that to emit_jcc_rel32 encodes a byte store.
+        auto emit_index_out_of_range_trap = [&]() {
+            emit_host_error_trap("error: interpreter: list index out of range\n");
+        };
+
+auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& name) {
+            const int cap = alloc.container_capacity(name);
+            if (cap <= 0) return;
+            // A literal index was already range-checked by the typechecker, so
+            // the guard would be dead weight on every straight-line access.
+            int32_t lit = 0;
+            if (imm32_of(idx_id, lit)) return;
+            emit_cmp_reg_imm32(code, idx, 0);
+            JumpPatch nonneg = emit_jcc_rel32(code, Cond::GreaterEq);
+            emit_index_out_of_range_trap();
+            resolve_jump_patch(code, nonneg, code.size());
+            emit_cmp_reg_imm32(code, idx, cap - 1);
+            JumpPatch in_range = emit_jcc_rel32(code, Cond::LessEq);
+            emit_index_out_of_range_trap();
+            resolve_jump_patch(code, in_range, code.size());
         };
 
         // Integer remainder, C semantics: the result takes the sign of the
@@ -1196,6 +1249,34 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
             emit_store_rbp_offset(code, saved.first, saved.second);
         }
         for (size_t i = 0; i < fn.params.size(); ++i) {
+            // A float[64] parameter arrives in XMM_i, NOT in kArgRegs[i]. The
+            // GP spill below put a GP register's bits in the slot, so reading the
+            // parameter back produced a different near-zero denormal than the
+            // caller sent -- which is how `def ident(x: float[64]) -> float[64]:
+            // return x` came to return 0.0 for an argument of 9.75. Passing a
+            // float and ignoring it worked, so nothing exercised this path.
+            // Declared type first, then the kind inferred from call sites, so an
+            // unannotated float parameter takes the XMM path too. Unknown falls
+            // through to the GP spill, which is the status quo ante.
+            bool float_param =
+                i < fn.param_type_kinds.size() && fn.param_type_kinds[i] == "float";
+            if (i >= fn.param_type_kinds.size() || fn.param_type_kinds[i].empty()) {
+                const auto& pk = module_param_kinds[fn_index];
+                float_param = i < pk.size() && pk[i] == Kind::Float;
+            }
+
+            if (float_param) {
+                if (i >= 2) {
+                    throw std::runtime_error(
+                        "compile_module: a float parameter past position 1 is not "
+                        "supported in this slice (only 2 argument registers exist)");
+                }
+                // Float parameters are never promoted (see
+                // select_promoted_variables), so the slot is the home.
+                emit_movsd_rbp_mem(code, abi::kFloatArgRegs[i],
+                                   alloc.variable_offset(fn.params[i]));
+                continue;
+            }
             if (alloc.variable_in_register(fn.params[i])) {
                 emit_mov_reg_reg(code, alloc.variable_reg(fn.params[i]), abi::kArgRegs[i]);
             } else {
@@ -1288,6 +1369,14 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
             }
 
             case Op::Store: {
+                // 4.1. A valueless container store is a declaration, not an
+                // assignment: the slot run was reserved during layout and
+                // nothing is written here. Falling through to the normal store
+                // path would read args.at(0) on an empty vector.
+                if (instr.args.empty() &&
+                    (instr.type_kind == "list" || instr.type_kind == "tuple")) {
+                    break;
+                }
                 require_variable(instr.name, "store to");
                 if (is_float_value(value_kinds, instr.args.at(0))) {
                     Xmm src = read_float(instr.args.at(0));
@@ -1299,6 +1388,74 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
                 } else {
                     Reg src = read_left(instr.args.at(0));
                     emit_store_rbp_offset(code, src, alloc.variable_offset(instr.name));
+                }
+                break;
+            }
+
+            // 4.1. Container access. Len folds to the capacity because N is part
+            // of the type -- there is no length word in the frame to read, and
+            // inventing one would be a second source of truth that can disagree
+            // with the type. Index/IndexStore use the scaled SIB form so a
+            // RUNNING index costs no extra instruction beyond the address.
+            case Op::Len: {
+                Reg dst = compute_dest(instr.result);
+                const int cap = alloc.container_capacity(instr.name);
+                if (cap <= 0) {
+                    throw std::runtime_error("compile_module: len() of '" + instr.name +
+                                             "' which is not a container");
+                }
+                emit_mov_reg_imm64(code, dst, static_cast<int64_t>(cap));
+                commit_result(instr.result, dst);
+                break;
+            }
+
+            case Op::Index: {
+                const int disp = alloc.element_offset(instr.name, 0);
+                if (disp == 0 && alloc.container_capacity(instr.name) == 0) {
+                    throw std::runtime_error("compile_module: index into '" + instr.name +
+                                             "' which is not a container");
+                }
+                // kR for the index, because compute_dest() hands back kL when
+                // the result temp is spilled. Both operands reading through
+                // read_left() would land in the SAME scratch and the second
+                // would overwrite the index.
+                Reg idx = read_in(instr.args.at(0), kR);
+                emit_index_bounds_check(instr.args.at(0), idx, instr.name);
+                if (is_float_value(value_kinds, instr.result)) {
+                    // A float element load needs no special slot bookkeeping: the
+                    // result's float location is assigned by assign_float_locations
+                    // like any other float temp, and float_dest/commit_float_result
+                    // handle both the in-register and the spilled case. An earlier
+                    // note here claimed the spill slot was unallocated and threw
+                    // instead; that diagnosis was a guess, and the scaled SSE
+                    // emitter it needed was already present.
+                    Xmm dst = float_dest(instr.result);
+                    emit_movsd_xmm_rbp_scaled(code, dst, idx, disp);
+                    commit_float_result(instr.result, dst);
+                } else {
+                    Reg dst = compute_dest(instr.result);
+                    emit_load_rbp_scaled(code, dst, idx, disp);
+                    commit_result(instr.result, dst);
+                }
+                break;
+            }
+
+            case Op::IndexStore: {
+                const int disp = alloc.element_offset(instr.name, 0);
+                if (alloc.container_capacity(instr.name) == 0) {
+                    throw std::runtime_error("compile_module: index store into '" +
+                                             instr.name + "' which is not a container");
+                }
+                Reg idx = read_in(instr.args.at(0), kL);
+                emit_index_bounds_check(instr.args.at(0), idx, instr.name);
+                if (is_float_value(value_kinds, instr.args.at(1))) {
+                    Xmm src = read_float(instr.args.at(1));
+                    emit_movsd_rbp_scaled(code, src, idx, disp);
+                } else {
+                    // kR, not read_left: the value must not land in kL, which
+                    // is holding the index.
+                    Reg src = read_in(instr.args.at(1), kR);
+                    emit_store_rbp_scaled(code, src, idx, disp);
                 }
                 break;
             }
@@ -1725,31 +1882,77 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
                                 "not supported in this slice");
                         }
                         for (size_t i = 0; i < instr.args.size(); ++i) {
-                            materialize_into(abi::kArgRegs[i], instr.args[i]);
+                            // Marshal a float argument into XMM_i. Reading it
+                            // through materialize_into() would put integer-shaped
+                            // bits in a GP register, and the callee's prologue
+                            // would spill XMM_i -- so the two halves have to
+                            // agree or the value is simply lost.
+                            if (is_float_value(value_kinds, instr.args[i])) {
+                                Xmm fv = read_float(instr.args[i]);
+                                if (fv != abi::kFloatArgRegs[i]) {
+                                    emit_movsd_xmm_xmm(code, abi::kFloatArgRegs[i], fv);
+                                }
+                            } else {
+                                materialize_into(abi::kArgRegs[i], instr.args[i]);
+                            }
                         }
                         JumpPatch to_callee = emit_jmp_rel32(code);
                         code[to_callee.rel32_offset - 1] = 0xE8;   // rewrite jmp rel32 -> call rel32
                         pending_calls.push_back({to_callee, instr.name});
 
                         if (instr.result != kInvalidValue) {
-                            // A spilled call result: the callee left its
-                            // return value in RAX and nothing has written RAX
-                            // since, so store it into the slot directly.
-                            // compute_dest() would hand back kL instead and
-                            // cost an extra register-to-register copy through
-                            // scratch for no reason.
-                            const ValueLocation& loc = alloc.temp_location(instr.result);
-                            if (loc.in_register) {
-                                if (loc.reg != Reg::RAX) emit_mov_reg_reg(code, loc.reg, Reg::RAX);
+                            // A float[64]-returning function leaves its result in
+                            // XMM0, not RAX, per SysV and Win64. Reading RAX
+                            // unconditionally copied whatever stale bits were
+                            // there and re-read them as a double, so a function
+                            // returning 2.0 printed a different near-zero
+                            // denormal on each call. print()'s own branch in this
+                            // switch already consults value_kinds for exactly
+                            // this reason; this block now does the same.
+                            if (is_float_value(value_kinds, instr.result)) {
+                                Xmm d = float_dest(instr.result);
+                                if (d != abi::kFloatArgReg) {
+                                    emit_movsd_xmm_xmm(code, d, abi::kFloatArgReg);
+                                }
+                                commit_float_result(instr.result, d);
                             } else {
-                                emit_store_rbp_offset(code, Reg::RAX, loc.stack_slot);
+                                // An int/bool result: the callee left it in RAX
+                                // and nothing has written RAX since, so store it
+                                // into the slot directly. compute_dest() would
+                                // hand back kL instead and cost an extra
+                                // register-to-register copy for no reason.
+                                const ValueLocation& loc = alloc.temp_location(instr.result);
+                                if (loc.in_register) {
+                                    if (loc.reg != Reg::RAX) {
+                                        emit_mov_reg_reg(code, loc.reg, Reg::RAX);
+                                    }
+                                } else {
+                                    emit_store_rbp_offset(code, Reg::RAX, loc.stack_slot);
+                                }
                             }
                         }
                         break;
                     }
 
                     case Op::Return: {
-                        if (!instr.args.empty()) materialize_into(Reg::RAX, instr.args.at(0));
+                        // A float[64] return goes out in XMM0 (SysV and Win64),
+                        // NOT in RAX. materialize_into(Reg::RAX, ...) on a float
+                        // temp copies integer-shaped bits into a GP register, so
+                        // the callee never published the value at all and the
+                        // caller read stale RAX. This is the other half of the
+                        // same bug as the Op::Call capture above: fixing only the
+                        // caller still printed garbage, because the callee was
+                        // not putting the result where the caller looked.
+                        if (!instr.args.empty()) {
+                            if (is_float_value(value_kinds, instr.args.at(0))) {
+                                Xmm fv = read_float(instr.args.at(0));
+                                if (fv != abi::kFloatArgReg) {
+                                    emit_movsd_xmm_xmm(code, abi::kFloatArgReg, fv);
+                                }
+                            } else {
+                                materialize_into(Reg::RAX, instr.args.at(0));
+                            }
+                        }
                         for (const auto& saved : alloc.callee_saved_slots()) {
                             emit_load_rbp_offset(code, saved.first, saved.second);
                         }
@@ -1940,6 +2143,7 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
     compiled.phi_copies_total = phi_copies_total;
     compiled.phis_forwarded = phis_forwarded;
     compiled.phi_copies_coalesced = phi_copies_coalesced;
+    compiled.float_adds_reassociated = float_adds_reassociated;
     return compiled;
 }
 

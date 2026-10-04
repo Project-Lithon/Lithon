@@ -38,6 +38,10 @@ struct OptimizeStats {
     int tail_calls = 0;
     int strength_reduced = 0;
     int accum_unrolled = 0;
+    // 3.1: float add chains rotated to shorten the dependency chain. NOT
+    // semantics-preserving -- each rotation is a different rounding of the same
+    // mathematical sum. Only ever nonzero under the explicit opt-in flag.
+    int float_adds_reassociated = 0;
     // Merges deleted outright because every operand was the same value. Each one
     // is a copy set that never had to exist, and a promotion-pool register that
     // never had to be spent on it.
@@ -48,6 +52,13 @@ struct OptimizeStats {
     // compile_module folds them into the per-function kind vector before
     // allocation. Empty unless a float accumulator was actually split.
     std::vector<lithon::ir::ValueId> accum_float_values;
+    // 3.1. Float values reassociate_float_adds() created. Recorded for the same
+    // reason accum_float_values exists: codegen picks the XMM world from the
+    // caller's value-kind table, and a ValueId absent from that table reads as
+    // Unknown -- which sends a double through the INTEGER add path and produces
+    // nonsense rather than a rounding difference. Every value a pass invents
+    // must be declared, or the pass is not finished.
+    std::vector<lithon::ir::ValueId> reassoc_float_values;
 };
 
 inline void fold_constants(lithon::ir::Function& fn, OptimizeStats& stats) {
@@ -239,6 +250,16 @@ inline void eliminate_dead_code(lithon::ir::Function& fn, OptimizeStats& stats) 
             if (in.op != Op::Store && in.op != Op::Phi && !is_pure_op(in.op)) {
                 for (auto arg : in.args) mark_temp(arg);
             }
+            // 4.1. Index/IndexStore/Len name their container VARIABLE, not a
+            // ValueId, so the liveness walk above never sees the reference and
+            // `xs` looked dead. That let DCE delete the declaration -- which for
+            // a container is not a redundant store but the reservation of the
+            // slot run, so removing it makes every later Index address memory
+            // that was never claimed.
+            if (in.op == Op::Index || in.op == Op::IndexStore || in.op == Op::Len) {
+                mark_var(in.name);
+                for (auto arg : in.args) mark_temp(arg);
+            }
         }
     }
     while (!work.empty()) {
@@ -255,6 +276,14 @@ inline void eliminate_dead_code(lithon::ir::Function& fn, OptimizeStats& stats) 
         auto& v = block.instrs;
         size_t before = v.size();
         v.erase(std::remove_if(v.begin(), v.end(), [&](const Instr& in) {
+            // 4.1. A valueless container store is a DECLARATION. It reserves the
+            // run of slots the Index ops address, so it is not dead code even
+            // when nothing appears to read the variable -- dropping it would
+            // turn every element access into an address into unclaimed frame.
+            if (in.op == Op::Store && in.args.empty() &&
+                (in.type_kind == "list" || in.type_kind == "tuple")) {
+                return false;
+            }
             if (in.op == Op::Store) return live_vars.count(in.name) == 0;
             return is_removable_if_unused(in.op) && in.result != kInvalidValue
                    && live_temps.count(in.result) == 0;
@@ -1213,9 +1242,118 @@ inline void accumulator_unroll(lithon::ir::Function& fn, OptimizeStats& stats,
     }
 }
 
+// 3.1. Reassociate float addition -- SHORTEN the dependency chain, and change
+// the answer.
+//
+// The whole of this pass exists because one IEEE-754 fact is inconvenient:
+// floating-point addition is NOT associative. `((a+b)+c)` and `(a+(b+c))` are
+// the same real number and, in general, different doubles. So this is not an
+// optimisation in the sense every other pass here is -- it trades a proven
+// property (bit-exact agreement with the interpreter, which the whole test gate
+// is measured against) for latency. It therefore only ever runs when the caller
+// passed the explicit opt-in flag, and it is never on by default. Integer
+// arithmetic gets no such pass and needs none: integer addition is associative
+// and exact, so regrouping it is free.
+//
+// What it does: where a float add's left operand is itself an add that has
+// exactly one use, rotate
+//     %t = add %p, %q      %u = add %t, %r     -->     %u = add %p, %new
+//                                                     %new = add %q, %r
+// which drops one level off the chain. Repeated application turns a left-leaning
+// spine into a shallower tree, and a chain of N dependent adds has depth N
+// while the rotated form is closer to log2(N).
+//
+// Two conditions make it safe to *move the code*, independent of the flag:
+//
+//   * `%t` must have exactly one use, or some other reader would lose its
+//     operand and the value would still be needed. `eliminate_dead_code` runs
+//     afterwards and collects the now-dead `%t`.
+//   * the new instruction goes where `%u` is, not where `%t` was. That ordering
+//     is what makes both operands in scope: `%r` dominates `%u` because it is
+//     `%u`'s own operand, and `%q` dominates `%u` because it reaches it through
+//     `%t`, which has no other use. Building the new add at `%t`'s position
+//     instead would be wrong whenever `%r` is defined between the two.
+//
+// `is_float` is required, not optional. Without it there is no way to tell a
+// float add from an integer one, and reassociating an integer chain would be
+// pointless rather than wrong -- but the whole point of this pass is that the
+// float case is the one that changes results, so a caller that has not proven
+// the kinds gets nothing.
+inline void reassociate_float_adds(lithon::ir::Function& fn, OptimizeStats& stats,
+                                   const std::vector<bool>* is_float) {
+    using namespace lithon::ir;
+    if (!is_float) return;
+
+    auto is_f = [&](ValueId v) { return v < is_float->size() && (*is_float)[v]; };
+
+    // How often each value is read. The single-use test below is the one that
+    // keeps this from deleting an operand something else still needs, so it has
+    // to count uses across the WHOLE function, not the block being rewritten.
+    std::unordered_map<ValueId, int> uses;
+    ValueId next_id = 0;
+    for (const auto& b : fn.blocks) {
+        for (const auto& in : b.instrs) {
+            if (in.result != kInvalidValue) next_id = std::max(next_id, in.result + 1);
+            for (ValueId a : in.args) ++uses[a];
+        }
+    }
+
+    // Where each value is defined, so the rotation can recognise `%t` as an add
+    // rather than trusting the use count alone.
+    std::unordered_map<ValueId, const Instr*> def_of;
+    for (const auto& b : fn.blocks)
+        for (const auto& in : b.instrs)
+            if (in.result != kInvalidValue) def_of[in.result] = &in;
+
+    for (auto& b : fn.blocks) {
+        for (size_t i = 0; i < b.instrs.size(); ++i) {
+            const Instr& u = b.instrs[i];
+            if (u.op != Op::Add || u.result == kInvalidValue || u.args.size() != 2) continue;
+            const ValueId t = u.args[0];
+            const ValueId r = u.args[1];
+
+            if (uses[t] != 1) continue;                    // still someone else's
+            if (!is_f(t) || !is_f(r)) continue;            // float chains only
+            const auto dit = def_of.find(t);
+            if (dit == def_of.end()) continue;
+            const Instr* d = dit->second;
+            if (d->op != Op::Add || d->args.size() != 2) continue;
+            const ValueId p = d->args[0];
+            const ValueId q = d->args[1];
+            if (!is_f(p) || !is_f(q)) continue;
+
+            // The rotated pair. `%t` is left behind for eliminate_dead_code.
+            Instr fresh;
+            fresh.op = Op::Add;
+            fresh.result = next_id++;
+            fresh.args = {q, r};
+            fresh.type_kind = d->type_kind;
+            fresh.type_width = d->type_width;
+
+            // Insert BEFORE touching `u`, and then reach `u` through the index
+            // rather than through the reference. `insert` can reallocate the
+            // block's vector, which leaves every earlier reference -- including
+            // `u` -- dangling; writing `u.args` after the insert is a
+            // use-after-free that happens to work until it does not. This is
+            // why the result was one rotation short of the two the chain owes.
+            b.instrs.insert(b.instrs.begin() + static_cast<long>(i), fresh);
+            Instr& rewritten = b.instrs[i + 1];
+            rewritten.args[0] = p;
+            rewritten.args[1] = fresh.result;
+            ++i;                 // step past the inserted instruction
+            stats.reassoc_float_values.push_back(fresh.result);
+            ++stats.float_adds_reassociated;
+        }
+    }
+}
+
 struct OptimizePasses {
     bool strength_reduce = true;   // rewrite invariant*IV multiplies into adds
     int accum_unroll = 1;          // split a reduction accumulator into N partials (<=1 off)
+    // 3.1. Reassociate float adds. Off by default and opt-in ONLY, because it
+    // changes results: this is the one pass here that is allowed to disagree
+    // with the interpreter, and it may disagree in the last bit.
+    bool ffast_math_equivalent = false;
 };
 
 // `is_float` (optional) maps each original ValueId to whether it is a double;
@@ -1228,6 +1366,11 @@ inline OptimizeStats optimize_function(lithon::ir::Function& fn,
     fold_constants(fn, stats);
     if (passes.strength_reduce) strength_reduce_multiplies(fn, stats);
     accumulator_unroll(fn, stats, passes.accum_unroll, is_float);
+    // After constant folding, deliberately: folding turns a chain of literals
+    // into one constant and there is nothing left to rotate, which is correct --
+    // a chain that was already computed at compile time has no dependency chain
+    // to shorten.
+    if (passes.ffast_math_equivalent) reassociate_float_adds(fn, stats, is_float);
     eliminate_dead_code(fn, stats);
     return stats;
 }

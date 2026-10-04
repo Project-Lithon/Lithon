@@ -118,5 +118,25 @@ int main() {
         { CodeBuffer b; emit_sub_rsp_imm32(b, v); line("sub rsp, " + std::to_string(v), b); }
         { CodeBuffer b; emit_add_rsp_imm32(b, v); line("add rsp, " + std::to_string(v), b); }
     }
+    // 4.1. Scaled-index addressing, paired across the full register space so
+    // REX.X is actually exercised: an index in r8..r15 needs X set, and without
+    // it the address silently uses only the low three bits. The data register is
+    // varied across the loop for the same reason (REX.R).
+    for (int d = 0; d < 16; ++d) {
+        Reg rd = static_cast<Reg>(d);
+        std::string D = R64[d];
+        for (int i : {1, 9, 13}) {
+            Reg ri = static_cast<Reg>(i);
+            std::string I = R64[i];
+            for (auto v : disps) {
+                { CodeBuffer b; emit_load_rbp_scaled(b, rd, ri, v);
+                  line("mov " + D + ", qword ptr [rbp" + std::string(v < 0 ? "" : "+") +
+                       std::to_string(v) + "+" + I + "*8]", b); }
+                { CodeBuffer b; emit_store_rbp_scaled(b, rd, ri, v);
+                  line("mov qword ptr [rbp" + std::string(v < 0 ? "" : "+") +
+                       std::to_string(v) + "+" + I + "*8], " + D, b); }
+            }
+        }
+    }
     return 0;
 }

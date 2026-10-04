@@ -5,6 +5,10 @@
 #include <cmath>
 #include <unordered_map>
 #include <unordered_set>
+
+// For Kind, to type the optional inferred parameter kinds. print_guard.h does
+// not include this header, so there is no cycle.
+#include "print_guard.h"
 #include <vector>
 #include "ir/ir.h"
 #include "jit_abi.h"
@@ -27,7 +31,9 @@ using PromotionMap = std::unordered_map<std::string, Reg>;
 // the number of its loads/stores, each scaled by 10^(loop depth). Only
 // variables that beat the cost of saving+restoring a register (two
 // memory ops per call) are promoted.
-inline PromotionMap select_promoted_variables(const lithon::ir::Function& fn) {
+inline PromotionMap select_promoted_variables(
+    const lithon::ir::Function& fn,
+    const std::vector<lithon::jit::Kind>& param_kinds = {}) {
     using namespace lithon::ir;
     // Depth comes from the CFG analysis (header dominance), not from a textual
     // block range. A loop whose body is not contiguous -- which is exactly what
@@ -35,8 +41,24 @@ inline PromotionMap select_promoted_variables(const lithon::ir::Function& fn) {
     // -- used to score as depth 0 and lose its variables to a colder rival.
     const LoopInfo loops = compute_loop_info(fn);
 
+    // A float[64] parameter arrives in XMM0/XMM1 and can only ever live in an
+    // XMM register or a frame slot -- never in a GP register. Promotion would
+    // make the prologue emit `mov <gp_reg>, rdi` for it and read the low 64 bits
+    // of an unrelated integer as the double.
+    auto param_is_float = [&](size_t i) {
+        // Declared type first, then the kind inferred from call sites. Both
+        // matter: inference alone would leave a function nobody calls as
+        // Unknown (safe), and the declared type alone is empty for untyped
+        // parameters, which is exactly the case that regressed.
+        if (i < fn.param_type_kinds.size() && !fn.param_type_kinds[i].empty())
+            return fn.param_type_kinds[i] == "float";
+        return i < param_kinds.size() && param_kinds[i] == lithon::jit::Kind::Float;
+    };
+
     std::unordered_map<std::string, double> weight;
-    for (const auto& p : fn.params) weight[p] += 1.0;   // entry store
+    for (size_t i = 0; i < fn.params.size(); ++i) {
+        if (!param_is_float(i)) weight[fn.params[i]] += 1.0;   // entry store
+    }
 
     for (size_t b = 0; b < fn.blocks.size(); ++b) {
         int depth = 0;
@@ -49,9 +71,23 @@ inline PromotionMap select_promoted_variables(const lithon::ir::Function& fn) {
         }
     }
 
+    // 4.1. A container is a RUN of frame slots, not a value, so it must never be
+    // promoted: a promoted `xs` would hand out one register and then Index would
+    // compute an address from it, which is exactly the "address-as-value" bug
+    // that #2 above names. Excluded here, before ranking, so no container can
+    // reach a register by any path.
+    auto is_container = [&](const std::string& name) {
+        for (const auto& b : fn.blocks)
+            for (const auto& in : b.instrs)
+                if (in.op == Op::Store && in.name == name &&
+                    (in.type_kind == "list" || in.type_kind == "tuple"))
+                    return true;
+        return false;
+    };
+
     std::vector<std::pair<std::string, double>> ranked;
     for (const auto& kv : weight) {
-        if (kv.second > 2.0) ranked.push_back(kv);
+        if (kv.second > 2.0 && !is_container(kv.first)) ranked.push_back(kv);
     }
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
         return a.second != b.second ? a.second > b.second : a.first < b.first;
@@ -127,6 +163,25 @@ public:
         assign_callee_saved_slots();
         if (!float_values.empty()) assign_float_locations(float_values, virtual_temps);
         finalize_frame_size();
+    }
+
+    // 4.1. Frame offset of element `index` of a container variable. Slots run
+    // DOWNWARD from the base (the frame grows down), so element i sits at
+    // base - i*8 -- getting this sign wrong would make `xs[0]` read the last
+    // element while every bounds check still passed.
+    int element_offset(const std::string& name, int index) const {
+        auto base = variable_offsets_.find(name);
+        if (base == variable_offsets_.end() || index < 0) return 0;
+        const int cap = container_capacity(name);
+        if (cap > 0 && index >= cap) return 0;   // caller range-checks; do not compute
+        return base->second + index * 8;
+    }
+    int container_capacity(const std::string& name) const {
+        auto it = container_capacity_.find(name);
+        return it == container_capacity_.end() ? 0 : it->second;
+    }
+    bool is_container(const std::string& name) const {
+        return container_capacity_.count(name) != 0;
     }
 
     int variable_offset(const std::string& name) const {
@@ -211,6 +266,10 @@ private:
     PromotionMap promoted_;
 
     std::unordered_map<std::string, int> variable_offsets_;
+    // 4.1. Containers record their capacity so Len can fold to a constant and
+    // so Index can tell a real container from a scalar that happens to be
+    // indexed by mistake.
+    std::unordered_map<std::string, int> container_capacity_;
     std::vector<std::string> variable_order_;
     std::vector<std::pair<Reg, int>> callee_saved_slots_;
     // Callee-saved registers the TEMPORARIES borrowed (they must survive a call,
@@ -290,7 +349,31 @@ private:
         auto assign_one = [&](const std::string& name) {
             if (!seen.insert(name).second) return;   // already handled
             variable_order_.push_back(name);
-            if (!promoted_.count(name)) {
+            if (promoted_.count(name)) return;
+
+            // 4.1. A container declaration reserves N slots, one per element,
+            // and records the BASE. `variable_offset` alone would hand back the
+            // first slot and silently alias every element onto it, so the
+            // element address must always go through element_offset(), which
+            // re-derives the offset from the base and the index.
+            int cap = 0;
+            for (const auto& b2 : fn_.blocks)
+                for (const auto& in2 : b2.instrs)
+                    if (in2.op == lithon::ir::Op::Store && in2.name == name &&
+                        (in2.type_kind == "list" || in2.type_kind == "tuple"))
+                        cap = in2.type_width > 0 ? in2.type_width : 1;
+            if (cap > 1) {
+                // Slots run DOWNWARD, but SIB addressing computes
+                // [rbp + disp + index*8] -- upward, and x86 has no negative
+                // scale. So element 0 is placed at the LOW address of the run
+                // and the run ascends from there. Anchoring element 0 at the
+                // high end instead (the obvious choice) would make xs[0] read
+                // the LAST element while every bounds check still passed.
+                int anchor = allocate_new_slot();
+                for (int i = 1; i < cap; ++i) allocate_new_slot();
+                variable_offsets_[name] = anchor - (cap - 1) * 8;
+                container_capacity_[name] = cap;
+            } else {
                 variable_offsets_[name] = allocate_new_slot();
             }
         };

@@ -87,6 +87,11 @@ struct FnState {
     const lithon::ir::Function* fn = nullptr;
     std::vector<Kind> vals;                          // by ValueId
     std::unordered_map<std::string, Kind> vars;      // variables and params
+    // 4.1. Element kind per container variable, so Index can type its result
+    // and IndexStore can check what it is writing. Keyed separately from `vars`
+    // because a container has no scalar Kind of its own -- the whole point is
+    // that `list[int[64],4]` is not an int.
+    std::unordered_map<std::string, Kind> containers;
     std::vector<Kind> param_kind;                    // inferred from call sites
     Kind ret = Kind::Unseen;
     bool called = false;
@@ -196,8 +201,38 @@ struct Analysis {
                         break;
                     }
                     case Op::Store:
+                        if (in.args.empty() &&
+                            (in.type_kind == "list" || in.type_kind == "tuple")) {
+                            // 4.1. Container declaration. Records the element
+                            // kind only; there is no scalar Kind for the
+                            // container itself.
+                            st.containers[in.name] =
+                                in.type_elem_kind == "float" ? Kind::Float : Kind::Int;
+                            break;
+                        }
                         if (!in.args.empty())
                             raise(st.vars[in.name], val(st, in.args[0]));
+                        break;
+
+                    // 4.1. Container access. Index carries the element kind;
+                    // IndexStore feeds it back so a mismatch between the declared
+                    // element type and what is actually written is caught here
+                    // rather than becoming a wrong print format downstream; Len
+                    // is always an int because N folds to a constant.
+                    case Op::Index: {
+                        auto it = st.containers.find(in.name);
+                        raise(st.vals[in.result],
+                              it == st.containers.end() ? Kind::Unseen : it->second);
+                        break;
+                    }
+                    case Op::IndexStore: {
+                        auto it = st.containers.find(in.name);
+                        if (it != st.containers.end() && in.args.size() >= 2)
+                            raise(it->second, val(st, in.args[1]));
+                        break;
+                    }
+                    case Op::Len:
+                        raise(st.vals[in.result], Kind::Int);
                         break;
 
                     case Op::Add: case Op::Sub: case Op::Mul:
@@ -414,6 +449,28 @@ inline std::vector<std::vector<Kind>> infer_value_kinds(const lithon::ir::Module
     std::vector<std::vector<Kind>> out;
     out.reserve(an.fns.size());
     for (auto& st : an.fns) out.push_back(st.vals);
+    return out;
+}
+
+// Per-function PARAMETER kinds, using the same fixpoint the print guard
+// already runs: a call site raises the callee's parameter kind to the kind of
+// the argument actually passed. Without this the prologue has to guess, and an
+// unannotated `float` parameter looked identical to an `int` one -- so it was
+// spilled from a GP argument register even though the caller had correctly
+// marshalled the double into XMM. Declared types win over inference; a
+// parameter nobody calls, or one only ever handed incomparable kinds, stays
+// Unknown and the prologue falls back to the GP path.
+inline std::vector<std::vector<Kind>> infer_param_kinds(const lithon::ir::Module& module) {
+    detail::Analysis an;
+    an.init(module);
+    for (int iter = 0; iter < 1000; ++iter) {
+        an.changed = false;
+        for (auto& st : an.fns) an.run_function(st, false, nullptr);
+        if (!an.changed) break;
+    }
+    std::vector<std::vector<Kind>> out;
+    out.reserve(an.fns.size());
+    for (auto& st : an.fns) out.push_back(st.param_kind);
     return out;
 }
 

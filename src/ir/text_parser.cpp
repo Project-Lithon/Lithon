@@ -39,21 +39,88 @@ ValueId parse_value_ref(const std::string& tok) {
     return static_cast<ValueId>(std::stoul(tok.substr(1)));
 }
 
-// Parses a type string like "int[8]", "float[32]", or "bool" into
-// (kind, width). width is -1 for bool or if no [N] is present.
-std::pair<std::string, int> parse_type_string(const std::string& raw) {
+// 4.1. A parsed type: the kind, its own width, and -- for a container -- the
+// element type inside it. `list[int[64], 10]` is kind "list", capacity 10, and
+// element "int" of width 64.
+//
+// The element type is a nested SUBSCRIPT, so this cannot be the old one-level
+// `t.find(']')` scan: for `list[int[64],10]` that finds the `]` belonging to
+// `int[64]` and would read the capacity as "64". Splitting on the bracket that
+// matches the OUTERMOST one is the whole fix, and it is done by counting depth
+// rather than by searching for a comma, so a comma inside a nested subscript
+// cannot be mistaken for the capacity separator.
+struct ParsedType {
+    std::string kind;
+    int width = -1;
+    std::string elem_kind;
+    int elem_width = -1;
+};
+
+// Index just past the `]` that closes the `[` at `open`, or npos.
+static size_t matching_close(const std::string& t, size_t open) {
+    int depth = 0;
+    for (size_t i = open; i < t.size(); ++i) {
+        if (t[i] == '[') ++depth;
+        else if (t[i] == ']') {
+            if (--depth == 0) return i;
+        }
+    }
+    return std::string::npos;
+}
+
+ParsedType parse_type_string(const std::string& raw) {
     std::string t = trim(raw);
     size_t bracket = t.find('[');
-    if (bracket == std::string::npos) {
-        return {t, -1};
-    }
-    std::string kind = t.substr(0, bracket);
-    size_t close = t.find(']', bracket);
-    if (close == std::string::npos) {
+    if (bracket == std::string::npos) return ParsedType{t, -1, "", -1};
+
+    ParsedType out;
+    out.kind = trim(t.substr(0, bracket));
+    const size_t close = matching_close(t, bracket);
+    if (close == std::string::npos)
         throw std::runtime_error("malformed type annotation: " + raw);
+
+    const std::string inner = trim(t.substr(bracket + 1, close - bracket - 1));
+    if (out.kind != "list" && out.kind != "tuple" && out.kind != "ptr") {
+        // A scalar: `int[8]` -- width is a bit width.
+        out.width = std::stoi(inner);
+        return out;
     }
-    std::string width_str = t.substr(bracket + 1, close - bracket - 1);
-    return {kind, std::stoi(width_str)};
+
+    // A container: `int[64], 10` or, for ptr, just `int[64]`. Split on the
+    // top-level comma only.
+    size_t comma = std::string::npos;
+    int depth = 0;
+    for (size_t i = 0; i < inner.size(); ++i) {
+        if (inner[i] == '[') ++depth;
+        else if (inner[i] == ']') --depth;
+        else if (inner[i] == ',' && depth == 0) { comma = i; break; }
+    }
+    // ptr carries no capacity -- `ptr[int[64]]` is complete as written -- so a
+    // missing comma is only an error for the sized containers.
+    if (comma == std::string::npos) {
+        if (out.kind == "ptr") {
+            const ParsedType e = parse_type_string(trim(inner));
+            out.elem_kind = e.kind;
+            out.elem_width = e.width;
+            return out;
+        }
+        throw std::runtime_error("malformed container type annotation: " + raw);
+    }
+
+    const std::string elem = trim(inner.substr(0, comma));
+    const std::string rest = trim(inner.substr(comma + 1));
+
+    // The element is itself a type string, so `list[list[int[8],4],2]` nests.
+    const ParsedType e = parse_type_string(elem);
+    out.elem_kind = e.kind;
+    out.elem_width = e.width;
+    if (e.width < 0 && e.kind == "list") {
+        // A list element with no width carries its capacity in the element slot;
+        // keep it addressable rather than silently flattening to -1.
+        out.elem_width = e.width;
+    }
+    out.width = rest.empty() ? -1 : std::stoi(rest);
+    return out;
 }
 
 struct OpAndArgs {
@@ -91,8 +158,8 @@ ParamSpec parse_param(const std::string& raw) {
         return ParamSpec{p, "", -1};
     }
     std::string name = trim(p.substr(0, colon));
-    auto [kind, width] = parse_type_string(p.substr(colon + 1));
-    return ParamSpec{name, kind, width};
+    const ParsedType pt = parse_type_string(p.substr(colon + 1));
+    return ParamSpec{name, pt.kind, pt.width};
 }
 
 } // namespace
@@ -119,9 +186,9 @@ Module parse_ir_text(const std::string& text) {
             size_t arrow = rest.find("->");
             if (arrow != std::string::npos) {
                 std::string ret_str = trim(rest.substr(arrow + 2));
-                auto [k, w] = parse_type_string(ret_str);
-                return_kind = k;
-                return_width = w;
+                const ParsedType rt = parse_type_string(ret_str);
+                return_kind = rt.kind;
+                return_width = rt.width;
                 rest = trim(rest.substr(0, arrow));
             }
 
@@ -189,9 +256,11 @@ Module parse_ir_text(const std::string& text) {
         size_t type_sep = rhs.find(" : ");
         if (type_sep != std::string::npos) {
             std::string type_str = trim(rhs.substr(type_sep + 3));
-            auto [kind, width] = parse_type_string(type_str);
-            instr.type_kind = kind;
-            instr.type_width = width;
+            const ParsedType pt = parse_type_string(type_str);
+            instr.type_kind = pt.kind;
+            instr.type_width = pt.width;
+            instr.type_elem_kind = pt.elem_kind;
+            instr.type_elem_width = pt.elem_width;
             rhs = trim(rhs.substr(0, type_sep));
         }
 
@@ -226,7 +295,27 @@ Module parse_ir_text(const std::string& text) {
         } else if (oa.op_name == "store") {
             instr.op = Op::Store;
             instr.name = oa.raw_args.at(0);
+            // 4.1. A container declaration carries no value: `store xs :
+            // list[int[64],4]` RESERVES the run of slots and binds the name. It
+            // is not an assignment, so there is nothing to store and requiring
+            // a value operand here is what made every container declaration
+            // impossible to express.
+            if (oa.raw_args.size() >= 2) instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+        // 4.1. Container ops. Their first argument is a container VARIABLE name,
+        // not a ValueId: the address is derived from the variable's slot run,
+        // so it is carried in `name` and only the real operands are refs.
+        } else if (oa.op_name == "Index") {
+            instr.op = Op::Index;
+            instr.name = oa.raw_args.at(0);
             instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+        } else if (oa.op_name == "IndexStore") {
+            instr.op = Op::IndexStore;
+            instr.name = oa.raw_args.at(0);
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(2)));
+        } else if (oa.op_name == "Len") {
+            instr.op = Op::Len;
+            instr.name = oa.raw_args.at(0);
         } else if (oa.op_name == "add") {
             instr.op = Op::Add;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));

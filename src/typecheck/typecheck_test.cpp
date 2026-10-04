@@ -184,6 +184,170 @@ block0:
     return
 )");
 
+    // ---------------------------------------------------------------- 4.1
+    // Containers. Two rules are pinned here.
+    //
+    // First: a scalar literal cannot BUILD a container. Before 4.1 the literal
+    // branch of check_value_into_target only knew int and float targets, so
+    // `store ys, %int : list[float[64],4]` fell through and was accepted --
+    // a typed variable whose declaration constrained nothing. That made the
+    // element-type comparison below untestable: every container case fed it an
+    // int, and was being rejected for the wrong reason.
+    expect_rejects("int literal cannot build list[int[64],4]", R"(
+function __main__():
+block0:
+    %0 = const_i64 1
+    store xs, %0 : list[int[64],4]
+    return
+)", "a literal cannot build");
+
+    expect_rejects("int literal cannot build ptr[int[64]]", R"(
+function __main__():
+block0:
+    %0 = const_i64 1
+    store p, %0 : ptr[int[64]]
+    return
+)", "a literal cannot build");
+
+    // Second: shape validation happens before anything else, so a malformed
+    // container names its own problem instead of the conversion.
+    expect_rejects("capacity 0 rejected", R"(
+function __main__():
+block0:
+    %0 = const_i64 1
+    store xs, %0 : list[int[64],0]
+    return
+)", "capacity must be positive");
+
+    expect_rejects("negative capacity rejected", R"(
+function __main__():
+block0:
+    %0 = const_i64 1
+    store xs, %0 : list[int[64],-3]
+    return
+)", "capacity must be positive");
+
+    expect_rejects("list with no element type rejected", R"(
+function __main__():
+block0:
+    %0 = const_i64 1
+    store xs, %0 : list[,4]
+    return
+)", "needs an element type");
+
+    // ptr renders without a phantom capacity, and a nested element renders as
+    // `list[...]` rather than as its bare capacity -- `list[list[4], 2]` reads
+    // like a list of 4-element ints, which is not what it is.
+    expect_rejects("ptr renders with no capacity", R"(
+function __main__():
+block0:
+    %0 = const_i64 1
+    store p, %0 : ptr[int[64]]
+    return
+)", "ptr[int[64]]");
+
+    expect_rejects("nested list renders its element as list[...]", R"(
+function __main__():
+block0:
+    %0 = const_i64 1
+    store g, %0 : list[list[int[8],4],2]
+    return
+)", "list[list[...], 2]");
+
+    // 4.1 container access. The declarations below use a container that was
+    // already built, so the shape rules are tested on their own terms: an
+    // IndexStore into it is what a real program does, and it is the only way to
+    // get a list-typed VALUE to feed the element-type check.
+    expect_accepts("Index and IndexStore into list[int[64],4]", R"(
+function __main__():
+block0:
+    store xs : list[int[64],4]
+    %1 = const_i64 0
+    IndexStore xs, %1, %0
+    %2 = Index xs, %1
+    store n, %2 : int[64]
+    return
+)");
+
+    // Static-only capacity overflow: the index is a literal and N is part of the
+    // type, so this is decidable at compile time rather than being left to a
+    // runtime check.
+    expect_rejects("literal index == capacity", R"(
+function __main__():
+block0:
+    store xs : list[int[64],4]
+    %1 = const_i64 4
+    %2 = Index xs, %1
+    return
+)", "out of range for list[int[64], 4]");
+
+    expect_rejects("negative literal index", R"(
+function __main__():
+block0:
+    store xs : list[int[64],4]
+    %1 = const_i64 -1
+    %2 = Index xs, %1
+    return
+)", "out of range for list[int[64], 4]");
+
+    // Indexing a scalar must be a type error, not an address computed from a
+    // register. This is the rule that keeps Index off the scalar path entirely.
+    expect_rejects("indexing a scalar int[64]", R"(
+function __main__():
+block0:
+    %0 = const_i64 1
+    store s, %0 : int[64]
+    %1 = const_i64 0
+    %2 = Index s, %1
+    return
+)", "not a container");
+
+    expect_rejects("len() of a scalar", R"(
+function __main__():
+block0:
+    %0 = const_i64 1
+    store s, %0 : int[64]
+    %1 = Len s
+    return
+)", "not a container");
+
+    // THE element-type check. It has to differ from the container in a way the
+    // container's OWN (kind, width) cannot see, or the test passes for the wrong
+    // reason: a float into list[int[64],4] is already caught by the KINDS
+    // differing, so dropping the element comparison from LType::operator== still
+    // rejects it. list[int[8],4] against an int[64] value is same-kind,
+    // same-capacity, different-element-width -- only the recursive part of the
+    // type can refuse it. (Verified by mutation.)
+    expect_rejects("int[64] stored into a list[int[8],4]", R"(
+function __main__():
+block0:
+    store xs : list[int[8],4]
+    %1 = const_i64 2
+    %2 = const_i64 0
+    IndexStore xs, %2, %1
+    return
+)", "element type is int[8]");
+
+    expect_accepts("float stored into a list[float[64],4]", R"(
+function __main__():
+block0:
+    store xs : list[float[64],4]
+    %1 = const_f64 1.5
+    %2 = const_i64 0
+    IndexStore xs, %2, %1
+    return
+)");
+
+    // Len is typed as a full-width int even though codegen folds it.
+    expect_accepts("Len result is usable as an int", R"(
+function __main__():
+block0:
+    store xs : list[int[64],4]
+    %1 = Len xs
+    store n, %1 : int[64]
+    return
+)");
+
     // A count outside 0..63 is a compile-time error when it is a literal,
     // because x86 masks the count to 6 bits and would otherwise silently
     // shift by a different amount (64 would execute as 0, -1 as 63).

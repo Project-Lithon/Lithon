@@ -37,6 +37,11 @@ inline constexpr std::array<Reg, 5> kTempPool = {Reg::RAX, Reg::RCX, Reg::RDX, R
 inline constexpr int kShadowSpace = 0;
 #endif
 
+// A float[64] ARGUMENT arrives in XMM0/XMM1 on both ABIs, never in a GP
+// register, and it comes back in XMM0. This array did not exist, which is why
+// the prologue spilled every parameter from kArgRegs and float parameters came
+// out as garbage.
+inline constexpr Xmm kFloatArgRegs[2] = {Xmm::XMM0, Xmm::XMM1};
 inline constexpr std::array<Reg, 5> kPromotionPool = {
     Reg::RBX, Reg::R12, Reg::R13, Reg::R14, Reg::R15};
 

@@ -1,0 +1,21 @@
+function f() -> float[64]:
+block0:
+    %0 = const_f64 1.0
+    store x, %0 : float[64]
+    %1 = load x
+    %2 = const_f64 1.0
+    %3 = add %1, %2
+    store x, %3
+    %4 = load x
+    return %4
+    return
+
+function __main__():
+block0:
+    %0 = call f
+    call print, %0
+    %1 = call f
+    call print, %1
+    %2 = call f
+    call print, %2
+    return

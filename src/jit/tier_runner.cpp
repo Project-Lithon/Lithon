@@ -100,6 +100,10 @@ int main(int argc, char** argv) {
         std::cerr << "usage: tier_runner <file.ir> [--interp|--native|--auto|--strict]\n"
                      "                  [--no-lsr] [--accum-unroll] [--unroll-diamonds] [--dump-hex]\n"
                      "                  [--ssa]\n"
+                     "       --ffast-math-equivalent reassociates FLOAT addition, shortening the\n"
+                     "       dependency chain. NOT bit-exact: IEEE754 addition is not associative,\n"
+                     "       so results can differ from the interpreter's in the last bit. Off by\n"
+                     "       default and never implied by another flag. Integers are untouched.\n"
                      "       --accum-unroll splits a counted reduction's accumulator into 4 partials;\n"
                      "       off by default (the win is ~1.6x on a long-latency float accumulator).\n"
                      "       A float accumulator is reassociated, so its value may differ from the\n"
@@ -122,6 +126,8 @@ int main(int argc, char** argv) {
             options.accum_unroll = 4;
         } else if (a == "--no-accum-unroll") {
             options.accum_unroll = 1;
+        } else if (a == "--ffast-math-equivalent") {
+            options.ffast_math_equivalent = true;
         } else if (a == "--unroll-diamonds") {
             options.unroll_diamonds = true;
         } else if (a == "--dump-hex") {

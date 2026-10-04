@@ -51,6 +51,9 @@ static int float_encoding_checks() {
     {
         CodeBuffer c;
         emit_addsd(c, Xmm::XMM15, Xmm::XMM14);
+        // F2 first, REX immediately before the opcode: a REX byte is only a REX
+        // prefix when nothing follows it but the opcode, so the mandatory legacy
+        // prefix has to come first. GNU as agrees (f2 45 0f 58 fe).
         expect_bytes("addsd xmm15, xmm14 (REX.R and REX.B)", c,
                      {0x45, 0xf2, 0x0f, 0x58, 0xfe});
     }

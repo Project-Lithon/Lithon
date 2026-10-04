@@ -63,12 +63,17 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--no-lsr")) options.strength_reduce = false;
         else if (!std::strcmp(argv[i], "--accum-unroll")) options.accum_unroll = 4;
         else if (!std::strcmp(argv[i], "--no-accum-unroll")) options.accum_unroll = 1;
+        else if (!std::strcmp(argv[i], "--ffast-math-equivalent")) options.ffast_math_equivalent = true;
         else path = argv[i];
     }
     if (path.empty()) {
         std::cerr << "usage: lithon_jit <ir_file> [--dump-hex] [--stats]\n"
                      "                  [--no-opt] [--no-promote] [--no-rotate] [--unroll=N]\n"
                      "                  [--no-lsr] [--accum-unroll] [--unroll-diamonds]\n"
+                     "       --ffast-math-equivalent reassociates FLOAT addition, shortening the\n"
+                     "       dependency chain. NOT bit-exact: IEEE754 addition is not associative,\n"
+                     "       so results can differ from the interpreter's in the last bit. Off by\n"
+                     "       default and never implied by another flag. Integers are untouched.\n"
                      "       --accum-unroll splits a counted reduction's accumulator into 4 partials.\n"
                      "       Off by default; the win is on long-latency float accumulators (~1.6x).\n"
                      "       For a FLOAT accumulator it reassociates the adds, so the value is not\n"
@@ -243,6 +248,9 @@ int main(int argc, char** argv) {
             if (compiled.phis_forwarded)
                 std::fprintf(stderr, "[+] trivial merges folded away: %zu\n",
                              compiled.phis_forwarded);
+            if (compiled.float_adds_reassociated)
+                std::fprintf(stderr, "[+] float adds reassociated: %zu\n",
+                             compiled.float_adds_reassociated);
             if (compiled.phi_copies_coalesced)
                 std::fprintf(stderr, "[+] phi copies deleted by coalescing: %zu\n",
                              compiled.phi_copies_coalesced);

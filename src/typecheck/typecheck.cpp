@@ -12,13 +12,38 @@ using namespace lithon::ir;
 
 namespace {
 
+// 4.1. A type is now recursive: `list[int[64], 10]` is a kind, a capacity, and
+// an ELEMENT type. Element types are held one level deep rather than as a
+// shared_ptr tree, which is enough for list/tuple/ptr (4.2/4.3/4.4) and keeps
+// LType cheap to copy in the scope maps.
+//
+// The element MUST participate in equality. Without it `list[int[64],10]` and
+// `list[float[64],10]` would compare equal, and assigning one to the other
+// would pass the checker -- which is exactly the class of bug a typed container
+// is supposed to make impossible.
 struct LType {
     std::string kind;
     int width = -1;
+    std::string elem_kind;    // element type for list/tuple/ptr; "" when scalar
+    int elem_width = -1;
 
     bool operator==(const LType& other) const {
-        return kind == other.kind && width == other.width;
+        return kind == other.kind && width == other.width &&
+               elem_kind == other.elem_kind && elem_width == other.elem_width;
     }
+    bool operator!=(const LType& other) const { return !(*this == other); }
+
+    // 4.1. The single place that decides "does this have a bit width?". A
+    // container's `width` is a CAPACITY, and int_range() on a capacity would
+    // silently produce a bogus range -- int_range(10) is [-512, 511], so a
+    // `list[int[64],10]` misread as a 10-bit int would be diagnosed as an
+    // int[10] overflow and accepted where it should be rejected (and vice
+    // versa). Every caller must go through this.
+    bool is_scalar() const { return elem_kind.empty(); }
+    bool is_list() const { return kind == "list"; }
+
+    // The element type of a container, as a standalone LType.
+    LType element() const { return LType{elem_kind, elem_width, "", -1}; }
 };
 
 std::pair<int64_t, int64_t> int_range(int width) {
@@ -43,8 +68,23 @@ std::string wide_str(__int128 v) {
 }
 
 std::string type_str(const LType& t) {
-    if (t.width < 0) return t.kind;
-    return t.kind + "[" + std::to_string(t.width) + "]";
+    if (t.is_scalar()) {
+        if (t.width < 0) return t.kind;
+        return t.kind + "[" + std::to_string(t.width) + "]";
+    }
+    // 4.1. Render a container back the way it was written, so a diagnostic
+    // quotes the source spelling rather than a flattened approximation.
+    // A nested container element is one level deeper than LType holds, so it is
+    // rendered as `list[...]`. Printing its capacity alone (`list[4]`) would
+    // read like a list of ints named 4, which is a different type entirely.
+    std::string elem = t.elem_kind.empty() ? "?" : t.elem_kind;
+    if (t.elem_kind == "list" || t.elem_kind == "tuple" || t.elem_kind == "ptr") {
+        return t.kind + "[" + elem + "[...], " + std::to_string(t.width) + "]";
+    }
+    if (t.elem_width >= 0) elem += "[" + std::to_string(t.elem_width) + "]";
+    // ptr carries no capacity and must not print a phantom ", -1".
+    if (t.kind == "ptr") return t.kind + "[" + elem + "]";
+    return t.kind + "[" + elem + ", " + std::to_string(t.width) + "]";
 }
 
 using Scope = std::unordered_map<std::string, LType>;
@@ -366,6 +406,18 @@ private:
                       " (V1_SPEC 0.6.11)");
                 return;
             }
+            // 4.1. A scalar literal cannot build a container. This branch used
+            // to fall through and accept, so `store ys, %int_literal :
+            // list[float[64],4]` type-checked clean and the declaration became
+            // a contract about nothing. The old tests could not catch it: every
+            // container case fed it an int and expected rejection, which was
+            // then being granted for the wrong reason elsewhere.
+            if (!target.is_scalar() &&
+                (c->op == Op::ConstInt || c->op == Op::ConstFloat || c->op == Op::ConstBool)) {
+                error(context + ": a literal cannot build " + type_str(target) +
+                      " -- containers need an IndexStore (4.1)");
+                return;
+            }
             return;
         }
         if (const Instr* producer = find_producing_instr(id)) {
@@ -434,6 +486,67 @@ private:
                     return;
                 }
                 reg_types_[instr.result] = it->second;
+                return;
+            }
+            // 4.1. Container access. The shared preconditions are: the name must
+            // be a live binding, it must actually BE a container (indexing a
+            // scalar is a type error, not an address-of-value accident), and a
+            // LITERAL index is range-checked now because N is static -- this is
+            // the "static-only capacity overflow" diagnostic.
+            case Op::Index:
+            case Op::IndexStore:
+            case Op::Len: {
+                auto it = scope.find(instr.name);
+                if (it == scope.end()) {
+                    error("'" + instr.name + "' is not definitely assigned here (V1_SPEC 0.6.10)");
+                    return;
+                }
+                const LType& ct = it->second;
+                if (ct.kind != "list" && ct.kind != "tuple") {
+                    error(instr.name + " is " + type_str(ct) + ", not a container -- " +
+                          (instr.op == Op::Len ? "len()" : "indexing") +
+                          " needs a list or tuple");
+                    return;
+                }
+                if (instr.op == Op::Len) {
+                    // Folded to a constant by codegen, but it is still typed as a
+                    // full-width int so arithmetic on it behaves like any other.
+                    reg_types_[instr.result] = LType{"int", 64};
+                    return;
+                }
+
+                const ValueId idx = instr.args.at(0);
+                if (instr.op == Op::IndexStore && instr.args.size() < 2) {
+                    error("IndexStore needs an index and a value");
+                    return;
+                }
+                LType idx_t;
+                if (reg_type(idx, idx_t) && idx_t.kind != "int") {
+                    error("index into " + type_str(ct) + " must be an int, got " +
+                          type_str(idx_t));
+                    return;
+                }
+                // Static overflow. Only a LITERAL index is decidable here; a
+                // runtime index is checked in codegen, not guessed at here.
+                if (const Instr* c = find_producing_const(idx)) {
+                    const int64_t n = c->int_imm;
+                    if (n < 0 || n >= ct.width) {
+                        error("index " + std::to_string(n) + " is out of range for " +
+                              type_str(ct) + " -- valid indices are 0.." +
+                              std::to_string(ct.width - 1));
+                        return;
+                    }
+                }
+                if (instr.op == Op::Index) {
+                    reg_types_[instr.result] = ct.element();
+                } else {
+                    LType val_t;
+                    if (reg_type(instr.args.at(1), val_t) && val_t != ct.element()) {
+                        error("storing " + type_str(val_t) + " into " + type_str(ct) +
+                              ": element type is " + type_str(ct.element()));
+                        return;
+                    }
+                }
                 return;
             }
             case Op::Add:
@@ -542,7 +655,16 @@ private:
                                              "re-assignment of '" + instr.name + "'");
                     return;
                 }
-                LType declared{instr.type_kind, instr.type_width};
+                const LType declared = declared_type_of(instr);
+                if (declared.kind.empty()) return;   // already reported
+                // 4.1. A valueless container store is a DECLARATION: it reserves
+                // storage and binds the name. Its shape was already validated
+                // above; there is no value to check into it, and running the
+                // conversion check here would demand a list out of thin air.
+                if (instr.args.empty() && !declared.is_scalar()) {
+                    scope[instr.name] = declared;
+                    return;
+                }
                 check_value_into_target(instr.args.at(0), declared,
                                          "declaration of '" + instr.name + "'");
                 scope[instr.name] = declared;
@@ -566,6 +688,35 @@ private:
             default:
                 return;
         }
+    }
+
+    // 4.1. Builds the recursive type for a declaration, rejecting a container
+    // whose shape is missing rather than letting it degrade into a bare
+    // kind+capacity. `list` with no element would otherwise become
+    // LType{"list", 10, "", -1} -- indistinguishable from a list whose element
+    // failed to parse, and every later equality check would pass it.
+    LType declared_type_of(const Instr& instr) {
+        LType t{instr.type_kind, instr.type_width, instr.type_elem_kind, instr.type_elem_width};
+        const bool container = t.kind == "list" || t.kind == "tuple" || t.kind == "ptr";
+
+        if (t.kind == "list" || t.kind == "tuple") {
+            if (t.elem_kind.empty()) {
+                error("'" + instr.name + ": " + t.kind +
+                      " needs an element type, e.g. " + t.kind + "[int[64], 8]");
+                return LType{};
+            }
+            if (t.width <= 0) {
+                error("'" + instr.name + ": " + t.kind + " capacity must be positive, got " +
+                      std::to_string(t.width));
+                return LType{};
+            }
+        }
+        if (t.kind == "ptr" && t.elem_kind.empty()) {
+            error("'" + instr.name + ": ptr needs an element type, e.g. ptr[int[64]]");
+            return LType{};
+        }
+        (void)container;
+        return t;
     }
 
     void check_for_loop_shapes() {
