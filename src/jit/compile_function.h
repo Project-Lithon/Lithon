@@ -111,19 +111,23 @@ struct CompileOptions {
     // in the loop buffer / uop cache than the saved back edge is worth.
     // Straight-line unrolling above is the variant that pays.
     bool unroll_diamonds = false;
-    // Diagnostic: refuse to hand the encoder an Xmm::none operand. The encoder's
-    // xmm_is_extended(Xmm::none) currently answers true, so rex_sse sets a
-    // spurious REX.B and the sentinel decodes to a real register (xmm8-xmm15,
-    // NOT r13: in an SSE instruction REX.B extends the ModRM r/m xmm operand).
-    // If any codegen path passes `none` where a register was meant, it works by
-    // accident today, and fixing the encoder's REX handling alone shifts that
-    // accidental register -- which is how the float accumulator and the float
-    // div-by-zero trap tests broke. With this on, the first such call site throws
-    // with a name instead of silently encoding a hidden register. Off by default
-    // so the existing green suite is untouched; turn it on for
-    // compile_module_accum_float_test FIRST, fix whatever it names, and only
-    // then land the REX-before-F2 ordering fix in x86_encoder.h.
-    bool check_xmm_operands = false;
+    // Tripwire: refuse to hand the encoder an Xmm::none operand. `none` (0xFF) is
+    // the "no register" sentinel for a memory rm operand and is never a valid
+    // register. It used to leak into REX: xmm_is_extended(none) answered true, so
+    // an SSE instruction with a MEMORY operand got a spurious REX.B, and since
+    // rm is then the base register, [rbp+disp] was fetched from [r13+disp]. (For
+    // a register-register form REX.B would instead select xmm8-xmm15; the memory
+    // form is the one that actually bit.) That is fixed in x86_encoder.h, which
+    // now also refuses `none` as a register operand outright.
+    //
+    // This option is the codegen-side check that no float path even tries: with
+    // it on, the first call site that produces `none` throws with its name and
+    // the function being compiled, instead of reaching the encoder. It is cheap
+    // (one comparison per float operand) and on by default so a future
+    // regression is an immediate, named error. It covers float_dest,
+    // load_float_value and read_float; the encoder's own refusal covers every
+    // other emitter.
+    bool check_xmm_operands = true;
     // SSA pipeline: canonicalize loops, promote promotable variables to SSA
     // values (Mem2Reg), simplify with Phi-aware DSE + trivial-Phi copy
     // propagation, then resolve the phis into edge copies so the existing
@@ -1406,11 +1410,44 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
 
             case Op::Store: {
                 // 4.1. A valueless container store is a declaration, not an
-                // assignment: the slot run was reserved during layout and
-                // nothing is written here. Falling through to the normal store
-                // path would read args.at(0) on an empty vector.
+                // assignment: the slot run was reserved during layout, and
+                // falling through to the normal store path would read
+                // args.at(0) on an empty vector.
+                //
+                // It does zero the elements, because the interpreter does:
+                // a fresh list[float[64],4] reads back 0.0 there, and a frame
+                // slot holds whatever the stack contained before (a pointer's
+                // bits, printed as a denormal like 6.95e-310). Zero bits are
+                // 0 for an int, False for a bool and +0.0 for a double, so one
+                // all-zero fill is right for every element kind. It happens AT
+                // the declaration, not in the prologue, so a declaration that
+                // runs again inside a loop resets the container exactly as the
+                // interpreter's does.
+                //
+                // kR carries the zero and kL the running index: both are
+                // permanent scratch, never a value's home, so nothing live is
+                // disturbed. Small containers are unrolled; larger ones use a
+                // short loop so code size does not grow with capacity.
                 if (instr.args.empty() &&
                     (instr.type_kind == "list" || instr.type_kind == "tuple")) {
+                    const int cap = alloc.container_capacity(instr.name);
+                    if (cap > 0) {
+                        const int base = alloc.element_offset(instr.name, 0);
+                        emit_xor_zero(code, kR);
+                        if (cap <= 16) {
+                            for (int i = 0; i < cap; ++i) {
+                                emit_store_rbp_offset(code, kR, base + 8 * i);
+                            }
+                        } else {
+                            emit_xor_zero(code, kL);
+                            const size_t top = code.size();
+                            emit_store_rbp_scaled(code, kR, kL, base);
+                            emit_add_reg_imm32(code, kL, 1);
+                            emit_cmp_reg_imm32(code, kL, cap);
+                            JumpPatch again = emit_jcc_rel32(code, Cond::Less);
+                            resolve_jump_patch(code, again, top);
+                        }
+                    }
                     break;
                 }
                 require_variable(instr.name, "store to");

@@ -1,0 +1,13 @@
+function get(n: int[64]) -> float[64]:
+block0:
+    store xs : list[float[64],4]
+    %0 = load n
+    %1 = Index xs, %0
+    return %1
+
+function __main__():
+block0:
+    %0 = const_i64 
+    %1 = call get, %0
+    call print, %1
+    return

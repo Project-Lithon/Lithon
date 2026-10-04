@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 // Zero-dependency x86-64 instruction encoder. Hand-written, no
@@ -607,10 +608,28 @@ enum class Xmm : uint8_t { XMM0 = 0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7,
                            // Not a register. Passed to rex_sse for the rm
                            // field of an instruction whose rm operand is
                            // memory, where no REX.B bit applies. The encoding
-                           // helpers never accept it as a destination.
+                           // helpers never accept it as a register operand:
+                           // xmm_low3() refuses it, and every emitter below
+                           // reads each register operand through xmm_low3().
                            none = 0xFF };
 
-inline uint8_t xmm_low3(Xmm r) { return static_cast<uint8_t>(static_cast<uint8_t>(r) & 7); }
+// The ModRM/opcode low three bits of a register operand.
+//
+// Xmm::none is 0xFF, whose low three bits are 7, so without this check a `none`
+// that reached an emitter as a REGISTER operand would silently encode as xmm7 --
+// the same hidden-register failure the xmm_is_extended fix below closed for the
+// REX bits, one step further along. Every emitter reads each register operand
+// through here, and `none` is only ever legitimate as rex_sse's rm argument
+// (which never calls this), so refusing it here covers every emitter at once and
+// turns a silently wrong program into an error that names the problem.
+inline uint8_t xmm_low3(Xmm r) {
+    if (r == Xmm::none) {
+        throw std::logic_error(
+            "x86_encoder: Xmm::none used as a register operand (it is a 'no register' "
+            "sentinel for memory operands, and would encode as xmm7)");
+    }
+    return static_cast<uint8_t>(static_cast<uint8_t>(r) & 7);
+}
 inline bool xmm_is_extended(Xmm r) {
     // Xmm::none is 0xFF, so a bare `>= 8` said TRUE for it -- and rex_sse(x) with
     // a memory rm operand defaults rm to none. That set a spurious REX.B, which

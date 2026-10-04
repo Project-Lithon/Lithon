@@ -5,8 +5,10 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <string>
 #include <unordered_map>
 #include <stdexcept>
+#include <vector>
 
 namespace lithon::interp {
 
@@ -19,6 +21,19 @@ class Frame {
 public:
     std::unordered_map<ValueId, LithonValue> regs;
     std::unordered_map<std::string, LithonValue> vars;
+    // 4.1. Containers live apart from scalar variables: a list is a run of
+    // values, not one, and the JIT likewise keeps it in a run of frame slots
+    // rather than in a variable's single slot. Keyed by the container's name.
+    std::unordered_map<std::string, std::vector<LithonValue>> lists;
+
+    std::vector<LithonValue>& get_list(const std::string& name, const char* what) {
+        auto it = lists.find(name);
+        if (it == lists.end()) {
+            throw std::runtime_error(std::string("interpreter: ") + what + " '" + name +
+                                     "' which is not a container");
+        }
+        return it->second;
+    }
 
     LithonValue get_reg(ValueId id) const {
         auto it = regs.find(id);
@@ -36,6 +51,23 @@ public:
         return it->second;
     }
 };
+
+// The value a container element holds before anything is written to it. Zero
+// of the element's own kind, so a freshly declared list[float[64],4] reads
+// back 0.0 rather than an int zero, and reading an unwritten element is
+// defined instead of whatever the frame happened to contain. The native tier
+// has to produce the same zeros, or the two tiers disagree on this.
+LithonValue zero_of_kind(const std::string& elem_kind) {
+    if (elem_kind == "float") return LithonValue::make_float(0.0);
+    if (elem_kind == "bool")  return LithonValue::make_bool(false);
+    return LithonValue::make_int(0);
+}
+
+// A valueless `store xs : list[T,N]` is a declaration, not an assignment: it
+// names the container and its capacity and carries no value to store.
+bool is_container_declaration(const Instr& in) {
+    return in.args.empty() && (in.type_kind == "list" || in.type_kind == "tuple");
+}
 
 LithonValue apply_binop(Op op, LithonValue lhs, LithonValue rhs) {
     bool either_float = lhs.is_float() || rhs.is_float();
@@ -271,8 +303,50 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     frame.regs[instr.result] = frame.get_var(instr.name);
                     break;
                 case Op::Store:
+                    if (is_container_declaration(instr)) {
+                        if (instr.type_width <= 0) {
+                            throw std::runtime_error("interpreter: container '" + instr.name +
+                                                     "' declared with a non-positive capacity");
+                        }
+                        // Re-executing the declaration (inside a loop, say)
+                        // resets the container, like rebinding a name to a
+                        // fresh list does.
+                        frame.lists[instr.name].assign(static_cast<size_t>(instr.type_width),
+                                                       zero_of_kind(instr.type_elem_kind));
+                        break;
+                    }
                     frame.vars[instr.name] = frame.get_reg(instr.args.at(0));
                     break;
+                case Op::Len:
+                    // N is part of the type, so this is the capacity; there is
+                    // no length that can change at run time.
+                    frame.regs[instr.result] = LithonValue::make_int(
+                        static_cast<int64_t>(frame.get_list(instr.name, "len() of").size()));
+                    break;
+                case Op::Index:
+                case Op::IndexStore: {
+                    std::vector<LithonValue>& elems = frame.get_list(
+                        instr.name, instr.op == Op::Index ? "index into" : "index store into");
+                    LithonValue idx = frame.get_reg(instr.args.at(0));
+                    if (!idx.is_int()) {
+                        throw std::runtime_error("interpreter: list index must be an int");
+                    }
+                    // Negative indices trap on purpose: CPython would wrap
+                    // xs[-1] to the last element, Lithon does not. The text is
+                    // fixed (no index, no capacity) because the JIT's trap
+                    // passes a literal string and stderr is compared
+                    // byte-for-byte between the tiers.
+                    const int64_t i = idx.as_int();
+                    if (i < 0 || i >= static_cast<int64_t>(elems.size())) {
+                        throw std::runtime_error("interpreter: list index out of range");
+                    }
+                    if (instr.op == Op::Index) {
+                        frame.regs[instr.result] = elems[static_cast<size_t>(i)];
+                    } else {
+                        elems[static_cast<size_t>(i)] = frame.get_reg(instr.args.at(1));
+                    }
+                    break;
+                }
                 case Op::Add:
                 case Op::Sub:
                 case Op::Mul:

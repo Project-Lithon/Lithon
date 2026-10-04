@@ -12,9 +12,11 @@
 // float-typed variable holds a float, so this is now a type error naming the
 // literal and suggesting the fix.
 //
-// The two rules that must NOT be confused with it, both covered below:
-// expression-level promotion (`7 + 0.5` is 7.5) and int -> float for values
-// whose provenance is not a literal (`b: float[64] = a` where a is an int).
+// Two rules that must NOT be confused with it, both covered below:
+// expression-level promotion (`7 + 0.5` is 7.5), which is still allowed, and
+// int -> float on ASSIGNMENT for a non-literal (`b: float[64] = a` where a is
+// an int). That second one used to promote; V1_SPEC 0.6.11 now says Lithon does
+// not convert on assignment, so it is rejected exactly like the literal case.
 
 #include "typecheck.h"
 #include "ir/text_parser.h"
@@ -99,9 +101,11 @@ block0:
     return
 )");
 
-    // Promotion still applies to a non-literal int. This is tests/
-    // typed_programs/int_to_float_ok.py, which must keep passing.
-    expect_accepts("int VARIABLE into float[64] still promotes", R"(
+    // No conversion on assignment (V1_SPEC 0.6.11): an int VARIABLE is not a
+    // float either. This used to be accepted (tests/typed_programs/
+    // int_to_float_ok.py); the checker moved and this expectation had not.
+    // tools/typecheck.py and that .py program must agree with this rule.
+    expect_rejects("int VARIABLE into float[64] is rejected", R"(
 function __main__():
 block0:
     %0 = const_i64 5
@@ -109,7 +113,7 @@ block0:
     %1 = load a
     store b, %1 : float[64]
     return
-)");
+)", "a float-typed location must hold a float");
 
     // Expression-level promotion is a different rule and never comes through
     // the assignment path: 7 + 0.5 is 7.5, not a rejection.
