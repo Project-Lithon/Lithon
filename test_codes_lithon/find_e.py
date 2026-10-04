@@ -1,16 +1,16 @@
-e:float[128] = 0.0
-i:int[64] = 0
+def get_factorial(lim: int[64]) -> float[64]:
+    fact: float[64] = 1.0
+    while lim > 1:
+        fact = fact * lim
+        lim = lim - 1
+    return fact
 
-def get_factorial(lim:int[64]) -> int[64]:
-	fact:int[64] = 1
-	while lim > 1:
-		fact *= lim
-		lim -= 1
-	print(fact)
-	return fact
-
-for i in range(10):
-	print(1/get_factorial(i+1))
-	e += 1/(get_factorial(i+1))
+e: float[64] = 1.0   # <-- the n=0 term: 1/0! = 1, seeded directly instead of summed
+i: int[64] = 0
+while i < 80:
+    term: float[64] = 1.0 / get_factorial(i + 1)
+    #print(term)
+    e = e + term
+    i = i + 1
 
 print(e)
