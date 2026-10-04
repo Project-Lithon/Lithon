@@ -616,7 +616,7 @@ inline bool xmm_is_extended(Xmm r) {
     // a memory rm operand defaults rm to none. That set a spurious REX.B, which
     // does not just waste a prefix bit: it reinterprets the base register, so
     // [rbp+disp] was fetched from [r13+disp]. A wild address, i.e. SIGBUS.
-    return static_cast<uint8_t>(r) >= 8;
+    return static_cast<uint8_t>(r) >= 8 && r != Xmm::none;
 }
 
 // The SSE scaled forms need REX.R for an extended XMM reg field and REX.X for
@@ -625,7 +625,7 @@ inline bool xmm_is_extended(Xmm r) {
 // r8..r15 lost its X bit and addressed the low three bits of the register. That
 // is not a decoding failure; it reads a wildly out-of-frame address and faults.
 inline uint8_t rex3_xmm(Xmm reg_field, Reg index_field) {
-    return static_cast<uint8_t>(0x40 | 8 |
+    return static_cast<uint8_t>(0x40 |
                                 (xmm_is_extended(reg_field) ? 4 : 0) |
                                 (reg_is_extended(index_field) ? 2 : 0));
 }
@@ -652,8 +652,8 @@ inline uint8_t rex_sse(Xmm reg_field, Xmm rm_field = Xmm::none) {
 // which differ only in the opcode byte. Verified: addsd xmm0, xmm1 =
 // f2 0f 58 c1.
 inline void emit_sse_sd_op(CodeBuffer& buf, uint8_t opcode, Xmm dst, Xmm src) {
-    if (xmm_is_extended(dst) || xmm_is_extended(src)) emit_u8(buf, rex_sse(dst, src));
     emit_u8(buf, 0xF2);
+    if (xmm_is_extended(dst) || xmm_is_extended(src)) emit_u8(buf, rex_sse(dst, src));
     emit_u8(buf, 0x0F);
     emit_u8(buf, opcode);
     emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(dst)), static_cast<Reg>(xmm_low3(src))));
@@ -673,8 +673,8 @@ inline void emit_divsd(CodeBuffer& buf, Xmm dst, Xmm src) { emit_sse_sd_op(buf, 
 // the arithmetic ops above. Verified: roundsd xmm12, xmm0, 0x0b =
 // 66 44 0f 3a 0b e0 0b (the 0x0B opcode byte was the missing piece).
 inline void emit_roundsd_imm8(CodeBuffer& buf, Xmm dst, Xmm src, uint8_t imm) {
-    if (xmm_is_extended(dst) || xmm_is_extended(src)) emit_u8(buf, rex_sse(dst, src));
     emit_u8(buf, 0x66);
+    if (xmm_is_extended(dst) || xmm_is_extended(src)) emit_u8(buf, rex_sse(dst, src));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x3A);
     emit_u8(buf, 0x0B);
@@ -688,8 +688,8 @@ inline constexpr uint8_t kRoundTowardZeroSuppressInexact = 0x0B;
 // Encoding: 66 0F 2F /r. Verified: comisd xmm0, xmm1 = 66 0f 2f c1.
 // Used for both float ordering compares and the Div-by-zero check.
 inline void emit_comisd(CodeBuffer& buf, Xmm lhs, Xmm rhs) {
-    if (xmm_is_extended(lhs) || xmm_is_extended(rhs)) emit_u8(buf, rex_sse(lhs, rhs));
     emit_u8(buf, 0x66);
+    if (xmm_is_extended(lhs) || xmm_is_extended(rhs)) emit_u8(buf, rex_sse(lhs, rhs));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x2F);
     emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(lhs)), static_cast<Reg>(xmm_low3(rhs))));
@@ -700,8 +700,8 @@ inline void emit_comisd(CodeBuffer& buf, Xmm lhs, Xmm rhs) {
 // Encoding: 66 0F 2E /r. Prefers ucomisd over comisd for the ordering
 // compares because it never traps on a signalling NaN.
 inline void emit_ucomisd(CodeBuffer& buf, Xmm lhs, Xmm rhs) {
-    if (xmm_is_extended(lhs) || xmm_is_extended(rhs)) emit_u8(buf, rex_sse(lhs, rhs));
     emit_u8(buf, 0x66);
+    if (xmm_is_extended(lhs) || xmm_is_extended(rhs)) emit_u8(buf, rex_sse(lhs, rhs));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x2E);
     emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(lhs)), static_cast<Reg>(xmm_low3(rhs))));
@@ -713,8 +713,8 @@ inline void emit_ucomisd(CodeBuffer& buf, Xmm lhs, Xmm rhs) {
 // this position-independent -- the JIT emits code into an mmap'd buffer
 // whose address it does not control.
 inline void emit_comisd_zero(CodeBuffer& buf, Xmm lhs, int32_t disp32) {
-    if (xmm_is_extended(lhs)) emit_u8(buf, rex_sse(lhs));
     emit_u8(buf, 0x66);
+    if (xmm_is_extended(lhs)) emit_u8(buf, rex_sse(lhs));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x2F);
     emit_u8(buf, static_cast<uint8_t>(0x05 | (xmm_low3(lhs) << 3)));  // mod=00 rm=101
@@ -729,8 +729,8 @@ inline void emit_comisd_zero(CodeBuffer& buf, Xmm lhs, int32_t disp32) {
 // this position-independent -- the JIT emits code into an mmap'd buffer
 // whose address it does not control.
 inline void emit_movsd_xmm_rip(CodeBuffer& buf, Xmm dst) {
-    if (xmm_is_extended(dst)) emit_u8(buf, rex_sse(dst));
     emit_u8(buf, 0xF2);
+    if (xmm_is_extended(dst)) emit_u8(buf, rex_sse(dst));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x10);
     emit_u8(buf, static_cast<uint8_t>(0x05 | (xmm_low3(dst) << 3)));  // mod=00 rm=101
@@ -742,8 +742,8 @@ inline void emit_movsd_xmm_rip(CodeBuffer& buf, Xmm dst) {
 // reg=src, rm=101), disp32. Like emit_movsd_xmm_rip, the disp32 is a zero
 // placeholder the caller patches once the target position is final.
 inline void emit_movsd_mem_rip(CodeBuffer& buf, Xmm src) {
-    if (xmm_is_extended(src)) emit_u8(buf, rex_sse(src));
     emit_u8(buf, 0xF2);
+    if (xmm_is_extended(src)) emit_u8(buf, rex_sse(src));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x11);
     emit_u8(buf, static_cast<uint8_t>(0x05 | (xmm_low3(src) << 3)));  // mod=00 rm=101
@@ -765,8 +765,8 @@ inline size_t movsd_rip_disp_offset(CodeBuffer& buf) { return buf.size() - 4; }
 // F2 0F 10 /r. This is how a double gets from the register it was
 // computed in to the register it is consumed from.
 inline void emit_movsd_xmm_xmm(CodeBuffer& buf, Xmm dst, Xmm src) {
-    if (xmm_is_extended(dst) || xmm_is_extended(src)) emit_u8(buf, rex_sse(dst, src));
     emit_u8(buf, 0xF2);
+    if (xmm_is_extended(dst) || xmm_is_extended(src)) emit_u8(buf, rex_sse(dst, src));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x10);
     emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(dst)), static_cast<Reg>(xmm_low3(src))));
@@ -780,8 +780,8 @@ inline void emit_movsd_xmm_xmm(CodeBuffer& buf, Xmm dst, Xmm src) {
 // still RBP, so -- exactly as in the integer pair -- mod=10 is used
 // unconditionally to sidestep the "mod=00 + base=RBP means RIP-relative" rule.
 inline void emit_movsd_xmm_rbp_scaled(CodeBuffer& buf, Xmm dst, Reg index_reg, int32_t disp) {
-    emit_u8(buf, rex3_xmm(dst, index_reg));
     emit_u8(buf, 0xF2);
+    if (xmm_is_extended(dst) || reg_is_extended(index_reg)) emit_u8(buf, rex3_xmm(dst, index_reg));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x10);
     emit_u8(buf, static_cast<uint8_t>(0x80 | (xmm_low3(dst) << 3) | 0x4));
@@ -791,8 +791,8 @@ inline void emit_movsd_xmm_rbp_scaled(CodeBuffer& buf, Xmm dst, Reg index_reg, i
 }
 
 inline void emit_movsd_rbp_scaled(CodeBuffer& buf, Xmm src, Reg index_reg, int32_t disp) {
-    emit_u8(buf, rex3_xmm(src, index_reg));
     emit_u8(buf, 0xF2);
+    if (xmm_is_extended(src) || reg_is_extended(index_reg)) emit_u8(buf, rex3_xmm(src, index_reg));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x11);
     emit_u8(buf, static_cast<uint8_t>(0x80 | (xmm_low3(src) << 3) | 0x4));
@@ -802,8 +802,8 @@ inline void emit_movsd_rbp_scaled(CodeBuffer& buf, Xmm src, Reg index_reg, int32
 }
 
 inline void emit_movsd_xmm_rbp(CodeBuffer& buf, Xmm dst, int32_t offset) {
-    if (xmm_is_extended(dst)) emit_u8(buf, rex_sse(dst));
     emit_u8(buf, 0xF2);
+    if (xmm_is_extended(dst)) emit_u8(buf, rex_sse(dst));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x10);
     emit_u8(buf, static_cast<uint8_t>(0x80 | (xmm_low3(dst) << 3) | reg_low3(Reg::RBP)));
@@ -812,8 +812,8 @@ inline void emit_movsd_xmm_rbp(CodeBuffer& buf, Xmm dst, int32_t offset) {
 
 // movsd [rbp + disp32], xmm -- store a double into a frame slot.
 inline void emit_movsd_rbp_mem(CodeBuffer& buf, Xmm src, int32_t offset) {
-    if (xmm_is_extended(src)) emit_u8(buf, rex_sse(src));
     emit_u8(buf, 0xF2);
+    if (xmm_is_extended(src)) emit_u8(buf, rex_sse(src));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x11);
     emit_u8(buf, static_cast<uint8_t>(0x80 | (xmm_low3(src) << 3) | reg_low3(Reg::RBP)));
@@ -827,7 +827,8 @@ inline void emit_movsd_rbp_mem(CodeBuffer& buf, Xmm src, int32_t offset) {
 // f2 48 0f 2a c0.
 inline void emit_cvtsi2sd(CodeBuffer& buf, Xmm dst, Reg src64) {
     emit_u8(buf, 0xF2);
-    emit_u8(buf, rex(true, static_cast<Reg>(0), src64));  // REX.W + REX.B
+    // REX.W, REX.R for an extended xmm dst (ModRM.reg), REX.B for an extended GP src.
+    emit_u8(buf, static_cast<uint8_t>(0x48 | (xmm_is_extended(dst) ? 4 : 0) | (reg_is_extended(src64) ? 1 : 0)));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x2A);
     emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(dst)), src64));
@@ -837,7 +838,8 @@ inline void emit_cvtsi2sd(CodeBuffer& buf, Xmm dst, Reg src64) {
 // truncating toward zero. Encoding: F2 REX.W 0F 2C /r.
 inline void emit_cvttsd2si(CodeBuffer& buf, Reg dst64, Xmm src) {
     emit_u8(buf, 0xF2);
-    emit_u8(buf, rex(true, dst64, static_cast<Reg>(0)));  // REX.W + REX.R
+    // REX.W, REX.R for an extended GP dst (ModRM.reg), REX.B for an extended xmm src (ModRM.rm).
+    emit_u8(buf, static_cast<uint8_t>(0x48 | (reg_is_extended(dst64) ? 4 : 0) | (xmm_is_extended(src) ? 1 : 0)));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x2C);
     emit_u8(buf, modrm_reg_reg(dst64, static_cast<Reg>(xmm_low3(src))));
@@ -848,8 +850,9 @@ inline void emit_cvttsd2si(CodeBuffer& buf, Reg dst64, Xmm src) {
 // Encoding: 66 0F 57 /r. Verified: xorpd xmm0, xmm0 = 66 0f 57 c0.
 // Used to materialize 0.0 for the Div-by-zero check.
 inline void emit_xorpd_zero(CodeBuffer& buf, Xmm reg) {
-    if (xmm_is_extended(reg)) emit_u8(buf, rex_sse(reg));
     emit_u8(buf, 0x66);
+    // reg is BOTH the reg and rm operand, so an extended register needs R and B.
+    if (xmm_is_extended(reg)) emit_u8(buf, rex_sse(reg, reg));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x57);
     emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(reg)), static_cast<Reg>(xmm_low3(reg))));

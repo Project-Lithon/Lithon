@@ -21,6 +21,7 @@
 #include "jit/cpu_features.h"
 #include "jit/exec_memory.h"
 #include "jit/loop_info.h"
+#include "jit/print_guard.h"
 #include "jit/ssa.h"
 
 using namespace lithon;
@@ -44,7 +45,7 @@ int main(int argc, char** argv) {
 
     std::string path, dump_code_path;
     bool dump_hex = false, stats = false, dump_loops = false, dump_phi = false;
-    bool run_mem2reg = false, canonicalize = false;
+    bool run_mem2reg = false, canonicalize = false, strict = false;
     jit::CompileOptions options;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--dump-hex")) dump_hex = true;
@@ -53,6 +54,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--dump-phi")) dump_phi = true;
         else if (!std::strcmp(argv[i], "--mem2reg")) { run_mem2reg = true; options.ssa_pipeline = true; }
         else if (!std::strcmp(argv[i], "--ssa")) options.ssa_pipeline = true;
+        else if (!std::strcmp(argv[i], "--strict")) strict = true;
         else if (!std::strcmp(argv[i], "--canonicalize-loops")) canonicalize = true;
         else if (!std::strcmp(argv[i], "--dump-code") && i + 1 < argc) dump_code_path = argv[++i];
         else if (!std::strcmp(argv[i], "--no-opt")) options.optimize = false;
@@ -70,6 +72,9 @@ int main(int argc, char** argv) {
         std::cerr << "usage: lithon_jit <ir_file> [--dump-hex] [--stats]\n"
                      "                  [--no-opt] [--no-promote] [--no-rotate] [--unroll=N]\n"
                      "                  [--no-lsr] [--accum-unroll] [--unroll-diamonds]\n"
+                     "       --strict turns the print-guard's findings (a value that is not\n"
+                     "       provably int/bool/float, e.g. a variable stored both an int and a\n"
+                     "       float) from warnings into a hard error. Default: warn, then compile.\n"
                      "       --ffast-math-equivalent reassociates FLOAT addition, shortening the\n"
                      "       dependency chain. NOT bit-exact: IEEE754 addition is not associative,\n"
                      "       so results can differ from the interpreter's in the last bit. Off by\n"
@@ -112,6 +117,18 @@ int main(int argc, char** argv) {
             if (!errors.empty()) {
                 for (const auto& e : errors) std::cerr << "RCR error: " << e.message << "\n";
                 return 1;
+            }
+        }
+
+        // lithon_jit has no tier fallback, so a module the guard cannot prove
+        // safe would otherwise be compiled with Unknown-kind values silently
+        // lowered as integers. Say so; --strict makes it fatal.
+        {
+            auto verdict = jit::check_print_safety(module);
+            if (!verdict.native_safe) {
+                for (const auto& r : verdict.reasons)
+                    std::cerr << (strict ? "error: " : "warning: ") << r << "\n";
+                if (strict) return 1;
             }
         }
 

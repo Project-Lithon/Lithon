@@ -348,6 +348,49 @@ block0:
     return
 )");
 
+    // The index guard in compile_function.h only fires for an index that is NOT
+    // a compile-time constant, so the typechecker must keep accepting that
+    // shape: if it started rejecting a computed index, the runtime guard would
+    // become unreachable and its test coverage would silently vanish.
+    expect_accepts("dynamic index into list[int[64],4]", R"(
+function __main__():
+block0:
+    store xs : list[int[64],4]
+    %0 = const_i64 3
+    store i, %0 : int[64]
+    %1 = load i
+    %2 = Index xs, %1
+    store n, %2 : int[64]
+    return
+)");
+
+    // Boundary of the static rule: capacity-1 is the last legal literal index.
+    // Together with the "literal index == capacity" rejection above, this pins
+    // the off-by-one from both sides.
+    expect_accepts("literal index capacity-1", R"(
+function __main__():
+block0:
+    store xs : list[int[64],4]
+    %1 = const_i64 3
+    %2 = Index xs, %1
+    store n, %2 : int[64]
+    return
+)");
+
+    // A float element read out of a list is a float: it must satisfy a
+    // float[64] declaration. This is the typing half of the float-element-load
+    // path (the encoder half -- REX before the F2 prefix -- is tracked
+    // separately and is not pinned here).
+    expect_accepts("float element load into float[64]", R"(
+function __main__():
+block0:
+    store xs : list[float[64],4]
+    %1 = const_i64 0
+    %2 = Index xs, %1
+    store d, %2 : float[64]
+    return
+)");
+
     // A count outside 0..63 is a compile-time error when it is a literal,
     // because x86 masks the count to 6 bits and would otherwise silently
     // shift by a different amount (64 would execute as 0, -1 as 63).

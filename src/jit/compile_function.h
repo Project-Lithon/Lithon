@@ -111,6 +111,19 @@ struct CompileOptions {
     // in the loop buffer / uop cache than the saved back edge is worth.
     // Straight-line unrolling above is the variant that pays.
     bool unroll_diamonds = false;
+    // Diagnostic: refuse to hand the encoder an Xmm::none operand. The encoder's
+    // xmm_is_extended(Xmm::none) currently answers true, so rex_sse sets a
+    // spurious REX.B and the sentinel decodes to a real register (xmm8-xmm15,
+    // NOT r13: in an SSE instruction REX.B extends the ModRM r/m xmm operand).
+    // If any codegen path passes `none` where a register was meant, it works by
+    // accident today, and fixing the encoder's REX handling alone shifts that
+    // accidental register -- which is how the float accumulator and the float
+    // div-by-zero trap tests broke. With this on, the first such call site throws
+    // with a name instead of silently encoding a hidden register. Off by default
+    // so the existing green suite is untouched; turn it on for
+    // compile_module_accum_float_test FIRST, fix whatever it names, and only
+    // then land the REX-before-F2 ordering fix in x86_encoder.h.
+    bool check_xmm_operands = false;
     // SSA pipeline: canonicalize loops, promote promotable variables to SSA
     // values (Mem2Reg), simplify with Phi-aware DSE + trivial-Phi copy
     // propagation, then resolve the phis into edge copies so the existing
@@ -742,6 +755,15 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
         // signed compares rather than one unsigned one: Less/GreaterEq are
         // genuine Jcc bytes, whereas the unsigned Below in Cond is a SETcc
         // opcode and handing that to emit_jcc_rel32 encodes a byte store.
+        //
+        // NEGATIVE INDICES TRAP, ON PURPOSE. CPython accepts xs[-1] as the last
+        // element; Lithon does not, and this is a deliberate divergence, not an
+        // oversight: the first compare rejects every index < 0 with the same
+        // "list index out of range" the interpreter raises, so the two tiers
+        // agree with each other. (A literal negative index never reaches here --
+        // the typechecker rejects it statically, see typecheck_test.cpp.)
+        // Python-style wraparound would be a language change and would need to
+        // land in the interpreter, typechecker and this guard together.
         auto emit_index_out_of_range_trap = [&]() {
             emit_host_error_trap("error: interpreter: list index out of range\n");
         };
@@ -930,13 +952,27 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
         // never a moment where two unrelated XMM values must both be live in
         // scratch.
 
+        // Diagnostic gate for CompileOptions::check_xmm_operands. Identity when
+        // off. When on, a sentinel Xmm::none is a codegen bug at `where`, not
+        // an encoder quirk to be papered over.
+        auto require_xmm = [&](Xmm x, const char* where) -> Xmm {
+            if (options.check_xmm_operands && x == Xmm::none) {
+                throw std::logic_error(
+                    std::string("compile_module: Xmm::none reached the encoder in ") + where +
+                    " (function '" + original_fn.name + "')");
+            }
+            return x;
+        };
+
         // Where the result of a float op should be written, honouring the
         // FusedStore optimization: if the very next instruction stores this
         // value into a variable, write straight to the variable's slot and
         // skip the intermediate entirely.
         auto float_dest = [&](ValueId id) -> Xmm {
             if (info_of(id).kind == TempInfo::Kind::FusedStore) return abi::kScratchFloat;
-            return alloc.float_in_register(id) ? alloc.float_register(id) : abi::kScratchFloat;
+            return alloc.float_in_register(id)
+                       ? require_xmm(alloc.float_register(id), "float_dest")
+                       : abi::kScratchFloat;
         };
 
         // Write a computed double back to where its value lives. A no-op in
@@ -1013,7 +1049,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     "compile_module: float value aliases a general-purpose register");
             }
             if (alloc.float_in_register(id)) {
-                Xmm src = alloc.float_register(id);
+                Xmm src = require_xmm(alloc.float_register(id), "load_float_value");
                 if (src != dst) emit_movsd_xmm_xmm(code, dst, src);
             } else {
                 emit_movsd_xmm_rbp(code, dst, alloc.float_stack_slot(id));
@@ -1022,7 +1058,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
 
         auto read_float = [&](ValueId id) -> Xmm {
             if (info_of(id).kind == TempInfo::Kind::Normal && alloc.float_in_register(id)) {
-                return alloc.float_register(id);
+                return require_xmm(alloc.float_register(id), "read_float");
             }
             load_float_value(abi::kScratchFloat, id);
             return abi::kScratchFloat;

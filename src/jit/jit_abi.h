@@ -62,22 +62,24 @@ inline constexpr Reg kScratchRight = Reg::R11;
 //     ABIs, so they never need saving, and none is an argument
 //     register, so marshalling printf's double in XMM0 can never
 //     clobber a source operand.
-//   * XMM6-XMM15 are callee-saved on Microsoft x64 but only
-//     XMM8-XMM15 on System V, so they are left alone. This is the one
-//     place the two ABIs genuinely disagree, and staying inside
-//     XMM0-XMM7 sidesteps it entirely.
+//   * XMM6-XMM15 are callee-saved on Microsoft x64 ONLY. On System V every
+//     XMM register is caller-saved. This is the one place the two ABIs
+//     genuinely disagree, so the float TEMPORARY pool stays inside XMM0-XMM5.
+//     NOTE: the reserved scratch registers below (XMM12-XMM15) are outside
+//     that pool, so on Windows a function that writes them must save and
+//     restore them in its prologue/epilogue. That is NOT implemented yet.
 //   * XMM6/XMM7 would additionally be wrong on SysV as promotion
 //     registers for a different reason: nothing in the current design
 //     needs six simultaneously-live float temporaries.
 //   * XMM15 is reserved as the permanent scratch, mirroring how r10
-//     and r11 are reserved on the GP side. It is caller-saved on both
-//     ABIs, so using it as scratch costs nothing.
+//     and r11 are reserved on the GP side. Caller-saved on System V; on
+//     Microsoft x64 it is callee-saved (see the note above).
 inline constexpr std::array<Xmm, 6> kFloatTempPool = {
     Xmm::XMM0, Xmm::XMM1, Xmm::XMM2, Xmm::XMM3, Xmm::XMM4, Xmm::XMM5};
 
 // Two reserved XMM scratch registers, never allocated to a value. Both are
-// caller-saved on System V and Microsoft x64, so using them costs no
-// prologue/epilogue work. Two rather than one because every float op here is
+// caller-saved on System V (no prologue/epilogue work) but CALLEE-saved on
+// Microsoft x64, where saving them is still TODO. Two rather than one because every float op here is
 // two-operand and the register allocator's destination may be the same
 // register as one of the operands: staging both operands in scratch first is
 // what makes the sequence correct without a copy in every case.

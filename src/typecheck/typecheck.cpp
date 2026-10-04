@@ -435,6 +435,20 @@ private:
         }
         LType source;
         if (reg_type(id, source)) {
+            // The literal rule above, extended to every other int value: a
+            // float-typed location must hold a float. Codegen never converts on
+            // a store, so an int register written into a float variable leaves
+            // that variable stored as both kinds -- joined to Unknown by the
+            // print guard, and lowered as an integer by lithon_jit, which has
+            // no guard. Expression-level promotion (`n + 0.5`) is unaffected:
+            // Add/Sub/Mul/Mod infer a float result directly, so `x = n + 0.0`
+            // is the way to write the conversion.
+            if (target.kind == "float" && source.kind == "int") {
+                error(context + ": " + type_str(source) + " value stored into " + type_str(target) +
+                      " -- a float-typed location must hold a float; Lithon does not convert "
+                      "on assignment (V1_SPEC 0.6.11)");
+                return;
+            }
             check_assignment_compatible(source, target, context);
         }
     }
