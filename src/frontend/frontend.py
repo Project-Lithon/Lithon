@@ -30,36 +30,83 @@ class Block:
         self.lines = []
 
 
-def render_type_suffix(kind, width):
+def render_type_suffix(kind, width, elem_kind=None, elem_width=None):
+    """Renders the trailing " : T" / " : T[N]" annotation the IR parser reads.
+
+    A container is `list[int[64], 4]`: the capacity is the OUTER bracket and the
+    element type is nested inside it, which is the opposite arrangement from a
+    scalar's `int[64]` where the bracket holds the width. Keeping that shape is
+    what lets `parse_type_string` on the C++ side recurse once and land on the
+    same ParsedType either way.
+    """
     if not kind:
         return ""
+    if kind in CONTAINER_KINDS:
+        if elem_kind is None:
+            raise NotImplementedError(f"{kind} annotation is missing its element type")
+        inner = render_type_suffix(elem_kind, elem_width).lstrip(" :")
+        return f" : {kind}[{inner}, {width}]"
     if width is None or width == -1:
         return f" : {kind}"
     return f" : {kind}[{width}]"
 
 
 def parse_type_annotation(node):
-    """Returns (kind, width) from an annotation AST node, or raises
-    NotImplementedError for forms this frontend slice doesn't handle.
-    Mirrors tools/typecheck.py's parse_annotation, kept independent
-    since this is a separate scaffolding tool (frontend vs checker)."""
+    """Returns (kind, width, elem_kind, elem_width) from an annotation AST node,
+    or raises NotImplementedError for forms this frontend slice doesn't handle.
+    elem_kind/elem_width are None for every scalar and set for every container.
+    Mirrors the C++ parse_type_string, kept independent since this is a separate
+    scaffolding tool (frontend vs IR parser)."""
     if isinstance(node, ast.Name):
         if node.id == "bool":
-            return "bool", -1
+            return "bool", -1, None, None
         raise NotImplementedError(f"type '{node.id}' requires an explicit size, e.g. {node.id}[64]")
 
     if isinstance(node, ast.Subscript):
         if not isinstance(node.value, ast.Name):
             raise NotImplementedError("unsupported type annotation form")
         base = node.value.id
+        if base in CONTAINER_KINDS:
+            return _parse_container_annotation(base, node.slice)
         if base not in ("int", "float", "str"):
             raise NotImplementedError(f"unknown type '{base}'")
         size_node = node.slice
         if not isinstance(size_node, ast.Constant) or not isinstance(size_node.value, int):
             raise NotImplementedError(f"{base}[N] requires a literal integer size")
-        return base, size_node.value
+        return base, size_node.value, None, None
 
     raise NotImplementedError("unsupported type annotation form")
+
+
+def _parse_container_annotation(base, slice_node):
+    """Parses the `T, N` of `list[T, N]`.
+
+    The capacity is mandatory and must be a literal integer, because it is the
+    thing that makes a list fixed-capacity and heap-free: N decides the frame
+    size at compile time. A computed capacity would mean the compiler cannot
+    size the allocation, which is the entire reason this type exists, so it is
+    rejected rather than deferred.
+    """
+    if not isinstance(slice_node, ast.Tuple) or len(slice_node.elts) != 2:
+        raise NotImplementedError(
+            f"{base}[T, N] needs an element type and a literal capacity, "
+            f"e.g. {base}[int[64], 4]")
+    elem_node, cap_node = slice_node.elts
+    if not isinstance(cap_node, ast.Constant) or not isinstance(cap_node.value, int) \
+            or isinstance(cap_node.value, bool):
+        raise NotImplementedError(f"{base}[T, N] requires a literal integer capacity")
+    if cap_node.value <= 0:
+        raise NotImplementedError(f"{base} capacity must be positive, got {cap_node.value}")
+    elem_kind, elem_width, elem_elem_kind, elem_elem_width = \
+        parse_type_annotation(elem_node)
+    if elem_elem_kind is not None:
+        # 4.1 accepts a nested container as a TYPE -- the type has to exist
+        # before the flat-stride work that can lay one out -- but rejects it in
+        # codegen, where the outer stride becomes sizeof(inner) and no SIB scale
+        # can express it. Accepting it here keeps the type and the rejection in
+        # their agreed places rather than duplicating the error in three layers.
+        return base, cap_node.value, elem_kind, elem_width
+    return base, cap_node.value, elem_kind, elem_width
 
 
 # The synthesized module-level entry point is called `__main__`, which
@@ -89,6 +136,12 @@ IF_EXPR_TEMP = "__ifexpr"
 # `%` is `mod`, and is NOT the same shape as `div`: div always widens to float
 # (a quotient generally is not an integer), while mod is typed like mul (int
 # iff both operands are int) and keeps C's truncating remainder semantics.
+# 4.1. The container kinds whose annotation nests an element type and a
+# capacity: `list[T, N]`. `ptr[T]` carries no capacity and is 4.4, so it is not
+# in this set -- putting it here would demand a capacity it does not have.
+CONTAINER_KINDS = ("list",)
+
+
 BINARY_OPS = {
     ast.Add: "add",
     ast.Sub: "sub",
@@ -230,6 +283,15 @@ class IRBuilder:
                 raise NotImplementedError("only direct name calls are supported")
             if node.func.id == "print":
                 raise NotImplementedError("print() is a statement in this slice, not an expression")
+            if node.func.id == "len":
+                # Op::Len names a container variable and returns the capacity.
+                # It is not a call: there is no `len` function to emit a `call`
+                # for, and a user function named `len` would otherwise collide.
+                if len(node.args) != 1 or not isinstance(node.args[0], ast.Name):
+                    raise NotImplementedError("len() takes exactly one variable")
+                r = self.new_reg()
+                self.emit(f"{r} = Len {node.args[0].id}")
+                return r
             arg_regs = [self.build_expr(a) for a in node.args]
             callee = self.fn_rename.get(node.func.id, node.func.id)
             r = self.new_reg()
@@ -237,6 +299,20 @@ class IRBuilder:
                 self.emit(f"{r} = call {callee}, {', '.join(arg_regs)}")
             else:
                 self.emit(f"{r} = call {callee}")
+            return r
+
+        # `xs[i]`. Op::Index names a container VARIABLE rather than taking a
+        # ValueId, because the address comes from the variable's slot run. That
+        # is also why there is no list value to subscript -- see the note on
+        # assignment below.
+        if isinstance(node, ast.Subscript):
+            if not isinstance(node.value, ast.Name):
+                raise NotImplementedError(
+                    "only a plain variable can be indexed, e.g. xs[i]; there is no "
+                    "value that denotes a container yet")
+            idx = self.build_expr(node.slice)
+            r = self.new_reg()
+            self.emit(f"{r} = Index {node.value.id}, {idx}")
             return r
 
         if isinstance(node, ast.IfExp):
@@ -333,7 +409,14 @@ class IRBuilder:
 
         zero_reg = self.new_reg()
         self.emit(f"{zero_reg} = const_i64 0")
-        self.emit(f"store {loop_var}, {zero_reg}")
+        # A range() counter is an int by construction: it is compared against
+        # the limit and post-incremented, never anything else. The annotation
+        # has to be emitted HERE rather than asked of the source, because the
+        # source has no way to annotate a for-target -- `for k: int[64] in
+        # range(n)` is not valid Python. With the type checker now
+        # unconditional, leaving this store unannotated made every `for` loop
+        # in the language a type error.
+        self.emit(f"store {loop_var}, {zero_reg} : int[64]")
 
         header_label = self.reserve_label()
         body_label = self.reserve_label()
@@ -367,21 +450,47 @@ class IRBuilder:
             if not isinstance(node.target, ast.Name):
                 raise NotImplementedError("only simple name targets are supported for annotations")
             name = node.target.id
-            kind, width = parse_type_annotation(node.annotation)
+            kind, width, elem_kind, elem_width = parse_type_annotation(node.annotation)
+            suffix = render_type_suffix(kind, width, elem_kind, elem_width)
             if node.value is not None:
                 value_reg = self.build_expr(node.value)
-                suffix = render_type_suffix(kind, width)
                 self.emit(f"store {name}, {value_reg}{suffix}")
-            # annotation-only (no value) emits nothing -- the checker
-            # tracks the type from the annotation itself; nothing to
-            # store at runtime until a real value is assigned.
+                return
+            # An annotation-only declaration emits nothing for a SCALAR: the
+            # checker tracks the type from the annotation itself and there is no
+            # value to store yet.
+            #
+            # A container is different and this is the subtle part. `xs:
+            # list[int[64], 4]` with no value is not an empty declaration to be
+            # ignored -- it is what reserves and ZEROES the run. Both execution
+            # tiers key off this instruction: the allocator sizes N slots from it,
+            # and the interpreter materialises N zeroed elements from it. Emit
+            # nothing here and `xs` has no storage at all, so the first
+            # `xs[0] = 1` writes to a name that was never allocated. This is the
+            # reason the declaration is a `store` with no value operand rather
+            # than a separate opcode.
+            if kind in CONTAINER_KINDS:
+                self.emit(f"store {name}{suffix}")
             return
 
         if isinstance(node, ast.Assign):
-            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            if len(node.targets) != 1:
+                raise NotImplementedError("only single-target assignment is supported")
+            target = node.targets[0]
+            if isinstance(target, ast.Subscript):
+                # `xs[i] = v`. Op::IndexStore carries the container name in `name`
+                # and only the index and value as ValueIds.
+                if not isinstance(target.value, ast.Name):
+                    raise NotImplementedError(
+                        "only a plain variable can be index-assigned, e.g. xs[i] = v")
+                idx = self.build_expr(target.slice)
+                val = self.build_expr(node.value)
+                self.emit(f"IndexStore {target.value.id}, {idx}, {val}")
+                return
+            if not isinstance(target, ast.Name):
                 raise NotImplementedError("only single-name assignment targets are supported")
             value_reg = self.build_expr(node.value)
-            name = node.targets[0].id
+            name = target.id
             self.emit(f"store {name}, {value_reg}")
             return
 
@@ -468,16 +577,20 @@ def build_program(tree):
             param_strs = []
             for arg in stmt.args.args:
                 if arg.annotation is not None:
-                    kind, width = parse_type_annotation(arg.annotation)
-                    suffix = render_type_suffix(kind, width).replace(" : ", ":")
+                    kind, width, elem_kind, elem_width = parse_type_annotation(arg.annotation)
+                    suffix = render_type_suffix(kind, width, elem_kind,
+                                               elem_width).replace(" : ", ":")
                     param_strs.append(f"{arg.arg}{suffix}")
                 else:
                     param_strs.append(arg.arg)
 
             return_suffix = ""
             if stmt.returns is not None:
-                kind, width = parse_type_annotation(stmt.returns)
-                return_suffix = f" -> {kind}" + (f"[{width}]" if width not in (None, -1) else "")
+                kind, width, elem_kind, elem_width = parse_type_annotation(stmt.returns)
+                # " : " is stripped because the return suffix uses " -> " and the
+                # scalar path below writes the brackets itself.
+                return_suffix = render_type_suffix(kind, width, elem_kind,
+                                                   elem_width).replace(" : ", " -> ")
 
             emitted_name = fn_rename.get(stmt.name, stmt.name)
             header = f"function {emitted_name}({', '.join(param_strs)}){return_suffix}:"

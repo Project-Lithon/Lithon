@@ -127,6 +127,76 @@ int main() {
         }
     }
 
+    // 4.1. Packed stride: sizeof(T), not a uniform 8 bytes. Run the same
+    // program at every scalar width, because each width fails differently and
+    // none of the failures show up at the others:
+    //   - wrong SIB scale overlaps elements (the sum comes out wrong)
+    //   - REX.W left on a 4-byte access widens the store, overwriting the next
+    //     element and running past the frame into the saved return address
+    //   - an 8/16-bit load is a PARTIAL register write, so the low byte is right
+    //     and the bits above it are leftover garbage; only the xor-then-mov
+    //     pair fixes that, and only an exact-value check would notice
+    // int[64] was the only width that worked before packing, and it is the one
+    // width whose bugs are least likely to appear.
+    for (int w : {8, 16, 32, 64}) {
+        char fname[32];
+        std::snprintf(fname, sizeof fname, "packed%d", w);
+        Function pf;
+        pf.name = fname;
+        BasicBlock pb;
+        pb.label = "block0";
+        { Instr d; d.op = Op::Store; d.name = "xs"; d.type_kind = "list";
+          d.type_width = 4; d.type_elem_kind = "int"; d.type_elem_width = w;
+          pb.instrs.push_back(d); }
+        for (int k = 0; k < 4; ++k) {
+            Instr c; c.op = Op::ConstInt; c.result = ValueId(k); c.int_imm = k;
+            c.type_kind = "int"; c.type_width = w;
+            pb.instrs.push_back(c);
+        }
+        for (int k = 0; k < 4; ++k) {
+            Instr v; v.op = Op::ConstInt; v.result = ValueId(4 + k); v.int_imm = 10 * (k + 1);
+            v.type_kind = "int"; v.type_width = w;
+            pb.instrs.push_back(v);
+        }
+        for (int k = 0; k < 4; ++k) {
+            Instr is; is.op = Op::IndexStore; is.name = "xs";
+            is.args = {ValueId(k), ValueId(4 + k)};
+            pb.instrs.push_back(is);
+        }
+        for (int k = 0; k < 4; ++k) {
+            Instr ix; ix.op = Op::Index; ix.name = "xs";
+            ix.result = ValueId(8 + k); ix.args = {ValueId(k)};
+            pb.instrs.push_back(ix);
+        }
+        Instr a1; a1.op = Op::Add; a1.result = 12; a1.args = {8, 9}; pb.instrs.push_back(a1);
+        Instr a2; a2.op = Op::Add; a2.result = 13; a2.args = {10, 11}; pb.instrs.push_back(a2);
+        Instr a3; a3.op = Op::Add; a3.result = 14; a3.args = {12, 13}; pb.instrs.push_back(a3);
+        { Instr ln; ln.op = Op::Len; ln.name = "xs"; ln.result = 15; pb.instrs.push_back(ln); }
+        Instr a4; a4.op = Op::Add; a4.result = 16; a4.args = {15, 15}; pb.instrs.push_back(a4);
+        Instr a5; a5.op = Op::Add; a5.result = 17; a5.args = {14, 16}; pb.instrs.push_back(a5);
+        { Instr r; r.op = Op::Return; r.result = kInvalidValue; r.args = {17};
+          pb.instrs.push_back(r); }
+        pf.blocks = {pb};
+
+        Module pm; pm.functions = {pf};
+        CompiledModule pc = compile_module(pm);
+        ExecutableBuffer pmem(pc.code);
+        typedef int64_t (*PackedFunc)(void);
+        PackedFunc pfn = reinterpret_cast<PackedFunc>(
+            reinterpret_cast<uint8_t*>(pmem.data()) + pc.function_offset.at(fname));
+        int64_t pn = pfn();
+        // 10+20+30+40 == 100, plus 2*len == 8. Values are small enough to fit
+        // EVERY width on purpose: storing 300 into an int[8] element truncates
+        // to 44, which is correct behaviour but would make one shared expected
+        // value impossible. This block is about layout, not overflow.
+        std::printf("list[int[%d],4]: sum + 2*len = %lld (expect 108)\n", w, (long long)pn);
+        if (pn != 108) {
+            std::fprintf(stderr, "FAIL: list[int[%d],4] gave %lld, expected 108 -- packed "
+                            "stride or element width is wrong\n", w, (long long)pn);
+            return 1;
+        }
+    }
+
     // A dynamic (non-literal) index that is IN RANGE must still work. The
     // bounds check added for 4.1 emits a trap on failure, and the trap calls
     // host_report_error, which exits the process -- so the failing half cannot

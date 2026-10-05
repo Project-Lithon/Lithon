@@ -235,6 +235,59 @@ int main() {
         check(alloc.frame_size() % 16 == 0, "frame size is 16-byte aligned");
     }
 
+    // 4.1. Packed stride, asserted at the ALLOCATOR level rather than end to end.
+    //
+    // An end-to-end sum over a list cannot see this at all: elements at stride 4
+    // and at stride 8 are equally distinct, so both sum to the same total and a
+    // uniform-8-byte stride survives a passing run. Mutating container_element_stride
+    // to a constant 8 leaves every list program in the suite green. The stride is
+    // only observable where the bytes are -- the element offsets themselves, and
+    // how many frame slots the container consumes -- and it is load-bearing for
+    // 4.4, where addressof(xs, i) has to agree with what Index actually addresses.
+    for (int w : {8, 16, 32, 64}) {
+        const int esz = w / 8;
+        Function cf;
+        cf.name = "c";
+        BasicBlock cb;
+        cb.label = "block0";
+        Instr d; d.op = Op::Store; d.name = "xs"; d.type_kind = "list";
+        d.type_width = 4; d.type_elem_kind = "int"; d.type_elem_width = w;
+        cb.instrs.push_back(d);
+        cb.instrs.push_back(const_int(0, 1));
+        cb.instrs.push_back(instr(Op::Store, kInvalidValue, {0}, "xs"));
+        Instr after; after.op = Op::Store; after.name = "tail";
+        after.type_kind = "int"; after.type_width = 64;
+        cb.instrs.push_back(after);
+        cb.instrs.push_back(const_int(1, 7));
+        cb.instrs.push_back(instr(Op::Store, kInvalidValue, {1}, "tail"));
+        cb.instrs.push_back(instr(Op::Return, kInvalidValue));
+        cf.blocks = {cb};
+
+        RegisterAllocator ca(cf);
+        const int base = ca.element_offset("xs", 0);
+        bool packed = true;
+        for (int i = 0; i < 4; ++i)
+            if (ca.element_offset("xs", i) != base + i * esz) packed = false;
+        check(packed, ("list element offsets advance by exactly sizeof(T), int[" +
+                       std::to_string(w) + "] stride " + std::to_string(esz)).c_str());
+        check(ca.container_stride("xs") == esz,
+              ("container_stride agrees with the element width, int[" +
+               std::to_string(w) + "]").c_str());
+
+        // The run is 4 elements and must occupy 4*sizeof(T) bytes, rounded up to
+        // whole 8-byte slots -- so a bool[8] list of 4 costs 8 bytes, not 32.
+        // Measured against `tail`, which is allocated after the container: the
+        // container may not reach past the end of its own storage.
+        const int tail = ca.variable_offset("tail");
+        const int end = base + 4 * esz;
+        check(end <= tail || tail < base,
+              ("list run of 4 int[" + std::to_string(w) + "] fits before the next "
+               "variable's slot").c_str());
+        check(ca.frame_size() >= 4 * esz,
+              ("frame is large enough for the packed run, int[" +
+               std::to_string(w) + "]").c_str());
+    }
+
     std::printf(g_failed == 0 ? "PASS\n" : "FAIL\n");
     return g_failed == 0 ? 0 : 1;
 }

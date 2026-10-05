@@ -127,6 +127,12 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|X86_64)$")
         add_executable(phi_register_test src/jit/phi_register_test.cpp src/ir/text_parser.cpp)
         target_include_directories(phi_register_test PUBLIC src src/jit)
         add_test(NAME phi_register_test COMMAND phi_register_test)
+        # 2.7: direct float Op::Phi, end to end -- it needs real machine code
+        # executed, so it cannot be a unit test over the counters alone.
+        add_executable(compile_module_direct_phi_test
+            src/jit/compile_module_direct_phi_test.cpp src/ir/text_parser.cpp)
+        target_include_directories(compile_module_direct_phi_test PUBLIC src src/jit)
+        add_test(NAME compile_module_direct_phi_test COMMAND compile_module_direct_phi_test)
 
         # 2.4 DSE + copy propagation on SSA: executes JIT'd code, parses IR text.
         add_executable(optimize_ssa_test src/jit/optimize_ssa_test.cpp src/ir/text_parser.cpp)

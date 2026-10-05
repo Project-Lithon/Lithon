@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -127,6 +129,23 @@ inline PromotionMap select_phi_registers(const lithon::ir::Function& fn,
     return phis;
 }
 
+// 4.1. Storage size in bytes of one container element, i.e. sizeof(T). This is
+// the single definition of the stride shared by the frame layout (here), the SIB
+// encoder (sib_scale_for_stride) and 4.4's pointer arithmetic -- three places
+// that must not each invent their own idea of an element's size.
+//
+// `bool` has no width subscript in the language and is one byte, matching C++
+// sizeof(bool). An int/float width is a bit count and is always 8/16/32/64, so
+// the byte size is a plain shift. `str` returns 0: it has no storage at all, so
+// no stride exists for it and a container of strings must be rejected rather
+// than laid out against a size that does not exist.
+inline int container_element_stride(const std::string& kind, int width) {
+    if (kind == "bool") return 1;
+    if (kind == "int" || kind == "float")
+        return (width > 0 && width % 8 == 0) ? width / 8 : 0;
+    return 0;   // str, or anything else without storage
+}
+
 class RegisterAllocator {
 public:
     // Convenience form: automatic weighted promotion, no virtual temps.
@@ -167,14 +186,22 @@ public:
 
     // 4.1. Frame offset of element `index` of a container variable. Slots run
     // DOWNWARD from the base (the frame grows down), so element i sits at
-    // base - i*8 -- getting this sign wrong would make `xs[0]` read the last
-    // element while every bounds check still passed.
+    // base + i*stride -- getting this sign wrong would make `xs[0]` read the
+    // last element while every bounds check still passed.
+    //
+    // The stride is packed sizeof(T), not a fixed 8: it is the same quantity
+    // 4.4's `_p + 1` scales by, so the two must come from one place or
+    // addressof(xs, i) would disagree with what Index actually addresses.
     int element_offset(const std::string& name, int index) const {
         auto base = variable_offsets_.find(name);
         if (base == variable_offsets_.end() || index < 0) return 0;
         const int cap = container_capacity(name);
         if (cap > 0 && index >= cap) return 0;   // caller range-checks; do not compute
-        return base->second + index * 8;
+        return base->second + index * container_stride(name);
+    }
+    int container_stride(const std::string& name) const {
+        auto it = container_stride_.find(name);
+        return it == container_stride_.end() ? 8 : it->second;
     }
     int container_capacity(const std::string& name) const {
         auto it = container_capacity_.find(name);
@@ -270,6 +297,7 @@ private:
     // so Index can tell a real container from a scalar that happens to be
     // indexed by mistake.
     std::unordered_map<std::string, int> container_capacity_;
+    std::unordered_map<std::string, int> container_stride_;
     std::vector<std::string> variable_order_;
     std::vector<std::pair<Reg, int>> callee_saved_slots_;
     // Callee-saved registers the TEMPORARIES borrowed (they must survive a call,
@@ -351,28 +379,82 @@ private:
             variable_order_.push_back(name);
             if (promoted_.count(name)) return;
 
-            // 4.1. A container declaration reserves N slots, one per element,
+            // 4.1. A container declaration reserves cap*sizeof(T) bytes, packed,
             // and records the BASE. `variable_offset` alone would hand back the
-            // first slot and silently alias every element onto it, so the
-            // element address must always go through element_offset(), which
-            // re-derives the offset from the base and the index.
+            // first slot and silently alias every element onto it, so the element
+            // address must always go through element_offset(), which re-derives
+            // the offset from the base, the index and the stride.
             int cap = 0;
+            std::string elem_kind;
+            int elem_width = -1;
             for (const auto& b2 : fn_.blocks)
                 for (const auto& in2 : b2.instrs)
                     if (in2.op == lithon::ir::Op::Store && in2.name == name &&
-                        (in2.type_kind == "list" || in2.type_kind == "tuple"))
+                        (in2.type_kind == "list" || in2.type_kind == "tuple")) {
                         cap = in2.type_width > 0 ? in2.type_width : 1;
+                        elem_kind = in2.type_elem_kind;
+                        elem_width = in2.type_elem_width;
+                    }
             if (cap > 1) {
+                const int stride = container_element_stride(elem_kind, elem_width);
+                if (stride <= 0) {
+                    // The type layer deliberately accepts a nested container so
+                    // the type can exist ahead of the codegen that lays it out.
+                    // The two cannot both be true here: an inner list makes the
+                    // OUTER stride sizeof(inner), and that is a non-power-of-two
+                    // the SIB byte cannot express (and x86 has no negative scale
+                    // to run it backwards). Say which of the two it is rather
+                    // than reporting a missing size for a type that parsed fine.
+                    if (elem_kind == "list" || elem_kind == "tuple" ||
+                        elem_kind == "dict")
+                        throw std::logic_error(
+                            "4.1: nested containers are a type-level feature only; '" +
+                            name + "' is a " + elem_kind + " whose element is itself a "
+                            "container, and no SIB scale can address a "
+                            "non-power-of-two stride");
+                    throw std::logic_error(
+                        "4.1: container '" + name + "' has element type " +
+                        (elem_kind.empty() ? std::string("<unknown>") : elem_kind) +
+                        " with no packed frame representation");
+                }
+                // A 4-byte float stride IS expressible (SIB scale 4), but the
+                // float value pipeline is not: every float temp is an 8-byte
+                // double, and the element accessors are movsd. Reached by
+                // IndexStore, a float[32] element would store 8 bytes into a
+                // 4-byte slot and overwrite the next element. Unreachable
+                // today only because const_f64 is always float[64] and no IR can
+                // produce a float[32] value at all -- which is an accident of the
+                // const surface, not a guarantee, so it is rejected explicitly.
+                if (elem_kind == "float" && elem_width != 64)
+                    throw std::logic_error(
+                        "4.1: container '" + name + "' has float[" +
+                        std::to_string(elem_width) +
+                        "] elements, but only float[64] elements are implemented; "
+                        "a narrower float needs a 4-byte value path, not just a "
+                        "4-byte stride");
+
                 // Slots run DOWNWARD, but SIB addressing computes
-                // [rbp + disp + index*8] -- upward, and x86 has no negative
+                // [rbp + disp + index*stride] -- upward, and x86 has no negative
                 // scale. So element 0 is placed at the LOW address of the run
                 // and the run ascends from there. Anchoring element 0 at the
                 // high end instead (the obvious choice) would make xs[0] read
                 // the LAST element while every bounds check still passed.
-                int anchor = allocate_new_slot();
-                for (int i = 1; i < cap; ++i) allocate_new_slot();
-                variable_offsets_[name] = anchor - (cap - 1) * 8;
+                //
+                // Elements are packed, so they do NOT get one slot each: a
+                // list[bool[8],4] needs 4 bytes and borrows half a slot rather
+                // than reserving 32. The run is rounded up to whole 8-byte
+                // slots because the frame cursor only moves in 8s.
+                const int total_bytes = cap * stride;
+                const int slots = (total_bytes + 7) / 8;
+                for (int i = 0; i < slots; ++i) allocate_new_slot();
+                // Lowest byte offset allocated. allocate_new_slot() parks the
+                // cursor at the offset it just handed out, so the cursor IS the
+                // base -- adding 8 here would lift element 0 one slot clear of
+                // its own storage and let the run scribble on the neighbouring
+                // variable (or off the top of the frame).
+                variable_offsets_[name] = next_slot_offset_;
                 container_capacity_[name] = cap;
+                container_stride_[name] = stride;
             } else {
                 variable_offsets_[name] = allocate_new_slot();
             }

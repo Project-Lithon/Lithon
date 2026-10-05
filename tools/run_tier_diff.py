@@ -63,13 +63,13 @@ block0:
     %0 = const_i64 3
     %1 = const_i64 4
     %2 = gt %0, %1
-    store flag, %2
+    store flag, %2 : bool
     %3 = load flag
     call print, %3
     return
 """, "tier1"),
     "bool_via_return": ("""
-function less(a, b):
+function less(a: int[64], b: int[64]) -> bool:
 block0:
     %0 = load a
     %1 = load b
@@ -106,15 +106,15 @@ block0:
 function main():
 block0:
     %0 = const_f64 1e308
-    store big, %0
+    store big, %0 : float[64]
     %1 = load big
     %2 = load big
     %3 = mul %1, %2
-    store inf, %3
+    store inf, %3 : float[64]
     %4 = load inf
     %5 = load inf
     %6 = sub %4, %5
-    store nan, %6
+    store nan, %6 : float[64]
     %7 = const_f64 7.5
     %8 = const_f64 2.0
     %9 = const_f64 -7.5
@@ -221,7 +221,7 @@ block2:
     return
 """, "tier1"),
     "int_recursion": ("""
-function fact(n):
+function fact(n: int[64]) -> int[64]:
 block0:
     %0 = load n
     %1 = const_i64 2
@@ -499,6 +499,56 @@ def check_trap(label, ir_path, expected_tier, expected_message):
     return not problems, tier
 
 
+def check_direct_phis(label, ir_path):
+    """2.7: the direct-Phi path must agree with the memory path, exactly.
+
+    The comparison is deliberately against `--ssa` (which resolves merges to
+    memory) and not against the interpreter. The two implementations of a
+    merge are what is being cross-checked here; the interpreter is not in the
+    business of resolving Phis at all, and going through it would only prove
+    both paths are wrong in the same way.
+
+    The three outcomes are kept apart on purpose:
+
+      match        both compiled and printed the same thing -> PASS
+      known gap    BOTH rejected the program for the same reason -> not a
+                   failure, and not a pass either. This is the pre-existing
+                   hole where --ssa cannot handle a program with a user
+                   function call or a container, so direct-Phi codegen is never
+                   reached for it. Collapsing this bucket into either
+                   neighbouring one would hide it: as a pass it would look
+                   covered, as a failure it would blame the new code.
+      mismatch     anything else -> FAIL
+    """
+    mem = run([str(ir_path), "--auto", "--ssa"])
+    direct = run([str(ir_path), "--auto", "--direct-phis"])
+
+    mem_err = without_tier_markers(mem.stderr)
+    direct_err = without_tier_markers(direct.stderr)
+
+    problems = []
+    if mem.returncode != 0 and direct.returncode != 0 and mem_err == direct_err:
+        print(f"[GAP ] {label:<40} both paths reject it (known --ssa limitation)")
+        return True, "gap"
+    if mem.returncode != direct.returncode:
+        problems.append(f"exit differs: --ssa {mem.returncode}, "
+                        f"--direct-phis {direct.returncode}")
+    if mem.stdout != direct.stdout:
+        problems.append("STDOUT MISMATCH\n"
+                        f"      --ssa        : {mem.stdout!r}\n"
+                        f"      --direct-phis : {direct.stdout!r}")
+    if mem_err != direct_err:
+        problems.append("STDERR MISMATCH\n"
+                        f"      --ssa        : {mem_err!r}\n"
+                        f"      --direct-phis : {direct_err!r}")
+
+    status = "PASS" if not problems else "FAIL"
+    print(f"[{status}] {label:<40} direct-phi path matches")
+    for prob in problems:
+        print(f"      {prob}")
+    return not problems, "match" if not problems else "mismatch"
+
+
 def main():
     if not RUNNER.exists():
         print(f"missing {RUNNER}; build it first (see src/jit/tier_runner.cpp)")
@@ -531,9 +581,23 @@ def main():
             results.append(ok)
             tiers[tier] += 1
 
+    print("--- direct float Op::Phi (2.7: direct path vs memory path) ---")
+    phi = {"match": 0, "gap": 0, "mismatch": 0}
+    with tempfile.TemporaryDirectory() as tmp:
+        for suite in SUITES:
+            for py in sorted(suite.glob("*.py")):
+                ir = compile_to_ir(py, tmp)
+                ok, kind = check_direct_phis(f"{suite.name}/{py.stem}", ir)
+                results.append(ok)
+                phi[kind] += 1
+
     passed = sum(results)
     print(f"\n{passed}/{len(results)} passed  "
           f"(native: {tiers['tier1']}, interpreter fallback: {tiers['tier0']})")
+    print(f"direct-Phi sweep: {phi['match']} matched, {phi['gap']} known gaps, "
+          f"{phi['mismatch']} mismatched")
+    if phi["mismatch"]:
+        return 1
     return 0 if all(results) else 1
 
 

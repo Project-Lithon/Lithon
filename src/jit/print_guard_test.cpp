@@ -349,6 +349,65 @@ block0:
     return
 )", true);
 
+    // 4.1. A container read is as safe to print as the element type is, because the
+    // declared element kind is what the guard reasons about. The bool case is
+    // the one that was broken: the element kind collapsed "not float" into Int,
+//    so a bool store joined Int against Bool into Unknown and the guard refused
+    // to compile a program the interpreter ran happily -- a native/interpreter
+    // divergence that only a bool list could produce.
+    expect("print(xs[0]) of a list[bool,4]", R"(
+function main():
+block0:
+    store xs : list[bool,4]
+    %0 = const_i64 0
+    %1 = const_bool 1
+    IndexStore xs, %0, %1
+    %2 = Index xs, %0
+    call print, %2
+    return
+)", true);
+
+    expect("print(xs[0]) of a list[int[64],4]", R"(
+function main():
+block0:
+    store xs : list[int[64],4]
+    %0 = const_i64 0
+    %1 = const_i64 7
+    IndexStore xs, %0, %1
+    %2 = Index xs, %0
+    call print, %2
+    return
+)", true);
+
+    expect("print(xs[0]) of a list[float[64],4]", R"(
+function main():
+block0:
+    store xs : list[float[64],4]
+    %0 = const_i64 0
+    %1 = const_f64 1.5
+    IndexStore xs, %0, %1
+    %2 = Index xs, %0
+    call print, %2
+    return
+)", true);
+
+    // The element-kind join has to keep working: a container written with two
+    // different element kinds is genuinely unprintable, and narrowing the
+    // element kind to make the bool case pass must not also make this one safe.
+    expect("list[bool,4] written with a bool and an int is refused", R"(
+function main():
+block0:
+    store xs : list[bool,4]
+    %0 = const_i64 0
+    %1 = const_bool 1
+    %2 = const_i64 1
+    IndexStore xs, %0, %1
+    IndexStore xs, %2, %2
+    %3 = Index xs, %0
+    call print, %3
+    return
+)", false);
+
     std::printf("\n%d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }

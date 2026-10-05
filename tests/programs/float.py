@@ -38,8 +38,8 @@ print(2.2250738585072014e-308)
 print(1.7976931348623157e308)
 
 # --- arithmetic --------------------------------------------------------
-a = 3.5
-b = 2.0
+a: float[64] = 3.5
+b: float[64] = 2.0
 print(a + b)
 print(a - b)
 print(a * b)
@@ -54,13 +54,13 @@ print(7 / 2)
 # A float value that survives a print() call: this is the register-allocator
 # case, where a float temp was being left in a caller-saved XMM that the host
 # formatter then clobbered.
-s = 0.0 * -0.0
-r = 5
+s: float[64] = 0.0 * -0.0
+r: int[64] = 5
 print(s * r > r)
 # NaN. Produced without a literal because there is no NaN syntax: inf - inf,
 # where inf comes from an overflow at run time (1e308 * 1e308).
-big = 1e308
-nan = big * big - big * big
+big: float[64] = 1e308
+nan: float[64] = big * big - big * big
 # Every ordered comparison against NaN is False. This is where the unordered
 # case (comisd sets ZF, PF and CF all at once) has to be excluded explicitly,
 # or NaN would come out as less than everything.
@@ -93,7 +93,7 @@ print(-4.0 % 2.0)
 print(1.0 % 2.0)
 # --- modulo against inf and nan ---------------------------------------
 # inf is made by overflowing at run time; there is no inf literal.
-inf = 1e308 * 1e308
+inf: float[64] = 1e308 * 1e308
 nan = inf - inf
 # n = trunc(1.0/inf) is exactly 0, so the answer is the dividend, 1.0. This
 # is the case that has to skip the n*b multiply: IEEE says 0 * inf is NaN,

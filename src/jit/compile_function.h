@@ -135,6 +135,19 @@ struct CompileOptions {
     // correctness-first path, not a speed one -- see resolve_phis() for why the
     // phis still travel through memory slots.
     bool ssa_pipeline = false;
+    // 2.7: keep Op::Phi in the IR and let the backend emit the merges itself,
+    // as register moves on the incoming edges, instead of rewriting them into
+    // memory slots first. Requires ssa_pipeline, since nothing else puts a Phi
+    // in the IR.
+    //
+    // Why this is safe to do at all: in SSA a Phi's result is a fresh ValueId
+    // that is defined at the join and used only after it, so it can never also
+    // be some other Phi's operand. The copies on one edge therefore form a set
+    // of moves between DISJOINT sources and destinations -- no cycles, and no
+    // ordering hazard between them. That is exactly what resolve_phis() has to
+    // work around by round-tripping through memory, and it is why a direct
+    // emitter needs no parallel-copy resolution pass at all.
+    bool direct_phis = false;
 };
 
 struct CompiledModule {
@@ -163,6 +176,11 @@ struct CompiledModule {
     // incoming edge's `mov` had no work left to do. Distinct from
     // phis_forwarded above, which counts copies that never came into being.
     size_t phi_copies_coalesced = 0;
+    // 2.7: Phi copies the backend emitted itself, as register moves on the
+    // incoming edges, because direct_phis kept them out of memory. Counts
+    // MOVES, not Phis: a two-predecessor join is one Phi and two copies. Zero
+    // is the normal answer whenever direct_phis is off, which is the default.
+    size_t phi_copies_direct = 0;
     // 3.1. Float add chains rotated under --ffast-math-equivalent. Reported so
     // the flag's effect is visible; it is zero unless that flag was passed.
     size_t float_adds_reassociated = 0;
@@ -476,6 +494,8 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
     size_t phi_copies_total = 0;
     size_t phis_forwarded = 0;
     size_t phi_copies_coalesced = 0;
+    // 2.7: counts MOVES, documented on CompiledModule::phi_copies_direct.
+    size_t phi_copies_direct = 0;
     size_t float_adds_reassociated = 0;
 
     struct PendingCallPatch {
@@ -544,7 +564,7 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
             // reuses those ids for the loads it leaves behind, so the kind
             // table has to be re-derived from the transformed IR or those ids
             // would read as Unknown and a float phi would print as an integer.
-            phis_forwarded += run_ssa_pipeline(fn).phis_forwarded;
+            phis_forwarded += run_ssa_pipeline(fn, !options.direct_phis).phis_forwarded;
             Module ssa_module;
             ssa_module.functions.push_back(fn);
             value_kinds = infer_value_kinds(ssa_module).front();
@@ -1345,6 +1365,180 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             }
         };
 
+        // 2.7. Direct Phi emission. A Phi is an EDGE copy: operand i arrives
+        // on the edge out of pred(s)[i]. So the copy for `from -> to` is the
+        // operand sitting at from's own index in to's predecessor list, which
+        // is why build_cfg() is used here rather than a hand-rolled walk --
+        // Cfg::pred is deduped, and liveness::compute_edge_uses indexed the
+        // operands with that same deduped order, so any other order would
+        // silently pair a Phi with the wrong incoming value.
+        const Cfg phi_cfg = build_cfg(fn);
+        // Successor label -> its Phis, in predecessor order.
+        std::unordered_map<std::string, std::vector<const ir::Instr*>> phis_in;
+        if (options.direct_phis) {
+            for (const auto& b : fn.blocks)
+                for (const auto& in : b.instrs)
+                    if (in.op == Op::Phi) phis_in[b.label].push_back(&in);
+        }
+
+        auto has_phis = [&](const std::string& label) {
+            if (!options.direct_phis) return false;
+            auto it = phis_in.find(label);
+            return it != phis_in.end() && !it->second.empty();
+        };
+
+        // Emits every Phi copy on the edge from block `from` to block `to`.
+        //
+        // These are PARALLEL copies, and that is the whole difficulty. SSA does
+        // not make them sequential: the operands are all read at the instant
+        // the edge is taken, before any destination is written.
+        //
+        // The tempting argument that no resolution is needed -- "a Phi's result
+        // is a fresh ValueId, so sources and destinations are disjoint" -- is
+        // true of ValueIds and false of REGISTERS, and the difference cost a
+        // nested-loop bug that printed 40 where 100 was correct. Two values whose
+        // live ranges merely touch at the edge are not interfering, so the
+        // allocator is free to give them the same register: with the outer total
+        // and the inner index both in r10, this pair of copies
+        //
+        //     %26 <- %8     ; destination r10, which is %25's register
+        //     %27 <- %25    ; source    r10, read AFTER it was just clobbered
+        //
+        // silently accumulates a zero every outer iteration. No ValueId is ever
+        // both a source and a destination, so no amount of checking at the IR
+        // level would have caught it; it has to be resolved on locations.
+        auto emit_phi_copies = [&](size_t from, const std::string& to) {
+            if (!options.direct_phis) return;
+            auto tit = phi_cfg.index.find(to);
+            if (tit == phi_cfg.index.end()) return;
+            auto pit = phis_in.find(to);
+            if (pit == phis_in.end() || pit->second.empty()) return;
+
+            size_t edge = SIZE_MAX;
+            const auto& preds = phi_cfg.pred[tit->second];
+            for (size_t i = 0; i < preds.size(); ++i)
+                if (preds[i] == from) { edge = i; break; }
+            // A predecessor with no matching operand index means the Phi's
+            // arity disagrees with the CFG, which validate_ssa() rejects before
+            // this point; bail rather than guess an index.
+            if (edge == SIZE_MAX || edge >= pit->second.front()->args.size()) return;
+
+            // One pending move. dst_is_reg says whether there is a register to
+            // clobber at all: a destination in a frame slot cannot disturb any
+            // source, so such a move never has to wait.
+            struct Move {
+                ValueId src;
+                ValueId dst;
+                bool is_float;
+                bool dst_is_reg;
+            };
+            std::vector<Move> todo;
+            for (const ir::Instr* phi : pit->second) {
+                const ValueId src_id = phi->args[edge];
+                if (src_id == ir::kInvalidValue) continue;
+                const ValueId dst_id = phi->result;
+                ++phi_copies_direct;
+                const bool dst_float =
+                    dst_id < is_float_kinds.size() && is_float_kinds[dst_id];
+                if (dst_float) {
+                    // A float Phi fed by an int would mean the print guard and
+                    // the checker disagree about the merge type, so that is
+                    // refused instead of reinterpreted.
+                    const bool src_float =
+                        src_id < is_float_kinds.size() && is_float_kinds[src_id];
+                    if (!src_float)
+                        throw std::runtime_error(
+                            "compile_module: float Op::Phi fed by a non-float value");
+                }
+                todo.push_back({src_id, dst_id, dst_float,
+                                dst_float ? alloc.float_in_register(dst_id)
+                                          : alloc.temp_location(dst_id).in_register});
+            }
+
+            // Location identity, as a comparable token. A move that has already
+            // been staged reads from the break register instead of its original
+            // source, so the token has to reflect that or the resolution below
+            // cannot see that the dependency is gone.
+            auto token_of = [&](const Move& m, bool is_staged) -> int {
+                if (is_staged) return -2;   // the break register, never a destination
+                if (m.is_float)
+                    return alloc.float_in_register(m.src)
+                               ? 1000 + (int)alloc.float_register(m.src) : -1;
+                const ValueLocation& sl = alloc.temp_location(m.src);
+                return sl.in_register ? (int)sl.reg : -1;
+            };
+            auto dst_token = [&](const Move& m) -> int {
+                if (!m.dst_is_reg) return -1;
+                return m.is_float ? 1000 + (int)alloc.float_register(m.dst)
+                                   : (int)alloc.temp_location(m.dst).reg;
+            };
+
+            // Emit one move for real.
+            auto emit_one = [&](const Move& m, bool staged) {
+                if (m.is_float) {
+                    const Xmm src = staged ? abi::kScratchFloat : read_float(m.src);
+                    if (m.dst_is_reg)
+                        emit_movsd_xmm_xmm(code, alloc.float_register(m.dst), src);
+                    else
+                        emit_movsd_rbp_mem(code, src, alloc.float_stack_slot(m.dst));
+                } else {
+                    const Reg src = staged ? kL : read_left(m.src);
+                    const ValueLocation& loc = alloc.temp_location(m.dst);
+                    if (loc.in_register) {
+                        if (loc.reg != src) emit_mov_reg_reg(code, loc.reg, src);
+                    } else {
+                        emit_store_rbp_offset(code, src, loc.stack_slot);
+                    }
+                }
+            };
+
+            // Park a source in the break register, which nothing else can be
+            // holding: r10/r11 and XMM14/XMM15 are reserved by jit_abi.h and
+            // never handed out by the allocator. Only a genuine cycle reaches
+            // here, and only one cycle at a time, so one break register is
+            // enough -- but it has to be returned to its destination last, or
+            // the value it holds is lost.
+            auto break_cycle = [&](const Move& m) {
+                if (m.is_float) emit_movsd_xmm_xmm(code, abi::kScratchFloat, read_float(m.src));
+                else emit_mov_reg_reg(code, kL, read_left(m.src));
+            };
+
+            std::vector<bool> staged(todo.size(), false);
+            while (!todo.empty()) {
+                bool progress = false;
+                for (size_t i = 0; i < todo.size() && progress == false; ++i) {
+                    // Safe when this destination is not a register some other
+                    // pending move still has to read.
+                    const int dt = dst_token(todo[i]);
+                    // Starts TRUE, not "true when the destination is not a
+                    // register". Written the other way round it is a trap: the
+                    // scan below is guarded by `&& safe`, so seeding `safe` with
+                    // false for every register destination skips the scan
+                    // entirely and condemns every move at once. Nothing is then
+                    // ever emittable and the resolution spins forever.
+                    bool safe = true;
+                    for (size_t j = 0; j < todo.size(); ++j) {
+                        if (j == i) continue;   // a move never conflicts with itself
+                        const int st = token_of(todo[j], staged[j]);
+                        // -1 is a source with no register (a constant, or a
+                        // spilled value): reading it touches no register, so it
+                        // can never be clobbered by a destination.
+                        if (st != -1 && st == dt) { safe = false; break; }
+                    }
+                    if (!safe) continue;
+                    emit_one(todo[i], staged[i]);
+                    todo.erase(todo.begin() + static_cast<long>(i));
+                    staged.erase(staged.begin() + static_cast<long>(i));
+                    progress = true;
+                }
+                if (progress) continue;
+                // Nothing was safe, so what is left is one or more cycles in
+                // the register graph. Break one and go round again.
+                break_cycle(todo.front());
+                staged.front() = true;
+            }
+        };
+
         // Local join points for the aggressive unroller: a target that is a
         // position in the emitted stream rather than an IR label, bound once
         // the stream has been extended past it.
@@ -1433,15 +1627,16 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     const int cap = alloc.container_capacity(instr.name);
                     if (cap > 0) {
                         const int base = alloc.element_offset(instr.name, 0);
+                        const int stride = alloc.container_stride(instr.name);
                         emit_xor_zero(code, kR);
                         if (cap <= 16) {
                             for (int i = 0; i < cap; ++i) {
-                                emit_store_rbp_offset(code, kR, base + 8 * i);
+                                emit_store_rbp_offset(code, kR, base + stride * i, stride);
                             }
                         } else {
                             emit_xor_zero(code, kL);
                             const size_t top = code.size();
-                            emit_store_rbp_scaled(code, kR, kL, base);
+                            emit_store_rbp_scaled(code, kR, kL, base, stride);
                             emit_add_reg_imm32(code, kL, 1);
                             emit_cmp_reg_imm32(code, kL, cap);
                             JumpPatch again = emit_jcc_rel32(code, Cond::Less);
@@ -1492,6 +1687,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 // the result temp is spilled. Both operands reading through
                 // read_left() would land in the SAME scratch and the second
                 // would overwrite the index.
+                const int stride = alloc.container_stride(instr.name);
                 Reg idx = read_in(instr.args.at(0), kR);
                 emit_index_bounds_check(instr.args.at(0), idx, instr.name);
                 if (is_float_value(value_kinds, instr.result)) {
@@ -1503,11 +1699,11 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     // instead; that diagnosis was a guess, and the scaled SSE
                     // emitter it needed was already present.
                     Xmm dst = float_dest(instr.result);
-                    emit_movsd_xmm_rbp_scaled(code, dst, idx, disp);
+                    emit_movsd_xmm_rbp_scaled(code, dst, idx, disp, stride);
                     commit_float_result(instr.result, dst);
                 } else {
                     Reg dst = compute_dest(instr.result);
-                    emit_load_rbp_scaled(code, dst, idx, disp);
+                    emit_load_rbp_scaled(code, dst, idx, disp, stride);
                     commit_result(instr.result, dst);
                 }
                 break;
@@ -1519,16 +1715,17 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     throw std::runtime_error("compile_module: index store into '" +
                                              instr.name + "' which is not a container");
                 }
+                const int stride = alloc.container_stride(instr.name);
                 Reg idx = read_in(instr.args.at(0), kL);
                 emit_index_bounds_check(instr.args.at(0), idx, instr.name);
                 if (is_float_value(value_kinds, instr.args.at(1))) {
                     Xmm src = read_float(instr.args.at(1));
-                    emit_movsd_rbp_scaled(code, src, idx, disp);
+                    emit_movsd_rbp_scaled(code, src, idx, disp, stride);
                 } else {
                     // kR, not read_left: the value must not land in kL, which
                     // is holding the index.
                     Reg src = read_in(instr.args.at(1), kR);
-                    emit_store_rbp_scaled(code, src, idx, disp);
+                    emit_store_rbp_scaled(code, src, idx, disp, stride);
                 }
                 break;
             }
@@ -1846,22 +2043,82 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                                 pending_blocks.push_back({emit_jcc_rel32(code, invert(cond)), lb.exit_label});
                         } else if (flags & detail::kExitOnlyBranch) {
                             pending_blocks.push_back({emit_jcc_rel32(code, invert(cond)), targets[1]});
+                        } else if (has_phis(targets[0]) || has_phis(targets[1])) {
+                            // 2.7. A conditional branch with a merge on either
+                            // arm cannot use emit_branch_to: the two arms need
+                            // DIFFERENT copies, and only one of them can be the
+                            // fall-through. So the else arm is given a real
+                            // local label and both arms are materialised:
+                            //
+                            //     jcc  L_else          ; !cond -> else arm
+                            //     <copies -> target0>
+                            //     jmp  target0
+                            //   L_else:
+                            //     <copies -> target1>
+                            //     jmp  target1          ; omitted if it falls through
+                            //
+                            // The fall-through test is against next_label, which
+                            // is still correct: the else arm's code is emitted
+                            // before the next block's, so that block's offset is
+                            // bound after it either way.
+                            const size_t l_else = new_local();
+                            pending_locals.push_back({emit_jcc_rel32(code, invert(cond)), l_else});
+                            emit_phi_copies(bi, targets[0]);
+                            pending_blocks.push_back({emit_jmp_rel32(code), targets[0]});
+                            bind_local(l_else);
+                            emit_phi_copies(bi, targets[1]);
+                            if (targets[1] != next_label)
+                                pending_blocks.push_back({emit_jmp_rel32(code), targets[1]});
                         } else {
                             emit_branch_to(cond, targets[0], targets[1], next_label);
                         }
                         break;
                     }
 
+                    case Op::Phi:
+                        // 2.7. Nothing is emitted here. A Phi is not an
+                        // instruction that executes inside its block -- its
+                        // copies live on the incoming edges, emitted by
+                        // emit_phi_copies before the predecessor's terminator.
+                        // Falling through to the default case would treat it as
+                        // an unknown opcode.
+                        break;
+
                     case Op::Jump: {
-                        if (instr.name == next_label) break;   // fall through
+                        // 2.7. Every path out of this block needs the copies for
+                        // its edge, and there are three ways out, not one. The
+                        // fall-through and the rotated back edge both used to
+                        // skip them, and the back edge is the one that matters:
+                        // it is the loop-carried merge, so omitting its copies
+                        // left the accumulator at its ENTRY value forever and
+                        // `for i in range(10): total += i` printed 0.
+                        if (instr.name == next_label) {          // fall through
+                            emit_phi_copies(bi, instr.name);
+                            break;
+                        }
                         auto it = block_index.find(instr.name);
                         if (allow_rotate && options.rotate_loops && it != block_index.end() &&
                             it->second <= bi && detail::is_rotatable_header(fn.blocks[it->second])) {
                             // Loop rotation: re-test the loop condition here instead of
                             // jumping back to the header, so each iteration executes one
                             // conditional jump instead of a conditional plus an unconditional.
+                            // NO emit_phi_copies here, and that is not an
+                            // oversight. This arm only runs when the jump target
+                            // is a rotatable header, and
+                            // detail::is_rotatable_header() rejects any block
+                            // containing Op::Phi -- its opcode switch has no
+                            // case for it. A header with a merge is therefore
+                            // never rotated, so on this edge there is never a
+                            // copy to emit and the call would be dead code.
+                            // The consequence worth knowing: with direct_phis,
+                            // every loop that carries a value goes through the
+                            // ordinary jump arm below instead, which does emit
+                            // its copies. An earlier draft did call it here,
+                            // and no test could tell it apart from the no-op --
+                            // so it was removed rather than left unverified.
                             emit_block_body_fn(it->second, next_label, 0, detail::LocalBranch{});
                         } else {
+                            emit_phi_copies(bi, instr.name);
                             pending_blocks.push_back({emit_jmp_rel32(code), instr.name});
                         }
                         break;
@@ -2213,6 +2470,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
     compiled.function_offset = std::move(function_offset);
     compiled.float_pool = std::move(float_pool);
     compiled.phi_copies_in_registers = phi_copies_in_registers;
+    compiled.phi_copies_direct = phi_copies_direct;
     compiled.phi_copies_total = phi_copies_total;
     compiled.phis_forwarded = phis_forwarded;
     compiled.phi_copies_coalesced = phi_copies_coalesced;

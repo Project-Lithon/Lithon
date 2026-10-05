@@ -26,16 +26,12 @@
 
 using namespace lithon;
 
-static bool module_has_any_typing(const ir::Module& module) {
-    for (const auto& fn : module.functions) {
-        if (!fn.return_type_kind.empty()) return true;
-        for (const auto& k : fn.param_type_kinds) if (!k.empty()) return true;
-        for (const auto& block : fn.blocks)
-            for (const auto& instr : block.instrs)
-                if (instr.op == ir::Op::Store && !instr.type_kind.empty()) return true;
-    }
-    return false;
-}
+// 4.1 REMOVED: this used to skip the type checker entirely for a module with no
+// annotations at all, which made adding an annotation a whole-module semantic
+// switch -- annotate one variable and every unannotated variable in the file
+// became an error. It also meant most of the regression corpus was never
+// checked at all: 14 of 18 programs in tests/programs/ had zero annotations and
+// so were silently exempt. The checker is unconditional now.
 
 int main(int argc, char** argv) {
     // Detect CPU target features once, before any code generation can ask
@@ -54,6 +50,13 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--dump-phi")) dump_phi = true;
         else if (!std::strcmp(argv[i], "--mem2reg")) { run_mem2reg = true; options.ssa_pipeline = true; }
         else if (!std::strcmp(argv[i], "--ssa")) options.ssa_pipeline = true;
+        // 2.7. Implies --ssa: nothing but the SSA pipeline puts a Phi in the
+        // IR, so asking for direct emission without it would silently do
+        // nothing at all.
+        else if (!std::strcmp(argv[i], "--direct-phis")) {
+            options.direct_phis = true;
+            options.ssa_pipeline = true;
+        }
         else if (!std::strcmp(argv[i], "--strict")) strict = true;
         else if (!std::strcmp(argv[i], "--canonicalize-loops")) canonicalize = true;
         else if (!std::strcmp(argv[i], "--dump-code") && i + 1 < argc) dump_code_path = argv[++i];
@@ -112,7 +115,7 @@ int main(int argc, char** argv) {
     try {
         ir::Module module = ir::parse_ir_text(buffer.str());
 
-        if (module_has_any_typing(module)) {
+        {
             auto errors = typecheck::check_module(module);
             if (!errors.empty()) {
                 for (const auto& e : errors) std::cerr << "RCR error: " << e.message << "\n";
@@ -216,6 +219,12 @@ int main(int argc, char** argv) {
 
         auto t0 = std::chrono::steady_clock::now();
         jit::CompiledModule compiled = jit::compile_module(module, options);
+        // 2.7. Report the direct-Phi work so the flag is observable rather
+        // than something you have to take on trust.
+        if (options.direct_phis) {
+            std::fprintf(stderr, "[+] direct phis: %zu incoming-edge copies emitted\n",
+                         compiled.phi_copies_direct);
+        }
 
         if (!dump_code_path.empty()) {
             std::ofstream out(dump_code_path, std::ios::binary);

@@ -52,6 +52,17 @@ inline Kind join(Kind a, Kind b) {
     return Kind::Unknown;
 }
 
+// The element kind of a container annotation ("int", "bool", "float"), as a
+// scalar Kind. `bool` is a case that has to exist on its own: folding it into
+// "not float, therefore int" made a bool list read back as Int, and the
+// IndexStore feedback join below then turned Int^Bool into Unknown, so print
+// refused to compile `list[bool, N]` natively while the interpreter ran it.
+inline Kind kind_of_elem(const std::string& elem_kind) {
+    if (elem_kind == "float") return Kind::Float;
+    if (elem_kind == "bool") return Kind::Bool;
+    return Kind::Int;
+}
+
 inline const char* kind_name(Kind k) {
     switch (k) {
         case Kind::Int:     return "int";
@@ -206,8 +217,7 @@ struct Analysis {
                             // 4.1. Container declaration. Records the element
                             // kind only; there is no scalar Kind for the
                             // container itself.
-                            st.containers[in.name] =
-                                in.type_elem_kind == "float" ? Kind::Float : Kind::Int;
+                            st.containers[in.name] = kind_of_elem(in.type_elem_kind);
                             break;
                         }
                         if (!in.args.empty())

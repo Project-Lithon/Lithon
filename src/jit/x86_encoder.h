@@ -325,13 +325,184 @@ inline void emit_disp32_le(CodeBuffer& buf, int32_t disp) {
     emit_u32_le(buf, static_cast<uint32_t>(disp));
 }
 
-// mov [rbp + offset], src   (store to a stack slot)
-// Encoding: REX.W + 89 /r, ModRM(mod=10, reg=src, rm=RBP), disp32
-inline void emit_store_rbp_offset(CodeBuffer& buf, Reg src, int32_t offset) {
-    emit_u8(buf, rex(true, src, Reg::RBP));
-    emit_u8(buf, 0x89);
-    emit_u8(buf, static_cast<uint8_t>(0x80 | (reg_low3(src) << 3) | reg_low3(Reg::RBP)));
-    emit_disp32_le(buf, offset);
+// 4.1. Scaled-index forms of the two above: [rbp + disp + index*stride]. A list
+// element lives at base + i*stride, so with a RUNNING index the address cannot
+// be a constant displacement -- it needs a SIB byte.
+//
+// The SIB always carries a displacement even when the index is 0, because
+// mod=00 with base=RBP (101) means RIP-relative on x86-64, not [rbp+0]. Using
+// mod=10 unconditionally sidesteps that special case rather than branching on
+// it, at the cost of four bytes.
+//
+// The stride is packed, i.e. exactly sizeof(T), because that is what makes
+// `ptr[T]` arithmetic in 4.4 mean "one element": if a list spaced its elements
+// 8 bytes apart while pointer arithmetic assumed sizeof(T), addressof(xs, i)
+// would compute the wrong address for every type narrower than 8 bytes and the
+// two features would silently disagree. This turns out to be cheaper than the
+// uniform-8-byte stride it replaces rather than dearer -- every scalar type in
+// the language is 1, 2, 4 or 8 bytes, which is exactly the set of scale factors
+// the SIB byte can encode, so all of them are a single SIB form with no lea, no
+// imul and no extra instruction. A stride outside that set (a nested container,
+// 4.1. Scaled-index forms: [rbp + disp + index*stride]. A list element lives at
+// base + i*stride, so with a RUNNING index the address cannot be a constant
+// displacement -- it needs a SIB byte.
+//
+// The SIB always carries a displacement even when the index is 0, because
+// mod=00 with base=RBP (101) means RIP-relative on x86-64, not [rbp+0]. Using
+// mod=10 unconditionally sidesteps that special case rather than branching on
+// it, at the cost of four bytes.
+//
+// The stride is packed, i.e. exactly sizeof(T), because that is what makes
+// `ptr[T]` arithmetic in 4.4 mean "one element": if a list spaced its elements
+// 8 bytes apart while pointer arithmetic assumed sizeof(T), addressof(xs, i)
+// would compute the wrong address for every type narrower than 8 bytes and the
+// two features would silently disagree. This turned out to be CHEAPER than the
+// uniform-8-byte stride it replaces rather than dearer -- every scalar type is
+// 1, 2, 4 or 8 bytes, which is exactly the set of factors the SIB byte can
+// encode, so all four widths are one SIB form with no lea and no imul. A stride
+// outside that set (a nested container, whose inner length makes it a
+// non-power-of-two) is not representable and is rejected at compile time rather
+// than silently mis-addressed.
+//
+// SS is 00=x1, 01=x2, 10=x4, 11=x8. Writing the wrong constant here silently
+// emits a different scale -- caught by tools/check_encoder_vs_as.py disagreeing
+// with GNU as on the *4 vs *8 operand text, which is a better bug report than
+// the wrong answer at runtime would have been.
+constexpr uint8_t kSibScale1 = 0 << 6;   // SS=00 -> scale factor 1
+constexpr uint8_t kSibScale2 = 1 << 6;   // SS=01 -> scale factor 2
+constexpr uint8_t kSibScale4 = 2 << 6;   // SS=10 -> scale factor 4
+constexpr uint8_t kSibScale8 = 3 << 6;   // SS=11 -> scale factor 8
+
+// SIB scale field for an element stride in bytes, or -1 when the stride is not
+// one of the four encodable factors.
+//
+// -1 rather than 0 as the failure value: scale 1 is SS=00, which IS 0, so a 0
+// sentinel is indistinguishable from a perfectly valid answer and every
+// 1-byte-stride access would have been reported as unrepresentable.
+inline int sib_scale_for_stride(int stride) {
+    switch (stride) {
+        case 1: return kSibScale1;
+        case 2: return kSibScale2;
+        case 4: return kSibScale4;
+        case 8: return kSibScale8;
+        default: return -1;
+    }
+}
+
+// The stride must be one of 1/2/4/8. Anything else has no SIB encoding, so this
+// fails here rather than emitting an address that reads the wrong memory.
+inline uint8_t checked_sib_scale(int stride) {
+    const int s = sib_scale_for_stride(stride);
+    if (s < 0) throw std::logic_error("x86_encoder: element stride " +
+                                      std::to_string(stride) +
+                                      " has no SIB scale encoding");
+    return static_cast<uint8_t>(s);
+}
+
+inline void emit_sib_tail(CodeBuffer& buf, Reg data_reg, Reg index_reg, uint8_t scale) {
+    // ModRM: mod=10 (disp32), reg=data_reg, r/m=100 (SIB follows)
+    emit_u8(buf, static_cast<uint8_t>(0x80 | (reg_low3(data_reg) << 3) | 0x4));
+    // SIB: scale, index=index_reg, base=RBP
+    emit_u8(buf, static_cast<uint8_t>(scale | (reg_low3(index_reg) << 3) |
+                                      reg_low3(Reg::RBP)));
+}
+
+// 4.1. Width-correct integer element access, scaled or not.
+//
+// Packed layout means sizeof(T) is BOTH the SIB scale and the operand width, so
+// one `bytes` argument drives both. That coincidence is why packing is cheap:
+// a 4-byte element is `mov dword ptr [rbp+d+i*4], r32` -- the same SIB form
+// with REX.W dropped. There is no separate narrow path.
+//
+// REX.W must NOT be set on a sub-8-byte access. Leaving it set silently widens
+// the access to 8 bytes, so storing element i would overwrite element i+1 and
+// run off the end of the frame; that surfaced as element 0 reading back as
+// `20<<32 + 10` and a segfault on return once the overrun reached the saved
+// return address. REX is dropped entirely when neither the data nor the index
+// register is extended, which is the common case.
+inline void emit_xor_zero(CodeBuffer& buf, Reg reg);
+
+inline void emit_rbp_mov_narrow(CodeBuffer& buf, Reg data_reg, Reg addr_reg, int32_t disp,
+                                int bytes, bool store, bool scaled,
+                                bool zero_extend = true) {
+    // An 8- or 16-bit load is a PARTIAL register write: `mov al, [mem]` writes
+    // AL and leaves bits 8..63 of the destination exactly as they were. A
+    // 32-bit load zero-extends for free, which is why only the 1- and 2-byte
+    // element types were affected -- reading a stored 10 back printed
+    // 12586541842954, the low byte correct and every bit above it leftover
+    // garbage from whatever used that register last. Zero the destination first.
+    // A store is unaffected: only the low bits of the source are written.
+    if (zero_extend && !store && (bytes == 1 || bytes == 2)) emit_xor_zero(buf, data_reg);
+    if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8)
+        throw std::logic_error("x86_encoder: element width " + std::to_string(bytes) +
+                               " is not 1, 2, 4 or 8");
+    const bool wide = bytes == 8;
+    const bool byte_form = bytes == 1;
+    const bool word_form = bytes == 2;
+    // 0x8B/0x89 are specifically the 32-bit forms. A 16-bit operand needs the
+    // 0x66 prefix and an 8-bit one needs the 0x8A/0x88 opcodes entirely -- reusing
+    // 0x8B for a byte access assembled `mov eax, DWORD PTR [rbp-0x12c]` from
+    // `mov al, BYTE PTR [rbp-0x12c]`, silently widening a 1-byte list element to
+    // 4 and corrupting every element packed after it.
+    //
+    // spl/bpl/sil/dil have NO encoding unless a REX byte is present, and
+    // al/cl/dl/bl have none WITH one, so REX is width-dependent here too.
+    const bool byte_reg_needs_rex =
+        byte_form && (data_reg == Reg::RSP || data_reg == Reg::RBP ||
+                      data_reg == Reg::RSI || data_reg == Reg::RDI);
+    // R and X do NOT depend on `wide`. Only W does. Gating R/X on `wide` made a
+    // 4-byte access with an r8..r15 index emit REX with X clear, so the index
+    // contributed only its low three bits and the access read a wild address --
+    // the same failure the SSE path had. addr_reg is the SIB index when scaled
+    // and the frame base when not, so X is only ever about an index.
+    const bool rex_r = reg_is_extended(data_reg);
+    const bool rex_x = scaled && reg_is_extended(addr_reg);
+    if (word_form) emit_u8(buf, 0x66);
+    if (wide || byte_reg_needs_rex || rex_r || rex_x)
+        emit_u8(buf, static_cast<uint8_t>(0x40 | (wide ? 8 : 0) |
+                                         (rex_r ? 4 : 0) | (rex_x ? 2 : 0)));
+    emit_u8(buf, byte_form ? (store ? 0x88 : 0x8A) : (store ? 0x89 : 0x8B));
+    if (scaled)
+        emit_sib_tail(buf, data_reg, addr_reg, checked_sib_scale(bytes));
+    else
+        emit_u8(buf, static_cast<uint8_t>(0x80 | (reg_low3(data_reg) << 3) |
+                                          reg_low3(Reg::RBP)));
+    emit_disp32_le(buf, disp);
+}
+
+// 4.1. Narrow unscaled element access, same width contract as the scaled form.
+inline void emit_load_rbp_narrow(CodeBuffer& buf, Reg dst, int32_t disp, int bytes,
+                                 bool zero_extend = true) {
+    emit_rbp_mov_narrow(buf, dst, Reg::RBP, disp, bytes, /*store=*/false, /*scaled=*/false,
+                        zero_extend);
+}
+
+inline void emit_store_rbp_narrow(CodeBuffer& buf, Reg src, int32_t disp, int bytes) {
+    emit_rbp_mov_narrow(buf, src, Reg::RBP, disp, bytes, /*store=*/true, /*scaled=*/false);
+}
+
+// mov dst, [rbp + disp + index*stride], at the element's own width
+inline void emit_load_rbp_scaled(CodeBuffer& buf, Reg dst, Reg index_reg, int32_t disp,
+                                 int stride = 8, bool zero_extend = true) {
+    emit_rbp_mov_narrow(buf, dst, index_reg, disp, stride, /*store=*/false, /*scaled=*/true,
+                        zero_extend);
+}
+
+// mov [rbp + disp + index*stride], src, at the element's own width
+inline void emit_store_rbp_scaled(CodeBuffer& buf, Reg src, Reg index_reg, int32_t disp,
+                                  int stride = 8) {
+    emit_rbp_mov_narrow(buf, src, index_reg, disp, stride, /*store=*/true, /*scaled=*/true);
+}
+
+inline void emit_store_rbp_offset(CodeBuffer& buf, Reg src, int32_t offset, int bytes = 8) {
+    if (bytes == 8) {
+        emit_u8(buf, rex(true, src, Reg::RBP));
+        emit_u8(buf, 0x89);
+        emit_u8(buf, static_cast<uint8_t>(0x80 | (reg_low3(src) << 3) | reg_low3(Reg::RBP)));
+        emit_disp32_le(buf, offset);
+        return;
+    }
+    emit_rbp_mov_narrow(buf, src, Reg::RBP, offset, bytes, /*store=*/true, /*scaled=*/false);
 }
 
 // mov dst, [rbp + offset]   (load from a stack slot)
@@ -341,50 +512,6 @@ inline void emit_load_rbp_offset(CodeBuffer& buf, Reg dst, int32_t offset) {
     emit_u8(buf, 0x8B);
     emit_u8(buf, static_cast<uint8_t>(0x80 | (reg_low3(dst) << 3) | reg_low3(Reg::RBP)));
     emit_disp32_le(buf, offset);
-}
-
-// 4.1. Scaled-index forms of the two above: [rbp + disp + index*8]. A list
-// element lives at base + i*8, so with a RUNNING index the address cannot be a
-// constant displacement -- it needs a SIB byte.
-//
-// The SIB always carries a displacement even when the index is 0, because
-// mod=00 with base=RBP (101) means RIP-relative on x86-64, not [rbp+0]. Using
-// mod=10 unconditionally sidesteps that special case rather than branching on
-// it, at the cost of four bytes.
-//
-// scale=10 (x8) matches kSlotSize: every element occupies one 8-byte frame
-// slot, so a list of int, float, or bool elements has the same stride. That is
-// a property of THIS frame layout, not of the language -- a narrower element
-// type does not get a narrower slot, because registers and the slot cursor are
-// both 64 bits wide.
-// SS is 00=x1, 01=x2, 10=x4, 11=x8. Writing 2 here silently emits x4 -- caught
-// by tools/check_encoder_vs_as.py disagreeing with GNU as on the *4 vs *8
-// operand text, which is a better bug report than the wrong answer at runtime
-// would have been.
-constexpr uint8_t kSibScale8 = 3 << 6;   // SS=11 -> scale factor 8
-
-inline void emit_sib_tail(CodeBuffer& buf, Reg data_reg, Reg index_reg) {
-    // ModRM: mod=10 (disp32), reg=data_reg, r/m=100 (SIB follows)
-    emit_u8(buf, static_cast<uint8_t>(0x80 | (reg_low3(data_reg) << 3) | 0x4));
-    // SIB: scale=x8, index=index_reg, base=RBP
-    emit_u8(buf, static_cast<uint8_t>(kSibScale8 | (reg_low3(index_reg) << 3) |
-                                      reg_low3(Reg::RBP)));
-}
-
-// mov dst, [rbp + disp + index*8]
-inline void emit_load_rbp_scaled(CodeBuffer& buf, Reg dst, Reg index_reg, int32_t disp) {
-    emit_u8(buf, rex3(true, dst, index_reg, Reg::RBP));
-    emit_u8(buf, 0x8B);
-    emit_sib_tail(buf, dst, index_reg);
-    emit_disp32_le(buf, disp);
-}
-
-// mov [rbp + disp + index*8], src
-inline void emit_store_rbp_scaled(CodeBuffer& buf, Reg src, Reg index_reg, int32_t disp) {
-    emit_u8(buf, rex3(true, src, index_reg, Reg::RBP));
-    emit_u8(buf, 0x89);
-    emit_sib_tail(buf, src, index_reg);
-    emit_disp32_le(buf, disp);
 }
 
 // push reg / pop reg. Encoding: [41] 50+r / [41] 58+r.
@@ -798,24 +925,26 @@ inline void emit_movsd_xmm_xmm(CodeBuffer& buf, Xmm dst, Xmm src) {
 // list[float[64]] element. The r/m field selects SIB (100) and the base is
 // still RBP, so -- exactly as in the integer pair -- mod=10 is used
 // unconditionally to sidestep the "mod=00 + base=RBP means RIP-relative" rule.
-inline void emit_movsd_xmm_rbp_scaled(CodeBuffer& buf, Xmm dst, Reg index_reg, int32_t disp) {
+inline void emit_movsd_xmm_rbp_scaled(CodeBuffer& buf, Xmm dst, Reg index_reg, int32_t disp,
+int stride = 8) {
     emit_u8(buf, 0xF2);
     if (xmm_is_extended(dst) || reg_is_extended(index_reg)) emit_u8(buf, rex3_xmm(dst, index_reg));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x10);
     emit_u8(buf, static_cast<uint8_t>(0x80 | (xmm_low3(dst) << 3) | 0x4));
-    emit_u8(buf, static_cast<uint8_t>(kSibScale8 | (reg_low3(index_reg) << 3) |
+    emit_u8(buf, static_cast<uint8_t>(checked_sib_scale(stride) | (reg_low3(index_reg) << 3) |
                                       reg_low3(Reg::RBP)));
     emit_disp32_le(buf, disp);
 }
 
-inline void emit_movsd_rbp_scaled(CodeBuffer& buf, Xmm src, Reg index_reg, int32_t disp) {
+inline void emit_movsd_rbp_scaled(CodeBuffer& buf, Xmm src, Reg index_reg, int32_t disp,
+ int stride = 8) {
     emit_u8(buf, 0xF2);
     if (xmm_is_extended(src) || reg_is_extended(index_reg)) emit_u8(buf, rex3_xmm(src, index_reg));
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x11);
     emit_u8(buf, static_cast<uint8_t>(0x80 | (xmm_low3(src) << 3) | 0x4));
-    emit_u8(buf, static_cast<uint8_t>(kSibScale8 | (reg_low3(index_reg) << 3) |
+    emit_u8(buf, static_cast<uint8_t>(checked_sib_scale(stride) | (reg_low3(index_reg) << 3) |
                                       reg_low3(Reg::RBP)));
     emit_disp32_le(buf, disp);
 }

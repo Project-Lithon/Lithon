@@ -17,23 +17,12 @@ namespace {
 // annotations anywhere) is treated as the original, pre-0.6
 // execution-only path, unchanged -- this is what keeps the original
 // 11-program regression suite working without modification.
-bool module_has_any_typing(const lithon::ir::Module& module) {
-    for (const auto& fn : module.functions) {
-        if (!fn.return_type_kind.empty()) return true;
-        for (const auto& k : fn.param_type_kinds) {
-            if (!k.empty()) return true;
-        }
-        for (const auto& block : fn.blocks) {
-            for (const auto& instr : block.instrs) {
-                if (instr.op == lithon::ir::Op::Store && !instr.type_kind.empty()) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
+// 4.1 REMOVED: this used to skip the type checker entirely for a module with no
+// annotations at all, which made adding an annotation a whole-module semantic
+// switch -- annotate one variable and every unannotated variable in the file
+// became an error. It also meant most of the regression corpus was never
+// checked at all: 14 of 18 programs in tests/programs/ had zero annotations and
+// so were silently exempt. The checker is unconditional now.
 } // namespace
 
 int main(int argc, char** argv) {
@@ -56,7 +45,7 @@ int main(int argc, char** argv) {
     try {
         lithon::ir::Module module = lithon::ir::parse_ir_text(buffer.str());
 
-        if (module_has_any_typing(module)) {
+        {
             auto errors = lithon::typecheck::check_module(module);
             if (!errors.empty()) {
                 for (const auto& e : errors) {

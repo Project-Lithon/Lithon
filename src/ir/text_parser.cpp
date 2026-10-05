@@ -18,13 +18,32 @@ std::string trim(const std::string& s) {
     return s.substr(start, end - start + 1);
 }
 
+// Splits on `delim` but ignores delimiters inside [], () or {}, so a container
+// annotation survives being a member of a comma-separated list.
+//
+// Without the bracket depth this silently truncates any type that contains a
+// comma of its own: `function g(xs: list[int[64],4])` split its parameter at the
+// annotation's own comma and reported "malformed type annotation: list[int[64]",
+// pointing at text the programmer never wrote. Every container type in 4.1-4.4
+// has this shape -- list[T,N], tuple[T,N], dict[K,V,N] -- so this was going to
+// bite 4.2, 4.3 and 4.4 as well, and a confusing truncated-type error is a bad
+// way to discover it. Argument lists keep the same behaviour they always had,
+// since no value expression can contain a bare bracket pair at that point.
 std::vector<std::string> split(const std::string& s, char delim) {
     std::vector<std::string> out;
     std::string cur;
-    std::istringstream ss(s);
-    while (std::getline(ss, cur, delim)) {
-        out.push_back(trim(cur));
+    int depth = 0;
+    for (char ch : s) {
+        if (ch == '[' || ch == '(' || ch == '{') ++depth;
+        else if (ch == ']' || ch == ')' || ch == '}') --depth;
+        if (ch == delim && depth <= 0) {
+            out.push_back(trim(cur));
+            cur.clear();
+        } else {
+            cur.push_back(ch);
+        }
     }
+    out.push_back(trim(cur));
     return out;
 }
 

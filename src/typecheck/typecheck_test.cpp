@@ -322,7 +322,30 @@ block0:
     // rejects it. list[int[8],4] against an int[64] value is same-kind,
     // same-capacity, different-element-width -- only the recursive part of the
     // type can refuse it. (Verified by mutation.)
+    //
+    // The value is a PARAMETER, not a literal. An int literal narrows into a
+    // narrower element whenever it fits -- the rule a scalar `x: int[8] = 2`
+    // already follows, and the one that makes list[int[32],N] reachable from
+    // the frontend, which cannot put a width on a literal. A runtime int[64]
+    // still may not, so a parameter is what keeps this test pointed at the
+    // element-type comparison itself.
     expect_rejects("int[64] stored into a list[int[8],4]", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store v, %0 : int[64]
+    %1 = load v
+    store xs : list[int[8],4]
+    %2 = const_i64 0
+    IndexStore xs, %2, %1
+    return
+)", "cannot narrow int[64] into int[8]");
+
+    // The companion to the case above: the same int[8] element accepts a
+    // literal that fits. Both halves matter -- accepting every literal would
+    // hide an out-of-range one, and rejecting every literal would leave the
+    // packed-stride widths unusable from Python.
+    expect_accepts("fitting literal stored into a list[int[8],4]", R"(
 function __main__():
 block0:
     store xs : list[int[8],4]
@@ -330,7 +353,17 @@ block0:
     %2 = const_i64 0
     IndexStore xs, %2, %1
     return
-)", "element type is int[8]");
+)");
+
+    expect_rejects("out-of-range literal stored into a list[int[8],4]", R"(
+function __main__():
+block0:
+    store xs : list[int[8],4]
+    %1 = const_i64 300
+    %2 = const_i64 0
+    IndexStore xs, %2, %1
+    return
+)", "does not fit int[8]");
 
     expect_accepts("float stored into a list[float[64],4]", R"(
 function __main__():

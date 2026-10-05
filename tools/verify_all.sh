@@ -78,6 +78,9 @@ else
     skip_reason frontend tools/test_frontend_entry.py
 fi
 
+step "type checker runs on EVERY module, annotated or not (no skip-the-checker gate)"
+python3 tools/check_typecheck_unconditional.py
+
 step "regression suites (interpreter oracle vs CPython) + typed suite"
 python3 tools/run_regression.py
 python3 tools/run_typed_regression.py

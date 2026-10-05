@@ -14,13 +14,13 @@
 # directory through build/tier_runner and compares native output against the
 # interpreter. Keeping it annotation-free is what lets run_regression.py also
 # check it against real CPython.
-def half():
+def half() -> float[64]:
     return 2.0
 
-def quarter():
+def quarter() -> float[64]:
     return 0.25
 
-def seven():
+def seven() -> int[64]:
     return 7
 
 print(half())
@@ -43,13 +43,13 @@ print(seven() + 1)
 # while the caller had correctly marshalled the double into XMM. The parameter
 # kind is now inferred from call sites, which is why these are still
 # annotation-free and stay runnable by real CPython.
-def ident2(x):
+def ident2(x: float[64]) -> float[64]:
     return x
 
-def dbl2(x):
+def dbl2(x: float[64]) -> float[64]:
     return x + x
 
-def add2u(a, b):
+def add2u(a: float[64], b: float[64]) -> float[64]:
     return a + b
 
 print(ident2(9.75))
@@ -58,7 +58,7 @@ print(add2u(1.5, 2.25))
 
 # An untyped int parameter next to them, so inference cannot silently turn every
 # parameter into a float.
-def dbli(x):
+def dbli(x: int[64]) -> int[64]:
     return x + x
 
 print(dbli(9))

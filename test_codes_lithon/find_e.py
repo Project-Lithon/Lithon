@@ -7,7 +7,7 @@ def get_factorial(lim: int[64]) -> float[64]:
 
 e: float[64] = 1.0   # <-- the n=0 term: 1/0! = 1, seeded directly instead of summed
 i: int[64] = 0
-while i < 80:
+while i < 8000:
     term: float[64] = 1.0 / get_factorial(i + 1)
     #print(term)
     e = e + term

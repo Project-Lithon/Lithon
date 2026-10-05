@@ -391,7 +391,8 @@ inline void copy_propagate(lithon::ir::Function& fn, OptimizeStats& stats) {
 //
 // validate_ssa() runs on the way out, so a placement bug fails loudly at the
 // transform that caused it instead of compiling to something subtly wrong.
-inline OptimizeStats optimize_ssa_function(lithon::ir::Function& fn) {
+inline OptimizeStats optimize_ssa_function(lithon::ir::Function& fn,
+                                           bool resolve_to_memory = true) {
     OptimizeStats stats;
     mem2reg(fn);
     for (int iter = 0; iter < 64; ++iter) {
@@ -409,20 +410,25 @@ inline OptimizeStats optimize_ssa_function(lithon::ir::Function& fn) {
     std::string err;
     if (!validate_ssa(fn, &err))
         throw std::runtime_error("optimize_ssa_function: " + err);
-    resolve_phis(fn);
+    // 2.7. Resolving is the fallback, not the only way. With direct_phis the
+    // Phis stay in the IR and the backend emits the edge copies as register
+    // moves; a float merge then costs one movsd instead of a store and a load
+    // through a memory slot.
+    if (resolve_to_memory) resolve_phis(fn);
     return stats;
 }
 
 
 // The whole SSA pipeline behind one call, so compile_module stays a readable
 // list of phases and there is exactly one place that decides their order.
-inline OptimizeStats run_ssa_pipeline(lithon::ir::Function& fn) {
+inline OptimizeStats run_ssa_pipeline(lithon::ir::Function& fn,
+                                      bool resolve_to_memory = true) {
     canonicalize_loops(fn);
     // 2.6, after canonicalization (which needs the preheader and single-latch
     // shape to reason about) and before Phi placement, so the new exit edges are
     // the edges phis are placed on.
     synthesize_loop_exits(fn);
-    return optimize_ssa_function(fn);
+    return optimize_ssa_function(fn, resolve_to_memory);
 }
 
 // Self tail calls become loops. The frontend emits `return f(...)` as

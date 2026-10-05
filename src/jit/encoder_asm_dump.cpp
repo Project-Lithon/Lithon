@@ -17,6 +17,8 @@ static const char* R32[16] = {"eax","ecx","edx","ebx","esp","ebp","esi","edi",
                               "r8d","r9d","r10d","r11d","r12d","r13d","r14d","r15d"};
 static const char* R8B[16] = {"al","cl","dl","bl","spl","bpl","sil","dil",
                               "r8b","r9b","r10b","r11b","r12b","r13b","r14b","r15b"};
+static const char* R16[16] = {"ax","cx","dx","bx","sp","bp","si","di",
+                              "r8w","r9w","r10w","r11w","r12w","r13w","r14w","r15w"};
 
 static void line(const std::string& text, const CodeBuffer& b) {
     std::printf("%s|", text.c_str());
@@ -135,6 +137,92 @@ int main() {
                 { CodeBuffer b; emit_store_rbp_scaled(b, rd, ri, v);
                   line("mov qword ptr [rbp" + std::string(v < 0 ? "" : "+") +
                        std::to_string(v) + "+" + I + "*8], " + D, b); }
+            }
+        }
+    }
+    // Step 0. The SSE scaled forms, for a list[float[64]] element access. These
+    // were the instruction that actually broke: REX was emitted BEFORE the
+    // mandatory F2 prefix, so REX.X was ignored, an extended index register was
+    // silently mis-encoded, and the access read a wild address and raised SIGBUS.
+    // A "0 mismatches" run that omitted these forms was an untested path wearing
+    // a green checkmark -- exactly what this block exists to prevent.
+    //
+    // Paired across the full register space for the same reason as the integer
+    // pair above, and for one more: an XMM8-15 destination needs REX.R while an
+    // r8..r15 index needs REX.X, and the two have to be emitted together.
+    // ModRM.mod is 10 unconditionally so the displacement is always disp32.
+    static const char* XMM[] = {"xmm0","xmm1","xmm2","xmm3","xmm4","xmm5","xmm6","xmm7",
+                                "xmm8","xmm9","xmm10","xmm11","xmm12","xmm13","xmm14","xmm15"};
+    for (int d = 0; d < 16; ++d) {
+        Xmm xd = static_cast<Xmm>(d);
+        std::string D = XMM[d];
+        for (int i : {1, 9, 13}) {
+            Reg ri = static_cast<Reg>(i);
+            std::string I = R64[i];
+            for (auto v : disps) {
+                const std::string addr = "[rbp" + std::string(v < 0 ? "" : "+") +
+                                         std::to_string(v) + "+" + I + "*8]";
+                { CodeBuffer b; emit_movsd_xmm_rbp_scaled(b, xd, ri, v);
+                  line("movsd " + D + ", qword ptr " + addr, b); }
+                { CodeBuffer b; emit_movsd_rbp_scaled(b, xd, ri, v);
+                  line("movsd qword ptr " + addr + ", " + D, b); }
+            }
+        }
+    }
+    // 4.1. Narrow element access. Packed layout makes sizeof(T) both the SIB
+    // scale and the operand width, so list[bool[8],N], list[int[16],N] and
+    // list[int[32],N] all take this path. Two failure modes live here and
+    // neither shows up as a wrong ANSWER, so they need byte coverage:
+    //   - REX.W left set on a sub-8-byte access widens the move to 8 bytes, so
+    //     storing element i overwrites element i+1 and runs off the frame.
+    //   - REX.R / REX.X gated on the width made a narrow access with an r8..r15
+    //     register emit REX with R or X clear, so the register contributed only
+    //     its low three bits and the access read a wild address.
+    // Neither is visible in a scalar round-trip; both are visible in the bytes.
+    {
+        auto wname = [](int bytes, int d) -> const char* {
+            switch (bytes) {
+                case 1: return R8B[d];
+                case 2: return R16[d];
+                case 4: return R32[d];
+                default: return R64[d];
+            }
+        };
+        auto wsz = [](int bytes) -> const char* {
+            switch (bytes) {
+                case 1: return "byte ptr";
+                case 2: return "word ptr";
+                case 4: return "dword ptr";
+                default: return "qword ptr";
+            }
+        };
+        for (int wb : {1, 2, 4, 8}) {
+            const int wbytes = wb;
+            const std::string wsz_p = wsz(wbytes);
+            for (int d = 0; d < 16; ++d) {
+                const Reg rd = static_cast<Reg>(d);
+                const std::string D = wname(wbytes, d);
+                for (auto v : disps) {
+                    const std::string at = "[rbp" + std::string(v < 0 ? "" : "+") +
+                                           std::to_string(v) + "]";
+                    { CodeBuffer b; emit_load_rbp_narrow(b, rd, v, wbytes, /*zero_extend=*/false);
+                      line("mov " + D + ", " + wsz_p + " " + at, b); }
+                    { CodeBuffer b; emit_store_rbp_narrow(b, rd, v, wbytes);
+                      line("mov " + wsz_p + " " + at + ", " + D, b); }
+                }
+                for (int i : {1, 9, 13}) {
+                    const Reg ri = static_cast<Reg>(i);
+                    const std::string I = R64[i];
+                    for (auto v : disps) {
+                        const std::string at = "[rbp" + std::string(v < 0 ? "" : "+") +
+                                               std::to_string(v) + "+" + I + "*" +
+                                               std::to_string(wbytes) + "]";
+                        { CodeBuffer b; emit_load_rbp_scaled(b, rd, ri, v, wbytes, /*zero_extend=*/false);
+                          line("mov " + D + ", " + wsz_p + " " + at, b); }
+                        { CodeBuffer b; emit_store_rbp_scaled(b, rd, ri, v, wbytes);
+                          line("mov " + wsz_p + " " + at + ", " + D, b); }
+                    }
+                }
             }
         }
     }

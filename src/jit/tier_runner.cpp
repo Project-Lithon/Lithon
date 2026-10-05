@@ -37,18 +37,12 @@
 
 namespace {
 
-bool has_type_annotations(const lithon::ir::Module& m) {
-    for (const auto& fn : m.functions) {
-        if (!fn.return_type_kind.empty()) return true;
-        for (const auto& k : fn.param_type_kinds)
-            if (!k.empty()) return true;
-        for (const auto& b : fn.blocks)
-            for (const auto& in : b.instrs)
-                if (in.op == lithon::ir::Op::Store && !in.type_kind.empty()) return true;
-    }
-    return false;
-}
-
+// 4.1 REMOVED: this used to skip the type checker entirely for a module with no
+// annotations at all, which made adding an annotation a whole-module semantic
+// switch -- annotate one variable and every unannotated variable in the file
+// became an error. It also meant most of the regression corpus was never
+// checked at all: 14 of 18 programs in tests/programs/ had zero annotations and
+// so were silently exempt. The checker is unconditional now.
 void run_interpreter(const lithon::ir::Module& m) {
     std::fputs("[tier0] interpreter\n", stderr);
     lithon::interp::run_main(m);
@@ -134,6 +128,11 @@ int main(int argc, char** argv) {
             dump_hex = true;
         } else if (a == "--ssa") {
             options.ssa_pipeline = true;
+        } else if (a == "--direct-phis") {
+            // 2.7. Implies --ssa, for the same reason: only the SSA pipeline
+            // materialises a Phi.
+            options.direct_phis = true;
+            options.ssa_pipeline = true;
         } else {
             std::cerr << "unknown argument: " << a << "\n";
             return 2;
@@ -148,7 +147,7 @@ int main(int argc, char** argv) {
     try {
         auto module = lithon::ir::parse_ir_text(buf.str());
 
-        if (has_type_annotations(module)) {
+        {
             auto errors = lithon::typecheck::check_module(module);
             if (!errors.empty()) {
                 for (const auto& e : errors) std::cerr << "RCR error: " << e.message << "\n";

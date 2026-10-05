@@ -490,7 +490,18 @@ private:
 
     void check_instr(const Instr& instr, Scope& scope) {
         switch (instr.op) {
-            case Op::ConstInt:   reg_types_[instr.result] = LType{"int", 64}; return;
+            // 4.1. A const takes its width from the trailing " : T[N]" suffix
+            // when one is present, and defaults to int[64] otherwise. Hardcoding
+            // 64 unconditionally made every narrower element type unreachable
+            // from IR -- there was no way to write a single int[32] value, so
+            // list[int[32],N] could be type-declared but never exercised, and
+            // the packed-stride frame layout it depends on went untested.
+            case Op::ConstInt:
+                reg_types_[instr.result] =
+                    instr.type_kind == "int" && instr.type_width > 0
+                        ? LType{"int", instr.type_width}
+                        : LType{"int", 64};
+                return;
             case Op::ConstFloat: reg_types_[instr.result] = LType{"float", 64}; return;
             case Op::ConstBool:  reg_types_[instr.result] = LType{"bool", -1}; return;
             case Op::Load: {
@@ -554,12 +565,17 @@ private:
                 if (instr.op == Op::Index) {
                     reg_types_[instr.result] = ct.element();
                 } else {
-                    LType val_t;
-                    if (reg_type(instr.args.at(1), val_t) && val_t != ct.element()) {
-                        error("storing " + type_str(val_t) + " into " + type_str(ct) +
-                              ": element type is " + type_str(ct.element()));
-                        return;
-                    }
+                    // 4.1. Element stores go through check_value_into_target, the
+                    // same path a scalar `x: int[32] = 11` takes, so a literal
+                    // narrows into a narrower element when it fits and a runtime
+                    // value still may not. Checking `val_t != ct.element()`
+                    // instead made the two disagree in a way nothing explained:
+                    // `x: int[32] = 11` compiled and `xs[0] = 11` into a
+                    // list[int[32],4] did not, which left every packed-stride
+                    // element width unreachable from the frontend, because the
+                    // frontend cannot attach a width to an int literal.
+                    check_value_into_target(instr.args.at(1), ct.element(),
+                                            "store into " + type_str(ct));
                 }
                 return;
             }

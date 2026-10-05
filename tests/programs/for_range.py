@@ -1,4 +1,4 @@
-total = 0
+total: int[64] = 0
 for i in range(10):
     total = total + i
 print(total)
