@@ -30,6 +30,8 @@
 
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include <string_view>
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #  define LITHON_CPU_FEATURES_X86 1
@@ -150,6 +152,44 @@ inline uint64_t read_xcr0() { return 0; }
 
 #endif
 
+// 4.5. Test override: a mask string ("avx2", "avx", "fma", "avx512", comma or
+// space separated) names features to CLEAR from an otherwise-honest detection.
+// Pure parse+apply so it is unit-testable off-host against synthetic leaves.
+// Clearing a parent (avx) drags its dependents (avx2, fma, avx512*) down too,
+// and the usable_* flags are recomputed from whatever bits survive, so a
+// "no AVX2" mask lands on exactly the same surface an AVX2-less host reports.
+inline void apply_feature_mask(Features& f, std::string_view mask) {
+    bool clear_avx = false, clear_avx2 = false, clear_fma = false, clear_avx512 = false;
+    for (std::string_view rest = mask;;) {
+        while (!rest.empty() && (rest.front() == ',' || rest.front() == ' '))
+            rest.remove_prefix(1);
+        if (rest.empty()) break;
+        const size_t comma = rest.find_first_of(", ");
+        const std::string_view tok =
+            rest.substr(0, comma == std::string_view::npos ? rest.size() : comma);
+        if (tok == "avx512" || tok == "avx512f") clear_avx512 = true;
+        else if (tok == "avx2") clear_avx2 = true;
+        else if (tok == "avx") clear_avx = true;
+        else if (tok == "fma") clear_fma = true;
+        if (comma == std::string_view::npos) break;
+        rest.remove_prefix(comma + 1);
+    }
+    if (clear_avx512) f.avx512f = f.avx512dq = f.avx512bw = f.avx512cd = f.avx512vl = false;
+    if (clear_avx) {
+        f.avx = f.avx2 = f.fma = false;
+        f.avx512f = f.avx512dq = f.avx512bw = f.avx512cd = f.avx512vl = false;
+    }
+    if (clear_avx2) f.avx2 = false;
+    if (clear_fma) f.fma = false;
+    f.usable_avx = f.avx && f.osxsave && (f.xcr0 & 0x6u) == 0x6u;
+    f.usable_avx512 = f.usable_avx && f.avx512f && (f.xcr0 & 0xE0u) == 0xE0u;
+}
+
+inline void apply_env_override(Features& f) {
+    const char* raw = std::getenv("LITHON_CPU_FEATURES");
+    if (raw && *raw) apply_feature_mask(f, raw);
+}
+
 inline Features detect() {
     Features f;
 #if LITHON_CPU_FEATURES_X86
@@ -177,8 +217,10 @@ inline Features detect() {
     decoded.max_leaf = f.max_leaf;
     decoded.max_subleaf7 = f.max_subleaf7;
     std::memcpy(decoded.vendor, f.vendor, sizeof(f.vendor));
+    apply_env_override(decoded);
     return decoded;
 #else
+    apply_env_override(f);
     return f;
 #endif
 }

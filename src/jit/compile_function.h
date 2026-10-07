@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "dict_hash.h"
 #include "float_runtime.h"
 #include "ir/ir.h"
 #include "jit_abi.h"
@@ -1387,26 +1388,26 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             return it != phis_in.end() && !it->second.empty();
         };
 
-        // Emits every Phi copy on the edge from block `from` to block `to`.
+        // Emits every Phi copy on the edge from block from to block to.
         //
-        // These are PARALLEL copies, and that is the whole difficulty. SSA does
-        // not make them sequential: the operands are all read at the instant
-        // the edge is taken, before any destination is written.
+        // These are parallel copies. All of the operands are read at the
+        // moment the edge is taken, before any destination is written.
         //
-        // The tempting argument that no resolution is needed -- "a Phi's result
-        // is a fresh ValueId, so sources and destinations are disjoint" -- is
-        // true of ValueIds and false of REGISTERS, and the difference cost a
-        // nested-loop bug that printed 40 where 100 was correct. Two values whose
-        // live ranges merely touch at the edge are not interfering, so the
-        // allocator is free to give them the same register: with the outer total
-        // and the inner index both in r10, this pair of copies
+        // SSA does not make that safe. The common argument is that a Phi result
+        // is a fresh ValueId, so no source is ever also a destination. That is
+        // true of ValueIds and false of registers. Two values whose live ranges
+        // only touch at the edge do not interfere, so the allocator may give
+        // them the same register. Then this pair of copies breaks:
         //
-        //     %26 <- %8     ; destination r10, which is %25's register
-        //     %27 <- %25    ; source    r10, read AFTER it was just clobbered
+        //     %26 gets register r10
+        //     %27 also gets register r10
+        //     copy %26 from %8     writes r10
+        //     copy %27 from %25    reads r10 after it was overwritten
         //
-        // silently accumulates a zero every outer iteration. No ValueId is ever
-        // both a source and a destination, so no amount of checking at the IR
-        // level would have caught it; it has to be resolved on locations.
+        // The accumulator restarts every outer iteration and the program
+        // prints 40 instead of 100. No ValueId is ever both a source and a
+        // destination, so checking at the IR level cannot catch this. It has to
+        // be resolved on locations.
         auto emit_phi_copies = [&](size_t from, const std::string& to) {
             if (!options.direct_phis) return;
             auto tit = phi_cfg.index.find(to);
@@ -1418,13 +1419,13 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             const auto& preds = phi_cfg.pred[tit->second];
             for (size_t i = 0; i < preds.size(); ++i)
                 if (preds[i] == from) { edge = i; break; }
-            // A predecessor with no matching operand index means the Phi's
-            // arity disagrees with the CFG, which validate_ssa() rejects before
-            // this point; bail rather than guess an index.
+            // A predecessor with no matching operand index means the Phi arity
+            // disagrees with the CFG. validate_ssa rejects that before this
+            // point, so bail instead of guessing an index.
             if (edge == SIZE_MAX || edge >= pit->second.front()->args.size()) return;
 
             // One pending move. dst_is_reg says whether there is a register to
-            // clobber at all: a destination in a frame slot cannot disturb any
+            // clobber at all. A destination in a frame slot cannot disturb any
             // source, so such a move never has to wait.
             struct Move {
                 ValueId src;
@@ -1442,8 +1443,8 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     dst_id < is_float_kinds.size() && is_float_kinds[dst_id];
                 if (dst_float) {
                     // A float Phi fed by an int would mean the print guard and
-                    // the checker disagree about the merge type, so that is
-                    // refused instead of reinterpreted.
+                    // the checker disagree about the merge type, so refuse it
+                    // instead of reinterpreting it.
                     const bool src_float =
                         src_id < is_float_kinds.size() && is_float_kinds[src_id];
                     if (!src_float)
@@ -1455,12 +1456,13 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                                           : alloc.temp_location(dst_id).in_register});
             }
 
-            // Location identity, as a comparable token. A move that has already
-            // been staged reads from the break register instead of its original
-            // source, so the token has to reflect that or the resolution below
-            // cannot see that the dependency is gone.
+            // Location identity as a comparable token. A staged move reads from
+            // the break register instead of its original source, so the token
+            // has to say that or the scan below cannot see the dependency is
+            // gone. Minus one means a source with no register. Minus two means
+            // the break register, which is never a destination.
             auto token_of = [&](const Move& m, bool is_staged) -> int {
-                if (is_staged) return -2;   // the break register, never a destination
+                if (is_staged) return -2;
                 if (m.is_float)
                     return alloc.float_in_register(m.src)
                                ? 1000 + (int)alloc.float_register(m.src) : -1;
@@ -1474,15 +1476,15 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             };
 
             // Emit one move for real.
-            auto emit_one = [&](const Move& m, bool staged) {
+            auto emit_one = [&](const Move& m, bool is_staged) {
                 if (m.is_float) {
-                    const Xmm src = staged ? abi::kScratchFloat : read_float(m.src);
+                    const Xmm src = is_staged ? abi::kScratchFloat : read_float(m.src);
                     if (m.dst_is_reg)
                         emit_movsd_xmm_xmm(code, alloc.float_register(m.dst), src);
                     else
                         emit_movsd_rbp_mem(code, src, alloc.float_stack_slot(m.dst));
                 } else {
-                    const Reg src = staged ? kL : read_left(m.src);
+                    const Reg src = is_staged ? kL : read_left(m.src);
                     const ValueLocation& loc = alloc.temp_location(m.dst);
                     if (loc.in_register) {
                         if (loc.reg != src) emit_mov_reg_reg(code, loc.reg, src);
@@ -1492,12 +1494,11 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 }
             };
 
-            // Park a source in the break register, which nothing else can be
-            // holding: r10/r11 and XMM14/XMM15 are reserved by jit_abi.h and
-            // never handed out by the allocator. Only a genuine cycle reaches
-            // here, and only one cycle at a time, so one break register is
-            // enough -- but it has to be returned to its destination last, or
-            // the value it holds is lost.
+            // Park a source in the break register. r10 and r11 plus XMM14 and
+            // XMM15 are reserved by jit_abi.h and never handed out by the
+            // allocator, so nothing else can be holding them. Only a real cycle
+            // gets here, and one cycle at a time, so one break register is
+            // enough. It has to be written back last or the value is lost.
             auto break_cycle = [&](const Move& m) {
                 if (m.is_float) emit_movsd_xmm_xmm(code, abi::kScratchFloat, read_float(m.src));
                 else emit_mov_reg_reg(code, kL, read_left(m.src));
@@ -1507,12 +1508,12 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             while (!todo.empty()) {
                 bool progress = false;
                 for (size_t i = 0; i < todo.size() && progress == false; ++i) {
-                    // Safe when this destination is not a register some other
-                    // pending move still has to read.
+                    // Safe when no other pending move still reads this
+                    // destination.
                     const int dt = dst_token(todo[i]);
-                    // Starts TRUE, not "true when the destination is not a
+                    // This starts true, not "true when the destination is not a
                     // register". Written the other way round it is a trap: the
-                    // scan below is guarded by `&& safe`, so seeding `safe` with
+                    // scan below is guarded by "and safe", so seeding safe with
                     // false for every register destination skips the scan
                     // entirely and condemns every move at once. Nothing is then
                     // ever emittable and the resolution spins forever.
@@ -1520,9 +1521,8 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     for (size_t j = 0; j < todo.size(); ++j) {
                         if (j == i) continue;   // a move never conflicts with itself
                         const int st = token_of(todo[j], staged[j]);
-                        // -1 is a source with no register (a constant, or a
-                        // spilled value): reading it touches no register, so it
-                        // can never be clobbered by a destination.
+                        // A source with no register reads no register, so no
+                        // destination can clobber it.
                         if (st != -1 && st == dt) { safe = false; break; }
                     }
                     if (!safe) continue;
@@ -1532,12 +1532,13 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     progress = true;
                 }
                 if (progress) continue;
-                // Nothing was safe, so what is left is one or more cycles in
-                // the register graph. Break one and go round again.
+                // Nothing was safe, so what is left is a cycle in the register
+                // graph. Break one and go round again.
                 break_cycle(todo.front());
                 staged.front() = true;
             }
         };
+
 
         // Local join points for the aggressive unroller: a target that is a
         // position in the emitted stream rather than an IR label, bound once
@@ -1565,7 +1566,127 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 if (plan.skip_instr[bi][pos]) continue;
                 const Instr& instr = block.instrs[pos];
 
-                switch (instr.op) {
+        // 4.3. Hashes the key in the dict's key slot into a starting bucket, in kL.
+        //
+        // The multiply is 64-bit because the golden ratio constant is a full 64-bit
+        // value: emit_imul_reg_reg_imm32 would silently truncate it to a different
+        // multiplier, which still spreads keys but not the SAME keys, so
+        // construction and lookup would disagree about where an entry lives.
+        auto emit_dict_bucket = [&](const RegisterAllocator::DictLayout& d) {
+            emit_load_rbp_offset(code, kL, d.key_slot_offset);
+            emit_mov_reg_imm64(code, kR, static_cast<int64_t>(dict::kHashMultiplier));
+            emit_imul_reg_reg(code, kL, kR);
+            const int shift = dict::hash_shift(d.buckets);
+            // A one bucket table shifts by 64, which is undefined for a 64-bit
+            // shift, and the answer is 0 for every key, so it is skipped.
+            if (shift > 0 && shift < 64)
+                emit_shr_reg_imm8(code, kL, static_cast<uint8_t>(shift));
+            if (d.buckets > 1) emit_and_reg_imm32(code, kL, d.buckets - 1);
+            else emit_xor_zero(code, kL);
+        };
+
+        // 4.3. Spills a key operand to the slot the probe reads it from.
+        //
+        // The key has to survive the whole walk, and by the time the probe
+        // starts its first register may be one of the two scratches the probe is
+        // about to overwrite. Storing it before the probe and reloading it from
+        // the slot is what keeps a dict read from comparing the table against
+        // the hash multiplier.
+        auto spill_dict_key = [&](const RegisterAllocator::DictLayout& d, Reg key) {
+            // Canonical form first, so the value in the slot is the value both
+            // tiers agree to compare.
+            if (d.key_kind == "bool") {
+                emit_test_reg_reg(code, key);
+                emit_setcc(code, Cond::NotZero, key);
+                emit_movzx_reg_reg8(code, key, key);
+            } else if (d.key_width > 0 && d.key_width < 64) {
+                emit_and_reg_imm32(code, key,
+                                   static_cast<int32_t>((uint64_t{1} << d.key_width) - 1));
+            }
+            emit_store_rbp_offset(code, key, d.key_slot_offset, 8);
+        };
+
+        // 4.3. The probe. Walks forward from the key's own bucket until it finds a
+        // matching key or an empty bucket, then runs one of two continuations: on_hit
+        // with the bucket in kL, or on_miss with nothing live.
+        //
+        // Two exits rather than one, because control flow already says which side
+        // of the search we came out on. Folding that into a flag would mean finding
+        // a third register, and there is no third: the bucket index and the loaded
+        // table key take both of them.
+        auto emit_dict_probe = [&](const std::string& name,
+                                   const std::function<void()>& on_hit,
+                                   const std::function<void()>& on_miss) {
+            const auto& d = alloc.dict_layout(name);
+            if (d.buckets <= 0) {
+                throw std::runtime_error("compile_module: probe of '" + name +
+                                         "' which is not a dict");
+            }
+            emit_dict_bucket(d);
+
+            emit_xor_zero(code, kR);
+            emit_store_rbp_offset(code, kR, d.steps_offset, 8);
+
+            const size_t top = code.size();
+            // Occupancy is tested first. Only an occupied bucket has a key worth
+            // comparing: on the all-empty table the keys array is never written,
+            // so reading it at an empty bucket compares the search key against
+            // whatever bits the stack contained, and a stale match returns a
+            // garbage value (or Answers True) instead of a dict-key-not-found
+            // trap. The key at an occupied bucket goes in the scratch and is
+            // compared against the spilled search key in memory. The search key
+            // is never in a register during the walk, which is what lets the loop
+            // run on two.
+            emit_load_rbp_scaled(code, kR, kL, d.occupied_offset, 8);
+            emit_cmp_reg_imm32(code, kR, 0);
+            JumpPatch empty = emit_jcc_rel32(code, Cond::Equal);
+
+            // Occupied. A hit ends the walk; anything else probes on.
+            emit_load_rbp_scaled(code, kR, kL, d.keys_offset, d.key_stride);
+            emit_cmp_reg_rbp_offset(code, kR, d.key_slot_offset);
+            JumpPatch hit = emit_jcc_rel32(code, Cond::Equal);
+
+            // Step to the next bucket and go round. Wrapping with an and is what
+            // makes the walk circular, and it is why the bucket count is a power
+            // of two.
+            //
+            // The bound is N probes, not N-1. The counter is incremented before
+            // the compare, so steps counts the bucket just examined, and a table
+            // of four buckets is probed at all four of them. Comparing against
+            // buckets-1 stopped one early, which is invisible on any table with a
+            // free bucket in the chain and silently wrong on a full one: the last
+            // entry of a four long collision chain could not be found.
+            emit_add_reg_imm32(code, kL, 1);
+            emit_and_reg_imm32(code, kL, d.buckets - 1);
+            emit_load_rbp_offset(code, kR, d.steps_offset);
+            emit_add_reg_imm32(code, kR, 1);
+            emit_store_rbp_offset(code, kR, d.steps_offset, 8);
+            emit_cmp_reg_imm32(code, kR, d.buckets);
+            JumpPatch again = emit_jcc_rel32(code, Cond::Less);
+            resolve_jump_patch(code, again, top);
+
+            // Falling off the end of the walk is the third way to miss, and the
+            // only one that cannot happen in a program the typechecker accepted.
+            // It arrives here by falling through, which is why the miss
+            // continuation is emitted before the hit one.
+            resolve_jump_patch(code, empty, code.size());
+            on_miss();
+
+            // Skip the hit continuation. Without it a miss falls into the hit code,
+            // which for contains means `xor dst,dst` is immediately overwritten by
+            // `mov dst,1` and every membership test answers True.
+            //
+            // The patch is resolved LAST, after the hit code has been emitted,
+            // because its target is the end of that code and the end does not
+            // exist yet. Resolving it here would aim it at the first byte of the
+            // hit continuation, which is the same as not jumping at all.
+            JumpPatch over_hit = emit_jmp_rel32(code);
+            resolve_jump_patch(code, hit, code.size());
+            on_hit();
+            resolve_jump_patch(code, over_hit, code.size());
+        };
+
+            switch (instr.op) {
             case Op::ConstInt:
             case Op::ConstBool:
                 break;   // always an immediate at its uses
@@ -1602,6 +1723,50 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 break;
             }
 
+            // 4.4. A pointer is a frame address in a general-purpose register,
+            // computed as rbp + variable_offset. The variable can never be
+            // promoted here: select_promoted_variables keeps addressed
+            // variables out of registers (a promoted variable has no slot to
+            // point at), so alloc.variable_offset is authoritative and the two
+            // instructions are unforgeable -- a lea would have the same bytes,
+            // but spelling it as mov+add needs no new encoder support and
+            // reads exactly like the arithmetic it is.
+            case Op::AddressOf: {
+                require_variable(instr.name, "address of");
+                Reg dst = compute_dest(instr.result);
+                emit_mov_reg_reg(code, dst, Reg::RBP);
+                emit_add_reg_imm32(code, dst, alloc.variable_offset(instr.name));
+                commit_result(instr.result, dst);
+                break;
+            }
+
+            // 4.4. Load the pointee through the pointer. The width is the
+            // pointee type from the instruction's trailing suffix: int[64] is
+            // an 8-byte move, int[32]/int[16]/int[8]/bool are narrow
+            // zero-extending loads, and a float pointee goes through the XMM
+            // machinery like every other double. The typechecker guarantees the
+            // suffix matches the pointer's pointee, so the width cannot lie
+            // about what the pointer points at.
+            case Op::ValueOf: {
+                Reg ptr = read_left(instr.args.at(0));
+                if (is_float_value(value_kinds, instr.result)) {
+                    Xmm dst = float_dest(instr.result);
+                    emit_movsd_xmm_mem_reg(code, dst, ptr);
+                    commit_float_result(instr.result, dst);
+                    break;
+                }
+                int pointee_bytes = 8;
+                if (instr.type_kind == "bool") {
+                    pointee_bytes = 1;
+                } else if (instr.type_kind == "int" && instr.type_width > 0) {
+                    pointee_bytes = instr.type_width / 8;
+                }
+                Reg dst = compute_dest(instr.result);
+                emit_load_reg_indirect(code, dst, ptr, pointee_bytes);
+                commit_result(instr.result, dst);
+                break;
+            }
+
             case Op::Store: {
                 // 4.1. A valueless container store is a declaration, not an
                 // assignment: the slot run was reserved during layout, and
@@ -1622,6 +1787,30 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 // permanent scratch, never a value's home, so nothing live is
                 // disturbed. Small containers are unrolled; larger ones use a
                 // short loop so code size does not grow with capacity.
+                if (instr.args.empty() && instr.type_kind == "dict") {
+                    // 4.3. Only the occupancy array is cleared. Keys and values
+                    // are left alone, because a probe stops at the occupancy
+                    // marker and never reads either array for an empty bucket.
+                    // Zeroing all three would be a second pass over the frame
+                    // for bytes that are unreachable by construction.
+                    const auto& d = alloc.dict_layout(instr.name);
+                    if (d.buckets > 0) {
+                        emit_xor_zero(code, kR);
+                        if (d.buckets <= 16) {
+                            for (int i = 0; i < d.buckets; ++i)
+                                emit_store_rbp_offset(code, kR, d.occupied_offset + 8 * i, 8);
+                        } else {
+                            emit_xor_zero(code, kL);
+                            const size_t top = code.size();
+                            emit_store_rbp_scaled(code, kR, kL, d.occupied_offset, 8);
+                            emit_add_reg_imm32(code, kL, 1);
+                            emit_cmp_reg_imm32(code, kL, d.buckets);
+                            JumpPatch again = emit_jcc_rel32(code, Cond::Less);
+                            resolve_jump_patch(code, again, top);
+                        }
+                    }
+                    break;
+                }
                 if (instr.args.empty() &&
                     (instr.type_kind == "list" || instr.type_kind == "tuple")) {
                     const int cap = alloc.container_capacity(instr.name);
@@ -1730,6 +1919,103 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 break;
             }
 
+                    case Op::DictStore: {
+                // 4.3. Construction runs the SAME probe a lookup does, rather
+                // than resolving the bucket while compiling.
+                //
+                // Resolving it statically is the obvious optimisation and it is
+                // wrong here, for one reason: a store can land after a collision,
+                // so its bucket depends on which buckets are already taken. That
+                // is only knowable from the occupancy array at the moment the
+                // store happens, which is true in the interpreter too. Computing
+                // it at compile time would mean tracking occupancy statically
+                // across the whole block, and a dict declared inside a loop
+                // resets, so the static state and the runtime state would
+                // disagree from the second iteration onwards.
+                //
+                // So both tiers probe, and they agree by construction rather
+                // than by two independent static computations happening to
+                // match.
+                const auto& d = alloc.dict_layout(instr.name);
+                if (d.buckets <= 0) {
+                    throw std::runtime_error("compile_module: store into '" + instr.name +
+                                             "' which is not a dict");
+                }
+                spill_dict_key(d, read_left(instr.args.at(0)));
+                if (d.value_kind != "float")
+                    emit_store_rbp_offset(code, read_right(instr.args.at(1)),
+                                          d.value_slot_offset, 8);
+                // 4.3. A store writes on both exits, so both continuations are
+                // the same body. A miss here is a bucket the key hashes to that is
+                // still free, which is where a new entry goes; making it a separate
+                // empty continuation meant the common case, a key that is not
+                // already present, skipped the write and built an empty table.
+                const auto write_entry = [&] {
+                        // kL is the bucket the key landed in.
+                        if (d.value_kind == "float") {
+                            Xmm v = read_float(instr.args.at(1));
+                            emit_movsd_rbp_scaled(code, v, kL, d.values_offset,
+                                                  d.value_stride);
+                        } else {
+                            emit_load_rbp_offset(code, kR, d.value_slot_offset);
+                            emit_store_rbp_scaled(code, kR, kL, d.values_offset,
+                                                  d.value_stride);
+                        }
+                        // The key is stored in the form the probe compares against,
+                        // which is why it is reloaded from the slot rather than
+                        // taken from the probe's own register: the probe leaves the
+                        // bucket in kL and nothing else.
+                        emit_load_rbp_offset(code, kR, d.key_slot_offset);
+                        emit_store_rbp_scaled(code, kR, kL, d.keys_offset, d.key_stride);
+                        emit_mov_reg_imm(code, kR, 1);
+                        emit_store_rbp_scaled(code, kR, kL, d.occupied_offset, 8);
+                };
+                emit_dict_probe(instr.name, write_entry, write_entry);
+                break;
+            }
+            case Op::DictIndex:
+            case Op::DictContains: {
+                const auto& d = alloc.dict_layout(instr.name);
+                if (d.buckets <= 0) {
+                    throw std::runtime_error("compile_module: read from '" + instr.name +
+                                             "' which is not a dict");
+                }
+                spill_dict_key(d, read_left(instr.args.at(0)));
+                emit_dict_probe(
+                    instr.name,
+                    [&] {
+                        if (instr.op == Op::DictContains) {
+                            Reg dst = compute_dest(instr.result);
+                            emit_mov_reg_imm(code, dst, 1);
+                            commit_result(instr.result, dst);
+                            return;
+                        }
+                        if (d.value_kind == "float") {
+                            Xmm dst = float_dest(instr.result);
+                            emit_movsd_xmm_rbp_scaled(code, dst, kL, d.values_offset,
+                                                      d.value_stride);
+                            commit_float_result(instr.result, dst);
+                        } else {
+                            Reg dst = compute_dest(instr.result);
+                            emit_load_rbp_scaled(code, dst, kL, d.values_offset,
+                                                 d.value_stride);
+                            commit_result(instr.result, dst);
+                        }
+                    },
+                    [&] {
+                        if (instr.op == Op::DictContains) {
+                            Reg dst = compute_dest(instr.result);
+                            emit_xor_zero(code, dst);
+                            commit_result(instr.result, dst);
+                            return;
+                        }
+                        // A read of an absent key traps. The message is fixed and
+                        // names no key, because the trap takes a literal string and
+                        // the two tiers are compared byte for byte on stderr.
+                        emit_host_error_trap("error: interpreter: dict key not found\n");
+                    });
+                break;
+            }
             case Op::Add:
             case Op::Sub:
             case Op::Mul:

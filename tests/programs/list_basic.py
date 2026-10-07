@@ -1,9 +1,9 @@
-# 4.1. Fixed-capacity list: write, read, len.
+# 4.1. Fixed capacity list: write, read, len.
 #
-# The annotation with no value is the DECLARATION. It is what reserves the run
-# and zeroes it, so unlike a scalar annotation it is not a no-op that the type
-# checker merely records -- drop it and the first IndexStore writes to a name
-# that was never allocated.
+# The annotation with no value is the declaration. It is what reserves the run
+# and zeroes it, so unlike a scalar annotation it is not a no op that the type
+# checker merely records. Drop it and the first IndexStore writes to a name that
+# was never allocated.
 
 xs: list[int[64], 6]
 

@@ -48,6 +48,12 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|X86_64)$")
     target_include_directories(typecheck_test PUBLIC src src/jit)
     add_test(NAME typecheck_test COMMAND typecheck_test)
 
+    # dict_hash_test: the shared hash and key form, pinned to fixed values.
+    # Header only, so it needs nothing linked.
+    add_executable(dict_hash_test src/dict_hash_test.cpp)
+    target_include_directories(dict_hash_test PUBLIC src)
+    add_test(NAME dict_hash_test COMMAND dict_hash_test)
+
     # These go through compile_module(), which is ABI-aware
     # (System V / Microsoft x64), so they run on every platform.
     set(LITHON_JIT_TESTS

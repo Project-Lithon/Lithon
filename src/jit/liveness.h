@@ -78,6 +78,15 @@ public:
                               const VirtualTemps& virtual_temps = VirtualTemps{}) {
         const Cfg g = build_cfg(fn);
         const std::vector<size_t> rpo = reverse_postorder(g);
+        // 2.8 regression: this was never stored. reverse_postorder() returned
+        // an empty list, so coalesce_phi_registers built an all -1 rpo_pos_
+        // table, every merge extent read as [-1,-1], and its "does any other
+        // live value already hold this register" check never fired. Two merges
+        // could then be coalesced onto a register a simultaneously-live temp
+        // still owned, and the pair of register copies at the join crossed --
+        // a loop with two conditionally-updated accumulators silently spun
+        // forever instead of terminating.
+        rpo_ = rpo;
 
         // RPO index -> block index. -1 marks a block the search never reached
         // (unreachable from the entry). Such a block's values are treated as

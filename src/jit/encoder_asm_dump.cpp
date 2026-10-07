@@ -226,5 +226,70 @@ int main() {
             }
         }
     }
+    // 4.5. VEX / AVX2 byte coverage. The vectorizing pass emits these exact
+    // forms, and a prefix-W/R/B/X mistake here is a wrong program (reads wild
+    // memory or a different register), so -- like the narrow access block
+    // above -- they get a byte-level pin against GNU as rather than trusting a
+    // scalar round-trip.
+    {
+        static const char* YMM[] = {"ymm0","ymm1","ymm2","ymm3","ymm4","ymm5","ymm6","ymm7",
+                                    "ymm8","ymm9","ymm10","ymm11","ymm12","ymm13","ymm14","ymm15"};
+        for (int d = 0; d < 16; ++d) {
+            Xmm xd = static_cast<Xmm>(d);
+            std::string D = YMM[d];
+            const Xmm s1 = static_cast<Xmm>((d + 1) % 16);
+            const Xmm s2 = static_cast<Xmm>((d + 9) % 16);
+            { CodeBuffer b; emit_vpaddd_reg(b, xd, s1, s2);
+              line("vpaddd " + D + ", " + YMM[(d + 1) % 16] + ", " + YMM[(d + 9) % 16], b); }
+            { CodeBuffer b; emit_vpsubd_reg(b, xd, s1, s2);
+              line("vpsubd " + D + ", " + YMM[(d + 1) % 16] + ", " + YMM[(d + 9) % 16], b); }
+            { CodeBuffer b; emit_vpmulld_reg(b, xd, s1, s2);
+              line("vpmulld " + D + ", " + YMM[(d + 1) % 16] + ", " + YMM[(d + 9) % 16], b); }
+            { CodeBuffer b; emit_vpxor_reg(b, xd, s1, s2);
+              line("vpxor " + D + ", " + YMM[(d + 1) % 16] + ", " + YMM[(d + 9) % 16], b); }
+            { CodeBuffer b; emit_vpaddd_xmm(b, xd, s1, s2);
+              line(std::string("vpaddd ") + XMM[d] + ", " + XMM[(d + 1) % 16] + ", " + XMM[(d + 9) % 16], b); }
+            for (int i : {1, 9, 13}) {
+                Reg ri = static_cast<Reg>(i);
+                std::string I = R64[i];
+                for (auto v : disps) {
+                    const std::string addr = "[rbp" + std::string(v < 0 ? "" : "+") +
+                                             std::to_string(v) + "+" + I + "*4]";
+                    { CodeBuffer b; emit_vmovdqu_ymm(b, xd, ri, v, 4);
+                      line("vmovdqu " + D + ", ymmword ptr " + addr, b); }
+                    { CodeBuffer b; emit_vmovdqu_ymm_mem(b, xd, ri, v, 4);
+                      line("vmovdqu ymmword ptr " + addr + ", " + D, b); }
+                    { CodeBuffer b; emit_vpaddd_mem(b, xd, s1, ri, v, 4);
+                      line("vpaddd " + D + ", " + YMM[(d + 1) % 16] + ", ymmword ptr " + addr, b); }
+                }
+                // 4.5. Disp8-compressed addressing (mod=01, signed-byte
+                // displacement): GNU as drops to mod=01 whenever the disp fits
+                // int8, and our mem forms must match that exactly or the byte
+                // comparison flags every short displacement. 0, 5, -1, 100,
+                // -128 and 127 probe both ends of the range and the boundary
+                // at which mod would flip to 10.
+                for (auto v : {0, 5, -1, 100, -128, 127}) {
+                    const std::string addr = "[rbp" + std::string(v < 0 ? "" : "+") +
+                                             std::to_string(v) + "+" + I + "*4]";
+                    { CodeBuffer b; emit_vmovdqu_ymm(b, xd, ri, v, 4);
+                      line("vmovdqu " + D + ", ymmword ptr " + addr, b); }
+                    { CodeBuffer b; emit_vmovdqu_ymm_mem(b, xd, ri, v, 4);
+                      line("vmovdqu ymmword ptr " + addr + ", " + D, b); }
+                    { CodeBuffer b; emit_vpaddd_mem(b, xd, s1, ri, v, 4);
+                      line("vpaddd " + D + ", " + YMM[(d + 1) % 16] + ", ymmword ptr " + addr, b); }
+                }
+            }
+            { CodeBuffer b; emit_vpbroadcastd_mem(b, xd, static_cast<Reg>(10), 1000, 4);
+              line("vpbroadcastd " + D + ", dword ptr [rbp+1000+r10*4]", b); }
+            { CodeBuffer b; emit_vextracti128_ymm_xmm(b, static_cast<Xmm>((d + 3) % 16), xd, 1);
+              line(std::string("vextracti128 ") + XMM[(d + 3) % 16] + ", " + D + ", 1", b); }
+            { CodeBuffer b; emit_vpshufd_xmm(b, static_cast<Xmm>((d + 3) % 16), xd, 0xB1);
+              line(std::string("vpshufd ") + XMM[(d + 3) % 16] + ", " + XMM[d] + ", 0xb1", b); }
+            { CodeBuffer b; emit_vmovd_xmm_to_r32(b, static_cast<Reg>(d), static_cast<Xmm>((d + 7) % 16));
+              line(std::string("vmovd ") + R32[d] + ", " + XMM[(d + 7) % 16], b); }
+        }
+        { CodeBuffer b; emit_vzeroupper(b); line("vzeroupper", b); }
+    }
+
     return 0;
 }

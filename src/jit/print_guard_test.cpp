@@ -408,6 +408,87 @@ block0:
     return
 )", false);
 
+    // ---- 4.4 pointers ----
+
+    // A raw pointer is unprintable in both tiers: the typechecker refuses the
+    // source, and if it ever got past that the guard must still refuse to run
+    // native on a print of an address. This is the "a pointer" kind_name.
+    expect("print of a raw pointer is refused", R"(
+function main():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = load _p
+    call print, %2
+    return
+)", false);
+
+    // valueof turns the pointer back into its pointee, which is provably an int
+    // and therefore native-safe exactly like any other int print.
+    expect("print(valueof(_p)) of an int pointee is native-safe", R"(
+function main():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = load _p
+    %3 = valueof %2 : int[64]
+    call print, %3
+    return
+)", true);
+
+    expect("print(valueof(_p)) of a float pointee is native-safe", R"(
+function main():
+block0:
+    %0 = const_f64 2.5
+    store x, %0 : float[64]
+    %1 = addressof x
+    store _p, %1 : ptr[float[64]]
+    %2 = load _p
+    %3 = valueof %2 : float[64]
+    call print, %3
+    return
+)", true);
+
+    // Pointer arithmetic survives the analysis as a pointer: first an add of a
+    // byte offset, then a valueof through it. The valueof's suffix is the
+    // pointee, so the print is still provably an int.
+    expect("valueof through pointer arithmetic is native-safe", R"(
+function main():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = load _p
+    %3 = const_i64 8
+    %4 = add %2, %3
+    store _q, %4 : ptr[int[64]]
+    %5 = load _q
+    %6 = valueof %5 : int[64]
+    call print, %6
+    return
+)", true);
+
+    // A pointer multiplied is not a walk and the guard must not fabricate a
+    // pointer (or an int) result for it. Refused conservatively.
+    expect("mul with a pointer is refused", R"(
+function main():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = load _p
+    %3 = const_i64 8
+    %4 = mul %2, %3
+    call print, %4
+    return
+)", false);
+
     std::printf("\n%d/%d passed\n", g_total - g_failed, g_total);
     return g_failed == 0 ? 0 : 1;
 }

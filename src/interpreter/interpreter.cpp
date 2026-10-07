@@ -1,6 +1,7 @@
 #include "interpreter.h"
 #include "runtime/value.h"
 #include "jit/float_runtime.h"
+#include "dict_hash.h"
 
 #include <cmath>
 #include <iostream>
@@ -26,11 +27,39 @@ public:
     // rather than in a variable's single slot. Keyed by the container's name.
     std::unordered_map<std::string, std::vector<LithonValue>> lists;
 
+    // 4.3. A dict is three parallel arrays rather than one, which is the same
+    // shape the JIT lays out in the frame: keys, occupied markers, values.
+    //
+    // Occupancy is kept separately instead of being inferred from the key,
+    // because a key is a value and every int value is a legal key. Zero is a
+    // key like any other, so a key array alone cannot say whether a bucket
+    // holds the key 0 or holds nothing at all.
+    struct DictTable {
+        std::vector<LithonValue> keys;
+        std::vector<LithonValue> values;
+        std::vector<bool> occupied;
+        // 4.3. How a key is reduced to its canonical form before it is hashed or
+        // compared. Both tiers read these two fields rather than the declaration,
+        // so the two cannot disagree about what counts as the same key.
+        bool bool_keys = false;
+        int key_width = 64;
+    };
+    std::unordered_map<std::string, DictTable> dicts;
+
     std::vector<LithonValue>& get_list(const std::string& name, const char* what) {
         auto it = lists.find(name);
         if (it == lists.end()) {
             throw std::runtime_error(std::string("interpreter: ") + what + " '" + name +
                                      "' which is not a container");
+        }
+        return it->second;
+    }
+
+    DictTable& get_dict(const std::string& name, const char* what) {
+        auto it = dicts.find(name);
+        if (it == dicts.end()) {
+            throw std::runtime_error(std::string("interpreter: ") + what + " '" + name +
+                                     "' which is not a dict");
         }
         return it->second;
     }
@@ -50,6 +79,40 @@ public:
         }
         return it->second;
     }
+
+    // 4.4. Synthetic addresses. The JIT computes a real rbp-relative pointer
+    // on the native stack, which an interpreter has no way to reproduce, so
+    // the interpreter proves pointer semantics on a synthetic address space
+    // of its own: each addressed variable is handed a small, strictly
+    // positive, distinct address on first mention, and valueof resolves the
+    // address back to the variable's live value through the reverse map.
+    //
+    // Determinism and uniqueness are the whole contract:
+    //   * the addresses depend only on program order, not on machine state,
+    //     so `_p == _q` (same target twice) is False, `_p == _q` of two
+    //     different variables is False, and `_p == 0` is always False after a
+    //     successful addressof -- 0 is never handed out, on purpose, so it
+    //     stays the "no pointer" sentinel that the `_p == 0` test means;
+    //   * a valueof of an address that resolves to no live variable is a
+    //     deterministic trap, which is the interpreter's answer for the
+    //     dangling-pointer case. That case is out of scope for 4.4 and never
+    //     exercised by the corpus.
+    std::unordered_map<std::string, int64_t> addr_of_var;
+    std::unordered_map<int64_t, std::string> var_of_addr;
+    int64_t synthetic_next = 0x1000;
+
+    int64_t address_of(const std::string& name) {
+        auto it = addr_of_var.find(name);
+        if (it != addr_of_var.end()) return it->second;
+        if (vars.find(name) == vars.end()) {
+            throw std::runtime_error("interpreter: reference to undefined variable '" + name + "'");
+        }
+        const int64_t addr = synthetic_next;
+        synthetic_next += 8;
+        addr_of_var[name] = addr;
+        var_of_addr[addr] = name;
+        return addr;
+    }
 };
 
 // The value a container element holds before anything is written to it. Zero
@@ -67,6 +130,50 @@ LithonValue zero_of_kind(const std::string& elem_kind) {
 // names the container and its capacity and carries no value to store.
 bool is_container_declaration(const Instr& in) {
     return in.args.empty() && (in.type_kind == "list" || in.type_kind == "tuple");
+}
+
+bool is_dict_declaration(const Instr& in) {
+    return in.args.empty() && in.type_kind == "dict";
+}
+
+// 4.3. Two keys are the same key when they are the same after normalization, so
+// True and 1 collide by design. Comparing the raw stored values would be enough
+// for int keys but would make {True: a, 1: b} two entries, and the probe would
+// find whichever came first with no way to tell that the table is wrong.
+int64_t canonical(const LithonValue& key, const Frame::DictTable& t) {
+    return dict::canonical_key(key.as_int(), t.bool_keys, t.key_width);
+}
+
+bool same_key(const LithonValue& a, const LithonValue& b, const Frame::DictTable& t) {
+    return canonical(a, t) == canonical(b, t);
+}
+
+// Walks forward from the key's own bucket until it finds the key or an empty
+// bucket. An empty bucket ends the search because linear probing only ever
+// fills forward from a start, so nothing past a hole can belong to this key.
+//
+// The step count is bounded by the bucket count even though the typechecker has
+// already guaranteed there is a free bucket. That guarantee is what makes a
+// miss terminate, and the bound is what makes it terminate even if the table
+// were somehow full, which is the difference between reporting a missing key and
+// reading off the end of the arrays.
+int64_t probe_bucket(const Frame::DictTable& t, const LithonValue& key, bool* found) {
+    const int64_t buckets = static_cast<int64_t>(t.occupied.size());
+    const int64_t start = dict::bucket_of(canonical(key, t), static_cast<int>(buckets));
+    int64_t b = start;
+    for (int64_t step = 0; step < buckets; ++step) {
+        if (!t.occupied[static_cast<size_t>(b)]) {
+            *found = false;
+            return b;
+        }
+        if (same_key(t.keys[static_cast<size_t>(b)], key, t)) {
+            *found = true;
+            return b;
+        }
+        b = (b + 1) & (buckets - 1);
+    }
+    *found = false;
+    return start;
 }
 
 LithonValue apply_binop(Op op, LithonValue lhs, LithonValue rhs) {
@@ -303,6 +410,28 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     frame.regs[instr.result] = frame.get_var(instr.name);
                     break;
                 case Op::Store:
+                    // 4.3. A dict declaration is a valueless store like the other
+                    // containers, so it arrives here and not on a dict opcode.
+                    // Every bucket starts empty, which is what makes a bare
+                    // declaration an empty dict rather than a table full of zero
+                    // valued entries.
+                    if (is_dict_declaration(instr)) {
+                        if (instr.type_width <= 0) {
+                            throw std::runtime_error("interpreter: dict '" + instr.name +
+                                                     "' declared with a non-positive bucket count");
+                        }
+                        const size_t n = static_cast<size_t>(instr.type_width);
+                        Frame::DictTable t;
+                        t.keys.assign(n, LithonValue::make_int(0));
+                        t.values.assign(n, LithonValue::make_int(0));
+                        t.occupied.assign(n, false);
+                        // Recorded once, at the declaration, so the probe does not
+                        // have to carry the key type through every call.
+                        t.bool_keys = instr.type_key_kind == "bool";
+                        t.key_width = instr.type_key_width > 0 ? instr.type_key_width : 64;
+                        frame.dicts[instr.name] = std::move(t);
+                        break;
+                    }
                     if (is_container_declaration(instr)) {
                         if (instr.type_width <= 0) {
                             throw std::runtime_error("interpreter: container '" + instr.name +
@@ -317,12 +446,75 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     }
                     frame.vars[instr.name] = frame.get_reg(instr.args.at(0));
                     break;
+                case Op::DictStore:
+                case Op::DictIndex:
+                case Op::DictContains: {
+                    Frame::DictTable& t = frame.get_dict(
+                        instr.name, instr.op == Op::DictStore ? "store into" : "read from");
+                    LithonValue key = frame.get_reg(instr.args.at(0));
+                    // 4.3. A bool is a legal key, so this accepts one and reads it
+                    // through the int accessor, which is where the bool's 0 or 1
+                    // lives. Only then is it canonicalized, which is what makes
+                    // True and 1 the same key.
+                    if (!key.is_int() && !key.is_bool()) {
+                        throw std::runtime_error(
+                            "interpreter: dict key must be an int or a bool");
+                    }
+                    bool found = false;
+                    const int64_t b = probe_bucket(t, key, &found);
+                    if (instr.op == Op::DictStore) {
+                        // The typechecker rejects a repeated key, so reaching a
+                        // found bucket here would mean the table was built by
+                        // hand. Overwriting is the defined answer for that rather
+                        // than a second entry, and it keeps the probe total.
+                        t.keys[static_cast<size_t>(b)] =
+                            LithonValue::make_int(canonical(key, t));
+                        t.values[static_cast<size_t>(b)] = frame.get_reg(instr.args.at(1));
+                        t.occupied[static_cast<size_t>(b)] = true;
+                    } else if (instr.op == Op::DictContains) {
+                        frame.regs[instr.result] = LithonValue::make_bool(found);
+                    } else {
+                        if (!found) {
+                            // The text is fixed, with no key in it, for the same
+                            // reason the index trap has no numbers: the JIT's
+                            // trap passes a literal string and the two tiers are
+                            // compared byte-for-byte on stderr.
+                            throw std::runtime_error("interpreter: dict key not found");
+                        }
+                        frame.regs[instr.result] = t.values[static_cast<size_t>(b)];
+                    }
+                    break;
+                }
                 case Op::Len:
                     // N is part of the type, so this is the capacity; there is
                     // no length that can change at run time.
                     frame.regs[instr.result] = LithonValue::make_int(
                         static_cast<int64_t>(frame.get_list(instr.name, "len() of").size()));
                     break;
+                // 4.4. A pointer is an address in the synthetic address space.
+                // AddressOf hands out the variable's address (first mention, so
+                // the same target twice yields the same pointer); valueof
+                // resolves it back and returns the variable's live value -- a
+                // float for a float variable, so printing matches the native
+                // movsd path. A valueof whose address names no live variable is
+                // the dangling case, deterministic but out of 4.4's scope.
+                case Op::AddressOf:
+                    frame.regs[instr.result] =
+                        LithonValue::make_int(frame.address_of(instr.name));
+                    break;
+                case Op::ValueOf: {
+                    LithonValue ptr = frame.get_reg(instr.args.at(0));
+                    if (!ptr.is_int()) {
+                        throw std::runtime_error("interpreter: valueof of a non-address value");
+                    }
+                    auto back = frame.var_of_addr.find(ptr.as_int());
+                    if (back == frame.var_of_addr.end()) {
+                        throw std::runtime_error(
+                            "interpreter: dereference of a pointer with no live variable behind it");
+                    }
+                    frame.regs[instr.result] = frame.get_var(back->second);
+                    break;
+                }
                 case Op::Index:
                 case Op::IndexStore: {
                     std::vector<LithonValue>& elems = frame.get_list(

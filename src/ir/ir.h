@@ -80,7 +80,45 @@ enum class Op : uint8_t {
     // so `len(xs)` is a compile-time constant and is folded to one.
     Index,
     IndexStore,
-    Len
+    Len,
+
+    // 4.3. Dict access. Same convention as the container ops above: the
+    // variable is named in `name`, the operands are in `args`.
+    //
+    //   DictStore     args = {key, value}    no result
+    //   DictIndex     args = {key}           result = value
+    //   DictContains  args = {key}           result = bool
+    //
+    // DictStore fills a slot of the table. The key is a compile-time constant
+    // because a dict is built only from a literal, which is what lets the bucket
+    // be resolved statically instead of at run time.
+    //
+    // DictIndex and DictContains take the key as a run-time value, so they emit
+    // a real hash and a real probe. DictContains never traps and reports a
+    // missing key as False. DictIndex traps on a missing key.
+    DictStore,
+    DictIndex,
+    DictContains,
+
+    // 4.4. Pointers. A pointer is an address, not a value to print, so these
+    // two ops together with the ptr[T] type are the whole surface exposed to
+    // the language.
+    //
+    //   AddressOf  args = {}                      result = address (ptr[T])
+    //   ValueOf    args = {ptr}                   result = pointee
+    //
+    // AddressOf names the target VARIABLE in `name` (like the container ops):
+    // the address of a scalar slot is derived from the variable, not from a
+    // ValueId. The result's pointee type comes from the builtin's ellipsis.
+    //
+    // ValueOf takes a pointer ValueId in args[0] and loads the pointee through
+    // it. The RESULT is the pointee, so the trailing " : T" instruction suffix
+    // names the pointee type directly (e.g. `%v = valueof %p : int[64]`): the
+    // compiler needs to know whether the load is an 8-byte move, a movsd, or a
+    // narrow zero-extend, and the value's kind feeds both the typechecker's
+    // compare rules and the print guard.
+    AddressOf,
+    ValueOf
 };
 
 using ValueId = uint32_t;
@@ -108,6 +146,17 @@ struct Instr {
     // which is exactly the state it was already in.
     std::string type_elem_kind;   // element kind for list/tuple/ptr; "" when not a container
     int type_elem_width = -1;     // element width; -1 when absent
+
+    // 4.3. A dict has two element types, so the pair above is not enough. For
+    // `dict[int[64], bool, 8]` the pair carries the VALUE and these carry the
+    // KEY.
+    //
+    // Adding a second pair rather than a nested node keeps every existing
+    // reader correct and untouched, which is the same argument that made the
+    // first pair flat instead of a recursive node. A non dict container leaves
+    // both empty, which is the state they were already in.
+    std::string type_key_kind;    // key kind for dict; "" otherwise
+    int type_key_width = -1;      // key width for dict; -1 otherwise
 };
 
 struct BasicBlock {

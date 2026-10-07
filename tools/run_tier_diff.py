@@ -346,6 +346,37 @@ block2:
 block3:
     return
 """, "tier1"),
+
+    # 4.4. addressof/valueof through real registers: the guard must track the
+    # pointer through the store/load and prove a valueof is Int (or Float)
+    # before letting native run. int, float and a pointer equality that has to
+    # stay an integer compare. A raw pointer is never printed here -- the
+    # typechecker refuses that at the source and the guard would refuse it too.
+    "ptr_round_trip": ("""
+function main():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = load _p
+    %3 = valueof %2 : int[64]
+    call print, %3
+    %4 = addressof x
+    store _r, %4 : ptr[int[64]]
+    %5 = load _r
+    %6 = load _p
+    %7 = eq %5, %6
+    call print, %7
+    %8 = const_f64 3.5
+    store y, %8 : float[64]
+    %9 = addressof y
+    store _py, %9 : ptr[float[64]]
+    %10 = load _py
+    %11 = valueof %10 : float[64]
+    call print, %11
+    return
+""", "tier1"),
 }
 
 # Programs that must FAIL at run time, the same way in both tiers.
@@ -396,6 +427,29 @@ block0:
     return
 """
 
+# 4.3. A dict read of a key that was never stored has no memory-safe answer, so
+# both tiers trap. The message is the interpreter's wording in both cases, which
+# is what makes a native trap and an interpreted one byte-identical.
+# 4.3. A dict read of a key that was never stored has no memory-safe answer, so
+# both tiers trap. The message is the interpreter's wording in both cases, which
+# is what makes a native trap and an interpreted one byte-identical.
+TRAP_DICT_MISS = """
+function lookup() -> int[64]:
+block0:
+    store d : dict[int[64], int[64], 4]
+    %0 = const_i64 @K@
+    %1 = DictIndex d, %0
+    return %1
+
+function main():
+block0:
+    %0 = const_i64 7
+    call print, %0
+    %1 = call lookup
+    call print, %1
+    return
+"""
+
 TRAP_MESSAGE = "error: interpreter: list index out of range"
 TRAP_EXIT = 1
 
@@ -407,6 +461,10 @@ TRAPS = {
     "load_index_negative": (TRAP_LOAD.replace("@N@", "-3"), "tier1", TRAP_MESSAGE),
     "load_index_eq_capacity": (TRAP_LOAD.replace("@N@", "4"), "tier1", TRAP_MESSAGE),
     "load_index_far_out": (TRAP_LOAD.replace("@N@", "99"), "tier1", TRAP_MESSAGE),
+    "dict_miss": (TRAP_DICT_MISS.replace("@K@", "1"), "tier1",
+                  "error: interpreter: dict key not found"),
+    "dict_miss_after_store": (TRAP_DICT_MISS.replace("@K@", "2"), "tier1",
+                              "error: interpreter: dict key not found"),
 }
 
 
@@ -502,23 +560,24 @@ def check_trap(label, ir_path, expected_tier, expected_message):
 def check_direct_phis(label, ir_path):
     """2.7: the direct-Phi path must agree with the memory path, exactly.
 
-    The comparison is deliberately against `--ssa` (which resolves merges to
-    memory) and not against the interpreter. The two implementations of a
-    merge are what is being cross-checked here; the interpreter is not in the
-    business of resolving Phis at all, and going through it would only prove
-    both paths are wrong in the same way.
+    The comparison is deliberately against --ssa, which resolves merges to
+    memory, and not against the interpreter. The two implementations of a merge
+    are what is being cross checked here. The interpreter is not in the business
+    of resolving Phis at all, and going through it would only prove both paths
+    are wrong in the same way.
 
-    The three outcomes are kept apart on purpose:
+    The three outcomes are kept apart on purpose.
 
-      match        both compiled and printed the same thing -> PASS
-      known gap    BOTH rejected the program for the same reason -> not a
-                   failure, and not a pass either. This is the pre-existing
-                   hole where --ssa cannot handle a program with a user
-                   function call or a container, so direct-Phi codegen is never
-                   reached for it. Collapsing this bucket into either
-                   neighbouring one would hide it: as a pass it would look
-                   covered, as a failure it would blame the new code.
-      mismatch     anything else -> FAIL
+    match means both compiled and printed the same thing, so that is a pass.
+
+    known gap means both rejected the program for the same reason, so it is not a
+    failure and not a pass either. This is the pre-existing hole where --ssa
+    cannot handle a program with a user function call or a container, so direct
+    Phi codegen is never reached for it. Collapsing this bucket into either
+    neighbouring one would hide it. As a pass it would look covered, as a
+    failure it would blame the new code.
+
+    mismatch is anything else, so that is a fail.
     """
     mem = run([str(ir_path), "--auto", "--ssa"])
     direct = run([str(ir_path), "--auto", "--direct-phis"])

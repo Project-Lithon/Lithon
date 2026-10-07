@@ -256,7 +256,20 @@ inline void eliminate_dead_code(lithon::ir::Function& fn, OptimizeStats& stats) 
             // a container is not a redundant store but the reservation of the
             // slot run, so removing it makes every later Index address memory
             // that was never claimed.
-            if (in.op == Op::Index || in.op == Op::IndexStore || in.op == Op::Len) {
+            if (in.op == Op::Index || in.op == Op::IndexStore || in.op == Op::Len ||
+                // 4.3. The dict ops name a variable for the same reason, and a
+                // miss here is worse than for a list: a dict's keys, occupancy
+                // and values are three regions, so a deleted declaration leaves
+                // all three unclaimed rather than one.
+                in.op == Op::DictStore || in.op == Op::DictIndex ||
+                in.op == Op::DictContains ||
+                // 4.4. AddressOf names the ADDRESS OF a variable. Dropping the
+                // target's store because "nothing loads it" would leave the
+                // variable unclaimed in the interpreter (where addressof of an
+                // unassigned name is an error) and in the frame (where the JIT
+                // pushes it only when a store reserves a slot), so the target
+                // must be kept alive exactly as if it were loaded.
+                in.op == Op::AddressOf) {
                 mark_var(in.name);
                 for (auto arg : in.args) mark_temp(arg);
             }
@@ -281,7 +294,8 @@ inline void eliminate_dead_code(lithon::ir::Function& fn, OptimizeStats& stats) 
             // when nothing appears to read the variable -- dropping it would
             // turn every element access into an address into unclaimed frame.
             if (in.op == Op::Store && in.args.empty() &&
-                (in.type_kind == "list" || in.type_kind == "tuple")) {
+                (in.type_kind == "list" || in.type_kind == "tuple" ||
+                 in.type_kind == "dict")) {
                 return false;
             }
             if (in.op == Op::Store) return live_vars.count(in.name) == 0;

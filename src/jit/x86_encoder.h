@@ -325,6 +325,25 @@ inline void emit_disp32_le(CodeBuffer& buf, int32_t disp) {
     emit_u32_le(buf, static_cast<uint32_t>(disp));
 }
 
+// cmp lhs, [rbp + disp]  (64-bit register against a frame slot)
+//
+// 4.3. Exists for the dict probe, which has two registers for three live values.
+// The bucket index and the loaded table key take one each, which leaves nowhere
+// to put a search key that has to survive every iteration of the walk. Holding
+// it in a frame slot and comparing against memory keeps the loop down to two
+// registers.
+//
+// The slot is read as a full 8 bytes. A narrower slot would compare the low
+// bytes against whatever was above them in the register, so the caller has to
+// have spilled a sign or zero extended value, not a truncated one.
+inline void emit_cmp_reg_rbp_offset(CodeBuffer& buf, Reg lhs, int32_t disp) {
+    emit_u8(buf, rex(true, lhs, Reg::RBP));
+    emit_u8(buf, 0x3B);
+    emit_u8(buf, static_cast<uint8_t>(0x80 | (reg_low3(lhs) << 3) | reg_low3(Reg::RBP)));
+    emit_disp32_le(buf, disp);
+}
+
+
 // 4.1. Scaled-index forms of the two above: [rbp + disp + index*stride]. A list
 // element lives at base + i*stride, so with a RUNNING index the address cannot
 // be a constant displacement -- it needs a SIB byte.
@@ -514,6 +533,61 @@ inline void emit_load_rbp_offset(CodeBuffer& buf, Reg dst, int32_t offset) {
     emit_disp32_le(buf, offset);
 }
 
+// 4.4. Register-indirect access: mov dst, [addr]. Every other memory form in
+// this file is rbp-relative; these are the first that use an actual ADDRESS
+// value in a register, which is the whole point of AddressOf. The pointer is
+// a GP register produced by AddressOf -- a temp from kTempPool or a scratch
+// register, never RSP/RBP -- but the encoding handles the full register file
+// anyway rather than trusting that.
+//
+// mod=00 + rm=100 would decode as "SIB follows" and mod=00 + rm=101 as
+// RIP-relative, so the three collision cases get their real form: RSP/R12 go
+// through the no-index SIB byte (which names base RSP/R12 under REX.B), and an
+// rm=5 base -- RBP or, under REX.B, R13 -- uses mod=01 with a zero disp8. Note
+// that mod=00 + rm=101 is RIP-relative even when REX.B extends it to R13, so
+// R13 needs the same escape RBP does; the allocator hands out R13 as a scratch
+// register, so this is not a theoretical case.
+inline void emit_load_reg_indirect_raw(CodeBuffer& buf, Reg data_reg, Reg addr_reg,
+                                       int bytes, bool zero_extend = true) {
+    if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8)
+        throw std::logic_error("x86_encoder: indirect element width " + std::to_string(bytes) +
+                               " is not 1, 2, 4 or 8");
+    // An 8- or 16-bit load is a partial register write: `mov al, [addr]`
+    // leaves bits 8..63 of the destination untouched. Zero the destination
+    // first, exactly as the rbp forms do for per-element access.
+    if (zero_extend && (bytes == 1 || bytes == 2)) emit_xor_zero(buf, data_reg);
+    const bool wide = bytes == 8;
+    const bool byte_form = bytes == 1;
+    const bool word_form = bytes == 2;
+    const bool byte_reg_needs_rex =
+        byte_form && (data_reg == Reg::RSP || data_reg == Reg::RBP ||
+                      data_reg == Reg::RSI || data_reg == Reg::RDI);
+    const uint8_t rm = reg_low3(addr_reg);
+    const bool needs_sib = rm == 4;                                  // RSP/R12
+    const bool fi_disp_escape = rm == 5;                             // RBP/R13
+    if (word_form) emit_u8(buf, 0x66);
+    if (wide || byte_reg_needs_rex || reg_is_extended(data_reg) || reg_is_extended(addr_reg))
+        emit_u8(buf, static_cast<uint8_t>(0x40 | (wide ? 8 : 0) |
+                                         (reg_is_extended(data_reg) ? 4 : 0) |
+                                         (reg_is_extended(addr_reg) ? 1 : 0)));
+    emit_u8(buf, byte_form ? 0x8A : 0x8B);
+    if (needs_sib) {
+        emit_u8(buf, static_cast<uint8_t>((reg_low3(data_reg) << 3) | 0x4));
+        // scale=0, index=100 (no index), base=addr
+        emit_u8(buf, static_cast<uint8_t>(0x20 | rm));
+    } else if (fi_disp_escape) {
+        emit_u8(buf, static_cast<uint8_t>(0x40 | (reg_low3(data_reg) << 3) | rm));
+        emit_u8(buf, 0);   // disp8 = 0
+    } else {
+        emit_u8(buf, static_cast<uint8_t>(reg_low3(data_reg) << 3 | rm));
+    }
+}
+
+// mov dst, [addr] at the pointee's own width (1/2/4 zero-extend, 8 wide).
+inline void emit_load_reg_indirect(CodeBuffer& buf, Reg data_reg, Reg addr_reg, int bytes) {
+    emit_load_reg_indirect_raw(buf, data_reg, addr_reg, bytes, /*zero_extend=*/true);
+}
+
 // push reg / pop reg. Encoding: [41] 50+r / [41] 58+r.
 inline void emit_push_reg(CodeBuffer& buf, Reg reg) {
     if (reg_is_extended(reg)) emit_u8(buf, 0x41);
@@ -633,6 +707,21 @@ inline void emit_sar_reg_1(CodeBuffer& buf, Reg dst) {
     emit_u8(buf, rex(true, Reg::RAX, dst));
     emit_u8(buf, 0xD1);
     emit_u8(buf, static_cast<uint8_t>(0xF8 | reg_low3(dst)));
+}
+
+// shr dst, imm8  -- LOGICAL right shift, REX.W + C1 /5 ib.
+//
+// The 4.3 dict hash needs this and `>>` does not: taking the top bits of the
+// Fibonacci product is a logical shift, and the arithmetic /7 form would
+// replicate the sign bit of a negative key and pull the whole table's layout
+// into the top bit instead of the low one. The /5 form is emitted here ONLY for
+// the hash, and it is deliberately a separate function from any operator so
+// nothing reaches for it by mistake and gets Python's >> semantics.
+inline void emit_shr_reg_imm8(CodeBuffer& buf, Reg dst, uint8_t imm) {
+    emit_u8(buf, rex(true, Reg::RAX, dst));
+    emit_u8(buf, 0xC1);
+    emit_u8(buf, static_cast<uint8_t>(0xE8 | reg_low3(dst)));
+    emit_u8(buf, imm);
 }
 
 // NOTE there is deliberately no emit_shr_reg_imm8 here. The /5 form is a
@@ -918,6 +1007,34 @@ inline void emit_movsd_xmm_xmm(CodeBuffer& buf, Xmm dst, Xmm src) {
     emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(dst)), static_cast<Reg>(xmm_low3(src))));
 }
 
+// 4.4. movsd xmm, [addr] -- load a double through a pointer value in a
+// register. Encoding: F2 0F 10 /r, ModRM(mod=00, reg=dst, rm=addr), with
+// the same two collision-register escapes as the integer indirect path
+// (RSP/R12 need the no-index SIB byte, and an rm=5 base -- RBP or, under
+// REX.B, R13 -- uses mod=01 with a zero disp8, because mod=00 + rm=101 is
+// RIP-relative even when extended).
+inline void emit_movsd_xmm_mem_reg(CodeBuffer& buf, Xmm dst, Reg addr_reg) {
+    emit_u8(buf, 0xF2);
+    if (xmm_is_extended(dst) || reg_is_extended(addr_reg))
+        emit_u8(buf, static_cast<uint8_t>(0x40 |
+                                         (xmm_is_extended(dst) ? 4 : 0) |
+                                         (reg_is_extended(addr_reg) ? 1 : 0)));
+    emit_u8(buf, 0x0F);
+    emit_u8(buf, 0x10);
+    const uint8_t rm = reg_low3(addr_reg);
+    const bool needs_sib = rm == 4;
+    const bool fi_disp_escape = rm == 5;
+    if (needs_sib) {
+        emit_u8(buf, static_cast<uint8_t>((xmm_low3(dst) << 3) | 0x4));
+        emit_u8(buf, static_cast<uint8_t>(0x20 | rm));
+    } else if (fi_disp_escape) {
+        emit_u8(buf, static_cast<uint8_t>(0x40 | (xmm_low3(dst) << 3) | rm));
+        emit_u8(buf, 0);   // disp8 = 0
+    } else {
+        emit_u8(buf, static_cast<uint8_t>(xmm_low3(dst) << 3 | rm));
+    }
+}
+
 // movsd xmm, [rbp + disp32] -- load a double from a frame slot. The XMM
 // counterpart of emit_load_rbp_offset: same rbp-relative addressing, F2
 // 0F 10 /r with ModRM(mod=10, reg=dst, rm=RBP).
@@ -1004,6 +1121,224 @@ inline void emit_xorpd_zero(CodeBuffer& buf, Xmm reg) {
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x57);
     emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(reg)), static_cast<Reg>(xmm_low3(reg))));
+}
+
+// =====================================================================
+// 4.5  VEX / AVX2
+//
+// The first VEX-prefixed opcode family, added for the vectorizing pass.
+// Everything below was checked byte-for-byte against GNU `as` via
+// encoder_asm_dump.cpp + tools/check_encoder_vs_as.py; the probe decodes
+// that pinned the two VEX prefix bytes down:
+//
+//   C4           -- 3-byte VEX marker
+//   byte1:      (~R)<<7 | (~X)<<6 | (~B)<<5 | mmap(5 bits)
+//                   mmap: 1 = 0F, 2 = 0F38, 3 = 0F3A
+//   byte2:      ((~vvvv) & 0xF)<<3 | L<<2 | pp(2 bits)
+//                   pp: 0 = none, 1 = 66, 2 = F3, 3 = F2
+//
+// Operand order decode for the 3-operand dword family (vpaddd & friends):
+// ModRM.reg is the DESTINATION (extended by VEX.R), ModRM.rm is the second
+// SOURCE register or memory (extended by VEX.B, index by VEX.X) and
+// VEX.vvvv is the FIRST source. L selects 256-bit (ymm) vs 128-bit (xmm) --
+// not REX.W, which stays 0 for dword ops.
+//
+// The integer vector path also owns two safety rules the scalar path can
+// now state in bytes instead of words:
+//   - a 4-byte element is `vmovdqu ymm, [rbp+disp+i*4]`: the SIB scale is
+//     BOTH the address stride and the operand width, so the stride 4 is
+//     what makes the whole thing int[32], no REX.W anywhere.
+//   - GNU as uses a disp8 with mod=01 whenever the displacement fits a
+//     signed byte (mod=10 disp32 otherwise, since mod=00 + SIB base RBP
+//     would mean no base register at all), so the mem form below mirrors
+//     that exactly or the assembler comparison would pin every short
+//     displacement as "different".
+// ---------------------------------------------------------------------
+
+enum : uint8_t { kVexPpNone = 0, kVexPp66 = 1, kVexPpF3 = 2, kVexPpF2 = 3 };
+
+inline void emit_vex3(CodeBuffer& buf, uint8_t map, bool wide, uint8_t pp,
+                      bool r_ext, bool x_ext, bool b_ext, uint8_t vvvv) {
+    emit_u8(buf, 0xC4);
+    emit_u8(buf, static_cast<uint8_t>(((r_ext ? 0 : 1) << 7) |
+                                      ((x_ext ? 0 : 1) << 6) |
+                                      ((b_ext ? 0 : 1) << 5) |
+                                      (map & 0x1F)));
+    emit_u8(buf, static_cast<uint8_t>(((~vvvv & 0xF) << 3) | (wide ? 4 : 0) | (pp & 3)));
+}
+
+// vzeroupper. 2.3-byte-prefixed no-operand opcode (VEX.128.0F 77). Must
+// precede every `ret` and every `call` in a function that touched a ymm
+// register; see tools/check_vex_transitions.py. Verified: C5 F8 77.
+inline void emit_vzeroupper(CodeBuffer& buf) {
+    emit_u8(buf, 0xC5);
+    emit_u8(buf, 0xF8);
+    emit_u8(buf, 0x77);
+}
+
+// mod = 01 (disp8) when the displacement fits a signed byte, else mod = 10
+// (disp32). SIB base is always RBP.
+inline void emit_sib_disp(CodeBuffer& buf, Reg dst, Reg index, uint8_t scale,
+                          int32_t disp) {
+    if (disp >= -128 && disp <= 127) {
+        emit_u8(buf, static_cast<uint8_t>(0x40 | (reg_low3(dst) << 3) | 0x4));
+        emit_u8(buf, static_cast<uint8_t>(scale | (reg_low3(index) << 3) | reg_low3(Reg::RBP)));
+        emit_u8(buf, static_cast<uint8_t>(disp));
+    } else {
+        emit_u8(buf, static_cast<uint8_t>(0x80 | (reg_low3(dst) << 3) | 0x4));
+        emit_u8(buf, static_cast<uint8_t>(scale | (reg_low3(index) << 3) | reg_low3(Reg::RBP)));
+        emit_disp32_le(buf, disp);
+    }
+}
+
+// 3-operand dword integer op whose second source is a register.
+// vpaddd ymm_d, ymm_s1, ymm_s2 == C5 FD FE C1 (map 0F, opcode FE, pp 66).
+// Extended-register form vpaddd ymm8,ymm9,ymm10 == C4 41 31 FE C2.
+inline void emit_vex_binop_reg(CodeBuffer& buf, uint8_t map, uint8_t opcode,
+                               bool wide, Xmm dst, Xmm src1, Xmm src2) {
+    emit_vex3(buf, map, wide, kVexPp66, xmm_is_extended(dst), false,
+              xmm_is_extended(src2), static_cast<uint8_t>(src1));
+    emit_u8(buf, opcode);
+    emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(dst)),
+                               static_cast<Reg>(xmm_low3(src2))));
+}
+
+// The same op with a memory second source: [rbp + index*stride + disp].
+inline void emit_vex_binop_mem(CodeBuffer& buf, uint8_t map, uint8_t opcode,
+                               bool wide, Xmm dst, Xmm src1, Reg index,
+                               int32_t disp, int stride) {
+    emit_vex3(buf, map, wide, kVexPp66, xmm_is_extended(dst),
+              reg_is_extended(index), false, static_cast<uint8_t>(src1));
+    emit_u8(buf, opcode);
+    emit_sib_disp(buf, static_cast<Reg>(xmm_low3(dst)), index,
+                  checked_sib_scale(stride), disp);
+}
+
+// vpaddd: map 0F, opcode FE. vpsubd: map 0F, opcode FA.
+// vpmulld: map 0F38, opcode 40 (verified: vpmulld ymm0,ymm0,ymm1 = C4 E2 7D 40 C1).
+// vpxor: map 0F, opcode EF.
+inline void emit_vpaddd_reg(CodeBuffer& buf, Xmm d, Xmm s1, Xmm s2) {
+    emit_vex_binop_reg(buf, 1, 0xFE, true, d, s1, s2);
+}
+inline void emit_vpaddd_mem(CodeBuffer& buf, Xmm d, Xmm s1, Reg idx, int32_t disp, int stride) {
+    emit_vex_binop_mem(buf, 1, 0xFE, true, d, s1, idx, disp, stride);
+}
+inline void emit_vpaddd_xmm(CodeBuffer& buf, Xmm d, Xmm s1, Xmm s2) {
+    emit_vex_binop_reg(buf, 1, 0xFE, false, d, s1, s2);
+}
+inline void emit_vpsubd_reg(CodeBuffer& buf, Xmm d, Xmm s1, Xmm s2) {
+    emit_vex_binop_reg(buf, 1, 0xFA, true, d, s1, s2);
+}
+inline void emit_vpsubd_mem(CodeBuffer& buf, Xmm d, Xmm s1, Reg idx, int32_t disp, int stride) {
+    emit_vex_binop_mem(buf, 1, 0xFA, true, d, s1, idx, disp, stride);
+}
+inline void emit_vpmulld_reg(CodeBuffer& buf, Xmm d, Xmm s1, Xmm s2) {
+    emit_vex_binop_reg(buf, 2, 0x40, true, d, s1, s2);
+}
+inline void emit_vpmulld_mem(CodeBuffer& buf, Xmm d, Xmm s1, Reg idx, int32_t disp, int stride) {
+    emit_vex_binop_mem(buf, 2, 0x40, true, d, s1, idx, disp, stride);
+}
+inline void emit_vpxor_reg(CodeBuffer& buf, Xmm d, Xmm s1, Xmm s2) {
+    emit_vex_binop_reg(buf, 1, 0xEF, true, d, s1, s2);
+}
+inline void emit_vpxor_xmm(CodeBuffer& buf, Xmm d, Xmm s1, Xmm s2) {
+    emit_vex_binop_reg(buf, 1, 0xEF, false, d, s1, s2);
+}
+
+// vmovdqu ymm, [rbp + index*stride + disp] -- unaligned 256-bit load.
+// pp is the mandatory F3 for the 0F 6F/7F opcodes. Verified:
+//   vmovdqu ymm8,[rbp+r15*4+0x40] = C4 21 7E 6F 44 BD 40   (disp8 form)
+//   vmovdqu [rbp+r8*4-0x40],ymm12 = C4 21 7E 7F 64 85 C0
+// A stride other than 1/2/4/8 has no SIB scale and is rejected up front.
+inline void emit_vmovdqu_ymm(CodeBuffer& buf, Xmm dst, Reg index, int32_t disp,
+                             int stride = 4) {
+    emit_vex3(buf, 1, true, kVexPpF3, xmm_is_extended(dst),
+              reg_is_extended(index), false, 0xF);
+    emit_u8(buf, 0x6F);
+    emit_sib_disp(buf, static_cast<Reg>(xmm_low3(dst)), index,
+                  checked_sib_scale(stride), disp);
+}
+
+inline void emit_vmovdqu_ymm_mem(CodeBuffer& buf, Xmm src, Reg index, int32_t disp,
+                                 int stride = 4) {
+    emit_vex3(buf, 1, true, kVexPpF3, xmm_is_extended(src),
+              reg_is_extended(index), false, 0xF);
+    emit_u8(buf, 0x7F);
+    emit_sib_disp(buf, static_cast<Reg>(xmm_low3(src)), index,
+                  checked_sib_scale(stride), disp);
+}
+
+// vpbroadcastd ymm, dword ptr [rip + disp32] -- the AVX2 way to get a
+// compile-time int32 constant into all 8 lanes. map 0F38, opcode 58, pp 66.
+// Verified (pool form): vpbroadcastd ymm2,[rip+0x300] = C4 E2 7D 58 15 <d32>.
+// The disp32 is a zero placeholder; call vpbroadcastd_rip_disp_offset()
+// immediately after to patch it once the pool's position is known, exactly
+// as emit_movsd_xmm_rip / movsd_rip_disp_offset work for doubles.
+//
+// The GP-register form (vpbroadcastd ymm, r32) is deliberately NOT encoded
+// here: VEX has no such form (only EVEX does), so GNU as emits EVEX for it
+// and any VEX attempt would be wrong. Constants are always pool dwords.
+inline void emit_vpbroadcastd_rip(CodeBuffer& buf, Xmm dst) {
+    emit_vex3(buf, 2, true, kVexPp66, xmm_is_extended(dst), false, false, 0xF);
+    emit_u8(buf, 0x58);
+    emit_u8(buf, static_cast<uint8_t>(0x05 | (xmm_low3(dst) << 3)));
+    emit_disp32_le(buf, 0);
+}
+
+// vpbroadcastd ymm, dword ptr [rbp + index*stride + disp] -- memory form,
+// dumped to the assembler comparison for byte coverage of the 58 opcode.
+inline void emit_vpbroadcastd_mem(CodeBuffer& buf, Xmm dst, Reg index,
+                                  int32_t disp, int stride = 4) {
+    emit_vex3(buf, 2, true, kVexPp66, xmm_is_extended(dst),
+              reg_is_extended(index), false, 0xF);
+    emit_u8(buf, 0x58);
+    emit_sib_disp(buf, static_cast<Reg>(xmm_low3(dst)), index,
+                  checked_sib_scale(stride), disp);
+}
+
+inline size_t vpbroadcastd_rip_disp_offset(CodeBuffer& buf) { return buf.size() - 4; }
+
+// vextracti128 xmm_dst, ymm_src, imm8 -- the first step of a horizontal
+// reduce: split the high 128-bit lane of a ymm into a fresh xmm. Note the
+// swap: ModRM.reg is the SOURCE ymm, ModRM.rm the DESTINATION xmm (VEX.R
+// extends the source, VEX.B the destination). map 0F3A, opcode 39, pp 66.
+// Verified: vextracti128 xmm3,ymm7,1 = C4 E3 7D 39 FB 01.
+inline void emit_vextracti128_ymm_xmm(CodeBuffer& buf, Xmm dst_xmm, Xmm src_ymm,
+                                      uint8_t imm) {
+    emit_vex3(buf, 3, true, kVexPp66, xmm_is_extended(src_ymm), false,
+              xmm_is_extended(dst_xmm), 0xF);
+    emit_u8(buf, 0x39);
+    emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(src_ymm)),
+                               static_cast<Reg>(xmm_low3(dst_xmm))));
+    emit_u8(buf, imm);
+}
+
+// vpshufd xmm_dst, xmm_src, imm8 -- 128-bit shuffle; the two halving steps of
+// the horizontal reduce. map 0F, opcode 70, pp 66, L=0.
+//   _MM_SHUFFLE(2,3,0,1)  = 0x4E   (swap adjacent dwords within each pair)
+//   _MM_SHUFFLE(1,0,3,2)  = 0xB1   (swap the two dword halves)
+// Verified: vpshufd xmm9,xmm8,0xB1 = C4 41 79 70 C8 B1.
+inline void emit_vpshufd_xmm(CodeBuffer& buf, Xmm dst, Xmm src, uint8_t imm) {
+    emit_vex3(buf, 1, false, kVexPp66, xmm_is_extended(dst), false,
+              xmm_is_extended(src), 0xF);
+    emit_u8(buf, 0x70);
+    emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(dst)),
+                               static_cast<Reg>(xmm_low3(src))));
+    emit_u8(buf, imm);
+}
+
+enum : uint8_t { kVpshufdSwapPairs = 0x4E, kVpshufdSwapHalves = 0xB1 };
+
+// vmovd r32, xmm -- move the low dword of an xmm/ymm to a GP register,
+// which is what ends a horizontal reduce. map 0F, opcode 7E, pp 66, L=0.
+// Note the swap again: ModRM.reg is the XMM source (VEX.R), ModRM.rm the GP
+// destination (VEX.B). Verified: vmovd eax,xmm15 = C5 79 7E F8 and
+// vmovd r10d,xmm15 = C4 41 79 7E FA.
+inline void emit_vmovd_xmm_to_r32(CodeBuffer& buf, Reg dst32, Xmm src) {
+    emit_vex3(buf, 1, false, kVexPp66, xmm_is_extended(src), false,
+              reg_is_extended(dst32), 0xF);
+    emit_u8(buf, 0x7E);
+    emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(src)), dst32));
 }
 
 } // namespace lithon::jit

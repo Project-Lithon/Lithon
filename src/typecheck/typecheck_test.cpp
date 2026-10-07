@@ -21,6 +21,7 @@
 #include "typecheck.h"
 #include "ir/text_parser.h"
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -32,7 +33,17 @@ namespace {
 int failures = 0;
 
 std::string errors_for(const std::string& ir) {
-    auto module = parse_ir_text(ir);
+    // A malformed type annotation is a hard error in the IR text parser rather
+    // than a diagnostic from the checker, so a case that reaches it would
+    // otherwise take the whole test binary down instead of reporting one
+    // failure. It is still a rejection, and these tests are about which layer
+    // refuses an illegal program as much as about the message.
+    lithon::ir::Module module;
+    try {
+        module = parse_ir_text(ir);
+    } catch (const std::exception& e) {
+        return std::string("parser refused the IR: ") + e.what();
+    }
     std::string joined;
     for (const auto& e : check_module(module)) {
         if (!joined.empty()) joined += " | ";
@@ -209,7 +220,7 @@ block0:
 function __main__():
 block0:
     %0 = const_i64 1
-    store p, %0 : ptr[int[64]]
+    store _p, %0 : ptr[int[64]]
     return
 )", "a literal cannot build");
 
@@ -246,7 +257,7 @@ block0:
 function __main__():
 block0:
     %0 = const_i64 1
-    store p, %0 : ptr[int[64]]
+    store _p, %0 : ptr[int[64]]
     return
 )", "ptr[int[64]]");
 
@@ -642,6 +653,675 @@ block3:
     call print, %3
     return
 )", "not definitely assigned");
+
+    std::printf("typecheck: 4.2 tuple construction and immutability\n");
+
+    // A literal fills the run through the ordinary IndexStore path, so it is
+    // accepted. This is the one place a tuple may be written.
+    expect_accepts("tuple built by a literal of matching arity", R"(
+function __main__():
+block0:
+    store t : tuple[int[64], 4]
+    %0 = const_i64 0
+    %1 = const_i64 1
+    IndexStore t, %0, %1
+    %2 = const_i64 1
+    %3 = const_i64 2
+    IndexStore t, %2, %3
+    %4 = const_i64 2
+    %5 = const_i64 3
+    IndexStore t, %4, %5
+    %6 = const_i64 3
+    %7 = const_i64 4
+    IndexStore t, %6, %7
+    %8 = const_i64 0
+    %9 = Index t, %8
+    call print, %9
+    return
+)");
+
+    // The all zero tuple. A bare declaration writes nothing, and that has to be
+    // legal, or the partially written rule below would reject it too.
+    expect_accepts("bare tuple declaration reads back as zeros", R"(
+function __main__():
+block0:
+    store z : tuple[int[64], 3]
+    %0 = const_i64 2
+    %1 = Index z, %0
+    call print, %1
+    return
+)");
+
+    // Immutability, which is the point of the whole type.
+    expect_rejects("store into a completed tuple", R"(
+function __main__():
+block0:
+    store t : tuple[int[64], 2]
+    %0 = const_i64 0
+    %1 = const_i64 1
+    IndexStore t, %0, %1
+    %2 = const_i64 1
+    %3 = const_i64 2
+    IndexStore t, %2, %3
+    %4 = const_i64 0
+    %5 = const_i64 9
+    IndexStore t, %4, %5
+    return
+)", "a tuple is immutable");
+
+    // The subtle one. Counting stores is not enough to tell a real literal from
+    // a write after the declaration, because a store of the declaration followed
+    // by one IndexStore is a valid one element initializer for a four slot
+    // tuple. What separates them is that a literal writes all N elements, so a
+    // partial one is an error.
+    expect_rejects("partially initialised tuple", R"(
+function __main__():
+block0:
+    store t : tuple[int[64], 4]
+    %0 = const_i64 0
+    %1 = const_i64 7
+    IndexStore t, %0, %1
+    %2 = const_i64 0
+    %3 = Index t, %2
+    call print, %3
+    return
+)", "initializer wrote 1 of 4 elements");
+
+    // Reading seals the tuple too. Element 0 must not be initialised by a read
+    // of element 0.
+    //
+    // The diagnostic that comes back is the immutability one rather than the
+    // partial initializer one. Closing construction removes the exemption before
+    // the store is considered at all. That order is worth asserting, because the
+    // alternative is a write that stays legal purely because of where it sits in
+    // the block.
+    expect_rejects("read cannot also initialise the tuple", R"(
+function __main__():
+block0:
+    store t : tuple[int[64], 2]
+    %0 = const_i64 0
+    %1 = Index t, %0
+    call print, %1
+    %2 = const_i64 1
+    %3 = const_i64 5
+    IndexStore t, %2, %3
+    return
+)", "a tuple is immutable");
+
+    // Elements go through the same rules a list uses, so a float cannot
+    // initialise an int slot.
+    expect_rejects("float literal into an int tuple element", R"(
+function __main__():
+block0:
+    store t : tuple[int[64], 2]
+    %0 = const_i64 0
+    %1 = const_f64 2.5
+    IndexStore t, %0, %1
+    %2 = const_i64 1
+    %3 = const_i64 1
+    IndexStore t, %2, %3
+    return
+)", "conversion does not exist");
+
+    // 4.2 is indexed reads only. len() on a tuple is deliberately left out.
+    expect_rejects("len() on a tuple", R"(
+function __main__():
+block0:
+    store t : tuple[int[64], 4]
+    %0 = Len t
+    call print, %0
+    return
+)", "not part of 4.2");
+
+    // Bounds still work, and a literal index is decided at compile time.
+    expect_rejects("literal index past the end of a tuple", R"(
+function __main__():
+block0:
+    store t : tuple[int[64], 4]
+    %0 = const_i64 9
+    %1 = Index t, %0
+    call print, %1
+    return
+)", "is out of range for tuple[int[64], 4]");
+
+    // A tuple declaration with no element type must not degrade into a bare
+    // kind and capacity that compares equal to something valid.
+    expect_rejects("tuple with no element type", R"(
+function __main__():
+block0:
+    store t : tuple
+    %0 = const_i64 0
+    %1 = Index t, %0
+    call print, %1
+    return
+)", "needs an element type");
+
+    // ------------------------------------------------------------------
+    // 4.3. Dicts. The rules are about what a table can be, not about what it
+    // holds: N buckets is fixed by the type, keys are constant so a store is
+    // resolvable, and the table is filled once.
+    std::printf("typecheck: dicts (4.3)\n");
+
+    expect_accepts("dict literal, read and contains", R"(
+function __main__():
+block0:
+    store d : dict[int[64], int[64], 4]
+    %0 = const_i64 1
+    %1 = const_i64 10
+    DictStore d, %0, %1
+    %2 = DictIndex d, %0
+    call print, %2
+    %3 = DictContains d, %0
+    call print, %3
+    return
+)");
+
+    // A literal key is how construction resolves a bucket. A computed key would
+    // turn construction into a run time insert, which is the probe loop the
+    // whole design is built to keep out of the store path.
+    expect_rejects("computed dict key", R"(
+function __main__(k: int[64]) -> int[64]:
+block0:
+    store d : dict[int[64], int[64], 4]
+    %0 = load k
+    %1 = const_i64 10
+    DictStore d, %0, %1
+    return %1
+)", "a dict key must be a constant");
+
+    // Duplicate keys are a compile time error rather than a last write wins,
+    // because in Python {1: a, 1: b} is one entry and which one survives is an
+    // implementation detail nobody should depend on.
+    expect_rejects("duplicate dict key", R"(
+function __main__():
+block0:
+    store d : dict[int[64], int[64], 4]
+    %0 = const_i64 1
+    %1 = const_i64 10
+    DictStore d, %0, %1
+    %2 = const_i64 20
+    DictStore d, %0, %2
+    return
+)", "duplicate dict key");
+
+    // Immutability, the same rule a tuple has. The illegal program is refused
+    // here rather than in codegen, so there is no run time check to pay for.
+    //
+    // The read in the middle is what makes it illegal. Construction ends at the
+    // first read, because a dict is filled by its literal and a literal has no
+    // reads in it, so a second store after one is a second table rather than a
+    // second entry.
+    expect_rejects("store into a dict after a read", R"(
+function __main__():
+block0:
+    store d : dict[int[64], int[64], 4]
+    %0 = const_i64 1
+    %1 = const_i64 10
+    DictStore d, %0, %1
+    %2 = DictIndex d, %0
+    call print, %2
+    %3 = const_i64 2
+    %4 = const_i64 20
+    DictStore d, %3, %4
+    return
+)", "immutable");
+
+    // The other way construction ends is a full table. One bucket and one entry
+    // is a complete dict, so the second store has nowhere to go even though
+    // nothing has read it yet.
+    expect_rejects("store into a full one bucket dict", R"(
+function __main__():
+block0:
+    store d : dict[int[64], int[64], 1]
+    %0 = const_i64 1
+    %1 = const_i64 10
+    DictStore d, %0, %1
+    %2 = const_i64 2
+    %3 = const_i64 20
+    DictStore d, %2, %3
+    return
+)", "2 entries but only 1 buckets");
+
+    // Two stores in a row with no read between them is a two entry literal, not
+    // an immutability violation. Refusing it would make a dict literal
+    // impossible to express.
+    expect_accepts("two stores in a row is construction", R"(
+function __main__():
+block0:
+    store d : dict[int[64], int[64], 4]
+    %0 = const_i64 1
+    %1 = const_i64 10
+    DictStore d, %0, %1
+    %2 = const_i64 2
+    %3 = const_i64 20
+    DictStore d, %2, %3
+    %4 = DictIndex d, %2
+    call print, %4
+    return
+)");
+
+    // A bucket count is a mask, so it has to be a power of two. 3 would make
+    // bucket_of a modulo and every table a different size.
+    expect_rejects("dict bucket count that is not a power of two", R"(
+function __main__():
+block0:
+    store d : dict[int[64], int[64], 3]
+    %0 = const_i64 1
+    %1 = const_i64 10
+    DictStore d, %0, %1
+    return
+)", "power of two");
+
+    // A dict annotation carries three fields and the IR parser insists on all
+    // three. A two field one is not a value-only dict, it is a typo, and it is
+    // refused before anything tries to lay a table out from it.
+    expect_rejects("dict with no value type", R"(
+function __main__():
+block0:
+    store d : dict[int[64], 4]
+    %0 = const_i64 1
+    %1 = DictIndex d, %0
+    call print, %1
+    return
+)", "malformed dict type annotation");
+
+    // A key type has to be one a table can hold. There is no string key: a
+    // frame slot holds a number, and 4.3 is not a step toward string keys.
+    expect_rejects("string keyed dict", R"(
+function __main__():
+block0:
+    store d : dict[str[64], int[64], 4]
+    %0 = const_i64 1
+    %1 = DictIndex d, %0
+    call print, %1
+    return
+)", "dict keys are int or bool only");
+
+    // An int key needs a width, because the key region is packed at the width
+    // the type names. A widthless int would leave the stride undefined, and it
+    // would be read back as a different key than it was stored as.
+    expect_rejects("dict int key with no width", R"(
+function __main__():
+block0:
+    store d : dict[int, int[64], 4]
+    %0 = const_i64 1
+    %1 = DictIndex d, %0
+    call print, %1
+    return
+)", "key width must be a multiple of 8");
+
+    // A dict is a frame of buckets, so it is not passed by value and it is not
+    // returned by value. Both are refused with the reason, rather than silently
+    // copying a frame layout that has no copy in the language.
+    expect_rejects("dict as a parameter", R"(
+function peek(d: dict[int[64], int[64], 4]) -> int[64]:
+block0:
+    %0 = const_i64 1
+    %1 = DictIndex d, %0
+    return %1
+)", "cannot be a dict");
+
+    expect_rejects("dict as a return type", R"(
+function make() -> dict[int[64], int[64], 4]:
+block0:
+    store d : dict[int[64], int[64], 4]
+    %0 = load d
+    return %0
+)", "cannot be a dict");
+
+    // len() folds for a list because N is static and so is a tuple's capacity.
+    // A dict has N buckets, not N entries, so len() would answer the wrong
+    // question. Rejected for the same reason a tuple's is.
+    expect_rejects("len() on a dict", R"(
+function __main__():
+block0:
+    store d : dict[int[64], int[64], 4]
+    %0 = Len d
+    call print, %0
+    return
+)", "no index and no length");
+
+    // A narrow key table stores one byte per key, so a literal that does not fit
+    // is refused rather than truncated into a different key. The frontend emits
+    // full width int literals, so a key that does fit is accepted and narrowed
+    // by canonical_key, which is what keeps int[8] tables usable at all.
+    expect_accepts("narrow dict key that fits", R"(
+function __main__():
+block0:
+    store d : dict[int[8], int[64], 4]
+    %0 = const_i64 100
+    %1 = const_i64 10
+    DictStore d, %0, %1
+    %2 = DictIndex d, %0
+    call print, %2
+    return
+)");
+
+    expect_rejects("narrow dict key that does not fit", R"(
+function __main__():
+block0:
+    store d : dict[int[8], int[64], 4]
+    %0 = const_i64 300
+    %1 = const_i64 10
+    DictStore d, %0, %1
+    return
+)", "does not fit int[8]");
+
+    // A bool key is not an int key. They are different types with different
+    // stored forms, so an int table does not quietly accept a bool the way
+    // Python's dict does.
+    expect_rejects("bool key into an int keyed dict", R"(
+function __main__():
+block0:
+    store d : dict[int[64], int[64], 4]
+    %0 = const_bool 1
+    %1 = DictIndex d, %0
+    call print, %1
+    return
+)", "must be int[64], got bool");
+
+    // The reverse direction is not a special case either. A bool keyed table is
+    // not an int keyed one that happens to hold 0 and 1, so an int operand is
+    // refused rather than silently canonicalised into a bool.
+    expect_rejects("int key into a bool keyed dict", R"(
+function __main__():
+block0:
+    store d : dict[bool, int[64], 4]
+    %0 = const_i64 1
+    %1 = DictIndex d, %0
+    call print, %1
+    return
+)", "must be bool, got int[64]");
+
+    // A value type a frame slot cannot hold. Same rule as a list element.
+    expect_rejects("dict of dicts", R"(
+function __main__():
+block0:
+    store d : dict[int[64], dict[int[64], int[64], 4], 4]
+    %0 = const_i64 1
+    %1 = DictIndex d, %0
+    call print, %1
+    return
+)", "dict values are int, float or bool only");
+
+    std::printf("typecheck: pointers (4.4)\n");
+
+    // The happy path: addressof builds the pointer, valueof reads back through
+    // it, the pointee suffix on valueof names the width of the native load.
+    expect_accepts("addressof/valueof round trip", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = load _p
+    %3 = valueof %2 : int[64]
+    call print, %3
+    return
+)");
+
+    expect_accepts("float and bool pointees", R"(
+function __main__():
+block0:
+    %0 = const_f64 2.5
+    store x, %0 : float[64]
+    %1 = addressof x
+    store _p, %1 : ptr[float[64]]
+    %2 = load _p
+    %3 = valueof %2 : float[64]
+    call print, %3
+    %4 = const_bool 1
+    store b, %4 : bool
+    %5 = addressof b
+    store _b, %5 : ptr[bool]
+    %6 = load _b
+    %7 = valueof %6 : bool
+    call print, %7
+    return
+)");
+
+    // Element-scaled pointer arithmetic on a byte offset. An int[64] pointee
+    // has stride 8, so +1 (which the frontend scaled to 8 bytes) and back.
+    expect_accepts("pointer add and sub by a scaled literal byte offset", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = load _p
+    %3 = const_i64 8
+    %4 = add %2, %3
+    store _q, %4 : ptr[int[64]]
+    %5 = load _q
+    %6 = const_i64 8
+    %7 = sub %5, %6
+    store _r, %7 : ptr[int[64]]
+    %8 = load _r
+    %9 = load _p
+    %10 = eq %8, %9
+    call print, %10
+    return
+)");
+
+    // Pointers compare equal only in the address sense: pointer-vs-pointer or
+    // pointer-vs-literal (the frontend emits `_p == 0` as an int compare).
+    expect_accepts("pointer equality compares addresses", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = load _p
+    %3 = addressof x
+    store _q, %3 : ptr[int[64]]
+    %4 = load _q
+    %5 = eq %2, %4
+    call print, %5
+    %6 = const_i64 0
+    %7 = eq %2, %6
+    call print, %7
+    return
+)");
+
+    // Re-assigning a pointer to another pointer of the same pointee.
+    expect_accepts("pointer re-assignment", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = addressof x
+    store _q, %2 : ptr[int[64]]
+    %3 = load _q
+    store _p, %3
+    return
+)");
+
+    // A pointer needs the value a variable carries; a valueof annotation must
+    // be exactly the pointee, a literal cannot build a pointer, and there is no
+    // null pointer, so a pointer must always arrive via addressof.
+    expect_rejects("valueof of a non-pointer", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = load x
+    %2 = valueof %1 : int[64]
+    call print, %2
+    return
+)", "valueof needs a pointer");
+
+    expect_rejects("valueof suffix that is not the pointee", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = load _p
+    %3 = valueof %2 : int[8]
+    call print, %3
+    return
+)", "but this instruction is annotated int[8]");
+
+    expect_rejects("literal into a pointer is refused", R"(
+function __main__():
+block0:
+    %0 = const_i64 0
+    store _p, %0 : ptr[int[64]]
+    return
+)", "there is no null pointer");
+
+    expect_rejects("annotated pointer missing its addressof", R"(
+function __main__():
+block0:
+    store _p : ptr[int[64]]
+    return
+)", "must be given an addressof");
+
+    // The underscore naming rule, enforced both ways on hand-written IR.
+    expect_rejects("a pointer that does not start with '_'", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store p, %1 : ptr[int[64]]
+    return
+)", "does not start with '_'");
+
+    expect_rejects("an '_'-named scalar", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store _x, %0 : int[64]
+    return
+)", "a name that starts with '_' must be a pointer");
+
+    // addressof wants a definitely-assigned plain scalar cell.
+    expect_rejects("addressof of an undeclared variable", R"(
+function __main__():
+block0:
+    %0 = addressof missing
+    store _p, %0 : ptr[int[64]]
+    return
+)", "not definitely assigned");
+
+    expect_rejects("addressof of a container", R"(
+function __main__():
+block0:
+    store xs : list[int[64], 4]
+    %0 = addressof xs
+    store _p, %0 : ptr[int[64]]
+    return
+)", "plain scalar variable");
+
+    expect_rejects("addressof of a pointer", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = addressof _p
+    store _q, %2 : ptr[int[64]]
+    return
+)", "an address with no storage of its own");
+
+    // Pointer arithmetic is add/sub of a literal, scaled by the pointee stride.
+    expect_rejects("pointer division", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = load _p
+    %3 = const_i64 2
+    %4 = div %2, %3
+    store _q, %4 : ptr[int[64]]
+    call print, %4
+    return
+)", "pointer division does not exist");
+
+    expect_rejects("pointer comparison by lt/gt", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = load _p
+    %3 = const_i64 0
+    %4 = lt %2, %3
+    call print, %4
+    return
+)", "pointer");
+
+    expect_rejects("non-literal pointer offset", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = const_i64 3
+    store i, %2 : int[64]
+    %3 = load i
+    %4 = load _p
+    %5 = add %4, %3
+    store _q, %5 : ptr[int[64]]
+    return
+)", "a pointer offset must be a literal");
+
+    expect_rejects("pointer offset that is not a multiple of the stride", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = load _p
+    %3 = const_i64 4
+    %4 = add %2, %3
+    store _q, %4 : ptr[int[64]]
+    return
+)", "not a multiple of the pointee stride");
+
+    // Pointers do not cross the function header: the header records a kind and
+    // a width but no pointee, so a passed or returned pointer would degrade.
+    expect_rejects("pointer parameter", R"(
+function __main__():
+block0:
+    return
+function helper(_p: ptr[int[64]]):
+block1:
+    return
+)", "cannot be a ptr");
+
+    expect_rejects("pointer return type", R"(
+function __main__():
+block0:
+    return
+function helper() -> ptr[int[64]]:
+block1:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    return %1
+)", "return type cannot be a ptr");
+
+    // A pointer to a container is refused where the pointee is still known.
+    expect_rejects("pointer to a container", R"(
+function __main__():
+block0:
+    store _p : ptr[list[int[64], 4]]
+    return
+)", "ptr pointees are int, float or bool only");
 
     if (failures) {
         std::printf("\n%d check(s) FAILED\n", failures);

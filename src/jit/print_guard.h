@@ -43,7 +43,7 @@
 
 namespace lithon::jit {
 
-enum class Kind : uint8_t { Unseen, Int, Bool, Float, Unknown };
+enum class Kind : uint8_t { Unseen, Int, Bool, Float, Ptr, Unknown };
 
 inline Kind join(Kind a, Kind b) {
     if (a == b) return a;
@@ -68,6 +68,7 @@ inline const char* kind_name(Kind k) {
         case Kind::Int:     return "int";
         case Kind::Bool:    return "bool";
         case Kind::Float:   return "float";
+        case Kind::Ptr:     return "a pointer";
         case Kind::Unknown: return "not provably int";
         case Kind::Unseen:  return "unresolved";
     }
@@ -86,6 +87,7 @@ inline Kind declared_kind(const std::string& type_kind) {
     if (type_kind == "int")   return Kind::Int;
     if (type_kind == "bool")  return Kind::Bool;
     if (type_kind == "float") return Kind::Float;
+    if (type_kind == "ptr")   return Kind::Ptr;
     return Kind::Unknown;                          // str, anything else
 }
 
@@ -130,6 +132,21 @@ struct Analysis {
         bool numeric_b = (b == Kind::Int || b == Kind::Float);
         if (numeric_a && numeric_b) return Kind::Float;
         return Kind::Unknown;   // bool operands: interpreter rejects them
+    }
+
+    // 4.4. Pointer arithmetic. Add/Sub of a pointer and an element-scaled
+    // integer keeps the pointer (the element scaling was already applied in
+    // the frontend, so the IR operates on byte offsets). Every other
+    // combination that mentions a pointer -- Mul with a pointer, a pointer
+    // times a pointer, Div/Mod -- is Unknown, which the typechecker rejects
+    // before codegen and the guard reports conservatively if it ever slips
+    // through as an unknown-operand complaint instead of a wrong print.
+    static Kind ptr_arith(lithon::ir::Op op, Kind a, Kind b) {
+        using lithon::ir::Op;
+        if (op != Op::Add && op != Op::Sub) return Kind::Unknown;
+        if (a == Kind::Ptr && b == Kind::Int) return Kind::Ptr;
+        if (a == Kind::Int && b == Kind::Ptr) return Kind::Ptr;
+        return Kind::Unknown;
     }
 
     void init(const lithon::ir::Module& m) {
@@ -245,19 +262,51 @@ struct Analysis {
                         raise(st.vals[in.result], Kind::Int);
                         break;
 
+                    // 4.4. addressof yields a pointer, which no value can ever
+                    // become Int/Float/Bool, so a raw pointer that reaches a
+                    // print is refused (tier0) instead of being formatted as a
+                    // number that the interpreter would not print. valueof turns
+                    // the pointer back into its pointee, whose kind comes from
+                    // the instruction's trailing suffix -- the typechecker has
+                    // already insisted that suffix is exactly the pointee.
+                    case Op::AddressOf:
+                        raise(st.vals[in.result], Kind::Ptr);
+                        break;
+                    case Op::ValueOf: {
+                        const Kind pointee = declared_kind(in.type_kind);
+                        raise(st.vals[in.result], pointee);
+                        break;
+                    }
+
                     case Op::Add: case Op::Sub: case Op::Mul:
                     // Mod is typed like Mul, NOT like Div: int % int stays int,
                     // so it must go through arith() unmodified. Routing it
                     // through the Div case would force every modulo result to
                     // Float and the native path would then take the double
                     // branch for `7 % 2`, which is 1 and not 1.0.
-                    case Op::Mod:
+                    //
+                    // 4.4. A pointer changes the answer: Add/Sub of a pointer
+                    // and an integer is a walk and stays a pointer, everything
+                    // else involving a pointer is refused. A progress in
+                    // pointer arithmetic is always an integer (the frontend
+                    // emits the scaled byte count), so Kind::Int on that side
+                    // is exactly what a surviving pointer needs.
+                    case Op::Mod: {
+                        const Kind k0 = val(st, in.args.at(0));
+                        const Kind k1 = val(st, in.args.at(1));
+                        const bool mention_ptr = (k0 == Kind::Ptr || k1 == Kind::Ptr);
                         raise(st.vals[in.result],
-                              arith(val(st, in.args.at(0)), val(st, in.args.at(1))));
+                              mention_ptr ? ptr_arith(in.op, k0, k1)
+                                          : arith(k0, k1));
                         if (final_pass) check_arith_operands(st, block, in, verdict);
                         break;
+                    }
                     case Op::Div: {
-                        Kind k = arith(val(st, in.args.at(0)), val(st, in.args.at(1)));
+                        const Kind k0 = val(st, in.args.at(0));
+                        const Kind k1 = val(st, in.args.at(1));
+                        Kind k = (k0 == Kind::Ptr || k1 == Kind::Ptr)
+                                     ? ptr_arith(in.op, k0, k1)
+                                     : arith(k0, k1);
                         raise(st.vals[in.result],
                               k == Kind::Unseen ? k
                               : (k == Kind::Unknown ? k : Kind::Float));

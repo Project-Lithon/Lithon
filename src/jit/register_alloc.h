@@ -78,18 +78,32 @@ inline PromotionMap select_promoted_variables(
     // compute an address from it, which is exactly the "address-as-value" bug
     // that #2 above names. Excluded here, before ranking, so no container can
     // reach a register by any path.
-    auto is_container = [&](const std::string& name) {
-        for (const auto& b : fn.blocks)
-            for (const auto& in : b.instrs)
+    //
+    // 4.3. A dict is in the same position, and more so: its storage is three
+    // regions, so a promoted dict would have no single address to compute from
+    // at all.
+    //
+    // 4.4. A variable whose ADDRESS is taken is excluded for the same reason
+    // Index excludes a list: the pointer is a frame address, and a promoted
+    // variable has no slot to point at. `variable_offset` -- which AddressOf
+    // lowers to -- is only meaningful for a variable that stayed in memory.
+    auto kept_in_memory = [&](const std::string& name) {
+        bool addressed = false;
+        for (const auto& b : fn.blocks) {
+            for (const auto& in : b.instrs) {
                 if (in.op == Op::Store && in.name == name &&
-                    (in.type_kind == "list" || in.type_kind == "tuple"))
+                    (in.type_kind == "list" || in.type_kind == "tuple" ||
+                     in.type_kind == "dict"))
                     return true;
-        return false;
+                if (in.op == Op::AddressOf && in.name == name) addressed = true;
+            }
+        }
+        return addressed;
     };
 
     std::vector<std::pair<std::string, double>> ranked;
     for (const auto& kv : weight) {
-        if (kv.second > 2.0 && !is_container(kv.first)) ranked.push_back(kv);
+        if (kv.second > 2.0 && !kept_in_memory(kv.first)) ranked.push_back(kv);
     }
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
         return a.second != b.second ? a.second > b.second : a.first < b.first;
@@ -128,6 +142,12 @@ inline PromotionMap select_phi_registers(const lithon::ir::Function& fn,
     }
     return phis;
 }
+
+// 4.3. Only float[64] has a value path, so a dict of narrower floats is
+// rejected for the same reason a container of them is. Keys have the same
+// constraint in reverse: a key is compared and hashed as an integer, and a
+// 4-byte float key has no way to be loaded as one.
+inline bool float_stride_supported(int width) { return width == 64; }
 
 // 4.1. Storage size in bytes of one container element, i.e. sizeof(T). This is
 // the single definition of the stride shared by the frame layout (here), the SIB
@@ -211,6 +231,14 @@ public:
         return container_capacity_.count(name) != 0;
     }
 
+    // 4.3. A dict is a container for every purpose that matters here, in
+    // particular for being kept out of register promotion. It is not one run of
+    // slots, so element_offset and container_stride are not meaningful for it and
+    // dict_layout is the only way to reach its storage.
+    bool is_dict(const std::string& name) const {
+        return dict_layouts_.count(name) != 0;
+    }
+
     int variable_offset(const std::string& name) const {
         auto it = variable_offsets_.find(name);
         return it != variable_offsets_.end() ? it->second : 0;
@@ -287,6 +315,44 @@ public:
         return variable_order_;
     }
 
+    // 4.3. A dict is three regions rather than one run, because a lookup has to
+    // reach the key array, the occupancy array and the value array by three
+    // independent addresses. Each region ascends from its own base for the same
+    // reason a container run does: SIB addressing only computes upward, so
+    // element 0 goes at the LOW address.
+    //
+    // This is public because codegen reads the layout directly. Six integers
+    // behind six accessors, taken separately at every use, is a way for a
+    // caller to mix up a key offset with a value offset, and those two are the
+    // pair where such a mistake still produces plausible output.
+    struct DictLayout {
+        int buckets = 0;
+        int keys_offset = 0;
+        int occupied_offset = 0;
+        int values_offset = 0;
+        int key_stride = 0;
+        int value_stride = 0;
+// 4.3. Two slots that belong to a lookup rather than to the table. The step
+        // count is what stops the walk if the occupancy array disagrees with the
+        // key array, and the key slot holds the key being searched for across
+        // every iteration of it. Neither is part of a region, and both exist
+        // because a probe has three values that have to stay live and there are
+        // only two scratch registers to keep them in.
+        int steps_offset = 0;
+        int key_slot_offset = 0;
+        int value_slot_offset = 0;
+        std::string key_kind;
+        std::string value_kind;
+        int key_width = -1;
+        int value_width = -1;
+    };
+
+    const DictLayout& dict_layout(const std::string& name) const {
+        static const DictLayout empty;
+        auto it = dict_layouts_.find(name);
+        return it == dict_layouts_.end() ? empty : it->second;
+    }
+
 private:
     const lithon::ir::Function& fn_;
     LivenessAnalysis liveness_;
@@ -298,6 +364,8 @@ private:
     // indexed by mistake.
     std::unordered_map<std::string, int> container_capacity_;
     std::unordered_map<std::string, int> container_stride_;
+
+    std::unordered_map<std::string, DictLayout> dict_layouts_;
     std::vector<std::string> variable_order_;
     std::vector<std::pair<Reg, int>> callee_saved_slots_;
     // Callee-saved registers the TEMPORARIES borrowed (they must survive a call,
@@ -372,6 +440,83 @@ private:
     // never both a register and a slot for the same variable (see the
     // class-level comment for why that would be dead weight, not just
     // stylistically wasteful).
+    // 4.3. Reserves a dict's three regions, or returns false if this variable is
+    // not a dict.
+    //
+    // Order matters and is the only reason this is not a loop over the regions:
+    // the frame cursor only moves DOWNWARD in 8-byte steps, and each region has
+    // to ASCEND from its own base. So a region is reserved by first parking the
+    // cursor below its whole size and then taking the cursor as the base. Doing
+    // the keys, then the occupancy array, then the values in that order means the
+    // three runs sit next to each other and cannot overlap.
+    bool assign_dict_slots(const std::string& name) {
+        const lithon::ir::Instr* decl = nullptr;
+        for (const auto& b2 : fn_.blocks)
+            for (const auto& in2 : b2.instrs)
+                if (in2.op == lithon::ir::Op::Store && in2.name == name &&
+                    in2.type_kind == "dict" && in2.args.empty())
+                    decl = &in2;
+        if (!decl) return false;
+
+        const int buckets = decl->type_width;
+        if (buckets <= 0)
+            throw std::logic_error("4.3: dict '" + name +
+                                   "' declared with a non-positive bucket count");
+        // The typechecker already rejects a count that is not a power of two,
+        // because the bucket is a mask. Re-checked here so hand-written IR gets
+        // the same refusal rather than a table whose lookups silently disagree.
+        if ((buckets & (buckets - 1)) != 0)
+            throw std::logic_error("4.3: dict '" + name +
+                                   "' bucket count must be a power of two, got " +
+                                   std::to_string(buckets));
+
+        DictLayout d;
+        d.buckets = buckets;
+        d.key_kind = decl->type_key_kind;
+        d.key_width = decl->type_key_width;
+        d.value_kind = decl->type_elem_kind;
+        d.value_width = decl->type_elem_width;
+        d.key_stride = container_element_stride(d.key_kind, d.key_width);
+        d.value_stride = container_element_stride(d.value_kind, d.value_width);
+        if (d.key_stride <= 0 || d.value_stride <= 0)
+            throw std::logic_error(
+                "4.3: dict '" + name + "' has key type " +
+                (d.key_kind.empty() ? std::string("<unknown>") : d.key_kind) +
+                " and value type " +
+                (d.value_kind.empty() ? std::string("<unknown>") : d.value_kind) +
+                ", and at least one of them has no packed frame representation");
+        if (d.value_kind == "float" && !float_stride_supported(d.value_width))
+            throw std::logic_error(
+                "4.3: dict '" + name + "' has float[" + std::to_string(d.value_width) +
+                "] values, but only float[64] values are implemented; a narrower "
+                "float needs a 4-byte value path, not just a 4-byte stride");
+
+        const auto reserve = [&](int bytes) {
+            const int slots = (bytes + 7) / 8;
+            for (int i = 0; i < slots; ++i) allocate_new_slot();
+            return next_slot_offset_;
+        };
+        d.keys_offset = reserve(buckets * d.key_stride);
+        // Occupancy is always one 8-byte slot per bucket, whatever the key width,
+        // because the marker is compared as a whole 8-byte value. A bool key
+        // packs to one byte and a separate marker keeps the two concerns apart:
+        // the key tells you WHAT is stored, the marker tells you IF anything is.
+        d.occupied_offset = reserve(buckets * 8);
+        d.values_offset = reserve(buckets * d.value_stride);
+        d.steps_offset = reserve(8);
+        d.key_slot_offset = reserve(8);
+        d.value_slot_offset = reserve(8);
+
+        // The bases are the container's identity for every later stage, so the
+        // name has to be findable. container_capacity_ is what is_container tests,
+        // which is what keeps a dict out of register promotion.
+        variable_offsets_[name] = d.keys_offset;
+        container_capacity_[name] = buckets;
+        container_stride_[name] = d.key_stride;
+        dict_layouts_[name] = d;
+        return true;
+    }
+
     void assign_variable_slots() {
         std::unordered_set<std::string> seen;
         auto assign_one = [&](const std::string& name) {
@@ -395,6 +540,13 @@ private:
                         elem_kind = in2.type_elem_kind;
                         elem_width = in2.type_elem_width;
                     }
+
+            // 4.3. A dict is found and laid out before the list path, because
+            // its storage is three regions and the list path's single stride is
+            // not meaningful for it. Reusing element_offset here would silently
+            // address bucket 0 of the key array for every element.
+            if (assign_dict_slots(name)) return;
+
             if (cap > 1) {
                 const int stride = container_element_stride(elem_kind, elem_width);
                 if (stride <= 0) {

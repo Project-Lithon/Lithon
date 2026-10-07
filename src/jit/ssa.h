@@ -268,8 +268,34 @@ inline std::unordered_set<std::string> promotable_variables(const lithon::ir::Fu
             }
 
     std::unordered_set<std::string> out;
+    // 4.3. A container declaration must never be promoted. It carries no value
+    // and is not one: it is the reservation of the frame a list, tuple or dict
+    // lives in, and the register allocator reads that reservation to lay the
+    // storage out. Promoting the declaration would delete the one instruction
+    // the layout is derived from, leaving every later access addressing a run
+    // that was never claimed.
     for (const auto& v : stored) {
         if (params.count(v)) continue;
+        bool is_container_decl = false;
+        for (const auto& b2 : fn.blocks)
+            for (const auto& in2 : b2.instrs)
+                if (in2.op == Op::Store && in2.name == v && in2.args.empty() &&
+                    (in2.type_kind == "list" || in2.type_kind == "tuple" ||
+                     in2.type_kind == "dict"))
+                    is_container_decl = true;
+        if (is_container_decl) continue;
+
+        // 4.4. A variable whose ADDRESS is taken must stay a memory slot for
+        // the same reason a container declaration does: AddressOf lowers to
+        // `variable_offset`, which only has meaning for a variable that has a
+        // frame home. Turning the variable into SSA values would delete the
+        // stores that reserve that home and leave every pointer into it
+        // addressing unclaimed frame.
+        bool addressed = false;
+        for (const auto& b2 : fn.blocks)
+            for (const auto& in2 : b2.instrs)
+                if (in2.op == Op::AddressOf && in2.name == v) addressed = true;
+        if (addressed) continue;
 
         // (1) every Load of v must be reached by a definition. Intra-block
         // ordering is respected: a store earlier in the block counts.

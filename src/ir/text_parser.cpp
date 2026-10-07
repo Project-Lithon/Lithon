@@ -73,7 +73,32 @@ struct ParsedType {
     int width = -1;
     std::string elem_kind;
     int elem_width = -1;
+
+    // 4.3. A dict carries a key type as well as a value type. The value is the
+    // pair above, so every existing reader of a dict's elements is already
+    // correct and does not need to learn about keys.
+    std::string key_kind;
+    int key_width = -1;
 };
+
+// Splits on commas that are not inside a subscript. `int[64], bool, 8` has a
+// comma inside int[64], and treating that one as a separator would read the
+// width as 64.
+static std::vector<std::string> split_top_level(const std::string& s) {
+    std::vector<std::string> parts;
+    size_t depth = 0;
+    size_t start = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '[') ++depth;
+        else if (s[i] == ']') --depth;
+        else if (s[i] == ',' && depth == 0) {
+            parts.push_back(trim(s.substr(start, i - start)));
+            start = i + 1;
+        }
+    }
+    parts.push_back(trim(s.substr(start)));
+    return parts;
+}
 
 // Index just past the `]` that closes the `[` at `open`, or npos.
 static size_t matching_close(const std::string& t, size_t open) {
@@ -99,9 +124,26 @@ ParsedType parse_type_string(const std::string& raw) {
         throw std::runtime_error("malformed type annotation: " + raw);
 
     const std::string inner = trim(t.substr(bracket + 1, close - bracket - 1));
-    if (out.kind != "list" && out.kind != "tuple" && out.kind != "ptr") {
+    if (out.kind != "list" && out.kind != "tuple" && out.kind != "ptr" &&
+        out.kind != "dict") {
         // A scalar: `int[8]` -- width is a bit width.
         out.width = std::stoi(inner);
+        return out;
+    }
+
+    // 4.3. A dict is the one container with three fields, `K, V, N`, so it is
+    // split separately rather than by extending the two field path below.
+    if (out.kind == "dict") {
+        const std::vector<std::string> parts = split_top_level(inner);
+        if (parts.size() != 3)
+            throw std::runtime_error("malformed dict type annotation: " + raw);
+        const ParsedType k = parse_type_string(parts[0]);
+        const ParsedType v = parse_type_string(parts[1]);
+        out.key_kind = k.kind;
+        out.key_width = k.width;
+        out.elem_kind = v.kind;
+        out.elem_width = v.width;
+        out.width = parts[2].empty() ? -1 : std::stoi(parts[2]);
         return out;
     }
 
@@ -280,6 +322,8 @@ Module parse_ir_text(const std::string& text) {
             instr.type_width = pt.width;
             instr.type_elem_kind = pt.elem_kind;
             instr.type_elem_width = pt.elem_width;
+            instr.type_key_kind = pt.key_kind;
+            instr.type_key_width = pt.key_width;
             rhs = trim(rhs.substr(0, type_sep));
         }
 
@@ -335,6 +379,33 @@ Module parse_ir_text(const std::string& text) {
         } else if (oa.op_name == "Len") {
             instr.op = Op::Len;
             instr.name = oa.raw_args.at(0);
+        // 4.3. Dict ops. Same convention as the container ops above: the first
+        // argument is the dict VARIABLE, so it lands in `name` and only the key
+        // and the value are real operand references.
+        } else if (oa.op_name == "DictStore") {
+            instr.op = Op::DictStore;
+            instr.name = oa.raw_args.at(0);
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(2)));
+        } else if (oa.op_name == "DictIndex") {
+            instr.op = Op::DictIndex;
+            instr.name = oa.raw_args.at(0);
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+        } else if (oa.op_name == "DictContains") {
+            instr.op = Op::DictContains;
+            instr.name = oa.raw_args.at(0);
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+        // 4.4. Pointer ops. AddressOf names the target VARIABLE like the
+        // container ops; ValueOf's pointer arrives as a real operand ValueId.
+        // `%v = valueof %p : int[64]` already works: the generic trailing
+        // " : T" suffix is parsed before we get here and lands in the element
+        // pair, which is where ValueOf's pointee is expected.
+        } else if (oa.op_name == "addressof") {
+            instr.op = Op::AddressOf;
+            instr.name = oa.raw_args.at(0);
+        } else if (oa.op_name == "valueof") {
+            instr.op = Op::ValueOf;
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
         } else if (oa.op_name == "add") {
             instr.op = Op::Add;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
