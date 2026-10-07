@@ -786,7 +786,7 @@ rather than hiding the fact that a variable contains a raw address.
 
 | Feature               | CPython              | Cython / mypyc              | PyPy           | **Lithon**                |
 | :-------------------- | :------------------- | :-------------------------- | :------------- | :------------------------ |
-| Syntax                | Python               | Python                      | Python         | **Python-like**           |
+| Syntax                | Python               | Python                      | Python         | **Python with Extended PEP-526**           |
 | Primary execution     | Bytecode interpreter | C extensions                | Tracing JIT    | **Native x86-64**         |
 | Static typing         | No                   | Optional                    | No             | **Mandatory**             |
 | Fixed-width integers  | No                   | Possible                    | No             | **Built-in**              |
