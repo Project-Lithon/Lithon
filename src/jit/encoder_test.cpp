@@ -216,6 +216,26 @@ static int float_encoding_checks() {
                      {0xf2, 0x0f, 0x11, 0x05, 0x00, 0x00, 0x00, 0x00});
     }
 
+    // VEX.vvvv must read 1111 when an instruction has no first source operand.
+    // emit_vex3 stores ~vvvv, so "unused" is register 0 (kVexNoSource), not 0xF;
+    // 0xF stored 0000 (= ymm15), which objdump shows as (bad) and the CPU rejects
+    // with #UD (SIGILL). Expected bytes verified against GNU as.
+    {
+        CodeBuffer c;
+        emit_vmovdqu_ymm(c, Xmm::XMM0, Reg::RCX, 0, 4);
+        expect_bytes("vmovdqu ymm0, [rbp+rcx*4]", c, {0xc4, 0xe1, 0x7e, 0x6f, 0x44, 0x8d, 0x00});
+    }
+    {
+        CodeBuffer c;
+        emit_vmovdqu_ymm_mem(c, Xmm::XMM12, Reg::R8, -64, 4);
+        expect_bytes("vmovdqu [rbp+r8*4-64], ymm12", c, {0xc4, 0x21, 0x7e, 0x7f, 0x64, 0x85, 0xc0});
+    }
+    {
+        CodeBuffer c;
+        emit_vextracti128_ymm_xmm(c, Xmm::XMM3, Xmm::XMM7, 1);
+        expect_bytes("vextracti128 xmm3, ymm7, 1", c, {0xc4, 0xe3, 0x7d, 0x39, 0xfb, 0x01});
+    }
+
     if (failures) {
         std::fprintf(stderr, "FAIL: %d SSE2 encoding check(s) wrong\n", failures);
         return 1;

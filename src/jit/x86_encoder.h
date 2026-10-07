@@ -1157,6 +1157,14 @@ inline void emit_xorpd_zero(CodeBuffer& buf, Xmm reg) {
 
 enum : uint8_t { kVexPpNone = 0, kVexPp66 = 1, kVexPpF3 = 2, kVexPpF2 = 3 };
 
+// emit_vex3's `vvvv` argument is the first-source REGISTER NUMBER; the helper
+// stores it inverted. For an instruction with no first source the field must
+// read 1111 in the byte, i.e. the argument must be register 0 (~0 & 0xF). Passing
+// 0xF here stores 0000 -- "ymm15" -- which objdump decodes as (bad) and the CPU
+// rejects with #UD for every one-source op (vmovdqu, vpbroadcastd, vextracti128,
+// vpshufd, vmovd).
+constexpr uint8_t kVexNoSource = 0;
+
 inline void emit_vex3(CodeBuffer& buf, uint8_t map, bool wide, uint8_t pp,
                       bool r_ext, bool x_ext, bool b_ext, uint8_t vvvv) {
     emit_u8(buf, 0xC4);
@@ -1253,7 +1261,7 @@ inline void emit_vpxor_xmm(CodeBuffer& buf, Xmm d, Xmm s1, Xmm s2) {
 inline void emit_vmovdqu_ymm(CodeBuffer& buf, Xmm dst, Reg index, int32_t disp,
                              int stride = 4) {
     emit_vex3(buf, 1, true, kVexPpF3, xmm_is_extended(dst),
-              reg_is_extended(index), false, 0xF);
+              reg_is_extended(index), false, kVexNoSource);
     emit_u8(buf, 0x6F);
     emit_sib_disp(buf, static_cast<Reg>(xmm_low3(dst)), index,
                   checked_sib_scale(stride), disp);
@@ -1262,7 +1270,7 @@ inline void emit_vmovdqu_ymm(CodeBuffer& buf, Xmm dst, Reg index, int32_t disp,
 inline void emit_vmovdqu_ymm_mem(CodeBuffer& buf, Xmm src, Reg index, int32_t disp,
                                  int stride = 4) {
     emit_vex3(buf, 1, true, kVexPpF3, xmm_is_extended(src),
-              reg_is_extended(index), false, 0xF);
+              reg_is_extended(index), false, kVexNoSource);
     emit_u8(buf, 0x7F);
     emit_sib_disp(buf, static_cast<Reg>(xmm_low3(src)), index,
                   checked_sib_scale(stride), disp);
@@ -1279,7 +1287,7 @@ inline void emit_vmovdqu_ymm_mem(CodeBuffer& buf, Xmm src, Reg index, int32_t di
 // here: VEX has no such form (only EVEX does), so GNU as emits EVEX for it
 // and any VEX attempt would be wrong. Constants are always pool dwords.
 inline void emit_vpbroadcastd_rip(CodeBuffer& buf, Xmm dst) {
-    emit_vex3(buf, 2, true, kVexPp66, xmm_is_extended(dst), false, false, 0xF);
+    emit_vex3(buf, 2, true, kVexPp66, xmm_is_extended(dst), false, false, kVexNoSource);
     emit_u8(buf, 0x58);
     emit_u8(buf, static_cast<uint8_t>(0x05 | (xmm_low3(dst) << 3)));
     emit_disp32_le(buf, 0);
@@ -1290,7 +1298,7 @@ inline void emit_vpbroadcastd_rip(CodeBuffer& buf, Xmm dst) {
 inline void emit_vpbroadcastd_mem(CodeBuffer& buf, Xmm dst, Reg index,
                                   int32_t disp, int stride = 4) {
     emit_vex3(buf, 2, true, kVexPp66, xmm_is_extended(dst),
-              reg_is_extended(index), false, 0xF);
+              reg_is_extended(index), false, kVexNoSource);
     emit_u8(buf, 0x58);
     emit_sib_disp(buf, static_cast<Reg>(xmm_low3(dst)), index,
                   checked_sib_scale(stride), disp);
@@ -1306,7 +1314,7 @@ inline size_t vpbroadcastd_rip_disp_offset(CodeBuffer& buf) { return buf.size() 
 inline void emit_vextracti128_ymm_xmm(CodeBuffer& buf, Xmm dst_xmm, Xmm src_ymm,
                                       uint8_t imm) {
     emit_vex3(buf, 3, true, kVexPp66, xmm_is_extended(src_ymm), false,
-              xmm_is_extended(dst_xmm), 0xF);
+              xmm_is_extended(dst_xmm), kVexNoSource);
     emit_u8(buf, 0x39);
     emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(src_ymm)),
                                static_cast<Reg>(xmm_low3(dst_xmm))));
@@ -1320,7 +1328,7 @@ inline void emit_vextracti128_ymm_xmm(CodeBuffer& buf, Xmm dst_xmm, Xmm src_ymm,
 // Verified: vpshufd xmm9,xmm8,0xB1 = C4 41 79 70 C8 B1.
 inline void emit_vpshufd_xmm(CodeBuffer& buf, Xmm dst, Xmm src, uint8_t imm) {
     emit_vex3(buf, 1, false, kVexPp66, xmm_is_extended(dst), false,
-              xmm_is_extended(src), 0xF);
+              xmm_is_extended(src), kVexNoSource);
     emit_u8(buf, 0x70);
     emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(dst)),
                                static_cast<Reg>(xmm_low3(src))));
@@ -1336,7 +1344,7 @@ enum : uint8_t { kVpshufdSwapPairs = 0x4E, kVpshufdSwapHalves = 0xB1 };
 // vmovd r10d,xmm15 = C4 41 79 7E FA.
 inline void emit_vmovd_xmm_to_r32(CodeBuffer& buf, Reg dst32, Xmm src) {
     emit_vex3(buf, 1, false, kVexPp66, xmm_is_extended(src), false,
-              reg_is_extended(dst32), 0xF);
+              reg_is_extended(dst32), kVexNoSource);
     emit_u8(buf, 0x7E);
     emit_u8(buf, modrm_reg_reg(static_cast<Reg>(xmm_low3(src)), dst32));
 }
