@@ -4,17 +4,15 @@
 
 # Lithon
 
-### Python-like syntax. Static types. Native x86-64 execution.
+### Native execution for typed Python.
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen?style=flat-square\&logo=github-actions)](https://github.com/Project-Lithon/lithon/actions)
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-20-00599C?style=flat-square\&logo=c%2B%2B)](https://en.cppreference.com/w/cpp/20)
 [![Architecture](https://img.shields.io/badge/arch-x86--64-red?style=flat-square)](https://en.wikipedia.org/wiki/X86-64)
-[![Typing](https://img.shields.io/badge/typing-mandatory%20static-green?style=flat-square)](#-static-typing)
+[![Typing](https://img.shields.io/badge/typing-extended%20static-green?style=flat-square)](#-static-typing)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
-**Lithon is an experimental Python-native programming language and compiler
-that brings mandatory static typing, native x86-64 execution, and explicit
-low-level memory access to the Python ecosystem.**
+**Lithon is an experimental Python library and native x86-64 JIT that brings extended static typing, native execution, and explicit low-level memory access to Python code.**
 
 </div>
 
@@ -28,36 +26,27 @@ low-level memory access to the Python ecosystem.**
 
 ## 🚀 What is Lithon?
 
-Lithon is a **Python-like, statically typed programming language implemented
-as a Python package**, with a custom native execution engine written in C++20.
+Lithon is a **Python library and native execution engine** that runs `.py`
+source code using an extended **PEP-526-style static typing syntax**.
 
-The goal is simple:
+Lithon is designed to keep Python's familiar source-code model while giving
+the compiler explicit type information that can be used for static verification,
+native machine-code generation, and predictable execution.
 
-> **Keep Python's expressive syntax while giving the programmer explicit
-> control over types, memory representation, and native machine-code execution.**
+Lithon is **not a separate programming language**. Python remains the source
+language and `.py` remains the source format. Lithon extends the typing
+information available to the compiler so that supported Python code can be
+lowered to native x86-64 machine code.
 
-Lithon does not attempt to be a drop-in replacement for Python. It deliberately
-chooses a more constrained model in exchange for predictability and native
-execution.
+For example:
 
-A Lithon program is statically verified before native execution. Values have
-explicit, fixed-width types such as `int[8]`, `int[16]`, `int[32]`, `int[64]`,
-`float[64]`, `bool`, and typed pointers such as `ptr[int[16]]`.
+```python
+x: int[64] = 10
+y: int[64] = 20
 
-For code that cannot currently be proven safe for the native tier, Lithon can
-fall back to its Tier-0 interpreter when using automatic execution.
+result: int[64] = x + y
 
-With `--strict`, Lithon refuses programs that cannot be compiled natively.
-
-```text
-Python-like source
-       │
-       ▼
- Static type / flow verification
-       │
-       ├── proven native-safe ──► x86-64 machine code ──► CPU
-       │
-       └── unsupported ─────────► Tier-0 interpreter
+print(result)
 ```
 
 ### Current status
@@ -78,8 +67,9 @@ drop-in Python replacement.
 
 Lithon is built around several principles:
 
-* **Python-like syntax** — familiar syntax without requiring Python's dynamic
-  execution model.
+* **Python source with extended PEP-526 typing** — Lithon works directly with
+  `.py` source while providing additional type information to the native
+  execution pipeline.
 * **Mandatory static typing** — types are verified before execution.
 * **Fixed-width values** — integer widths are explicit.
 * **Native execution** — supported programs can execute as generated x86-64
@@ -89,7 +79,7 @@ Lithon is built around several principles:
 * **Interpreter fallback** — unsupported native cases can still execute through
   Tier-0 when using automatic mode.
 * **Explicit unsafe memory access** — pointer variables require an `_` prefix.
-* **Compiler refusal over silent miscompilation** — when Lithon cannot prove
+* **JIT/Compiler refusal over silent miscompilation** — when Lithon cannot prove
   something, the native tier refuses it.
 
 The last point is fundamental to the project:
@@ -283,7 +273,7 @@ Lithon currently spans four implementation layers:
 
 ```mermaid
 graph TD
-    A[Python-like Lithon Source] --> B[Frontend]
+    A[Python .py Source] --> B[Frontend]
     B --> C[Typed IR]
     C --> D[Static Flow Verification]
 
@@ -786,7 +776,7 @@ rather than hiding the fact that a variable contains a raw address.
 
 | Feature               | CPython              | Cython / mypyc              | PyPy           | **Lithon**                |
 | :-------------------- | :------------------- | :-------------------------- | :------------- | :------------------------ |
-| Syntax                | Python               | Python                      | Python         | **Python with Extended PEP-526**           |
+| Syntax                | Python               | Python                      | Python         | **Python `.py` + Extended PEP-526**           |
 | Primary execution     | Bytecode interpreter | C extensions                | Tracing JIT    | **Native x86-64**         |
 | Static typing         | No                   | Optional                    | No             | **Mandatory**             |
 | Fixed-width integers  | No                   | Possible                    | No             | **Built-in**              |
@@ -801,8 +791,9 @@ Lithon is not intended to replace Python's enormous ecosystem.
 
 Instead, it explores a different point in the design space:
 
-> **What if a Python-like language made static types, fixed-width values,
-> native execution, and low-level memory access first-class features?**
+> **What if Python code could retain its familiar source model while giving the
+> execution engine explicit static types, fixed-width values, native execution,
+> and controlled low-level memory access?**
 
 ---
 
@@ -892,8 +883,8 @@ than CPython, PyPy, Cython, Rust, or C++.
 
 ## 📍 Current Known Limitations
 
-Lithon is powerful on its supported subset, but it is still an experimental
-compiler.
+Lithon is powerful on its supported subset, but its native execution engine is
+still experimental.
 
 Current limitations include:
 
@@ -907,7 +898,7 @@ Current limitations include:
 * Some SSA/native paths remain opt-in or have known unsupported cases.
 * There is no production AOT compiler yet.
 * The PyPI package has **not yet received its stable public release**.
-* The language is not intended to be a drop-in CPython replacement.
+* Lithon is not intended to be a drop-in CPython replacement.
 
 When the compiler cannot prove a construct is supported, it should refuse the
 native tier rather than silently produce questionable machine code.
@@ -996,13 +987,11 @@ Lithon is entering its **community-preview stage**.
 
 If you are interested in:
 
-* programming-language design
 * compiler construction
 * JIT compilation
 * x86-64 machine-code generation
 * static analysis
 * SSA and register allocation
-* low-level Python-like languages
 * systems programming
 
 then feedback, experiments, bug reports, and technical criticism are welcome.
@@ -1017,6 +1006,6 @@ especially valuable.
 
 Lithon is released under the [MIT License](LICENSE).
 
-> **Python-like at the surface. Native at the core. Explicit by design.**
+> **Native execution for typed Python. Explicit by design.**
 
 </div>
