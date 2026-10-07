@@ -2,7 +2,7 @@ import { qs } from "./dom.js";
 import { initSite } from "./site.js";
 
 const QUICKSTART_COMMANDS: readonly string[] = [
-  "git clone https://github.com/MotherOfProgrammers/Lithon.git",
+  "git clone https://github.com/Project-Lithon/lithon.git",
   "cd Lithon",
   "cmake -B build -DCMAKE_BUILD_TYPE=Release",
   "cmake --build build -j$(nproc)",
@@ -12,7 +12,7 @@ const QUICKSTART_COMMANDS: readonly string[] = [
 
 const FEEDBACK_MS = 1600;
 
-const REPO = "MotherOfProgrammers/Lithon";
+const REPO = "Project-Lithon/Lithon";
 const CONTRIBUTORS_API = `https://api.github.com/repos/${REPO}/contributors?per_page=30`;
 const CONTRIBUTORS_GRAPH = `https://github.com/${REPO}/graphs/contributors`;
 const CONTRIBUTOR_LIMIT = 8;
