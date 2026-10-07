@@ -410,10 +410,10 @@ block0:
 
     // ---- 4.4 pointers ----
 
-    // A raw pointer is unprintable in both tiers: the typechecker refuses the
-    // source, and if it ever got past that the guard must still refuse to run
-    // native on a print of an address. This is the "a pointer" kind_name.
-    expect("print of a raw pointer is refused", R"(
+    // A raw pointer prints as a hexadecimal address in both tiers, so the guard
+    // lets it run native (Kind::Ptr is what picks the hex format over the
+    // decimal one an int gets). This used to be refused; it pins the reversal.
+    expect("print of a raw pointer is native-safe (prints as hex)", R"(
 function main():
 block0:
     %0 = const_i64 5
@@ -423,7 +423,23 @@ block0:
     %2 = load _p
     call print, %2
     return
-)", false);
+)", true);
+
+    // Pointer arithmetic keeps the Ptr kind, so a printed `p + 1` is hex too and
+    // not a decimal int.
+    expect("print of pointer arithmetic is native-safe (still a pointer)", R"(
+function main():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    store _p, %1 : ptr[int[64]]
+    %2 = load _p
+    %3 = const_i64 8
+    %4 = add %2, %3
+    call print, %4
+    return
+)", true);
 
     // valueof turns the pointer back into its pointee, which is provably an int
     // and therefore native-safe exactly like any other int print.

@@ -54,7 +54,7 @@
 // so looking values up by id against the pre-optimization module stays
 // correct after optimize_function rewrites a private copy). A provably-
 // Bool argument prints True/False; a provably-Int argument prints as a
-// decimal. Anything else (float, or a join of incomparable kinds) throws,
+// decimal; a provably-Ptr argument prints as 0x<hex>. Anything else (float, or a join of incomparable kinds) throws,
 // so a caller either doesn't reach this compiler at all (tier_runner's
 // guard already refused it) or gets a clear, specific error (lithon_jit,
 // which has no guard) instead of silently mis-printing a float as a
@@ -64,6 +64,11 @@ namespace lithon::jit {
 
 namespace {
 static const char kIntPrintFormat[] = "%lld\n";
+// A pointer prints as a hexadecimal address, "0x" + lowercase hex with no
+// padding -- what C's %p does on glibc and Rust's {:p} does. Spelled out rather
+// than using %p because %p is implementation-defined (MSVC zero-pads it and
+// omits the 0x), and both tiers must agree on the bytes.
+static const char kPtrPrintFormat[] = "0x%llx\n";
 // No format specifiers, so these are passed directly as printf's sole
 // argument (its "format string") -- safe since printf treats a string
 // with no '%' as a literal, and it saves marshalling a second argument.
@@ -2467,6 +2472,13 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                                 materialize_into(abi::kArgRegs[1], arg);
                                 emit_mov_reg_imm(code, abi::kArgRegs[0],
                                     reinterpret_cast<int64_t>(kIntPrintFormat));
+                            } else if (k == Kind::Ptr) {
+                                // Same shape as the int path -- the pointer is
+                                // already a 64-bit address in a GP register --
+                                // with the hex format. AL stays 0 below.
+                                materialize_into(abi::kArgRegs[1], arg);
+                                emit_mov_reg_imm(code, abi::kArgRegs[0],
+                                    reinterpret_cast<int64_t>(kPtrPrintFormat));
                             } else {
                                 // Unresolved or mixed kind -- not float, which is
                                 // handled above. There is no format to fall back to
@@ -2478,7 +2490,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                                 // reinterpretation of a double.
                                 throw std::runtime_error(
                                     "compile_module: print() argument is not provably "
-                                    "int, bool or float (kind: " + std::string(kind_name(k)) +
+                                    "int, bool, float or ptr (kind: " + std::string(kind_name(k)) +
                                     "); native cannot choose a format for it");
                             }
                             emit_mov_reg_imm(code, kR, reinterpret_cast<int64_t>(&std::printf));

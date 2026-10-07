@@ -1061,6 +1061,20 @@ block0:
     return
 )");
 
+    // print() of the pointer itself (not the pointee) is allowed: it prints the
+    // address in hex, like C's %p / Rust's {:p}.
+    expect_accepts("print of a ptr prints its address", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[16]
+    %1 = addressof x
+    store _p, %1 : ptr[int[16]]
+    %2 = load _p
+    call print, %2
+    return
+)");
+
     expect_accepts("float and bool pointees", R"(
 function __main__():
 block0:

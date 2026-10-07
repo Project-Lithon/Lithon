@@ -706,10 +706,13 @@ private:
         }
         LType t;
         if (!reg_type(instr.args.at(0), t)) return;
-        static const std::unordered_set<std::string> allowed = {"int", "float", "str", "bool"};
+        // 4.4. ptr[T] prints as a hexadecimal address (0x7ffd...), the way C's
+        // %p and Rust's {:p} do. It is an address, not the pointee: print(p)
+        // shows where, print(valueof(p)) shows what.
+        static const std::unordered_set<std::string> allowed = {"int", "float", "str", "bool", "ptr"};
         if (allowed.find(t.kind) == allowed.end()) {
             error("print() does not accept " + type_str(t) + " -- V1_SPEC 0.6.9's closed "
-                  "overload set is int[N], float[N], str[N], bool only");
+                  "overload set is int[N], float[N], str[N], bool and ptr[T] only");
         }
     }
 

@@ -263,12 +263,13 @@ struct Analysis {
                         break;
 
                     // 4.4. addressof yields a pointer, which no value can ever
-                    // become Int/Float/Bool, so a raw pointer that reaches a
-                    // print is refused (tier0) instead of being formatted as a
-                    // number that the interpreter would not print. valueof turns
-                    // the pointer back into its pointee, whose kind comes from
-                    // the instruction's trailing suffix -- the typechecker has
-                    // already insisted that suffix is exactly the pointee.
+                    // become Int/Float/Bool. A print of it is formatted as a
+                    // hexadecimal address by both tiers (Kind::Ptr is what
+                    // tells them apart from an int, which prints in decimal).
+                    // valueof turns the pointer back into its pointee, whose
+                    // kind comes from the instruction's trailing suffix -- the
+                    // typechecker has already insisted that suffix is exactly
+                    // the pointee.
                     case Op::AddressOf:
                         raise(st.vals[in.result], Kind::Ptr);
                         break;
@@ -445,12 +446,17 @@ struct Analysis {
         // Int and Bool are native-safe, and so is Float: the JIT formats a
         // provably-float value with host_format_double(), which reproduces
         // CPython's shortest-roundtrip repr, so the bytes match what the
-        // interpreter prints. A join of incomparable kinds is still refused.
-        if (k != Kind::Int && k != Kind::Bool && k != Kind::Float) {
+        // interpreter prints. Ptr is native-safe too: both tiers print it as
+        // 0x<hex>. The FORMAT matches; the number does not -- the interpreter
+        // hands out synthetic addresses, the JIT prints real frame addresses --
+        // so a program that prints a pointer is not byte-comparable across
+        // tiers (see tools/run_tier_diff.py). A join of incomparable kinds is
+        // still refused.
+        if (k != Kind::Int && k != Kind::Bool && k != Kind::Float && k != Kind::Ptr) {
             verdict->native_safe = false;
             verdict->reasons.push_back(where + ": print argument %" +
                 std::to_string(in.args[0]) + " is " + kind_name(k) +
-                "; native print() cannot format it (only int, bool and float are supported)");
+                "; native print() cannot format it (only int, bool, float and ptr are supported)");
         }
     }
 };

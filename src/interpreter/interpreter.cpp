@@ -1,9 +1,11 @@
 #include "interpreter.h"
 #include "runtime/value.h"
 #include "jit/float_runtime.h"
+#include "jit/print_guard.h"
 #include "dict_hash.h"
 
 #include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -324,6 +326,32 @@ LithonValue apply_bitop(Op op, LithonValue lhs, LithonValue rhs) {
     }
 }
 
+// Per-function, per-value kinds from the SAME whole-module analysis the JIT
+// uses to choose a print format (print_guard.h). A pointer is a plain int in
+// this interpreter, so the value alone cannot say "print me in hex"; the static
+// kind does, and sharing the analysis keeps both tiers agreeing on which prints
+// are pointers. Set for the duration of run_main.
+const std::vector<std::vector<lithon::jit::Kind>>* g_value_kinds = nullptr;
+
+bool print_arg_is_ptr(const Module& module, const Function& fn, lithon::ir::ValueId id) {
+    if (!g_value_kinds || module.functions.empty()) return false;
+    if (&fn < module.functions.data() || &fn >= module.functions.data() + module.functions.size())
+        return false;
+    const size_t fi = static_cast<size_t>(&fn - module.functions.data());
+    if (fi >= g_value_kinds->size()) return false;
+    const auto& kinds = (*g_value_kinds)[fi];
+    return id < kinds.size() && kinds[id] == lithon::jit::Kind::Ptr;
+}
+
+// 0x<lowercase hex>, no padding -- byte-for-byte what the JIT's "0x%llx\n"
+// prints (compile_function.h kPtrPrintFormat).
+void do_print_ptr(LithonValue v) {
+    if (!v.is_int()) throw std::runtime_error("interpreter: print() of a pointer that is not an address");
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "0x%llx", static_cast<unsigned long long>(v.as_int()));
+    std::cout << buf << "\n";
+}
+
 void do_print(LithonValue v) {
     if (v.is_bool())        std::cout << (v.as_bool() ? "True" : "False") << "\n";
     else if (v.is_int())    std::cout << v.as_int() << "\n";
@@ -573,7 +601,9 @@ LithonValue execute_function(const Module& module, const Function& fn,
                 }
                 case Op::Call: {
                     if (instr.name == "print") {
-                        do_print(frame.get_reg(instr.args.at(0)));
+                        const lithon::ir::ValueId arg = instr.args.at(0);
+                        if (print_arg_is_ptr(module, fn, arg)) do_print_ptr(frame.get_reg(arg));
+                        else do_print(frame.get_reg(arg));
                         break;
                     }
                     const Function* callee = find_function(module, instr.name);
@@ -638,6 +668,9 @@ void run_main(const Module& module) {
     if (!main_fn) {
         throw std::runtime_error("interpreter: no '__main__' or 'main' function in module");
     }
+    const auto kinds = lithon::jit::infer_value_kinds(module);
+    g_value_kinds = &kinds;
+    struct Reset { ~Reset() { g_value_kinds = nullptr; } } reset;
     execute_function(module, *main_fn, {});
 }
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lithon"
-version = "0.1.0"
+version = "0.8.0"
 description = "Zero-dependency C++ execution engine and JIT compiler for Python"
 readme = "README.md"
 requires-python = ">=3.10"
