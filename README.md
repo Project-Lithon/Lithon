@@ -56,7 +56,7 @@ print(result)
 The compiler is already executing substantial typed programs natively and has
 a verification suite covering machine-code encoding, ABI correctness, static
 analysis, SSA, register allocation, floating point, containers, pointers,
-differential testing, and randomized fuzzing.
+AVX2 auto-vectorization, differential testing, and randomized fuzzing.
 
 It is **not yet a stable production library** and should not be treated as a
 drop-in Python replacement.
@@ -436,8 +436,8 @@ The verification suite checks several independent layers.
 
 | Area                                 |         Current result        |
 | :----------------------------------- | :---------------------------: |
-| CTest                                |       **31 / 31 passed**      |
-| x86-64 encoder comparisons           |        **8,951 cases**        |
+| CTest                                |       **32 / 32 passed**      |
+| x86-64 encoder comparisons           |        **9,239 cases**        |
 | Incorrect encoder cases              |             **0**             |
 | Typed differential fuzzing           |      **300 / 300 passed**     |
 | Bitwise / shift fuzzing              |      **200 / 200 passed**     |
@@ -447,6 +447,8 @@ The verification suite checks several independent layers.
 | ABI stack/callee-saved failures      |             **0**             |
 | Typed regression suite               |       **15 / 15 passed**      |
 | General regression suite             |       **23 / 23 passed**      |
+| SIMD vectorizer loop cases           |        **6 / 6 passed**      |
+| SIMD vectorizer gate + fallback      |        **verified**          |
 
 The full verification gate concludes:
 
@@ -461,8 +463,8 @@ The hand-written x86-64 encoder is compared against GNU `as`.
 Current comparison:
 
 ```text
-8951 instruction cases
-7661 byte-identical
+9239 instruction cases
+7949 byte-identical
 1290 different but valid encodings
 0 incorrect encodings
 ```
@@ -639,6 +641,7 @@ Current components include:
 * loop strength reduction
 * accumulator unrolling
 * optional floating-point reassociation
+* AVX2 auto-vectorization of int32 loop bodies (CPUID-gated scalar fallback)
 
 ### Direct Phi support
 
@@ -677,6 +680,46 @@ native --ffast-math-equivalent  1.0
 
 This behavior is intentional and documented rather than hidden behind a generic
 "optimization" switch.
+
+---
+
+## ⚡ SIMD Auto-Vectorization
+
+The native backend can fuse a canonical elementwise or reduction loop over a
+fixed-capacity `int[32]` list into **8-wide AVX2** lanes.
+
+The compiler recognizes the range-loop shape the `while`/`for` lowering
+produces — a small rotatable header (`i < N`), a straight-line body with a
+single element read/write and one integer op, and a `i = i + 1` latch — and
+replaces it with:
+
+* a **CPUID gate** (`has_avx2()`), read from an int32 constant pool appended
+  to the module;
+* an 8-wide **vector main loop** of `vmovdqu` / `vpaddd` | `vpsubd` |
+  `vpmulld` over `N - N%8` elements (reductions run a `vpxor` +
+  `vextracti128` + `vpshufd` halving merge);
+* a scalar **tail** for the last `N%8` elements;
+* the untouched **scalar header as a fallback**, so on any host without AVX2
+  the exact scalar code path still runs.
+
+Key properties:
+
+* The vector slices are byte-for-byte what the encoder emits and
+  `check_encoder_vs_as.py` verifies; the unit test re-encodes the register
+  core and proves the bytes are present, and absent from the scalar build.
+* 32-bit lanes are **exact** for every program the typechecker accepts: only
+  `int[32]` lists vectorize, so no wider-than-lane math can be reordered into
+  a different overflow.
+* Reductions are recognized only when the accumulator really is `int[32]`
+  (verified from IR width annotations), so the 32-bit lane adds and the
+  horizontal merge re-widen exactly.
+* `vzeroupper` is emitted before any `Call` or `Return` in a function that
+  used the vector path (audited by `check_vex_transitions.py`).
+* `--no-vectorize` disables the pass; it also needs loop rotation, so
+  `--no-rotate` disables it too (the fallback header is the rotated back edge).
+
+A loop the recognizer cannot prove safe is left scalar — the vectorizer
+refuses rather than guesses.
 
 ---
 
@@ -861,6 +904,9 @@ than CPython, PyPy, Cython, Rust, or C++.
 * [x] Differential testing
 * [x] Randomized compiler fuzzing
 * [x] CPU feature detection
+* [x] VEX instruction encoding
+* [x] AVX2 / SIMD vectorization
+* [x] SIMD reductions
 
 ### Phase II — AOT
 
@@ -873,9 +919,6 @@ than CPython, PyPy, Cython, Rust, or C++.
 
 * [ ] Direct syscall emission
 * [ ] Expanded raw-memory operations
-* [ ] VEX instruction encoding
-* [ ] AVX2 / SIMD vectorization
-* [ ] SIMD reductions
 * [ ] Expanded native FFI
 * [ ] ARM64 backend
 
@@ -896,6 +939,9 @@ Current limitations include:
 * Pointer values have strict restrictions around function boundaries and
   container access.
 * Some SSA/native paths remain opt-in or have known unsupported cases.
+* AVX2 vectorized code is emitted and byte-verified everywhere, but it is only
+  *executed* on hosts that report AVX2; on other hosts the CPUID gate always
+  takes the scalar fallback, so vector execution itself is not exercised there.
 * There is no production AOT compiler yet.
 * The PyPI package has **not yet received its stable public release**.
 * Lithon is not intended to be a drop-in CPython replacement.

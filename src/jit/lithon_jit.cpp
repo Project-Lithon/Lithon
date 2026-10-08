@@ -68,13 +68,14 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--no-lsr")) options.strength_reduce = false;
         else if (!std::strcmp(argv[i], "--accum-unroll")) options.accum_unroll = 4;
         else if (!std::strcmp(argv[i], "--no-accum-unroll")) options.accum_unroll = 1;
+        else if (!std::strcmp(argv[i], "--no-vectorize")) options.vectorize = false;
         else if (!std::strcmp(argv[i], "--ffast-math-equivalent")) options.ffast_math_equivalent = true;
         else path = argv[i];
     }
     if (path.empty()) {
         std::cerr << "usage: lithon_jit <ir_file> [--dump-hex] [--stats]\n"
                      "                  [--no-opt] [--no-promote] [--no-rotate] [--unroll=N]\n"
-                     "                  [--no-lsr] [--accum-unroll] [--unroll-diamonds]\n"
+                     "                  [--no-lsr] [--accum-unroll] [--unroll-diamonds] [--no-vectorize]\n"
                      "       --strict turns the print-guard's findings (a value that is not\n"
                      "       provably int/bool/float, e.g. a variable stored both an int and a\n"
                      "       float) from warnings into a hard error. Default: warn, then compile.\n"

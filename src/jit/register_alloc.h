@@ -260,6 +260,11 @@ public:
 
     const PromotionMap& promoted() const { return promoted_; }
 
+    // The block-level live sets this allocator was built from. The
+    // vectorizer reads them to prove its ymm scratch registers are not live
+    // at a loop header before it clobbers them.
+    const LivenessAnalysis& liveness() const { return liveness_; }
+
     // 2.8. How many merges ended up sharing a dead source's register, so the
     // copy that edge would have emitted was elided instead. Zero is a normal
     // answer, not a failure: a merge fed by a constant has nothing to share.

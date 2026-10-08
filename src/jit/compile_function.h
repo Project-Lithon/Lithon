@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 #include "dict_hash.h"
+#include "cpu_features.h"
 #include "float_runtime.h"
 #include "ir/ir.h"
 #include "jit_abi.h"
@@ -154,6 +155,27 @@ struct CompileOptions {
     // work around by round-tripping through memory, and it is why a direct
     // emitter needs no parallel-copy resolution pass at all.
     bool direct_phis = false;
+    // 4.5. SIMD auto-vectorization of canonical int[32] loops (AVX2, 8 lanes):
+    // rewrites "for i in 0..N: xs[i] = ys[i] + c" (and the same with the
+    // constant in x, or Sub/Mul, and the sibling reduction "acc += ys[i]") into
+    // a vector main loop over N/8 iterations of a ymm, a scalar tail for the
+    // N%8 remainder, and a scalar fallback gated on a compile-time snapshot of
+    // cpu_features::has_avx2(). The gate is a hoisted byte load + test, not a
+    // function call, so an AVX2-less host pays one cache hit and one branch.
+    //
+    // Off when there is no CPUID-disciplined reason to believe the bytes will
+    // execute, but the option itself only controls whether the pass runs: the
+    // ymm block is ALWAYS emitted whenever the pass fires (so --dump-hex /
+    // objdump can prove the instruction selection on any host), and it is
+    // executed only when the compile-time has_avx2() gate agrees that this
+    // machine can. Interpreter parity is automatic because the interp runs the
+    // original scalar IR and the tail + fallback reproduce the scalar results
+    // exactly (32-bit lane arithmetic wraps like the scalar adds).
+    //
+    // Requires rotate_loops (the back edge reuses the gate as its header) and
+    // is refused when ssa_pipeline/direct_phis are on (hand-written IR only
+    // goes through the SSA rewrite, not vectorization).
+    bool vectorize = true;
 };
 
 struct CompiledModule {
@@ -166,6 +188,11 @@ struct CompiledModule {
     // that memory. Empty for every module with no float constants,
     // which is all pre-float code.
     std::vector<uint64_t> float_pool;
+    // 4.5. The int32 constant pool: byte 0 is the AVX2 gate flag (the
+    // compile-time cpu_features::has_avx2 snapshot), bytes 1.. are the
+    // broadcast dwords of every 32-bit elementwise constant the vectorizer
+    // emitted. RIP-relative loads are resolved against it during compile.
+    std::vector<uint8_t> int_pool;
     // 2.5 accounting: how many resolved Phi copies became register moves and
     // how many there were. They differ only when the callee-saved pool ran out,
     // or when a merge carried a double (a GP register cannot hold one), so
@@ -487,6 +514,72 @@ inline bool match_diamond_unroll(const lithon::ir::Function& fn,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// 4.5. AVX2 auto-vectorization: shape recognition.
+//
+// The recognizer matches the one loop shape Lithon's frontend emits for a
+// straight-line elementwise or reduction loop and returns enough about it to
+// regenerate the block as ymm code. It runs against a function's blocks AFTER
+// the optimizer, so the canonical shapes below are what survives fold + DCE +
+// LSR for the loops the frontend lowers:
+//
+//   header (bi):        %iv = load i ; <bound> ; %t = lt %iv, %bound ;
+//                       branch %t, B, E
+//   body (bi+1):        <loop body instrs> ; store i, i+1 ; jump header
+//   exit (elsewhere):   ...
+//
+// matching `for i in range(N) / while i < N` where i is zeroed immediately
+// before the header and stepped by 1 in the latch. The body must be exactly
+// one of:
+//
+//   elementwise:  %v = Index ys, %ik ; %r = %v {add,sub,mul} c ;
+//                 IndexStore xs, %ik, %r
+//   reduction:    %v = Index ys, %ik ; %r = add acc, %v ; store acc, %r
+//
+// The two index operands need not be the same ValueId (codegen emits a fresh
+// `load i` per use); they must both be loads of the loop variable and are
+// otherwise ignored, because the emitted code counts its own induction register.
+//
+// Every precondition here is a correctness gate, not a tuning knob: index
+// arithmetic and 32-bit lane wrap are only exact because the typechecker
+// bounds each int[32] result (an overflowing int32 sum is refused at the
+// source, so the wrapped lane sum equals the 64-bit scalar sum for every
+// program the typechecker accepts). Changing one of these checks to allow a
+// wider loop shape through is a semantic change, not an optimisation.
+struct VectorLoop {
+    size_t header = 0;
+    size_t body = 0;
+    std::string iv_name;       // the loop induction variable (frame/ promoted slot)
+    std::string read_name;     // list read (Index source)
+    std::string write_name;    // list written (IndexStore target); == read for reduction
+    int64_t arith_const = 0;   // the int32 constant of the elementwise op
+    lithon::ir::Op arith = lithon::ir::Op::Add;
+    bool const_first = false;  // Add only: `c + %v` instead of `%v + c`
+    bool is_reduction = false;
+    std::string acc_name;      // reduction: the accumulator variable
+    size_t capacity = 0;       // bound == capacity of both lists (== N)
+};
+
+// True when at least one `store <name>` in the function carries an int[32]
+// annotation and no store to the variable ever names a different width. A
+// bare value that is never annotated is NOT accepted -- the reduction merge
+// is only provably exact when the accumulator's declared width is 32 bits
+// (the typechecker guarantees the final sum fits, so lanes cannot wrap).
+inline bool variable_is_int32(const lithon::ir::Function& fn,
+                              const std::string& name) {
+    using lithon::ir::Op;
+    bool saw_32 = false;
+    for (const auto& b : fn.blocks)
+        for (const auto& in : b.instrs) {
+            if (in.name != name) continue;
+            if (in.type_width != -1) {
+                if (in.type_width != 32) return false;
+                if (in.op == Op::Store) saw_32 = true;
+            }
+        }
+    return saw_32;
+}
+
 } // namespace detail
 
 inline CompiledModule compile_module(const lithon::ir::Module& module,
@@ -523,6 +616,26 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
         size_t pool_index;    // which entry of float_pool it wants
     };
     std::vector<PendingFloatPoolRef> pending_float_pool_refs;
+
+    // 4.5. The int32 constant pool, appended once after the last function,
+    // just before the double pool. Byte 0 is the CPUID gate flag (0 or 1,
+    // the compile-time snapshot of cpu_features::has_avx2); the following
+    // bytes hold the broadcast dwords of every elementwise constant, deduped
+    // by exact pattern. The gate loads byte 0 and the vpbroadcastd forms
+    // load dwords at 1 + 4*i, so a reference is (disp_offset, byte offset,
+    // tail) resolved against the pool's final position like the doubles.
+    // `tail` is the number of bytes AFTER the disp32 before the
+    // instruction ends (1 for `cmp byte [rip+i], imm8`, 0 for
+    // `vpbroadcastd`), because a RIP-relative displacement is measured
+    // from the end of the whole instruction, not from the end of the disp.
+    std::vector<uint8_t> int_pool;
+    std::unordered_map<int32_t, size_t> int_pool_index_;
+    struct PendingIntPoolRef {
+        size_t disp_offset;
+        size_t byte_offset;
+        size_t tail;
+    };
+    std::vector<PendingIntPoolRef> pending_int_pool_refs;
 
     // One source of truth for "this value is a double": the same Kind
     // lattice that gates print(). Codegen and the gate therefore cannot
@@ -1557,6 +1670,11 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
         size_t next_local = 0;
         auto new_local = [&]() { return next_local++; };
         auto bind_local = [&](size_t id) { local_offsets[id] = code.size(); };
+        // 4.5. Set by the vectorizer when it emits ymm code into this
+        // function; used to place vzeroupper before every call and return so
+        // an AVX2 host never transfers an upper-half ymm state into a callee
+        // or out through the epilogue (see tools/check_vex_transitions.py).
+        bool function_vex_used = false;
 
         // Emits block `bi`'s instructions. `next_label` is the label of the
         // block that will physically follow the emitted code (used to elide
@@ -2416,6 +2534,11 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     }
 
                     case Op::Call: {
+                        // 4.5. An AVX2 transition out of a ymm block into a
+                        // callee must first zero the ymm upper halves or the
+                        // callee's SSE works with stale state (and pays the
+                        // transition penalty on every entry).
+                        if (function_vex_used) emit_vzeroupper(code);
                         if (instr.name == "print") {
                             if (instr.args.size() != 1) {
                                 throw std::runtime_error(
@@ -2581,6 +2704,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                                 materialize_into(Reg::RAX, instr.args.at(0));
                             }
                         }
+                        if (function_vex_used) emit_vzeroupper(code);
                         for (const auto& saved : alloc.callee_saved_slots()) {
                             emit_load_rbp_offset(code, saved.first, saved.second);
                         }
@@ -2600,6 +2724,448 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
         auto emit_block_body = [&](size_t bi, const std::string& next_label, unsigned flags,
                                    detail::LocalBranch lb = detail::LocalBranch{}) {
             emit_block_body_fn(bi, next_label, flags, lb);
+        };
+
+        // ------------------------------------------------------------------
+        // 4.5. AVX2 auto-vectorizer.
+        //
+        // Recognises the single canonical loop shape the frontend lowers a
+        // `for i in range(N) / while i < N`-style elementwise or reduction
+        // loop into, and grows its header into:
+        //
+        //     block_offset[header] = gate:  cmp byte [rip+flag], 0
+        //                                     jz  L_fallback     (non-AVX2 host)
+        //     <vector main loop, N/8 iters of one ymm>
+        //     <scalar tail, N%8 iters>                         (wr == 0 when N%8==0)
+        //     <merge + store, for a reduction>
+        //     store iv, N ; jmp exit
+        //     L_fallback: <the ORIGINAL scalar code, emitted with kAllowRotate>
+        //
+        // The body/latch blocks are NOT skipped: they are emitted by the main
+        // block loop in their normal position, so the fallback's rotated back
+        // edge and the exit join land exactly where they always would. The
+        // gate sits at block_offset[header], so the zeroing initialiser's
+        // `jump header` enters the gate, the non-AVX2 `jz` falls into the
+        // fallback, and an AVX2 host runs the ymm path and jumps to the exit.
+        //
+        // Returned bool: true when the header was consumed (caller must
+        // `continue` the block loop). Every failure declines to the scalar
+        // emitter below -- vectorization is never a correctness requirement.
+        std::unordered_map<lithon::ir::ValueId, const Instr*> value_def;
+        for (const auto& b : fn.blocks)
+            for (const auto& in : b.instrs)
+                if (in.result != kInvalidValue) value_def[in.result] = &in;
+        auto def_of = [&](lithon::ir::ValueId id) -> const Instr* {
+            auto it = value_def.find(id);
+            return it == value_def.end() ? nullptr : it->second;
+        };
+        auto use_count = [&](lithon::ir::ValueId id) -> size_t {
+            size_t n = 0;
+            for (const auto& b : fn.blocks)
+                for (const auto& in : b.instrs)
+                    for (auto a : in.args) if (a == id) ++n;
+            return n;
+        };
+        auto is_const = [&](const Instr* d) {
+            return d != nullptr && d->op == Op::ConstInt;
+        };
+
+        auto try_emit_vectorized =
+            [&](size_t bi, const std::string& next_label) -> bool {
+            using lithon::ir::Op;
+            const BasicBlock& header_block = fn.blocks[bi];
+
+            // The canonical head the frontend's while/for lowering keeps: a tiny
+            // rotatable header whose Branch enters the very next block (the
+            // body) on one edge and the loop exit on the other, with the body's
+            // back-edge Jump targeting the header. Anything else -- early
+            // exits, hidden side branches -- is declined.
+            if (!detail::is_rotatable_header(header_block)) return false;
+            if (bi + 1 >= fn.blocks.size()) return false;
+            const BasicBlock& body_block = fn.blocks[bi + 1];
+            const Instr& hbranch = header_block.instrs.back();
+            auto hbt = branch_targets(hbranch);
+            if (hbt.size() != 2 || hbt[0] != body_block.label) return false;
+            {
+                auto body_at = block_index.find(body_block.label);
+                if (body_at == block_index.end() || body_at->second != bi + 1) return false;
+            }
+            if (body_block.instrs.size() < 2 ||
+                body_block.instrs.back().op != Op::Jump) return false;
+            {
+                auto latch_at = block_index.find(body_block.instrs.back().name);
+                if (latch_at == block_index.end() || latch_at->second != bi) return false;
+            }
+            const std::string exit_label = hbt[1];
+            {
+                auto exit_at = block_index.find(exit_label);
+                if (exit_at == block_index.end()) return false;
+            }
+
+            // Induction variable and bound, named by the header's single Load and
+            // the compare that orders it below the loop limit.
+            std::string iv_name;
+            lithon::ir::ValueId bound_value = kInvalidValue;
+            {
+                lithon::ir::ValueId iv_id = kInvalidValue;
+                int loads = 0;
+                for (const auto& in : header_block.instrs) {
+                    if (in.op == Op::Load) { iv_id = in.result; iv_name = in.name; ++loads; }
+                }
+                if (loads != 1 || iv_name.empty()) return false;
+                const Instr* cond = nullptr;
+                for (const auto& in : header_block.instrs) {
+                    if (in.op == Op::Lt || in.op == Op::Gt) cond = &in;
+                }
+                if (cond == nullptr || cond->args.size() != 2) return false;
+                if (cond->op == Op::Lt && cond->args[0] == iv_id) {
+                    bound_value = cond->args[1];
+                } else if (cond->op == Op::Gt && cond->args[1] == iv_id) {
+                    bound_value = cond->args[0];
+                } else {
+                    return false;
+                }
+            }
+
+            // The bound must be exactly the walked list's capacity, so a full
+            // N-trip can be fused from an N/8 vector main loop and an N%8
+            // scalar tail with no per-trip length checks.
+            size_t N = 0;
+            const Instr* bound_def = def_of(bound_value);
+            if (bound_def != nullptr && bound_def->op == Op::ConstInt) {
+                const int64_t b = bound_def->int_imm;
+                if (b < 8) return false;
+                N = static_cast<size_t>(b);
+            } else if (bound_def != nullptr && bound_def->op == Op::Len) {
+                const int cap = alloc.container_capacity(bound_def->name);
+                if (cap < 8) return false;
+                N = static_cast<size_t>(cap);
+            } else {
+                return false;
+            }
+
+            // Common shape pieces, collected by one pass over the body.
+            detail::VectorLoop vl;
+            vl.header = bi;
+            vl.body = bi + 1;
+            vl.iv_name = iv_name;
+
+            const Instr* index_read = nullptr;  // the single Op::Index
+            const Instr* arith = nullptr;       // elementwise Add/Sub/Mul / reduction Add
+            const Instr* index_store = nullptr; // elementwise IndexStore
+            const Instr* store_acc = nullptr;   // reduction Store to the accumulator
+            const Instr* latch_store = nullptr; // the Store to the induction var
+            int n_idx = 0, n_arith = 0, n_istore = 0, n_store = 0;
+
+            // The latch store `Store iv, add(load iv, 1)` is itself part of the
+            // body scan and its increment is an Add, but it is the loop
+            // machinery, not the elementwise operation, so it must be found
+            // first and excluded here (then separately validated below).
+            for (const auto& in : body_block.instrs)
+                if (in.op == Op::Store && in.name == iv_name) {
+                    if (latch_store != nullptr) return false;   // two stores to iv
+                    latch_store = &in;
+                }
+            const lithon::ir::ValueId latch_inc_result =
+                latch_store != nullptr && latch_store->args.size() == 1
+                    ? latch_store->args.at(0)
+                    : kInvalidValue;
+            for (const auto& in : body_block.instrs) {
+                switch (in.op) {
+                    case Op::Load:
+                    case Op::ConstInt:
+                        break;
+                    case Op::Index: index_read = &in; ++n_idx; break;
+                    case Op::IndexStore: index_store = &in; ++n_istore; break;
+                    case Op::Store:
+                        ++n_store;
+                        if (in.name == iv_name) latch_store = &in;
+                        else store_acc = &in;
+                        break;
+                    case Op::Jump: break;   // the validated back edge
+                    case Op::Add: case Op::Sub: case Op::Mul:
+                        if (in.op == Op::Add && in.result == latch_inc_result) break;
+                        arith = &in;
+                        ++n_arith;
+                        break;
+                    default: return false;
+                }
+            }
+
+            // The body is self-contained: every argument it reads is produced by
+            // the body itself, so no header/previous value is missing on the
+            // vector path (which emits none of the body's temporaries) and the
+            // loads of a dead variable are exactly the induction/accumulator.
+            {
+                std::unordered_set<lithon::ir::ValueId> body_defs;
+                for (const auto& in : body_block.instrs)
+                    if (in.result != kInvalidValue) body_defs.insert(in.result);
+                for (const auto& in : body_block.instrs)
+                    for (auto a : in.args)
+                        if (!body_defs.count(a)) return false;
+            }
+
+            // The latch stores iv <- iv + 1, so 8 whole strides of the vector
+            // path always match 8 scalar iterations.
+            {
+                if (latch_store == nullptr || latch_store->args.size() != 1) return false;
+                const Instr* inc = def_of(latch_store->args.at(0));
+                if (inc == nullptr || inc->op != Op::Add) return false;
+                const Instr* a0 = def_of(inc->args[0]);
+                const Instr* a1 = def_of(inc->args[1]);
+                const bool c0 = is_const(a0) && a0->int_imm == 1;
+                const bool c1 = is_const(a1) && a1->int_imm == 1;
+                if (c0 == c1) return false;
+                const bool l0 = a0 != nullptr && a0->op == Op::Load && a0->name == iv_name;
+                const bool l1 = a1 != nullptr && a1->op == Op::Load && a1->name == iv_name;
+                if (l0 == l1) return false;   // exactly one is the iv
+            }
+
+            // The induction variable must be zeroed by the most recent prior
+            // store to it (the loop's initialiser). A loop entered with a
+            // mid-range value would otherwise silently process elements from 0
+            // to N instead of from the true start.
+            {
+                const Instr* ivstore = nullptr;
+                for (size_t b = 0; b <= bi; ++b)
+                    for (const auto& in : fn.blocks[b].instrs)
+                        if (in.op == Op::Store && in.name == iv_name) ivstore = &in;
+                if (ivstore == nullptr || ivstore->args.size() != 1) return false;
+                const Instr* v = def_of(ivstore->args.at(0));
+                if (v == nullptr || v->op != Op::ConstInt || v->int_imm != 0) return false;
+            }
+
+            // The list walk: one Op::Index whose index is the induction load and
+            // whose list is a fixed int32 container of exactly N elements.
+            if (index_read == nullptr || index_read->args.size() != 1) return false;
+            {
+                const Instr* read_idx = def_of(index_read->args[0]);
+                if (read_idx == nullptr || read_idx->op != Op::Load ||
+                    read_idx->name != iv_name) return false;
+            }
+            if (alloc.container_stride(index_read->name) != 4) return false;
+            const int rcap = alloc.container_capacity(index_read->name);
+            if (rcap <= 0 || static_cast<size_t>(rcap) != N) return false;
+
+            if (n_istore == 0) {
+                // ---------------------- reduction -------------------------
+                if (n_idx != 1 || n_arith != 1 || n_store != 2) return false;
+                if (arith == nullptr || arith->op != Op::Add) return false;
+                if (store_acc == nullptr || store_acc->name == iv_name ||
+                    store_acc->args.size() != 1) return false;
+                const std::string& acc = store_acc->name;
+                if (store_acc->args[0] != arith->result || use_count(arith->result) != 1)
+                    return false;
+                const Instr* a0 = def_of(arith->args[0]);
+                const Instr* a1 = def_of(arith->args[1]);
+                const bool acc0 = a0 != nullptr && a0->op == Op::Load && a0->name == acc;
+                const bool acc1 = a1 != nullptr && a1->op == Op::Load && a1->name == acc;
+                if (acc0 == acc1) return false;
+                const lithon::ir::ValueId elem_arg = acc0 ? arith->args[1] : arith->args[0];
+                if (elem_arg != index_read->result) return false;
+                // A 32-bit accumulator is required: sum lanes wrap at 32 bits and
+                // are re-widened exactly, which is only meaningful when the
+                // variable really is int32 (never when it is int64).
+                if (!detail::variable_is_int32(fn, acc)) return false;
+                for (const auto& in : body_block.instrs)
+                    if (in.op == Op::Load && in.name != iv_name && in.name != acc)
+                        return false;
+                vl.is_reduction = true;
+                vl.acc_name = acc;
+                vl.read_name = index_read->name;
+                vl.write_name = index_read->name;
+            } else {
+                // ---------------------- elementwise -----------------------
+                if (n_idx != 1 || n_istore != 1 || n_arith != 1 || n_store != 1) return false;
+                if (index_store == nullptr || arith == nullptr) return false;
+                if (index_store->args.size() != 2 || index_store->args[1] != arith->result)
+                    return false;
+                {
+                    const Instr* store_idx = def_of(index_store->args[0]);
+                    if (store_idx == nullptr || store_idx->op != Op::Load ||
+                        store_idx->name != iv_name) return false;
+                }
+                if (use_count(arith->result) != 1) return false;
+                const bool idx0 = arith->args[0] == index_read->result;
+                const bool idx1 = arith->args[1] == index_read->result;
+                if (idx0 == idx1) return false;
+                const Instr* cdef = idx0 ? def_of(arith->args[1]) : def_of(arith->args[0]);
+                if (!is_const(cdef)) return false;
+                const int64_t c = cdef->int_imm;
+                if (c < INT32_MIN || c > INT32_MAX) return false;
+                if (arith->op == Op::Sub && !idx0) return false;   // `c - v` unsupported
+                const int wcap = alloc.container_capacity(index_store->name);
+                if (wcap != rcap || alloc.container_stride(index_store->name) != 4)
+                    return false;
+                vl.is_reduction = false;
+                vl.arith = arith->op;
+                vl.arith_const = c;
+                vl.read_name = index_read->name;
+                vl.write_name = index_store->name;
+            }
+            vl.capacity = N;
+
+            // A function that uses any double at all is declined: proving the
+            // vector path interferes with nothing XMM is easier than spilling.
+            if (!float_values.empty()) return false;
+
+            // Liveness: the vector path clobbers RCX (the induction) and, for a
+            // reduction, RAX at the merge; it never honours a value parked in
+            // XMM0/XMM1 and never produces a body temp. Refuse any such value
+            // live at the header, and any body value live at the header (a
+            // loop-carried temp would never be produced) or at the exit (a body
+            // value the join reads).
+            {
+                const auto& live_h = alloc.liveness().live_in(bi);
+                bool clobber = false;
+                for (lithon::ir::ValueId v : live_h) {
+                    if (plan.virtual_temps.count(v)) continue;
+                    const ValueLocation& loc = alloc.temp_location(v);
+                    if (loc.in_register && (loc.reg == Reg::RCX ||
+                                            (vl.is_reduction && loc.reg == Reg::RAX)))
+                        clobber = true;
+                    if (alloc.float_in_register(v)) {
+                        const Xmm r = alloc.float_register(v);
+                        if (r == Xmm::XMM0 || r == Xmm::XMM1) clobber = true;
+                    }
+                    if (clobber) return false;
+                }
+                auto exit_at = block_index.find(exit_label);
+                const auto& live_exit = alloc.liveness().live_in(exit_at->second);
+                for (const auto& in : body_block.instrs) {
+                    if (in.result == kInvalidValue) continue;
+                    if (live_h.count(in.result) || live_exit.count(in.result)) return false;
+                }
+            }
+
+            // ------------------------------------------------------------------
+            // Emission. Register plan (all hard-wired; see the layout comment at
+            // the top of this file's vectorizer note):
+            //   RCX  = element index (main loop and tail)
+            //   kR   = M, then N (the per-phase loop bound)
+            //   kL   = tail element value / tail accumulator, 32-bit
+            //   YMM0 = the 8 lanes / the running reduction (merged at the end)
+            //   YMM1 = the broadcast constant (elementwise) / reduce scratch
+            //   RAX  = the merge's 32-bit sum before it is re-widened (reduction)
+            const int read_disp = alloc.element_offset(vl.read_name, 0);
+            const int write_disp =
+                vl.is_reduction ? read_disp : alloc.element_offset(vl.write_name, 0);
+            const size_t M = N - N % 8;
+            const size_t l_tail = new_local();
+            const size_t l_done = new_local();
+            const size_t l_fall = new_local();
+
+            function_vex_used = true;
+            if (int_pool.empty()) int_pool.push_back(cpu_features::has_avx2() ? 1 : 0);
+            emit_cmp_byte_rip_imm(code, 0);
+            pending_int_pool_refs.push_back({cmp_byte_rip_imm_disp_offset(code), 0, 1});
+            pending_locals.push_back({emit_jcc_rel32(code, Cond::Equal), l_fall});
+
+            if (!vl.is_reduction) {
+                emit_vpbroadcastd_rip(code, Xmm::XMM1);
+                const int32_t ival = static_cast<int32_t>(vl.arith_const);
+                size_t offset;
+                auto it = int_pool_index_.find(ival);
+                if (it != int_pool_index_.end()) {
+                    offset = it->second;
+                } else {
+                    offset = int_pool.size();
+                    int_pool_index_.emplace(ival, offset);
+                    for (int i = 0; i < 4; ++i)
+                        int_pool.push_back(static_cast<uint8_t>((ival >> (8 * i)) & 0xFF));
+                }
+                pending_int_pool_refs.push_back({vpbroadcastd_rip_disp_offset(code), offset, 0});
+            }
+
+            // Vector main loop: do-while over M/8 ymm chunks (M >= 8 by the
+            // N >= 8 gate above, so it is entered at least once).
+            emit_mov_reg_imm64(code, Reg::RCX, 0);
+            emit_mov_reg_imm64(code, kR, static_cast<int64_t>(M));
+            if (vl.is_reduction) emit_vpxor_reg(code, Xmm::XMM0, Xmm::XMM0, Xmm::XMM0);
+            bind_local(new_local());   // l_main
+            if (vl.is_reduction) {
+                emit_vpaddd_mem(code, Xmm::XMM0, Xmm::XMM0, Reg::RCX, read_disp, 4);
+            } else {
+                emit_vmovdqu_ymm(code, Xmm::XMM0, Reg::RCX, read_disp, 4);
+                switch (vl.arith) {
+                    case Op::Add: emit_vpaddd_reg(code, Xmm::XMM0, Xmm::XMM0, Xmm::XMM1); break;
+                    case Op::Sub: emit_vpsubd_reg(code, Xmm::XMM0, Xmm::XMM0, Xmm::XMM1); break;
+                    case Op::Mul: emit_vpmulld_reg(code, Xmm::XMM0, Xmm::XMM0, Xmm::XMM1); break;
+                    default: return false;
+                }
+                emit_vmovdqu_ymm_mem(code, Xmm::XMM0, Reg::RCX, write_disp, 4);
+            }
+            emit_add_reg_imm32(code, Reg::RCX, 8);
+            emit_cmp_reg_reg(code, Reg::RCX, kR);
+            pending_locals.push_back({emit_jcc_rel32(code, Cond::Less), l_tail});
+
+            // Scalar tail: the N%8 remaining elements, one per iteration.
+            bind_local(l_tail);
+            emit_mov_reg_imm64(code, kR, static_cast<int64_t>(N));
+            if (vl.is_reduction) emit_mov_reg_imm64(code, kL, 0);
+            {
+                const size_t l_head = new_local();
+                bind_local(l_head);
+                emit_cmp_reg_reg(code, Reg::RCX, kR);
+                pending_locals.push_back({emit_jcc_rel32(code, Cond::GreaterEq), l_done});
+                if (vl.is_reduction) {
+                    emit_add_reg_rbp_scaled(code, kL, Reg::RCX, read_disp, 4, /*wide=*/false);
+                } else {
+                    emit_load_rbp_scaled(code, kL, Reg::RCX, read_disp, 4);
+                    const int32_t c = static_cast<int32_t>(vl.arith_const);
+                    switch (vl.arith) {
+                        case Op::Add: emit_add_reg_imm32(code, kL, c); break;
+                        case Op::Sub: emit_sub_reg_imm32(code, kL, c); break;
+                        case Op::Mul: emit_imul_reg_reg_imm32(code, kL, kL, c); break;
+                        default: return false;
+                    }
+                    emit_store_rbp_scaled(code, kL, Reg::RCX, write_disp, 4);
+                }
+                emit_add_reg_imm32(code, Reg::RCX, 1);
+                pending_locals.push_back({emit_jmp_rel32(code), l_head});
+            }
+
+            // Merge a reduction: horizontal-reduce YMM0 to xmm0/eax, then add
+            // the tail's scalar sum and the accumulator's entry value, and store
+            // the widened result back to the accumulator's register or slot.
+            bind_local(l_done);
+            if (vl.is_reduction) {
+                emit_vextracti128_ymm_xmm(code, Xmm::XMM1, Xmm::XMM0, 1);
+                emit_vpaddd_xmm(code, Xmm::XMM0, Xmm::XMM0, Xmm::XMM1);
+                emit_vpshufd_xmm(code, Xmm::XMM1, Xmm::XMM0, kVpshufdSwapPairs);
+                emit_vpaddd_xmm(code, Xmm::XMM0, Xmm::XMM0, Xmm::XMM1);
+                emit_vpshufd_xmm(code, Xmm::XMM1, Xmm::XMM0, kVpshufdSwapHalves);
+                emit_vpaddd_xmm(code, Xmm::XMM0, Xmm::XMM0, Xmm::XMM1);
+                emit_vmovd_xmm_to_r32(code, Reg::RAX, Xmm::XMM0);
+                emit_add_reg_reg(code, Reg::RAX, kL);
+                if (alloc.variable_in_register(vl.acc_name)) {
+                    const Reg acc_reg = alloc.variable_reg(vl.acc_name);
+                    emit_add_reg_reg(code, Reg::RAX, acc_reg);
+                    emit_mov_reg_reg(code, acc_reg, Reg::RAX);
+                } else {
+                    emit_load_rbp_offset(code, kR, alloc.variable_offset(vl.acc_name));
+                    emit_add_reg_reg(code, Reg::RAX, kR);
+                    emit_store_rbp_offset(code, Reg::RAX, alloc.variable_offset(vl.acc_name));
+                }
+            }
+            // Leave the induction variable exactly where the scalar loop would:
+            // N, so any consumer after the join sees the same value.
+            if (alloc.variable_in_register(iv_name)) {
+                emit_mov_reg_imm64(code, alloc.variable_reg(iv_name), static_cast<int64_t>(N));
+            } else {
+                emit_mov_reg_imm64(code, kR, static_cast<int64_t>(N));
+                emit_store_rbp_offset(code, kR, alloc.variable_offset(iv_name));
+            }
+            pending_blocks.push_back({emit_jmp_rel32(code), exit_label});
+
+            // Scalar fallback: the untouched header. Its Branch falls into the
+            // body/latch blocks this function's block loop emits next in their
+            // normal positions, and its rotated back edge (kAllowRotate) retests
+            // and loops within those scalar copies.
+            bind_local(l_fall);
+            emit_block_body(bi, next_label, detail::kAllowRotate);
+
+            return true;
         };
 
         // Aggressive diamond unroll, planned before anything is emitted.
@@ -2680,6 +3246,15 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 continue;
             }
 
+            // 4.5. A canonical elementwise/reduction loop over a fixed-capacity
+            // int32 list gets the AVX2 treatment: gate + vector main loop +
+            // scalar tail (+ merge, for a reduction), then the untouched scalar
+            // header as the fallback, which rotates onto the body/latch blocks
+            // this loop emits next in their normal positions.
+            if (options.vectorize && options.rotate_loops) {
+                if (try_emit_vectorized(bi, next_label)) continue;
+            }
+
             // Unrolling: header H immediately precedes body B, H's branch
             // enters B or leaves the loop, and B is simple straight-line
             // code ending in `jump H`. Emit U copies of B, each followed
@@ -2737,6 +3312,24 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
         resolve_jump_patch(code, p.patch, it->second);
     }
 
+    // Append the int32 constant pool first (flag byte + broadcast dwords),
+    // then the double pool, and resolve all pending RIP-relative references.
+    // Each pending site recorded the offset of its own disp32; the rel32 is
+    // measured from the END of the disp32, so pool_base + byte_offset -
+    // (disp_offset + 4) is exactly the RIP-relative displacement. This leaves
+    // the code position-independent within the final mapping.
+    for (const auto& site : pending_int_pool_refs) {
+        const size_t pool_base = code.size();
+        const int64_t rel = static_cast<int64_t>(pool_base + site.byte_offset) -
+                            static_cast<int64_t>(site.disp_offset + 4 + site.tail);
+        if (rel < INT32_MIN || rel > INT32_MAX) {
+            throw std::runtime_error(
+                "compile_module: int32 constant pool is out of reach");
+        }
+        patch_u32_at(code, site.disp_offset, static_cast<uint32_t>(rel));
+    }
+    for (uint8_t byte : int_pool) code.push_back(byte);
+
     // Append the double constant pool to the code and resolve every
     // pending RIP-relative reference to it. Each pending site recorded
     // the offset of its own disp32 and the pool index it wants; now that
@@ -2767,6 +3360,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
     compiled.code = std::move(code);
     compiled.function_offset = std::move(function_offset);
     compiled.float_pool = std::move(float_pool);
+    compiled.int_pool = std::move(int_pool);
     compiled.phi_copies_in_registers = phi_copies_in_registers;
     compiled.phi_copies_direct = phi_copies_direct;
     compiled.phi_copies_total = phi_copies_total;

@@ -146,6 +146,61 @@ int main(int argc, char** argv) {
         check("avx512 cpuid, os limited: level avx", simd_level(f) == SimdLevel::Avx);
     }
 
+    // 4.5. The env override for scalar-fallback tests: LITHON_CPU_FEATURES
+    // must make a Haswell-looking host report an AVX2-less one (so the
+    // vectorizing pass's CPUID gate is forced off), and must do it by
+    // clearing the raw bits and recomputing the usable_* flags the same way
+    // a genuinely weaker CPU would -- a fake that only touched raw avx2
+    // would leave usable_avx true and fool has_avx2() into staying on.
+    {
+        const uint32_t haswell = SSE_BASELINE | ECX_OSXSAVE | ECX_AVX | ECX_FMA;
+        auto masked_avx2 = [&](std::string_view m) {
+            Features f = decode(haswell, EDX_SSE2, EBX_AVX2, 0, XCR0_AVX);
+            apply_feature_mask(f, m);
+            return f;
+        };
+        {
+            Features f = masked_avx2("avx2");
+            check("mask avx2: raw avx2 clear", !f.avx2);
+            check("mask avx2: usable_avx stays (scalar fallback must come from gate)", f.usable_avx);
+            check("mask avx2: simd_level == avx", simd_level(f) == SimdLevel::Avx);
+        }
+        {
+            Features f = masked_avx2("avx");
+            check("mask avx: raw avx clear", !f.avx);
+            check("mask avx: avx2 clears with its parent", !f.avx2);
+            check("mask avx: fma clears with its parent", !f.fma);
+            check("mask avx: usable_avx recomputed false", !f.usable_avx);
+            check("mask avx: simd_level == sse2", simd_level(f) == SimdLevel::Sse2);
+        }
+        {
+            Features f = masked_avx2("avx512");
+            check("mask avx512 on avx2 host: no-op for avx2", f.avx2 && f.usable_avx);
+        }
+        {
+            // A Skylake-X host masked down to AVX2 (the vectorizing pass's
+            // gate must fall back the same way a real AVX2 CPU does).
+            const uint32_t skx = SSE_BASELINE | ECX_OSXSAVE | ECX_AVX | ECX_FMA;
+            const uint32_t ebx = EBX_AVX2 | EBX_AVX512F | EBX_AVX512DQ | EBX_AVX512CD |
+                                 EBX_AVX512BW | EBX_AVX512VL;
+            Features f = decode(skx, EDX_SSE2, ebx, 0, XCR0_AVX512);
+            apply_feature_mask(f, "avx512");
+            check("mask avx512 on skx: avx512 all clear", !f.avx512f && !f.avx512dq &&
+                                                           !f.avx512bw && !f.avx512cd && !f.avx512vl);
+            check("mask avx512 on skx: usable_avx512 recomputed false", !f.usable_avx512);
+            check("mask avx512 on skx: avx2 survives for the gate", f.usable_avx && f.avx2);
+            check("mask avx512 on skx: simd_level == avx2", simd_level(f) == SimdLevel::Avx2);
+        }
+        {
+            // Whitespace and comma splits, and unknown tokens are ignored --
+            // a typo in the env var must degrade toward scalar, not crash.
+            Features f = masked_avx2("  avx2 , fma ");
+            check("mask '  avx2 , fma ': both clear", !f.avx2 && !f.fma);
+            Features g = masked_avx2("bogus");
+            check("mask 'bogus': nothing clears", g.avx2 && g.fma && g.usable_avx);
+        }
+    }
+
     std::printf("host detection\n");
 #if LITHON_CPU_FEATURES_X86
     const Features& f = get();

@@ -343,6 +343,26 @@ inline void emit_cmp_reg_rbp_offset(CodeBuffer& buf, Reg lhs, int32_t disp) {
     emit_disp32_le(buf, disp);
 }
 
+// cmp byte ptr [rip + disp32], imm8 -- 80 /7 ib with mod=00 rm=101.
+// The one-instruction hoisted CPUID gate the vectorizer uses:
+//
+//     cmp byte ptr [rip+flag], 0     ;  80 3D <rel32> 00
+//     jz  L_fallback                 ;  only AVX2 hosts run the ymm block
+//
+// REX is deliberately absent: the encoded form reads the RIP-relative base
+// without an extension, so adding REX would force mod=11 decoding and break
+// the memory operand. The immutable follows the disp32, so the displacement's
+// first byte sits at buf.size()-5; call cmp_byte_rip_imm_disp_offset()
+// immediately afterwards and patch the rel32 once the flag byte's position
+// in the pool is known (exactly as movsd_rip_disp_offset does for doubles).
+inline void emit_cmp_byte_rip_imm(CodeBuffer& buf, uint8_t imm) {
+    emit_u8(buf, 0x80);
+    emit_u8(buf, 0x3D);
+    emit_disp32_le(buf, 0);
+    emit_u8(buf, imm);
+}
+inline size_t cmp_byte_rip_imm_disp_offset(CodeBuffer& buf) { return buf.size() - 5; }
+
 
 // 4.1. Scaled-index forms of the two above: [rbp + disp + index*stride]. A list
 // element lives at base + i*stride, so with a RUNNING index the address cannot
@@ -424,6 +444,24 @@ inline void emit_sib_tail(CodeBuffer& buf, Reg data_reg, Reg index_reg, uint8_t 
     // SIB: scale, index=index_reg, base=RBP
     emit_u8(buf, static_cast<uint8_t>(scale | (reg_low3(index_reg) << 3) |
                                       reg_low3(Reg::RBP)));
+}
+
+// add dst, [rbp + disp + index*stride] -- the accumulator step of the
+// vectorizer's scalar tail loop. Opcode 03 /r (destination-register ADD,
+// the same shape emit_load_rbp_scaled uses for 8B). `wide` mirrors the mov
+// emitters' width contract: wide=false is `add r32d, [mem]`, whose result is
+// truncated to 32 bits exactly like the vector lanes, which is the width the
+// tail accumulator must match for the scalar merge to agree with the ymm sum.
+inline void emit_add_reg_rbp_scaled(CodeBuffer& buf, Reg dst, Reg index_reg,
+                                    int32_t disp, int stride = 8, bool wide = true) {
+    const bool rex_r = reg_is_extended(dst);
+    const bool rex_x = reg_is_extended(index_reg);
+    if (wide || rex_r || rex_x)
+        emit_u8(buf, static_cast<uint8_t>(0x40 | (wide ? 8 : 0) |
+                                         (rex_r ? 4 : 0) | (rex_x ? 2 : 0)));
+    emit_u8(buf, 0x03);
+    emit_sib_tail(buf, dst, index_reg, checked_sib_scale(stride));
+    emit_disp32_le(buf, disp);
 }
 
 // 4.1. Width-correct integer element access, scaled or not.

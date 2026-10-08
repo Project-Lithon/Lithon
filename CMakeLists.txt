@@ -66,6 +66,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|X86_64)$")
         compile_function_loop_test
         compile_function_diamond_test
         compile_function_unroll_shift_test
+        vectorize_test
         cpu_features_test
         compile_module_call_test
         compile_module_fib_test

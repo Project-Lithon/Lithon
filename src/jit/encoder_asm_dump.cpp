@@ -137,6 +137,17 @@ int main() {
                 { CodeBuffer b; emit_store_rbp_scaled(b, rd, ri, v);
                   line("mov qword ptr [rbp" + std::string(v < 0 ? "" : "+") +
                        std::to_string(v) + "+" + I + "*8], " + D, b); }
+                // The vectorizer's scalar tail accumulator. Both widths are
+                // listed so the 32-bit form -- which must NOT carry REX.W, or
+                // it would stop wrapping at lane width -- cannot drift back to
+                // the 64-bit one without the assembler comparison catching it.
+                { CodeBuffer b; emit_add_reg_rbp_scaled(b, rd, ri, v);
+                  line("add " + D + ", qword ptr [rbp" + std::string(v < 0 ? "" : "+") +
+                       std::to_string(v) + "+" + I + "*8]", b); }
+                { CodeBuffer b; emit_add_reg_rbp_scaled(b, rd, ri, v, 8, false);
+                  line("add " + std::string(R32[d]) + ", dword ptr [rbp" +
+                       std::string(v < 0 ? "" : "+") +
+                       std::to_string(v) + "+" + I + "*8]", b); }
             }
         }
     }

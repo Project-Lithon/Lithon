@@ -111,6 +111,18 @@ public:
 
     int instruction_count() const { return instruction_count_; }
 
+    // The value set live on entry to / exit from a block, indexed by block
+    // index (not RPO). These are the block-level results of the fixpoint --
+    // the same sets the register allocator reads -- exposed for a consumer
+    // (the vectorizer) that must prove a value clobbered by its own ymm code
+    // is not live across the loop it is rewriting.
+    const std::unordered_set<lithon::ir::ValueId>& live_in(size_t block) const {
+        return live_in_.at(block);
+    }
+    const std::unordered_set<lithon::ir::ValueId>& live_out(size_t block) const {
+        return live_out_.at(block);
+    }
+
     // Blocks in reverse postorder, as CFG block indices. Exposed so a caller
     // that builds its own ordering (IRC's move list, say) can reuse the
     // analysis's notion of execution order instead of inventing a second one.
