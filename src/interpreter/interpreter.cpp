@@ -472,6 +472,12 @@ LithonValue execute_function(const Module& module, const Function& fn,
                                                        zero_of_kind(instr.type_elem_kind));
                         break;
                     }
+                    // 0.6.10. A valueless scalar or pointer store is a
+                    // type-only declaration: the typechecker consumed it, so
+                    // there is no value to read into the variable and no
+                    // binding to create. Without this, args.at(0) below
+                    // throws on hand-written IR.
+                    if (instr.args.empty()) break;
                     frame.vars[instr.name] = frame.get_reg(instr.args.at(0));
                     break;
                 case Op::DictStore:

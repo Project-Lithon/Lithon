@@ -1152,6 +1152,16 @@ private:
                 return;
             }
             case Op::Store: {
+                // 0.6.10. `i = i + 1` (and its augmented spelling) lowers to
+                // load / const 1 / add / store, and that canonical loop
+                // increment is exempt from the value conversion check. The
+                // exemption has to sit before the annotation branch too: a
+                // declared counter now reaches here as an ANNOTATED store
+                // (`i: int[8]` ... `i = i + 1`), and re-checking the widened
+                // iadd result against the declared width would reject the
+                // counter. The load in the pattern already proved the name
+                // assigned, so skipping binds nothing new.
+                if (exempt_increment_stores_.count(&instr)) return;
                 if (instr.type_kind.empty()) {
                     auto it = scope.find(instr.name);
                     if (it == scope.end()) {
@@ -1170,9 +1180,6 @@ private:
                         }
                         error("'" + instr.name + "' is assigned without a type annotation "
                               "(V1_SPEC 0.6.1) -- write '" + instr.name + ": <type> = ...' first");
-                        return;
-                    }
-                    if (exempt_increment_stores_.count(&instr)) {
                         return;
                     }
                     check_value_into_target(instr.args.at(0), it->second,
@@ -1201,14 +1208,18 @@ private:
                         return;
                     }
                 }
-                // 4.4. A valueless pointer store would mean a null literal, which
-                // does not exist: `p: ptr[T]` with no value is a promise to point
-                // at something that never gets named.
-                if (instr.args.empty() && declared.is_ptr()) {
-                    error("'" + instr.name + "': a pointer must be given an addressof "
-                          "-- there is no null pointer in Lithon (4.4)");
+                // 0.6.10. A valueless store whose type is a SCALAR or a POINTER
+                // is a type-only declaration -- `i: int[8]` or `_p: ptr[T]`
+                // written with no value. The frontend consumes the declaration
+                // (it records the type and carries it into the first
+                // assignment's own annotation), so this instruction has no
+                // value to write and binds nothing: the name stays UNASSIGNED
+                // until a real store, and a read before that is the ordinary
+                // "not definitely assigned" (0.6.10). That is also what keeps
+                // a bare pointer from ever reading as null -- there is no null
+                // pointer in Lithon (4.4), only an unassigned one.
+                if (instr.args.empty() && (declared.is_ptr() || declared.is_scalar()))
                     return;
-                }
                 // 4.1. A valueless container store is a DECLARATION: it reserves
                 // storage and binds the name. Its shape was already validated
                 // above; there is no value to check into it, and running the

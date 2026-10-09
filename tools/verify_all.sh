@@ -81,6 +81,9 @@ fi
 step "type checker runs on EVERY module, annotated or not (no skip-the-checker gate)"
 python3 tools/check_typecheck_unconditional.py
 
+step "uninitialized declarations (0.6.10): accept/reject and byte-identical codegen"
+python3 tools/check_uninit_decls.py
+
 step "regression suites (interpreter oracle vs CPython) + typed suite"
 python3 tools/run_regression.py
 python3 tools/run_typed_regression.py

@@ -171,8 +171,41 @@ Unknown
 Guess
   │
   ▼
-Generate potentially incorrect machine code
+     Generate potentially incorrect machine code
 ```
+
+### Declaring without initializing
+
+A declaration may omit the initializer. `x:int[8]` introduces the name and its
+type without storing anything; the name starts **unassigned**:
+
+```python
+i:int[8]
+i = 5
+print(i)
+```
+
+This is accepted only where the name is definitely assigned before every read.
+Reading it first is refused:
+
+```text
+RCR error: 'i' is not definitely assigned here (V1_SPEC 0.6.10)
+```
+
+An assignment inside one branch of an `if` does not count after it unless the
+other branch assigns too, and a loop body never leaves a name assigned after the
+loop. The first assignment is still range-checked, and the declaration emits no
+code, so this generates exactly the same machine code as writing the initializer
+in the declaration:
+
+```python
+i:int[8]
+i = 5
+print(i)
+# same machine code as i:int[8] = 5 followed by print(i)
+```
+
+Re-declaring a name with a different type is refused: a name has one type.
 
 ---
 

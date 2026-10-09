@@ -1190,12 +1190,26 @@ block0:
     return
 )", "there is no null pointer");
 
-    expect_rejects("annotated pointer missing its addressof", R"(
+    // 0.6.10. A bare pointer declaration is a type-only declaration: it names
+    // the type and nothing else, so it is accepted. The name is UNASSIGNED,
+    // not null -- a read before the first addressof is the ordinary
+    // "not definitely assigned", exactly as for a scalar.
+    expect_accepts("a bare pointer declaration is a type-only declaration", R"(
 function __main__():
 block0:
     store _p : ptr[int[64]]
     return
-)", "must be given an addressof");
+)");
+
+    expect_rejects("a bare pointer read before its addressof is not assigned", R"(
+function __main__():
+block0:
+    store _p : ptr[int[64]]
+    %0 = load _p
+    %1 = valueof %0 : int[64]
+    call print, %1
+    return
+)", "not definitely assigned");
 
     // The underscore naming rule, enforced both ways on hand-written IR.
     expect_rejects("a pointer that does not start with '_'", R"(
@@ -1336,6 +1350,120 @@ block0:
     store _p : ptr[list[int[64], 4]]
     return
 )", "ptr pointees are int, float or bool only");
+
+    std::printf("typecheck: 0.6.10 uninitialized declarations\n");
+
+    // A type-only declaration on its own emits nothing and is accepted: no
+    // store, no zeroing, no machine code.
+    expect_accepts("type-only scalar declaration with no assignment", R"(
+function __main__():
+block0:
+    store i : int[8]
+    return
+)");
+
+    // The frontend's lowering of `i: int[8]; i = 5`: the declaration is a
+    // valueless scalar store and the first assignment carries the type.
+    expect_accepts("scalar declaration then first assignment", R"(
+function __main__():
+block0:
+    store i : int[8]
+    %0 = const_i64 5
+    store i, %0 : int[8]
+    %1 = load i
+    call print, %1
+    return
+)");
+
+    // A read before that first assignment is the ordinary 0.6.10 error.
+    expect_rejects("read before the first assignment", R"(
+function __main__():
+block0:
+    store i : int[8]
+    %0 = load i
+    call print, %0
+    return
+)", "not definitely assigned");
+
+    // The first assignment obeys the declared type's range (V1_SPEC 0.6.5).
+    expect_rejects("first assignment out of the declared range", R"(
+function __main__():
+block0:
+    %0 = const_i64 300
+    store i, %0 : int[8]
+    return
+)", "does not fit int[8]");
+
+    // A valueless scalar store is a declaration, not a binding: the frontend
+    // consumes it and annotates the first assignment, so a bare unannotated
+    // store after it is still the 0.6.1 error.
+    expect_rejects("unannotated store after a type-only declaration", R"(
+function __main__():
+block0:
+    store i : int[8]
+    %0 = const_i64 5
+    store i, %0
+    return
+)", "without a type annotation");
+
+    // Both arms assign it: assigned at the join.
+    expect_accepts("both arms assign the declared variable", R"(
+function __main__():
+block0:
+    store i : int[8]
+    %0 = const_i64 1
+    branch %0, block1, block2
+block1:
+    %1 = const_i64 5
+    store i, %1 : int[8]
+    jump block3
+block2:
+    %2 = const_i64 6
+    store i, %2 : int[8]
+    jump block3
+block3:
+    %3 = load i
+    call print, %3
+    return
+)");
+
+    // Only one arm assigns it: not definitely assigned at the join.
+    expect_rejects("only one arm assigns the declared variable", R"(
+function __main__():
+block0:
+    store i : int[8]
+    %0 = const_i64 1
+    branch %0, block1, block2
+block1:
+    %1 = const_i64 5
+    store i, %1 : int[8]
+    jump block3
+block2:
+    jump block3
+block3:
+    %3 = load i
+    call print, %3
+    return
+)", "not definitely assigned");
+
+    // An assignment inside a loop body does not count after the loop.
+    expect_rejects("a loop-body assignment does not escape the loop", R"(
+function __main__():
+block0:
+    store i : int[8]
+    jump block1
+block1:
+    %0 = const_i64 0
+    branch %0, block2, block3
+block2:
+    %1 = const_i64 5
+    store i, %1 : int[8]
+    jump block1
+block3:
+    %2 = load i
+    call print, %2
+    return
+)", "not definitely assigned");
 
     if (failures) {
         std::printf("\n%d check(s) FAILED\n", failures);

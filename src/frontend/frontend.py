@@ -308,6 +308,14 @@ class IRBuilder:
         self.var_types = {}
         self.ptr_types = {}
         self.ptr_names = set()
+        # 0.6.10. Every `name: T` written in this function, recorded as the raw
+        # parse_type_annotation tuple. An annotation-only declaration emits no
+        # store, so this is where the declaration lives: it is what lets a
+        # later plain `name = ...` carry the declared type into the IR (the
+        # checker range-checks the first assignment against it, 0.6.5) and
+        # what makes a second `name: OtherType` a re-declaration error. Since
+        # each function gets a fresh IRBuilder, this is per-function.
+        self.declared = {}
 
     def new_reg(self):
         r = self.reg_counter
@@ -808,6 +816,23 @@ class IRBuilder:
             val_reg = self.build_expr(val_node)
             self.emit(f"DictStore {name}, {key_reg}, {val_reg}")
 
+    def declared_suffix(self, name):
+        """The " : T" a plain `name = ...` store must carry for a name this
+        function declared as a SCALAR or a pointer, or "" for anything else.
+
+        Only those two kinds are baked in: their declarations emit no store of
+        their own, so the first assignment is the only place the checker can
+        see the type (0.6.5 range check, 0.6.10 definite assignment).
+        Containers declare themselves with a valueless store that already
+        carries the suffix, and re-assigning one goes through the checker's
+        unannotated path as before, so they are left alone."""
+        decl = self.declared.get(name)
+        if decl is None:
+            return ""
+        if decl[0] not in ("int", "float", "bool", "ptr"):
+            return ""
+        return render_type_suffix(*decl)
+
     def build_stmt(self, node):
         if isinstance(node, ast.AnnAssign):
             if not isinstance(node.target, ast.Name):
@@ -817,6 +842,22 @@ class IRBuilder:
                 parse_type_annotation(node.annotation)
             suffix = render_type_suffix(kind, width, elem_kind, elem_width,
                                         key_kind, key_width)
+            # 0.6.10. A name declares its type once per function. Writing a
+            # DIFFERENT type on a second declaration of the same name has no
+            # single answer for what the name holds, so it is refused here,
+            # where both declarations are visible in source order. Same type
+            # re-declaration is fine (it is how a name is re-opened, e.g. a
+            # tuple restart).
+            decl_key = (kind, width, elem_kind, elem_width, key_kind, key_width)
+            prev_decl = self.declared.get(name)
+            if prev_decl is not None and prev_decl != decl_key:
+                def spell(d):
+                    return render_type_suffix(*d).lstrip(" :") or "?"
+                raise NotImplementedError(
+                    f"`{name}` is re-declared with a different type: first "
+                    f"declared {spell(prev_decl)}, now {spell(decl_key)} -- "
+                    f"a name has one type (V1_SPEC 0.6.10)")
+            self.declared[name] = decl_key
             if kind == "tuple":
                 self.build_tuple_declaration(name, width, suffix, node.value)
                 return
@@ -833,13 +874,16 @@ class IRBuilder:
                         f"a pointer is named with a leading underscore, write "
                         f"`_{name}: ptr[...]` or pick a name that starts with "
                         f"'_' (4.4)")
-                if node.value is None:
-                    raise NotImplementedError(
-                        f"`{name}: ptr[...]` needs `= addressof(...)`: pointers "
-                        f"are born from addressof, there is no null pointer in "
-                        f"Lithon (4.4)")
                 self.ptr_names.add(name)
                 self.var_types[name] = (elem_kind, elem_width)
+                if node.value is None:
+                    # 0.6.10. A bare `_p: ptr[T]` is a legal declaration: it
+                    # names the type and emits nothing else, so _p starts
+                    # UNASSIGNED -- not null. There is still no null pointer
+                    # in Lithon: the first `_p = addressof(...)` is what
+                    # assigns it, and a read before that is the same
+                    # "not definitely assigned" error as for any scalar.
+                    return
                 value_reg = self.build_expr(node.value)
                 self.emit(f"store {name}, {value_reg}{suffix}")
                 return
@@ -855,9 +899,14 @@ class IRBuilder:
                 value_reg = self.build_expr(node.value)
                 self.emit(f"store {name}, {value_reg}{suffix}")
                 return
-            # An annotation-only declaration emits nothing for a SCALAR: the
-            # checker tracks the type from the annotation itself and there is no
-            # value to store yet.
+            # An annotation-only declaration emits nothing for a SCALAR: there
+            # is no value to store and no storage to reserve. The declaration
+            # itself lives in self.declared, and the FIRST plain `name = ...`
+            # below carries its type into the IR as the store's annotation --
+            # which is what makes `i: int[8]; i = 300` a 0.6.5 range error and
+            # a read before that assignment a 0.6.10 error, while the machine
+            # code of `i: int[8]; i = 5` stays byte-identical to
+            # `i: int[8] = 5`.
             #
             # A container is different and this is the subtle part. `xs:
             # list[int[64], 4]` with no value is not an empty declaration to be
@@ -908,7 +957,11 @@ class IRBuilder:
                     f"({', '.join(['1'] * len(node.value.elts))})` (4.2)")
             value_reg = self.build_expr(node.value)
             name = target.id
-            self.emit(f"store {name}, {value_reg}")
+            # A declared scalar or pointer carries its type here, so the first
+            # assignment after `x: T` is checked against T like an initializer
+            # would be -- while an undeclared name stays unannotated and keeps
+            # the "assigned without a type annotation" (0.6.1) refusal.
+            self.emit(f"store {name}, {value_reg}{self.declared_suffix(name)}")
             return
 
         if isinstance(node, ast.AugAssign):

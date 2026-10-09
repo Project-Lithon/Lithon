@@ -1957,6 +1957,13 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     }
                     break;
                 }
+                // 0.6.10. Any valueless store left after the container
+                // declarations above is a type-only scalar or pointer
+                // declaration: the typechecker consumed it, there is no
+                // value to write, and it must emit no machine code. It
+                // used to fall through to args.at(0) and throw on
+                // hand-written IR.
+                if (instr.args.empty()) break;
                 require_variable(instr.name, "store to");
                 if (is_float_value(value_kinds, instr.args.at(0))) {
                     Xmm src = read_float(instr.args.at(0));
