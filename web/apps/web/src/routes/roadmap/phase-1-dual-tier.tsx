@@ -131,9 +131,9 @@ function Phase1DualTier() {
             </p>
             <p>
               Emitted code is written into memory the operating system marked
-              executable — <code>mmap</code> with{" "}
+              executable, <code>mmap</code> with{" "}
               <code>PROT_READ | PROT_EXEC</code> on Linux,{" "}
-              <code>VirtualAlloc</code> on Windows — and entered through a
+              <code>VirtualAlloc</code> on Windows, and entered through a
               function pointer. Nothing about that requires a runtime library,
               which is where the zero-dependency claim comes from: the engine's{" "}
               <em>inputs</em> are a compiler and a text file, and its output is
@@ -153,7 +153,7 @@ $ objdump -D -b binary -mi386:x86-64 -M intel /tmp/n.bin | grep -c imul
               Emitted functions have to be callable by ordinary C code, which
               means SysV and Win64 both have to be right about callee-saved
               registers and stack alignment. The audit does not read the emitter
-              to decide this — it disassembles every emitted function and checks
+              to decide this: it disassembles every emitted function and checks
               alignment at each call and return.
             </p>
             <p>
@@ -202,7 +202,7 @@ $ objdump -D -b binary -mi386:x86-64 -M intel /tmp/n.bin | grep -c imul
               Every optimization is independently switchable, so its effect can
               be measured rather than assumed. The numbers below are from an
               Intel i3-3110M, twelve interleaved rounds on the CPU-time clock
-              with one core pinned — and differences under about five percent on
+              with one core pinned, and differences under about five percent on
               a shared machine are not meaningful.
             </p>
             <SpecTable
@@ -256,7 +256,7 @@ $ objdump -D -b binary -mi386:x86-64 -M intel /tmp/n.bin | grep -c imul
             <p>
               Two of those rows are opt-in for a reason rather than by caution.
               Accumulator splitting reassociates a float reduction, so the
-              native value stops being bit-identical to the interpreter's —
+              native value stops being bit-identical to the interpreter's,
               correct, but a different answer in the last bits, which the
               tier-diff gate would (correctly) flag. Diamond unrolling is
               implemented, correct and fuzzed, and measured <em>slower</em>: a
@@ -275,10 +275,10 @@ $ objdump -D -b binary -mi386:x86-64 -M intel /tmp/n.bin | grep -c imul
             <p>
               The memory-based JIT is being converted to SSA one phase at a
               time, each independently switchable. The IR keeps mutable
-              variables in memory — a variable is written by a{" "}
-              <code>Store</code> and read by a <code>Load</code>, exactly like a
-              spill slot — so promotion here means turning those into values
-              that live in registers.
+              variables in memory: a variable is written by a <code>Store</code>{" "}
+              and read by a <code>Load</code>, exactly like a spill slot, so
+              promotion here means turning those into values that live in
+              registers.
             </p>
             <SpecTable
               caption="Shipped phases"
@@ -300,8 +300,8 @@ $ objdump -D -b binary -mi386:x86-64 -M intel /tmp/n.bin | grep -c imul
                 [
                   "2.3",
                   <span key="3">
-                    Mem2Reg — promote what is promotable, place its phis,
-                    rewrite the loads and stores away · <code>ssa.h</code>
+                    Mem2Reg: promote what is promotable, place its phis, rewrite
+                    the loads and stores away · <code>ssa.h</code>
                   </span>,
                 ],
                 [
@@ -335,7 +335,7 @@ $ objdump -D -b binary -mi386:x86-64 -M intel /tmp/n.bin | grep -c imul
                 [
                   "2.8",
                   <span key="8">
-                    Register coalescing — a merge's destination adopts its
+                    Register coalescing: a merge's destination adopts its
                     source's dead register · both halves
                   </span>,
                 ],
@@ -355,7 +355,7 @@ $ objdump -D -b binary -mi386:x86-64 -M intel /tmp/n.bin | grep -c imul
               The guard that makes it safe is a single comparison:{" "}
               <code>last_use == the store</code>'s index means the source is
               dead the instant the copy retires, so the merge itself is the only
-              thing left wanting the register. Four conditions back it up — the
+              thing left wanting the register. Four conditions back it up: the
               source must be a real register, the merge must not outlive a call
               unless the register is callee-saved, no other value's range may
               touch the merge's extent, and two merges may not claim one
@@ -368,7 +368,7 @@ phi copies: 5 of 9 in registers`}</CodeBlock>
             <p>
               A shortfall there is the register budget, not a defect. A Phi copy
               gets a callee-saved register, of which there are five, and real
-              variables rank for them first by loop-depth weight — so a
+              variables rank for them first by loop-depth weight, so a
               merge-heavy program gets every copy in a register, while a
               function with more merges than registers keeps the memory path for
               the remainder. Still correct, just not yet free.
@@ -414,9 +414,9 @@ phi copies: 5 of 9 in registers`}</CodeBlock>
                   No codegen path emits <code>Op::Phi</code>, so resolution
                   stores each incoming value on its predecessor <em>edge</em>{" "}
                   and turns the Phi into a load. That is what makes conditional
-                  expressions work today, and it is correct — <code>--ssa</code>{" "}
-                  is differential-fuzzed against the interpreter — but the
-                  merged value still round-trips through memory.
+                  expressions work today, and it is correct, <code>--ssa</code>{" "}
+                  is differential-fuzzed against the interpreter, but the merged
+                  value still round-trips through memory.
                 </p>
                 <p>
                   There is a related subtlety in the liveness that feeds it. A
@@ -424,7 +424,7 @@ phi copies: 5 of 9 in registers`}</CodeBlock>
                   block-granular liveness has no term for: the operand is read
                   at the instant the predecessor's branch is taken, later than
                   every ordinary use in that block. Filing it as a use of the
-                  join is wrong in both directions at once — it stretches the
+                  join is wrong in both directions at once: it stretches the
                   value's range backwards across the whole join and never
                   records that the value must survive to the end of the
                   predecessor, so a value whose last real use precedes the
@@ -443,7 +443,7 @@ phi copies: 5 of 9 in registers`}</CodeBlock>
               loop by the contiguous flat instruction span{" "}
               <code>[header, latch]</code>, which is a superset when the body
               happens to be laid out contiguously and an <em>underset</em> when
-              it is not — and the underset was the dangerous direction, because{" "}
+              it is not, and the underset was the dangerous direction, because{" "}
               <code>extend_across_loops()</code> then failed to carry a value
               across the back edge past a body block the span missed, making a
               live value look dead. Phase 2.7 moved the allocator onto real CFG
@@ -493,7 +493,7 @@ phi copies: 5 of 9 in registers`}</CodeBlock>
               relocates work rather than shrinking it. The liveness prerequisite
               has already landed in <code>compute_edge_uses()</code>. What is
               owed is value-kind inference for a float merge, an allocator slot
-              for the result, and codegen for the join's parallel copies — and
+              for the result, and codegen for the join's parallel copies, and
               that last one is the same interference problem as phase 2.8, so it
               moves the coalescing question rather than answering it.
             </p>

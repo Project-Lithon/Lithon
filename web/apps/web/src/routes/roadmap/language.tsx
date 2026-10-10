@@ -271,8 +271,8 @@ function LanguageReference() {
             <p>
               A language that is a strict superset of CPython cannot skip
               boxing, because CPython’s semantics require it. Lithon makes a
-              different promise instead — every variable has a proven, fixed
-              type before execution begins — and that promise costs a few Python
+              different promise instead: every variable has a proven, fixed type
+              before execution begins, and that promise costs a few Python
               behaviours. This page is the honest list of what was traded away
               and why.
             </p>
@@ -283,7 +283,7 @@ function LanguageReference() {
               Every binding carries an explicit annotation and every numeric
               type carries an explicit width. A bare <code>int</code> is not a
               type in Lithon; the checker rejects it by name, which is the whole
-              point — a type that cannot be written down cannot be proven.
+              point: a type that cannot be written down cannot be proven.
             </p>
             <SpecTable rows={TYPES_ROWS} />
             <Note title="Why there is no float-to-int cast">
@@ -320,7 +320,7 @@ print(7 % -3)   # Lithon:  1     CPython: -2`}</CodeBlock>
               That is what C, Rust, Java and every other compiled language do.
               The reason is the one C gives: a remainder never leaves the domain
               of its operands, so <code>Mod</code> is typed like{" "}
-              <code>Mul</code> — int if both operands are int — rather than like{" "}
+              <code>Mul</code>: int if both operands are int: rather than like{" "}
               <code>Div</code>, which has to widen to float because a quotient
               generally is not an integer. Typing it as <code>Div</code> would
               make <code>7 % 3</code> a float and lose the point.
@@ -390,7 +390,7 @@ print(1 << 64)   # Lithon: RCR error
             </p>
             <p>
               Which encoding gets used depends on whether the count is known at
-              compile time, and that is only visible in the generated code —
+              compile time, and that is only visible in the generated code,
               which is exactly the sort of claim the engine makes checkable:
             </p>
             <CodeBlock title="--dump-hex, then objdump">{`shl rax,0x3      # 48 c1 e0 03   literal count 3, never touches CL
@@ -408,7 +408,7 @@ sar rax,cl       # 48 d3 f8      dynamic count`}</CodeBlock>
               <code>float</code> is implemented end to end: constants, load and
               store, the five arithmetic operations, the three comparisons, and
               native <code>print</code>. The hard part was never the arithmetic
-              — SSE2 is straightforward once the encoding is right — it was
+              , SSE2 is straightforward once the encoding is right: it was
               making the two engines agree <em>byte for byte</em>, since that is
               the property everything else is measured against.
             </p>
@@ -419,7 +419,7 @@ sar rax,cl       # 48 d3 f8      dynamic count`}</CodeBlock>
               <code>0.10000000000000001</code>). <code>%.*g</code> is wrong in a
               way that is easy to miss: it picks exponent notation based on the
               precision it happened to need, whereas CPython’s threshold is
-              absolute — decimal exponent below −4 or above 16. That is why{" "}
+              absolute: decimal exponent below −4 or above 16. That is why{" "}
               <code>924966630.0</code> must print in full, not as{" "}
               <code>9.2499663e+08</code>.
             </Note>
@@ -441,7 +441,7 @@ sar rax,cl       # 48 d3 f8      dynamic count`}</CodeBlock>
               the operands are unordered, so ZF alone cannot separate “equal”
               from “NaN”. The same problem is why NaN comparisons are excluded
               with <code>setcc</code> plus <code>AND setnp</code> rather than a
-              parity branch — <code>0F 9A</code> is a byte-for-byte collision
+              parity branch, <code>0F 9A</code> is a byte-for-byte collision
               between <code>jp rel32</code> and <code>setp r/m8</code>, so a
               parity <code>Jcc</code> is simply not encodable here.
             </p>

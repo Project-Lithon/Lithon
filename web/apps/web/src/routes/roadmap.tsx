@@ -71,7 +71,7 @@ const PHASES: readonly {
       {
         t: "Hand-rolled x86-64 encoder",
         s: "done",
-        d: "Machine code assembled byte by byte in C++20. No LLVM, no Cranelift, no assembler — and every encoding proved against GNU as rather than trusted, because an encoder that is subtly wrong still produces plausible-looking disassembly.",
+        d: "Machine code assembled byte by byte in C++20. No LLVM, no Cranelift, no assembler, and every encoding proved against GNU as rather than trusted, because an encoder that is subtly wrong still produces plausible-looking disassembly.",
         e: "encoder_test · branch_test · stack_test · tools/check_encoder_vs_as.py",
       },
       {
@@ -83,7 +83,7 @@ const PHASES: readonly {
       {
         t: "Windows x64 calling convention",
         s: "active",
-        d: "The Win64 path is written and compiles, but the audit only exercises the host ABI — so on a Linux CI machine nothing has actually verified it. It stays in progress until a Windows host runs the same disassembly.",
+        d: "The Win64 path is written and compiles, but the audit only exercises the host ABI, so on a Linux CI machine nothing has actually verified it. It stays in progress until a Windows host runs the same disassembly.",
         e: "#if defined(_WIN32) in src/jit/jit_abi.h · no host-side test evidence yet",
       },
       {
@@ -95,7 +95,7 @@ const PHASES: readonly {
       {
         t: "VEX/SSE transition discipline",
         s: "done",
-        d: "A scanner that disassembles each function and flags legacy SSE after a VEX prefix with no vzeroupper. No AVX is emitted yet, so this is a guardrail laid before the road — and its --self-test mode proves the scanner actually fires.",
+        d: "A scanner that disassembles each function and flags legacy SSE after a VEX prefix with no vzeroupper. No AVX is emitted yet, so this is a guardrail laid before the road, and its --self-test mode proves the scanner actually fires.",
         e: "tools/check_vex_transitions.py --self-test proves the scanner fires",
       },
       {
@@ -119,7 +119,7 @@ const PHASES: readonly {
       {
         t: "Calls, recursion and tail calls",
         s: "done",
-        d: "Cross-function calls work, and a self tail-call becomes a loop — so fib recurses at O(1) stack rather than growing a frame per call.",
+        d: "Cross-function calls work, and a self tail-call becomes a loop, so fib recurses at O(1) stack rather than growing a frame per call.",
         e: "compile_module_call_test · fib_test",
       },
       {
@@ -169,7 +169,7 @@ const PHASES: readonly {
       {
         t: "ELF64 and PE32+ header synthesis",
         s: "next",
-        d: "Write the object headers directly — program headers, section table, entry point — instead of linking against an external toolchain. A header is a byte format, so it can be got exactly right and then checked exactly.",
+        d: "Write the object headers directly: program headers, section table, entry point: instead of linking against an external toolchain. A header is a byte format, so it can be got exactly right and then checked exactly.",
         e: "depends on a byte-stable emitter across both host ABIs",
       },
       {
@@ -266,7 +266,7 @@ const DEEP_DIVES = [
   {
     scope: "Reference",
     title: "Language and semantics",
-    text: "Types and flow, the supported subset, and every place Lithon deliberately does not follow CPython — modulo, shifts, and the float rules.",
+    text: "Types and flow, the supported subset, and every place Lithon deliberately does not follow CPython: modulo, shifts, and the float rules.",
     href: "/roadmap/language",
   },
   {
@@ -347,7 +347,7 @@ function Roadmap() {
                 <span className="text-muted-foreground">and its proof.</span>
               </>
             }
-            lede="Grouped by phase, one open at a time. Each milestone says what it covers and the test that holds it in place — if that test were deleted, the row would stop being true."
+            lede="Grouped by phase, one open at a time. Each milestone says what it covers and the test that holds it in place, if that test were deleted, the row would stop being true."
           />
 
           <div
@@ -433,7 +433,7 @@ function Roadmap() {
               <span className="text-muted-foreground">in detail.</span>
             </>
           }
-          lede="The tracker says what is planned. These pages say why, what it costs, and what would make it wrong — including the parts that are measured rather than promised."
+          lede="The tracker says what is planned. These pages say why, what it costs, and what would make it wrong: including the parts that are measured rather than promised."
         />
         <div className="rounded-lg border">
           {DEEP_DIVES.map((row, index) => (
@@ -464,7 +464,7 @@ function Roadmap() {
           milestone carries evidence, and why two entries are marked in progress
           despite working: the Win64 ABI has no test evidence yet, and Phi is
           emitted by lowering rather than by a code path of its own. It is also
-          why there is no percentage on this page — a number that cannot be
+          why there is no percentage on this page: a number that cannot be
           derived from a test is a decoration, and this tracker would rather
           show you the tests.
         </Note>

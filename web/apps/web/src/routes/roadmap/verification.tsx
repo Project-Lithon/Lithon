@@ -123,7 +123,7 @@ $ python3 tools/run_tier_diff.py          # 39/39, both tiers`}</CodeBlock>
             <p>
               <code>run_tier_diff.py</code> is the highest-value of those. It
               runs every program through <em>both</em> tiers and requires
-              byte-identical stdout, and then reports which tier actually ran —
+              byte-identical stdout, and then reports which tier actually ran,
               so a green run cannot hide "everything silently fell back to the
               interpreter". That property is the reason <code>--strict</code>{" "}
               exists as a flag rather than as a habit.
@@ -144,7 +144,7 @@ $ python3 tools/run_tier_diff.py          # 39/39, both tiers`}</CodeBlock>
               The general generator annotates every variable{" "}
               <code>int[64]</code> and so emits no <code>const_f64</code> at
               all. Four general modes ran for a long time without approaching
-              float code — and the float mode then found a real miscompile, an{" "}
+              float code, and the float mode then found a real miscompile, an{" "}
               <code>Unknown</code>-kind operand lowered as <em>integer</em>{" "}
               arithmetic.
             </p>
@@ -166,8 +166,8 @@ $ python3 tools/fuzz_diff.py --accum --count 300      # accumulator unroll`}</Co
               <code>--phi</code> is the only mode whose programs <em>need</em> a
               merge to be correct, so it is the only one that exercises Mem2Reg,
               Phi placement and copy resolution end to end. It runs every
-              program twice — plain <code>--auto</code> and{" "}
-              <code>--auto --ssa</code> — and requires both to match the
+              program twice: plain <code>--auto</code> and{" "}
+              <code>--auto --ssa</code>, and requires both to match the
               interpreter, which turns "the pipeline changed the answer" into a
               failure rather than a silent pass.
             </p>
@@ -179,7 +179,7 @@ $ python3 tools/fuzz_diff.py --accum --count 300      # accumulator unroll`}</Co
               interpreter-versus-JIT mismatch count. And neither modulo mode
               generates infinities or NaNs, so the <code>0 * inf</code> class of
               bug needs the adversarial <code>run_tier_diff.py</code> case
-              instead — that one <em>requires</em> the native tier, so a future
+              instead, that one <em>requires</em> the native tier, so a future
               guard change cannot quietly demote it to the interpreter and hide
               the bug.
             </p>
@@ -210,9 +210,9 @@ $ ./build/lithon_jit prog.ir --unroll-diamonds # opt in, measured slower`}</Code
               then off.
             </p>
             <CodeBlock title="did strength reduction fire?">{`$ objdump -D -b binary -mi386:x86-64 -M intel /tmp/n.bin | grep -c imul
-0                        # fired — no multiplies left
+0                        # fired: no multiplies left
 $ objdump -D -b binary -mi386:x86-64 -M intel /tmp/n2.bin | grep -c imul
-4                        # --no-lsr — proving the above was the pass`}</CodeBlock>
+4                        # --no-lsr: proving the above was the pass`}</CodeBlock>
           </DocSection>
 
           <DocSection
@@ -270,8 +270,8 @@ $ python3 tools/native_bench.py --runs 30 --pin 2 --compare /tmp/before.json`}</
                   25 of 26 opcodes are emitted and each is exercised through{" "}
                   <code>tier_runner --strict</code>, which proves the opcode
                   really executed natively rather than fell back. It does not
-                  prove every operand shape is right — that is what the
-                  encoder's byte-exact assertions and the fuzz modes are for.{" "}
+                  prove every operand shape is right, that is what the encoder's
+                  byte-exact assertions and the fuzz modes are for.{" "}
                   <code>gt</code> and <code>not</code> have a single native use
                   each in the checked-in IR corpus.
                 </p>
@@ -286,7 +286,7 @@ $ python3 tools/native_bench.py --runs 30 --pin 2 --compare /tmp/before.json`}</
             <Note title="The interpreter is an oracle, not a specification">
               <p>
                 Where Lithon and CPython disagree, the harness reports it
-                separately as a language gap rather than a JIT bug — loop
+                separately as a language gap rather than a JIT bug: loop
                 variables are one known case, deliberate. That is the right call
                 for this project, and it also means the suite cannot catch a bug
                 where both engines share the same wrong idea.

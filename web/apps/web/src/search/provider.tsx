@@ -217,6 +217,29 @@ export function SearchProvider({ children }: { children: React.ReactNode }) {
 
   const openSearch = useCallback(() => setOpen(true), [])
 
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return
+      const target = e.target as HTMLElement | null
+      if (target && (target.tagName === "INPUT" || target.isContentEditable))
+        return
+      const map: Record<string, string> = {
+        t: "action:theme",
+        d: "action:direction",
+        s: "action:sound",
+        m: "action:machine-view",
+      }
+      const id = map[e.key.toLowerCase()]
+      if (id) {
+        e.preventDefault()
+        run(id)
+      }
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [open, run])
+
   const searching = query.trim().length > 0
   const pages = searching
     ? docsResults.filter((r) => r.kind === "page")

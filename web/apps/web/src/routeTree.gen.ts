@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as BenchmarksRouteImport } from './routes/benchmarks'
 import { Route as PlaygroundRouteImport } from './routes/playground'
 import { Route as RoadmapRouteImport } from './routes/roadmap'
 import { Route as UseCasesRouteImport } from './routes/use-cases'
@@ -24,6 +25,11 @@ import { Route as RoadmapVerificationRouteImport } from './routes/roadmap/verifi
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const BenchmarksRoute = BenchmarksRouteImport.update({
+  id: '/benchmarks',
+  path: '/benchmarks',
   getParentRoute: () => rootRouteImport,
 } as any)
 const PlaygroundRoute = PlaygroundRouteImport.update({
@@ -79,6 +85,7 @@ const RoadmapVerificationRoute = RoadmapVerificationRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/benchmarks': typeof BenchmarksRoute
   '/playground': typeof PlaygroundRoute
   '/roadmap': typeof RoadmapRouteWithChildren
   '/use-cases': typeof UseCasesRoute
@@ -92,6 +99,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/benchmarks': typeof BenchmarksRoute
   '/playground': typeof PlaygroundRoute
   '/roadmap': typeof RoadmapRouteWithChildren
   '/use-cases': typeof UseCasesRoute
@@ -106,6 +114,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/benchmarks': typeof BenchmarksRoute
   '/playground': typeof PlaygroundRoute
   '/roadmap': typeof RoadmapRouteWithChildren
   '/use-cases': typeof UseCasesRoute
@@ -121,6 +130,7 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/benchmarks'
     | '/playground'
     | '/roadmap'
     | '/use-cases'
@@ -134,6 +144,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/benchmarks'
     | '/playground'
     | '/roadmap'
     | '/use-cases'
@@ -147,6 +158,7 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/'
+    | '/benchmarks'
     | '/playground'
     | '/roadmap'
     | '/use-cases'
@@ -161,6 +173,7 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  BenchmarksRoute: typeof BenchmarksRoute
   PlaygroundRoute: typeof PlaygroundRoute
   RoadmapRoute: typeof RoadmapRouteWithChildren
   UseCasesRoute: typeof UseCasesRoute
@@ -175,6 +188,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/benchmarks': {
+      id: '/benchmarks'
+      path: '/benchmarks'
+      fullPath: '/benchmarks'
+      preLoaderRoute: typeof BenchmarksRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/playground': {
@@ -271,6 +291,7 @@ const RoadmapRouteWithChildren =
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  BenchmarksRoute: BenchmarksRoute,
   PlaygroundRoute: PlaygroundRoute,
   RoadmapRoute: RoadmapRouteWithChildren,
   UseCasesRoute: UseCasesRoute,

@@ -4,7 +4,7 @@ const errors: DocPage = {
   slug: "errors",
   title: "Errors & diagnostics",
   description:
-    "The LITHON-E code family: static refusals, environmental failures, and dynamic traps — with real diagnostics.",
+    "The LITHON-E code family: static refusals, environmental failures, and dynamic traps: with real diagnostics.",
   group: "reference",
   tags: [
     "errors",
@@ -23,26 +23,26 @@ const errors: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "Every failure carries a `LITHON-Ennnn` code. The first digit is the tier the failure belongs to — the same numbering the runtime uses to decide refuse-vs-trap:",
+          text: "Every failure carries a `LITHON-Ennnn` code. The first digit is the tier the failure belongs to: the same numbering the runtime uses to decide refuse-vs-trap:",
         },
         {
           kind: "table",
           caption: "from docs/whitepaper.md",
           rows: [
             [
-              "`E01xx` — tier 1 · static refusal",
+              "`E01xx`: tier 1 · static refusal",
               "compile-time, the program never runs",
             ],
             [
-              "`E02xx` — tier 2 · environmental",
+              "`E02xx`: tier 2 · environmental",
               "the environment failed the program, not the program itself",
             ],
             [
-              "`E03xx` — tier 3 · dynamic arithmetic/logic trap",
+              "`E03xx`: tier 3 · dynamic arithmetic/logic trap",
               "runtime, per-operation",
             ],
             [
-              "`E04xx` — tier 3 · dynamic resource trap",
+              "`E04xx`: tier 3 · dynamic resource trap",
               "runtime, resource exhaustion",
             ],
           ],
@@ -51,36 +51,33 @@ const errors: DocPage = {
           kind: "table",
           caption: "the full code table",
           rows: [
-            ["`E0101` — 1 (static refusal)", "Overflow on reassignment"],
-            ["`E0102` — 1 (static refusal)", "Literal zero divisor"],
-            ["`E0103` — 1 (static refusal)", "Literal shift out of range"],
+            ["`E0101`, 1 (static refusal)", "Overflow on reassignment"],
+            ["`E0102`, 1 (static refusal)", "Literal zero divisor"],
+            ["`E0103`, 1 (static refusal)", "Literal shift out of range"],
             [
-              "`E0104` — 1 (static refusal)",
+              "`E0104`, 1 (static refusal)",
               "Literal-provable capacity overflow",
             ],
-            ["`E0105` — 1 (static refusal)", "Unsupported type width"],
+            ["`E0105`, 1 (static refusal)", "Unsupported type width"],
             [
-              "`E0201` — 2 (environmental)",
+              "`E0201`, 2 (environmental)",
               "Fallible value read before `.ok` check",
             ],
-            ["`E0301` — 3 (dynamic trap)", "Division by zero — shipped"],
-            ["`E0302` — 3 (dynamic trap)", "Modulo by zero — shipped"],
-            ["`E0303` — 3 (dynamic trap)", "Dynamic integer overflow"],
+            ["`E0301`, 3 (dynamic trap)", "Division by zero: shipped"],
+            ["`E0302`, 3 (dynamic trap)", "Modulo by zero: shipped"],
+            ["`E0303`, 3 (dynamic trap)", "Dynamic integer overflow"],
+            ["`E0304`, 3 (dynamic trap)", "Shift amount out of range: shipped"],
             [
-              "`E0304` — 3 (dynamic trap)",
-              "Shift amount out of range — shipped",
+              "`E0305`, 3 (dynamic trap)",
+              "Dynamic index/capacity out of range: shipped for list, dict TBD",
             ],
+            ["`E0306`, 3 (dynamic trap)", "Invalid integer literal in input"],
             [
-              "`E0305` — 3 (dynamic trap)",
-              "Dynamic index/capacity out of range — shipped for list, dict TBD",
-            ],
-            ["`E0306` — 3 (dynamic trap)", "Invalid integer literal in input"],
-            [
-              "`E0307` — 3 (dynamic trap)",
+              "`E0307`, 3 (dynamic trap)",
               "Input value outside the target width",
             ],
-            ["`E0308` — 3 (dynamic trap)", "End of input"],
-            ["`E0401` — 3 (resource trap)", "Stack overflow"],
+            ["`E0308`, 3 (dynamic trap)", "End of input"],
+            ["`E0401`, 3 (resource trap)", "Stack overflow"],
           ],
         },
       ],
@@ -91,7 +88,7 @@ const errors: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "The split is the point: overflow the verifier can prove at compile time is **E0101, a refusal** — the program never runs. Overflow only visible at run time is **E0303, a trap** — checked per operation in both tiers, identically.",
+          text: "The split is the point: overflow the verifier can prove at compile time is **E0101, a refusal**: the program never runs. Overflow only visible at run time is **E0303, a trap**: checked per operation in both tiers, identically.",
         },
         {
           kind: "code",
@@ -119,7 +116,7 @@ c: int[64] = b + 50          # Tier-3 trap (E0303) iff it overflows`,
       blocks: [
         {
           kind: "p",
-          text: "The type checker's own diagnostics (`RCR error:`) are a separate family — they fire before any `LITHON-E` code could apply. Every one names the construct, the offending binding, the spec section, and the fix:",
+          text: "The type checker's own diagnostics (`RCR error:`) are a separate family: they fire before any `LITHON-E` code could apply. Every one names the construct, the offending binding, the spec section, and the fix:",
         },
         {
           kind: "code",
@@ -186,7 +183,7 @@ const builtins: DocPage = {
   slug: "builtins",
   title: "Built-in functions",
   description:
-    "print, len, range, addressof, valueof, contains, and the wrap_* family — the whole prelude.",
+    "print, len, range, addressof, valueof, contains, and the wrap_* family: the whole prelude.",
   group: "reference",
   tags: [
     "builtins",
@@ -214,11 +211,11 @@ const builtins: DocPage = {
           rows: [
             [
               "`print(x)`",
-              "write one scalar value and a newline — the only output primitive",
+              "write one scalar value and a newline: the only output primitive",
             ],
             [
               "`len(xs)`",
-              "capacity of a `list`/`tuple`/`dict` — part of the type, cannot change at run time",
+              "capacity of a `list`/`tuple`/`dict`: part of the type, cannot change at run time",
             ],
             [
               "`range(n)` / `range(a, b)`",
@@ -228,11 +225,11 @@ const builtins: DocPage = {
             ["`valueof(_p)`", "read the scalar at `_p`"],
             [
               "`contains(d, k)`",
-              "`bool` — key `k` present in dict `d` (constant and runtime keys)",
+              "`bool`: key `k` present in dict `d` (constant and runtime keys)",
             ],
             [
               "`wrap_add(a, b)`",
-              "wrapping integer add — same wrapped value in both tiers",
+              "wrapping integer add: same wrapped value in both tiers",
             ],
             ["`wrap_sub(a, b)`", "wrapping integer sub"],
             ["`wrap_mul(a, b)`", "wrapping integer mul"],
@@ -275,18 +272,18 @@ print(z)`,
           rows: [
             [
               "`len()` on a scalar",
-              "type error — `len` is a container operation",
+              "type error: `len` is a container operation",
             ],
             [
               "`int()` / `float()` constructors",
-              "do not exist — conversion is a typing rule, not a call",
+              "do not exist: conversion is a typing rule, not a call",
             ],
             ["`cast()`", "does not exist anywhere in the language"],
             [
               "user-defined `print`",
-              "rejected — `print` is reserved as the fixed built-in",
+              "rejected: `print` is reserved as the fixed built-in",
             ],
-            ["`abs()` / `min()` / `max()`", "not yet — write the comparison"],
+            ["`abs()` / `min()` / `max()`", "not yet: write the comparison"],
           ],
         },
       ],
@@ -298,7 +295,7 @@ const semantics: DocPage = {
   slug: "semantics",
   title: "Semantics",
   description:
-    "Where Lithon deliberately diverges from CPython — modulo, shifts, float traps, truthiness.",
+    "Where Lithon deliberately diverges from CPython: modulo, shifts, float traps, truthiness.",
   group: "reference",
   tags: [
     "semantics",
@@ -317,7 +314,7 @@ const semantics: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "`%` truncates toward zero and takes the sign of the dividend — what C, Rust and Java do. CPython uses floor-division semantics; the two disagree on negatives:",
+          text: "`%` truncates toward zero and takes the sign of the dividend: what C, Rust and Java do. CPython uses floor-division semantics; the two disagree on negatives:",
         },
         {
           kind: "code",
@@ -350,7 +347,7 @@ print(7 % -3)`,
         },
         {
           kind: "p",
-          text: "Left shifts wrap, because there is no wider type to widen into. A count outside `0..63` is refused — at compile time for a literal (RCR, V1_SPEC 0.6.11), at run time otherwise (E0304). `2.5 & 1` is a type error: there is no float bit pattern in Lithon to reinterpret.",
+          text: "Left shifts wrap, because there is no wider type to widen into. A count outside `0..63` is refused: at compile time for a literal (RCR, V1_SPEC 0.6.11), at run time otherwise (E0304). `2.5 & 1` is a type error: there is no float bit pattern in Lithon to reinterpret.",
         },
       ],
     },
@@ -367,10 +364,10 @@ print(7 % -3)`,
           rows: [
             [
               "division by zero",
-              "traps like Python's `ZeroDivisionError` — **not** IEEE `inf`/`nan`",
+              "traps like Python's `ZeroDivisionError`, **not** IEEE `inf`/`nan`",
             ],
-            ["NaN divisor", "must **not** trap — Python propagates NaN"],
-            ["`-0.0` divisor", "must trap — it compares equal to `0.0`"],
+            ["NaN divisor", "must **not** trap, Python propagates NaN"],
+            ["`-0.0` divisor", "must trap: it compares equal to `0.0`"],
           ],
         },
         {
@@ -388,10 +385,7 @@ print(7 % -3)`,
         {
           kind: "table",
           rows: [
-            [
-              "`if x:` with `x: int`",
-              "type error — a condition must be `bool`",
-            ],
+            ["`if x:` with `x: int`", "type error: a condition must be `bool`"],
             ["`and` / `or` on non-bool", "type error"],
             ["chained comparison `a < b < c`", "not supported"],
             ["`for`/`else`", "rejected, never silently dropped"],
@@ -424,7 +418,7 @@ const verification: DocPage = {
       blocks: [
         {
           kind: "table",
-          caption: "from README.md — run it yourself, don't trust it",
+          caption: "from README.md: run it yourself, don't trust it",
           rows: [
             ["CTest", "32 / 32 passed"],
             ["x86-64 encoder comparisons", "9,239 cases"],
@@ -454,7 +448,7 @@ const verification: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "The hand-written x86-64 encoder is compared against GNU `as`, instruction by instruction. A byte difference is not automatically an error — x86-64 often has multiple valid encodings — so the harness decodes and classifies:",
+          text: "The hand-written x86-64 encoder is compared against GNU `as`, instruction by instruction. A byte difference is not automatically an error: x86-64 often has multiple valid encodings, so the harness decodes and classifies:",
         },
         {
           kind: "code",
@@ -511,7 +505,7 @@ $ python3 tools/fuzz_diff.py --phi --count 300        # merges, with and without
           kind: "note",
           tone: "warn",
           title: "What a green run does not prove",
-          text: "Opcode coverage is not operand coverage. 25 of 26 opcodes are emitted and exercised, but that does not prove every operand shape is right — `Mod` is the standing example: the general fuzzer only emits finite constants, so it cannot generate `1.0 % inf`, which was returning NaN natively while the interpreter was correct.",
+          text: "Opcode coverage is not operand coverage. 25 of 26 opcodes are emitted and exercised, but that does not prove every operand shape is right: `Mod` is the standing example: the general fuzzer only emits finite constants, so it cannot generate `1.0 % inf`, which was returning NaN natively while the interpreter was correct.",
         },
       ],
     },
@@ -526,12 +520,12 @@ $ python3 tools/fuzz_diff.py --phi --count 300        # merges, with and without
             ["CPython 3.12", "790.2430 ms"],
             ["Lithon native", "4.1810 ms"],
             ["Speedup", "**189.0×**"],
-            ["Result", "832040 — identical on both"],
+            ["Result", "832040: identical on both"],
           ],
         },
         {
           kind: "p",
-          text: "Benchmarks are the weakest form of evidence — they prove speed, not correctness. The suites above are what prove correctness; the benchmark is what the correctness buys you.",
+          text: "Benchmarks are the weakest form of evidence: they prove speed, not correctness. The suites above are what prove correctness; the benchmark is what the correctness buys you.",
         },
       ],
     },
@@ -560,7 +554,7 @@ const limits: DocPage = {
             ["IR opcodes emitted", "25 of 26"],
             [
               "`Phi`",
-              "lowered, not emitted — blocks if-as-expression merges without a memory round-trip",
+              "lowered, not emitted: blocks if-as-expression merges without a memory round-trip",
             ],
             ["arguments per function / call", "capped at 2"],
             ["float merges", "never promoted · needs an XMM pool"],
@@ -570,8 +564,8 @@ const limits: DocPage = {
             ["AVX-512", "not emitted · feature gating only"],
             ["`E0303`/`E0401` runtime traps", "designed, being built"],
             ["`//` floor division", "not yet implemented"],
-            ["`**` power", "limited — see the regression corpus"],
-            ["unsigned ints", "no `uint` — signed at every width"],
+            ["`**` power", "limited: see the regression corpus"],
+            ["unsigned ints", "no `uint`: signed at every width"],
             [
               "diamond unrolling",
               "opt-in via `--unroll-diamonds`, 1.10× slower today",
@@ -592,7 +586,7 @@ const limits: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: 'No stdlib, no import system beyond the built-ins, no classes, no closures, no exceptions. Lithon is an experiment in one narrow question — what happens to a Python-shaped language when the types are mandatory and the machine is visible — and the honest answer to "can it run my app?" is "almost certainly not, yet".',
+          text: 'No stdlib, no import system beyond the built-ins, no classes, no closures, no exceptions. Lithon is an experiment in one narrow question: what happens to a Python-shaped language when the types are mandatory and the machine is visible, and the honest answer to "can it run my app?" is "almost certainly not, yet".',
         },
         {
           kind: "linkcards",

@@ -1,5 +1,16 @@
-import { useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { createFileRoute } from "@tanstack/react-router"
+import {
+  CaretDownIcon,
+  CheckCircleIcon,
+  CopyIcon,
+  PlayIcon,
+  StackIcon,
+  TerminalWindowIcon,
+  XCircleIcon,
+} from "@phosphor-icons/react"
+
+import type { Diagnostic } from "@codemirror/lint"
 
 import { Badge } from "@workspace/ui/components/badge"
 import { Button } from "@workspace/ui/components/button"
@@ -9,168 +20,209 @@ import {
   CardHeader,
   CardTitle,
 } from "@workspace/ui/components/card"
-import { Kbd } from "@workspace/ui/components/kbd"
 import {
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-} from "@workspace/ui/components/tabs"
-import { Textarea } from "@workspace/ui/components/textarea"
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "@workspace/ui/components/dropdown-menu"
+import { Kbd } from "@workspace/ui/components/kbd"
 
 import { PageHero, WRAP } from "../site"
+import { metaForPath } from "../lib/seo"
+import { LithonEditor } from "../lib/lithon-editor"
 
-export const Route = createFileRoute("/playground")({ component: Playground })
+export const Route = createFileRoute("/playground")({
+  head: () => {
+    const meta = metaForPath("/playground")
+    return {
+      meta: [
+        { title: meta.title },
+        { name: "description", content: meta.description },
+        { property: "og:title", content: meta.title },
+        { property: "og:description", content: meta.description },
+        { tagName: "link", rel: "canonical", href: meta.canonical },
+      ],
+    }
+  },
+  component: Playground,
+})
+
+type RunResult = {
+  ok: boolean
+  stage: "input" | "frontend" | "typecheck" | "ir"
+  diagnostics: string[]
+  ir: string | null
+  typecheck: string | null
+  hint: string
+}
 
 const EXAMPLES = [
   {
+    id: "hello",
+    title: "Hello, typed",
+    note: "the smallest annotated program",
+    source: `x: int[64] = 10
+y: int[64] = 20
+
+result: int[64] = x + y
+
+print(result)`,
+  },
+  {
     id: "fib",
     title: "Recursive fibonacci",
-    note: "recursion · native tier-1",
-    code: `def fib(n: int[32]) -> int[32]:\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\nprint(fib(10))`,
+    note: "recursion, tier-1 native",
+    source: `def fib(n: int[64]) -> int[64]:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+x: int[64] = fib(10)
+print(x)`,
   },
   {
     id: "range",
     title: "Typed range loop",
-    note: "for-range · fixed int[32] accumulator",
-    code: `total: int[32] = 0\ni: int[32] = 0\n\nfor i in range(10):\n    total = total + i\n\nprint(total)`,
+    note: "for-range with a width-checked loop variable",
+    source: `total: int[64] = 0
+i: int[64] = 0
+
+for i in range(10):
+    total = total + i
+
+print(total)`,
   },
   {
-    id: "nested",
-    title: "Nested loop accumulator",
-    note: "while + for · verified nesting",
-    code: `row: int[32] = 1\nsum: int[32] = 0\n\nwhile row <= 3:\n    col: int[32] = 1\n    while col <= 3:\n        sum = sum + row * col\n        col = col + 1\n    row = row + 1\n\nprint(sum)`,
+    id: "while",
+    title: "While loop",
+    note: "conditionals with a loop-carried accumulator",
+    source: `i: int[64] = 0
+total: int[64] = 0
+
+while i < 10:
+    total = total + i
+    i = i + 1
+
+print(total)`,
   },
   {
     id: "float",
     title: "Float arithmetic",
-    note: "float[64] · SSE2 native output",
-    code: `a: float[64] = 3.5\nb: float[64] = 2.0\n\nprint(a + b)\nprint(a * b)`,
+    note: "float[64], SSE2 end to end",
+    source: `a: float[64] = 3.5
+b: float[64] = 2.0
+
+print(a + b)
+print(a * b)`,
   },
   {
-    id: "untyped",
-    title: "Untyped program",
-    note: "no annotations · tier-0 fallback",
-    code: `def double(n):\n    return n * 2\n\nprint(double(21))`,
+    id: "wrap",
+    title: "Wrapping arithmetic",
+    note: "wrap_add at the int[64] boundary",
+    source: `x: int[64] = 9223372036854775807
+y: int[64] = 1
+z: int[64] = wrap_add(x, y)
+print(z)`,
+  },
+  {
+    id: "pointer",
+    title: "Typed pointers",
+    note: "explicit raw memory, `_` prefix required",
+    source: `i: int[16] = 16
+_pi: ptr[int[16]] = addressof(i)
+print(valueof(_pi))`,
+  },
+  {
+    id: "list",
+    title: "Fixed-capacity list",
+    note: "capacity lives in the type",
+    source: `xs: list[int[64], 6]
+
+xs[0] = 10
+xs[1] = 20
+xs[2] = 30
+
+print(xs[0])
+print(len(xs))`,
   },
 ] as const
 
-type Line = {
-  kind: "prompt" | "success" | "muted" | "failure" | "value"
-  text: string
-}
-
-const LINE_CLASS: Record<Line["kind"], string> = {
-  prompt: "text-muted-foreground",
-  success: "text-accent-strong",
-  muted: "text-muted-foreground",
-  failure: "text-destructive",
-  value: "font-bold text-foreground",
-}
-
-function fibonacci(index: number): bigint | null {
-  if (!Number.isInteger(index) || index < 0 || index > 2000) return null
-  let [prev, current] = [0n, 1n]
-  for (let step = 0; step < index; step += 1)
-    [prev, current] = [current, prev + current]
-  return prev
-}
-
-function verify(code: string): Line[] {
-  const trimmed = code.trim()
-  if (trimmed === "")
-    return [
-      { kind: "prompt", text: "lithon ›" },
-      { kind: "failure", text: "empty program — nothing to verify" },
-    ]
-
-  const annotations =
-    trimmed.match(/:\s*(?:(?:int|float)\s*\[\s*\d+\s*\]|bool\b)/g)?.length ?? 0
-  const typed = annotations > 0
-  const match =
-    /print\s*\(\s*fib\s*\(\s*(\d+)\s*\)\s*\)/.exec(trimmed) ??
-    /fib\s*\(\s*(\d+)\s*\)/.exec(trimmed)
-  const index = match ? Number(match[1]) : Number.NaN
-  const value = Number.isNaN(index) ? null : fibonacci(index)
-
-  const lines: Line[] = [{ kind: "prompt", text: "lithon ›" }]
-  lines.push(
-    typed
-      ? { kind: "success", text: "✓ static flow verified · tier-1 native" }
-      : {
-          kind: "muted",
-          text: "○ static flow unverified — would run on the tier-0 interpreter",
-        }
-  )
-  lines.push(
-    typed
-      ? {
-          kind: "success",
-          text: `✓ ${annotations} fixed type annotation${annotations === 1 ? "" : "s"} resolved`,
-        }
-      : {
-          kind: "muted",
-          text: "○ annotate a binding — try `total: int[32] = 0`",
-        },
-    { kind: "prompt", text: "lithon ›" }
-  )
-
-  if (value !== null) {
-    lines.push({ kind: "value", text: `result: ${value}` })
-    lines.push({
-      kind: "muted",
-      text: `fib(${index}) · native path · 0.42 ms simulated`,
-    })
-  } else if (/\bprint\s*\(/.test(trimmed)) {
-    lines.push({
-      kind: "muted",
-      text: "program accepted — add print(fib(10)) to preview a computed value",
-    })
-  } else {
-    lines.push({
-      kind: "muted",
-      text: "no top-level call detected — nothing to evaluate",
-    })
+function toDiagnostic(message: string, line = 1): Diagnostic {
+  return {
+    from: Math.max(0, line - 1),
+    to: Math.max(1, line),
+    severity: "error",
+    message,
   }
-  return lines
 }
 
 function Playground() {
-  const [tab, setTab] = useState("code")
-  const [code, setCode] = useState<string>(EXAMPLES[0].code)
-  const [file, setFile] = useState("scratch.lithon")
-  const [state, setState] = useState<"idle" | "verifying" | "ready">("idle")
-  const [output, setOutput] = useState<Line[]>([
-    {
-      kind: "muted",
-      text: "Press “Run program” to send your code through the verifier.",
-    },
-  ])
+  const [code, setCode] = useState<string>(EXAMPLES[0].source)
+  const [result, setResult] = useState<RunResult | null>(null)
+  const [running, setRunning] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const abort = useRef<AbortController | null>(null)
 
-  const run = () => {
-    setState("verifying")
-    setOutput([
-      { kind: "prompt", text: "lithon ›" },
-      { kind: "muted", text: "checking static flow…" },
-    ])
-    window.setTimeout(() => {
-      setOutput(verify(code))
-      setState("ready")
-    }, 500)
-  }
+  const run = useCallback(async () => {
+    abort.current?.abort()
+    const controller = new AbortController()
+    abort.current = controller
+    setRunning(true)
+    try {
+      const res = await fetch("/api/lithon", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ code }),
+        signal: controller.signal,
+      })
+      if (!res.ok) {
+        setResult({
+          ok: false,
+          stage: "input",
+          diagnostics: [`runner unavailable (HTTP ${res.status})`],
+          ir: null,
+          typecheck: null,
+          hint: "The local runner is only wired up in dev (`bun run dev`).",
+        })
+        return
+      }
+      setResult((await res.json()) as RunResult)
+    } catch (e) {
+      if ((e as Error).name === "AbortError") return
+      setResult({
+        ok: false,
+        stage: "input",
+        diagnostics: [String(e)],
+        ir: null,
+        typecheck: null,
+        hint: "Could not reach the local Lithon runner.",
+      })
+    } finally {
+      setRunning(false)
+    }
+  }, [code])
 
-  const load = (id: string) => {
-    const example = EXAMPLES.find((item) => item.id === id)
-    if (!example) return
-    setCode(example.code)
-    setFile(`${example.id}.lithon`)
-    setTab("code")
-  }
+  useEffect(() => () => abort.current?.abort(), [])
+
+  const diagnostics: Diagnostic[] = result
+    ? result.diagnostics.map((d) => toDiagnostic(d))
+    : []
+
+  const status = running
+    ? { label: "running", tone: "default" as const }
+    : !result
+      ? { label: "idle", tone: "secondary" as const }
+      : result.ok
+        ? { label: "lowers to IR", tone: "default" as const }
+        : { label: `refused at ${result.stage}`, tone: "destructive" as const }
 
   return (
     <>
       <PageHero
-        kicker="04 / Playground · REPL"
+        kicker="04 / Playground"
         title={
           <>
             Write it.
@@ -180,115 +232,169 @@ function Playground() {
             See the path.
           </>
         }
-        lede="A small interactive surface for trying the Lithon shape. This frontend REPL simulates the verifier output so the experience is useful before the native engine is connected."
-        meta={["Interactive demo", "Client-side only", "No setup required"]}
+        lede="A real editor with Lithon syntax highlighting and autocomplete, wired to the actual type checker and frontend in this repo. Press Run and you get the engine's own verdict, not a simulation."
+        meta={["Real toolchain", "Live IR", "Local only"]}
       />
 
       <section className={`${WRAP} py-10`}>
-        <Tabs value={tab} onValueChange={setTab}>
-          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-            <TabsList>
-              <TabsTrigger value="code">Code</TabsTrigger>
-              <TabsTrigger value="examples">Examples</TabsTrigger>
-            </TabsList>
-            <Button onClick={run} disabled={state === "verifying"}>
-              {state === "verifying" ? "verifying…" : "Run program ↗"}
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-mono text-xs text-muted-foreground">
+              scratch
+            </span>
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                render={
+                  <Button variant="outline" size="sm" className="gap-1.5" />
+                }
+              >
+                <StackIcon />
+                Load an example
+                <CaretDownIcon className="size-3 opacity-60" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="w-72">
+                <DropdownMenuGroup>
+                  <DropdownMenuLabel>Start from a program</DropdownMenuLabel>
+                  {EXAMPLES.map((example) => (
+                    <DropdownMenuItem
+                      key={example.id}
+                      onClick={() => {
+                        setCode(example.source)
+                        setResult(null)
+                      }}
+                    >
+                      <div className="flex flex-col">
+                        <span className="text-sm">{example.title}</span>
+                        <span className="font-mono text-[11px] text-muted-foreground">
+                          {example.note}
+                        </span>
+                      </div>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+          <div className="flex items-center gap-2">
+            <Badge variant={status.tone}>{status.label}</Badge>
+            <Button onClick={run} disabled={running}>
+              {running ? (
+                "running…"
+              ) : (
+                <>
+                  <PlayIcon />
+                  Run
+                </>
+              )}
             </Button>
           </div>
+        </div>
 
-          <div className="grid gap-4 lg:grid-cols-2">
-            <TabsContent value="code">
-              <Card>
-                <CardHeader className="border-b pb-3">
-                  <CardTitle className="flex items-center justify-between font-mono text-xs font-normal text-muted-foreground">
-                    <span>{file}</span>
-                    <Badge variant="secondary">Python-flavored</Badge>
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="py-4">
-                  <Textarea
-                    value={code}
-                    onChange={(event) => setCode(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (
-                        event.key === "Enter" &&
-                        (event.metaKey || event.ctrlKey)
-                      ) {
-                        event.preventDefault()
-                        run()
-                      }
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div className="flex min-h-[30rem] flex-col">
+            <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
+              <CardHeader className="flex flex-row items-center justify-between border-b py-2">
+                <CardTitle className="font-mono text-xs font-normal text-muted-foreground">
+                  program.py
+                </CardTitle>
+                <div className="flex items-center gap-2">
+                  <span className="hidden font-mono text-[10px] text-muted-foreground sm:block">
+                    <Kbd>Ctrl</Kbd> + <Kbd>Enter</Kbd> to run
+                  </span>
+                  <Button
+                    size="icon-xs"
+                    variant="ghost"
+                    onClick={() => {
+                      navigator.clipboard.writeText(code)
+                      setCopied(true)
+                      window.setTimeout(() => setCopied(false), 1200)
                     }}
-                    aria-label="Lithon source code"
-                    spellCheck={false}
-                    autoCapitalize="off"
-                    autoCorrect="off"
-                    className="min-h-64 resize-y bg-muted font-mono text-xs leading-relaxed"
-                  />
-                </CardContent>
-              </Card>
-            </TabsContent>
-
-            <TabsContent value="examples">
-              <Card>
-                <CardHeader className="border-b pb-3">
-                  <CardTitle className="flex items-center justify-between font-mono text-xs font-normal text-muted-foreground">
-                    <span>examples</span>
-                    <Badge variant="secondary">pick a starting point</Badge>
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="divide-y py-2">
-                  {EXAMPLES.map((example) => (
-                    <button
-                      key={example.id}
-                      type="button"
-                      onClick={() => load(example.id)}
-                      className="w-full px-1 py-3 text-start hover:bg-muted"
-                    >
-                      <b className="block font-heading text-sm">
-                        {example.title}
-                      </b>
-                      <span className="font-mono text-xs text-muted-foreground">
-                        {example.note}
-                      </span>
-                    </button>
-                  ))}
-                </CardContent>
-              </Card>
-            </TabsContent>
-
-            <div>
-              <Card>
-                <CardHeader className="border-b pb-3">
-                  <CardTitle className="flex items-center justify-between font-mono text-xs font-normal text-muted-foreground">
-                    <span>● lithon runtime</span>
-                    <Badge
-                      variant={state === "verifying" ? "default" : "secondary"}
-                    >
-                      {state}
-                    </Badge>
-                  </CardTitle>
-                </CardHeader>
-                <CardContent
-                  className="min-h-64 space-y-1 py-4 font-mono text-xs"
-                  aria-live="polite"
-                >
-                  {output.map((line, index) => (
-                    <p key={index} className={LINE_CLASS[line.kind]}>
-                      {line.text}
-                    </p>
-                  ))}
-                </CardContent>
-              </Card>
-            </div>
+                    aria-label="Copy source"
+                  >
+                    {copied ? <CheckCircleIcon /> : <CopyIcon />}
+                  </Button>
+                </div>
+              </CardHeader>
+              <CardContent className="min-h-0 flex-1 p-0">
+                <LithonEditor
+                  value={code}
+                  onChange={setCode}
+                  diagnostics={diagnostics}
+                  onRun={run}
+                  minHeight="30rem"
+                />
+              </CardContent>
+            </Card>
           </div>
-        </Tabs>
 
-        <p className="mt-4 text-sm text-muted-foreground">
-          <b className="text-foreground">Note:</b> This browser playground is an
-          interactive product preview. Native compilation happens in the Lithon
-          engine. Press <Kbd>Ctrl</Kbd> or <Kbd>⌘</Kbd> + <Kbd>Enter</Kbd> to
-          run.
-        </p>
+          <div className="flex min-h-[30rem] flex-col gap-4">
+            <Card>
+              <CardHeader className="flex flex-row items-center justify-between border-b py-2">
+                <CardTitle className="font-mono text-xs font-normal text-muted-foreground">
+                  verdict
+                </CardTitle>
+                <span className="font-mono text-[10px] text-muted-foreground">
+                  typecheck.py + frontend.py
+                </span>
+              </CardHeader>
+              <CardContent className="space-y-2 py-3 font-mono text-xs">
+                {!result && !running && (
+                  <p className="text-muted-foreground">
+                    Press <Kbd>Ctrl</Kbd> + <Kbd>Enter</Kbd> to send the program
+                    through the real checker and frontend.
+                  </p>
+                )}
+                {running && (
+                  <p className="text-muted-foreground">
+                    running tools/typecheck.py and src/frontend/frontend.py…
+                  </p>
+                )}
+                {result && (
+                  <>
+                    <div className="flex items-start gap-2">
+                      {result.ok ? (
+                        <CheckCircleIcon className="mt-0.5 size-4 shrink-0 text-emerald-600" />
+                      ) : (
+                        <XCircleIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
+                      )}
+                      <span className={result.ok ? "" : "text-destructive"}>
+                        {result.hint}
+                      </span>
+                    </div>
+                    {result.typecheck && result.typecheck !== "ok" && (
+                      <p className="ps-6 text-amber-600">
+                        typecheck: {result.typecheck}
+                      </p>
+                    )}
+                    {result.diagnostics.map((d, i) => (
+                      <p key={i} className="ps-6 text-destructive">
+                        {d}
+                      </p>
+                    ))}
+                  </>
+                )}
+              </CardContent>
+            </Card>
+
+            <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
+              <CardHeader className="flex flex-row items-center justify-between border-b py-2">
+                <CardTitle className="flex items-center gap-2 font-mono text-xs font-normal text-muted-foreground">
+                  <TerminalWindowIcon />
+                  typed IR
+                </CardTitle>
+                <Badge variant="secondary">frontend output</Badge>
+              </CardHeader>
+              <CardContent className="min-h-0 flex-1 p-0">
+                <pre
+                  dir="ltr"
+                  className="h-full max-h-80 overflow-auto p-4 font-mono text-xs leading-relaxed"
+                >
+                  {result?.ir ?? "// press Run to lower this program to IR"}
+                </pre>
+              </CardContent>
+            </Card>
+          </div>
+        </div>
       </section>
     </>
   )

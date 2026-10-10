@@ -1,21 +1,32 @@
-export type Dir = "rtl" | "ltr"
+import {
+  hasConsent,
+  readCookie,
+  readPref,
+  writeCookie,
+  writePref,
+} from "./preferences"
+import type { Dir } from "./preferences"
+
+export type { Dir }
+
+export const THEME_COOKIE = "lithon_theme"
+export const DIRECTION_COOKIE = "lithon_direction"
+export const MACHINE_VIEW_COOKIE = "lithon_machine_view"
+export const SOUND_COOKIE = "lithon_sound"
+
+/** Defaults: LTR, dark. */
+export const DEFAULT_DIR: Dir = "ltr"
+export const DEFAULT_THEME = "dark"
 
 export function applyTheme(next: "dark" | "light") {
   document.documentElement.classList.toggle("dark", next === "dark")
   document.documentElement.dataset.theme = next
-  try {
-    localStorage.setItem("lithon-theme", next)
-  } catch {}
+  writePref(THEME_COOKIE, next)
 }
 
 export function readTheme(): "dark" | "light" {
-  try {
-    const stored = localStorage.getItem("lithon-theme")
-    if (stored === "dark" || stored === "light") return stored
-  } catch {}
-  return window.matchMedia("(prefers-color-scheme: dark)").matches
-    ? "dark"
-    : "light"
+  const stored = readPref<"dark" | "light">(THEME_COOKIE, DEFAULT_THEME)
+  return stored === "light" ? "light" : "dark"
 }
 
 export function toggleTheme(): "dark" | "light" {
@@ -26,21 +37,16 @@ export function toggleTheme(): "dark" | "light" {
 
 export function applyDirection(next: Dir) {
   document.documentElement.dir = next
-  try {
-    localStorage.setItem("lithon-direction", next)
-  } catch {}
+  writePref(DIRECTION_COOKIE, next)
 }
 
 export function readDirection(): Dir {
-  try {
-    const stored = localStorage.getItem("lithon-direction")
-    if (stored === "ltr" || stored === "rtl") return stored
-  } catch {}
-  return "rtl"
+  const stored = readPref<Dir>(DIRECTION_COOKIE, DEFAULT_DIR)
+  return stored === "ltr" ? "ltr" : "rtl"
 }
 
 export function toggleDirection(): Dir {
-  const next = readDirection() === "rtl" ? "ltr" : "rtl"
+  const next = readDirection() === "ltr" ? "rtl" : "ltr"
   applyDirection(next)
   return next
 }
@@ -48,17 +54,11 @@ export function toggleDirection(): Dir {
 export const MACHINE_VIEW_EVENT = "lithon-machine-view"
 
 export function readMachineView(): boolean {
-  try {
-    return localStorage.getItem("lithon-machine-view") === "on"
-  } catch {
-    return false
-  }
+  return readPref<string>(MACHINE_VIEW_COOKIE, "off") === "on"
 }
 
 export function setMachineView(on: boolean) {
-  try {
-    localStorage.setItem("lithon-machine-view", on ? "on" : "off")
-  } catch {}
+  writePref(MACHINE_VIEW_COOKIE, on ? "on" : "off")
   window.dispatchEvent(new CustomEvent(MACHINE_VIEW_EVENT, { detail: on }))
 }
 
@@ -73,3 +73,11 @@ export function onMachineViewChange(cb: (on: boolean) => void): () => void {
   window.addEventListener(MACHINE_VIEW_EVENT, handler)
   return () => window.removeEventListener(MACHINE_VIEW_EVENT, handler)
 }
+
+/** Re-apply stored preferences, e.g. right after consent is granted. */
+export function syncPreferences() {
+  applyTheme(readTheme())
+  applyDirection(readDirection())
+}
+
+export { hasConsent, readCookie, writeCookie, readPref, writePref }

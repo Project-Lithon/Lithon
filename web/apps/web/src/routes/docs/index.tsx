@@ -7,9 +7,22 @@ import { Card, CardContent } from "@workspace/ui/components/card"
 import { DOC_GROUPS } from "../../docs/model"
 import { DOCS } from "../../docs/registry"
 import { SearchHint } from "../../docs/templates"
+import { metaForPath } from "../../lib/seo"
 import { PageHero, WRAP } from "../../site"
 
 export const Route = createFileRoute("/docs/")({
+  head: () => {
+    const meta = metaForPath("/docs")
+    return {
+      meta: [
+        { title: meta.title },
+        { name: "description", content: meta.description },
+        { property: "og:title", content: meta.title },
+        { property: "og:description", content: meta.description },
+        { tagName: "link", rel: "canonical", href: meta.canonical },
+      ],
+    }
+  },
   component: DocsIndex,
 })
 
@@ -29,7 +42,7 @@ function DocsIndex() {
             from source to speed.
           </>
         }
-        lede="From your first annotated program to the bytes the encoder emits — every example here is compiled by the real Lithon frontend and pinned to the repo's regression outputs."
+        lede="From your first annotated program to the bytes the encoder emits: every example here is compiled by the real Lithon frontend and pinned to the repo's regression outputs."
         meta={[
           "Mandatory static types",
           "Dual-tier execution",

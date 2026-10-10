@@ -50,7 +50,7 @@ const CALLBACK_SPEC = [
 const TILES = [
   [
     "Fits",
-    "Integer formatting, simple output, arithmetic, control flow — all of it already emits.",
+    "Integer formatting, simple output, arithmetic, control flow: all of it already emits.",
   ],
   [
     "Must move",
@@ -104,7 +104,7 @@ function Phase2Aot() {
             <p>
               Everything in Phase I runs in-process: the emitter writes bytes,
               the engine maps them executable, and the host calls in. That is a
-              JIT, and a JIT has a floor — the engine has to be there. Phase II
+              JIT, and a JIT has a floor: the engine has to be there. Phase II
               removes the floor by emitting the container as well as the code.
             </p>
             <p>
@@ -129,13 +129,13 @@ function Phase2Aot() {
               This is the part of the project most like the encoder itself, and
               for the same reason: it is a byte format, so it can be got exactly
               right and then checked exactly. A header is also unforgiving in a
-              way source code is not — a field that is merely unusual loads, and
+              way source code is not: a field that is merely unusual loads, and
               a field that is wrong does not.
             </p>
             <Note title="What has to be true first">
               A loadable image is only as stable as the code inside it. Before a
               binary can be written out, the emitter has to produce the same
-              bytes for the same IR on both ABIs — which is exactly the gap the
+              bytes for the same IR on both ABIs, which is exactly the gap the
               Win64 audit has to close first.
             </Note>
           </DocSection>
@@ -145,7 +145,7 @@ function Phase2Aot() {
               Under 10 KB is a constraint that decides the design rather than a
               target checked at the end. A statically linked libc will not fit
               in it, which means no <code>printf</code>, no <code>malloc</code>,
-              and no <code>snprintf</code> — so anything the program prints has
+              and no <code>snprintf</code>, so anything the program prints has
               to be formatted by emitted code.
             </p>
             <p>
@@ -175,7 +175,7 @@ function Phase2Aot() {
             <p>
               The harder half of decoupling is not the headers. It is every
               place the emitted code currently calls back into the engine to get
-              something done — formatting a float, trapping a division by zero,
+              something done: formatting a float, trapping a division by zero,
               refusing an out-of-range shift. Each of those is a call into a
               symbol the binary will not have.
             </p>
@@ -198,7 +198,7 @@ function Phase2Aot() {
             </p>
             <p>
               Neither blocks writing a header, but both mean the emitted image
-              would still change shape — and an image format is much harder to
+              would still change shape, and an image format is much harder to
               revise once binaries exist in the wild. Sequencing Phase II after
               Phase I closes is cheaper than versioning a container format.
             </p>

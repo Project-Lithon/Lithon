@@ -16,9 +16,15 @@ import {
   SheetTitle,
   SheetTrigger,
 } from "@workspace/ui/components/sheet"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@workspace/ui/components/tooltip"
 
 import { DOC_GROUPS } from "../../docs/model"
 import { flatPageOrder, pageBySlug } from "../../docs/registry"
+import { metaForPath } from "../../lib/seo"
 import {
   BlockView,
   DocsBadgeRow,
@@ -36,6 +42,38 @@ export const Route = createFileRoute("/docs/$slug")({
     const page = pageBySlug(params.slug)
     if (!page) throw notFound()
     return page
+  },
+  head: ({ params }) => {
+    const page = pageBySlug(params.slug)
+    if (!page) return {}
+    const meta = metaForPath(`/docs/${params.slug}`)
+    const group = DOC_GROUPS.find((g) => g.slug === page.group)
+    return {
+      meta: [
+        { title: meta.title },
+        { name: "description", content: meta.description },
+        { property: "og:title", content: meta.title },
+        { property: "og:description", content: meta.description },
+        { property: "og:type", content: "article" },
+        { property: "og:url", content: meta.canonical },
+        { name: "twitter:card", content: "summary_large_image" },
+        { name: "twitter:title", content: meta.title },
+        { name: "twitter:description", content: meta.description },
+        { tagName: "link", rel: "canonical", href: meta.canonical },
+        {
+          "script:ld+json": JSON.stringify({
+            "@context": "https://schema.org",
+            "@type": "TechArticle",
+            headline: page.title,
+            description: page.description,
+            articleSection: group?.title,
+            keywords: page.tags.join(", "),
+            url: meta.canonical,
+            isPartOf: { "@type": "TechSite", name: "Lithon docs" },
+          }),
+        },
+      ],
+    }
   },
   component: DocsPage,
 })
@@ -161,6 +199,13 @@ function DocsPage() {
             </h1>
             <p className="mt-2 text-muted-foreground">{page.description}</p>
             <DocsBadgeRow tags={page.tags} />
+            {machineView && (
+              <p className="mt-4 rounded-lg border border-accent-strong/30 bg-accent/10 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+                <b className="text-foreground">Machine view is on.</b> Every
+                example below opens on its IR / x86-64 tab instead of the
+                source. Toggle it back from the sidebar or the command palette.
+              </p>
+            )}
           </header>
 
           <div className="space-y-10">
@@ -244,16 +289,28 @@ function DocsPage() {
                 ))}
               </nav>
             </div>
-            <Button
-              variant={machineView ? "default" : "ghost"}
-              size="sm"
-              className="w-full justify-start"
-              onClick={() => setMachineViewPref(!machineView)}
-              aria-pressed={machineView}
-            >
-              <CpuIcon />
-              Machine view
-            </Button>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    variant={machineView ? "default" : "ghost"}
+                    size="sm"
+                    className="w-full justify-start"
+                    onClick={() => setMachineViewPref(!machineView)}
+                    aria-pressed={machineView}
+                  />
+                }
+              >
+                <CpuIcon />
+                Machine view
+                <span
+                  className={`ms-auto size-1.5 rounded-full ${machineView ? "bg-accent-strong" : "bg-muted-foreground/40"}`}
+                />
+              </TooltipTrigger>
+              <TooltipContent>
+                Opens every example on its IR / x86-64 tab instead of the source
+              </TooltipContent>
+            </Tooltip>
           </div>
         </aside>
       </div>

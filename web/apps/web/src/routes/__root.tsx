@@ -36,6 +36,15 @@ import {
 } from "@workspace/ui/components/tooltip"
 import appCss from "@workspace/ui/globals.css?url"
 import { initSoundFeedback, readStoredSound, toggleSound } from "../lib/sound"
+import { ConsentBanner, PREFERENCE_SCRIPT } from "../lib/consent"
+import { CiStatusStrip } from "../lib/ci-status"
+import {
+  DEFAULT_DIR,
+  applyDirection,
+  applyTheme,
+  readDirection,
+  readTheme,
+} from "../lib/appearance"
 import { SearchProvider, useSearch } from "../search/provider"
 
 export const Route = createRootRoute({
@@ -70,13 +79,14 @@ export const Route = createRootRoute({
   shellComponent: RootDocument,
 })
 
-const THEME_SCRIPT = `try{var s=localStorage.getItem("lithon-theme");var d=s==="dark"||s==="light"?s==="dark":matchMedia("(prefers-color-scheme: dark)").matches;document.documentElement.classList.toggle("dark",d);document.documentElement.dataset.theme=d?"dark":"light"}catch(e){}try{var r=localStorage.getItem("lithon-direction");if(r==="ltr"||r==="rtl")document.documentElement.dir=r}catch(e){}`
+const THEME_SCRIPT = PREFERENCE_SCRIPT
 
 const NAV_LINKS = [
   { to: "/", hash: "engine", label: "The engine" },
   { to: "/docs", label: "Docs" },
   { to: "/use-cases", label: "Use cases" },
   { to: "/roadmap", label: "Roadmap" },
+  { to: "/benchmarks", label: "Benchmarks" },
   { to: "/playground", label: "Playground" },
 ] as const
 
@@ -396,34 +406,33 @@ function SiteFooter() {
             Back to top
           </Button>
         </div>
+        <div className="w-full border-t pt-4 sm:ms-0 sm:border-0 sm:pt-0">
+          <CiStatusStrip />
+        </div>
       </div>
     </footer>
   )
 }
 
 function RootDocument({ children }: { children: React.ReactNode }) {
-  const [dir, setDir] = useState<"rtl" | "ltr">("rtl")
+  const [dir, setDir] = useState<"rtl" | "ltr">(DEFAULT_DIR)
 
   useEffect(() => {
     const stop = initSoundFeedback()
-    try {
-      const stored = localStorage.getItem("lithon-direction")
-      if (stored === "ltr" || stored === "rtl") setDir(stored)
-    } catch {}
+    setDir(readDirection())
+    applyTheme(readTheme())
+    applyDirection(readDirection())
     return stop
   }, [])
 
   const toggleDir = () => {
     const next = dir === "rtl" ? "ltr" : "rtl"
-    document.documentElement.dir = next
-    try {
-      localStorage.setItem("lithon-direction", next)
-    } catch {}
     setDir(next)
+    applyDirection(next)
   }
 
   return (
-    <html lang="en" dir="rtl" suppressHydrationWarning>
+    <html lang="en" dir="ltr" suppressHydrationWarning>
       <head>
         <HeadContent />
         <script dangerouslySetInnerHTML={{ __html: THEME_SCRIPT }} />
@@ -441,6 +450,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
               <SiteHeader dir={dir} onToggleDir={toggleDir} />
               <main id="main">{children}</main>
               <SiteFooter />
+              <ConsentBanner />
             </TooltipProvider>
           </SearchProvider>
         </DirectionProvider>

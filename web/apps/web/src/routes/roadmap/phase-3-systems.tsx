@@ -63,7 +63,7 @@ const GROUNDWORK: readonly Row[] = [
   [
     "AVX emission",
     <span key="4" className="text-destructive">
-      — · not started
+      , · not started
     </span>,
   ],
 ]
@@ -137,7 +137,7 @@ function Phase3Systems() {
             <p>
               Phases I and II both assume a hosted process: there is a C
               runtime, there is a libc, and the program asks it to do things.
-              Phase III removes that assumption in both directions at once —
+              Phase III removes that assumption in both directions at once,
               downward to the kernel, and outward to memory somebody else owns.
             </p>
             <p>
@@ -199,8 +199,8 @@ function Phase3Systems() {
               Parallel list processing across a vector unit, with the feature
               gate deciding at emit time whether the host can run what is about
               to be written. This would be the first phase to emit AVX, which is
-              why the groundwork underneath it is worth naming — almost all of
-              it is already shipped.
+              why the groundwork underneath it is worth naming: almost all of it
+              is already shipped.
             </p>
             <SpecTable
               caption="Groundwork already landed for Phase III"

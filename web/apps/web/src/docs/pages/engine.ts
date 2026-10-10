@@ -29,7 +29,7 @@ const architecture: DocPage = {
           items: [
             {
               title: "1 · Frontend",
-              text: "`src/frontend/frontend.py` — parses `.py`, runs the extended PEP-526 checks, emits text IR. Pure Python, no engine needed.",
+              text: "`src/frontend/frontend.py`: parses `.py`, runs the extended PEP-526 checks, emits text IR. Pure Python, no engine needed.",
             },
             {
               title: "2 · IR text format",
@@ -49,7 +49,7 @@ const architecture: DocPage = {
           kind: "note",
           tone: "note",
           title: "No LLVM, no Cranelift, no runtime package",
-          text: "The entire backend is C++20 with zero third-party dependencies. GNU `as` appears in exactly one place — the encoder verification harness — and never in the build.",
+          text: "The entire backend is C++20 with zero third-party dependencies. GNU `as` appears in exactly one place: the encoder verification harness, and never in the build.",
         },
       ],
     },
@@ -118,13 +118,13 @@ block0:
     xor  eax, eax
     leave
     ret`,
-              note: "IR is real frontend output. The listing is hand-assembled for reading — the exact byte schedules live in the encoder — but every shape here (frame setup, `QWORD PTR [rbp-…]` slots, callee-saved discipline) is the one tools/check_stack_alignment.py parses out of real compiled modules.",
+              note: "IR is real frontend output. The listing is hand-assembled for reading: the exact byte schedules live in the encoder, but every shape here (frame setup, `QWORD PTR [rbp-…]` slots, callee-saved discipline) is the one tools/check_stack_alignment.py parses out of real compiled modules.",
             },
           },
         },
         {
           kind: "p",
-          text: "The IR stores and reloads `x`/`y` because the frontend emits a memory-shaped IR on purpose — that is the input the SSA pass (`Mem2Reg`) consumes, promoting provable slots into registers. What survives to the encoder after optimization is register-shaped, not stack-shaped.",
+          text: "The IR stores and reloads `x`/`y` because the frontend emits a memory-shaped IR on purpose, that is the input the SSA pass (`Mem2Reg`) consumes, promoting provable slots into registers. What survives to the encoder after optimization is register-shaped, not stack-shaped.",
         },
       ],
     },
@@ -139,7 +139,7 @@ block0:
             ["SysV (Linux/macOS)", "implemented and audited on every host"],
             [
               "Win64",
-              "implemented behind `#if defined(_WIN32)` — no test evidence yet",
+              "implemented behind `#if defined(_WIN32)`: no test evidence yet",
             ],
             [
               "Stack alignment",
@@ -181,11 +181,11 @@ const dualTier: DocPage = {
   sections: [
     {
       id: "tier-1",
-      title: "Tier-1 — the native lane",
+      title: "Tier-1: the native lane",
       blocks: [
         {
           kind: "p",
-          text: "Every IR block whose types are provably static is compiled by the backend into x86-64 and written into executable memory. There are no runtime type checks, no guards, and no boxing on this path — the verifier already did that work, once, at compile time.",
+          text: "Every IR block whose types are provably static is compiled by the backend into x86-64 and written into executable memory. There are no runtime type checks, no guards, and no boxing on this path: the verifier already did that work, once, at compile time.",
         },
         {
           kind: "code",
@@ -202,11 +202,11 @@ const dualTier: DocPage = {
     },
     {
       id: "tier-0",
-      title: "Tier-0 — the honest fallback",
+      title: "Tier-0: the honest fallback",
       blocks: [
         {
           kind: "p",
-          text: "A C++ interpreter over the same IR. It exists so that a program the native tier cannot yet prove still runs — same source, same IR, same output. It is a real implementation, not a debug printer: `run_tier_diff.py` requires both tiers to agree **byte for byte** on stdout and stderr.",
+          text: "A C++ interpreter over the same IR. It exists so that a program the native tier cannot yet prove still runs: same source, same IR, same output. It is a real implementation, not a debug printer: `run_tier_diff.py` requires both tiers to agree **byte for byte** on stdout and stderr.",
         },
         {
           kind: "p",
@@ -220,7 +220,7 @@ const dualTier: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: 'With `--strict`, a Tier-0 fallback is a **failure**, not a quiet slowdown. This is the switch the entire test suite leans on — without it, "the program printed the right number" could mean the interpreter carried the whole run.',
+          text: 'With `--strict`, a Tier-0 fallback is a **failure**, not a quiet slowdown. This is the switch the entire test suite leans on: without it, "the program printed the right number" could mean the interpreter carried the whole run.',
         },
         {
           kind: "code",
@@ -241,7 +241,7 @@ $ ./build/tier_runner prog.ir --strict   # same thing, two-step form`,
     },
     {
       id: "tier-diff",
-      title: "run_tier_diff.py — the cross-check",
+      title: "run_tier_diff.py: the cross-check",
       blocks: [
         {
           kind: "p",
@@ -269,7 +269,7 @@ const typechecking: DocPage = {
   slug: "typechecking",
   title: "The type checker",
   description:
-    "Static analysis over Python's AST — the unconditional gate every module passes before anything runs.",
+    "Static analysis over Python's AST: the unconditional gate every module passes before anything runs.",
   group: "engine",
   tags: [
     "typecheck",
@@ -287,7 +287,7 @@ const typechecking: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: '`tools/typecheck.py` is static analysis over Python\'s `ast` — no execution, no imports evaluated. It runs whether the module annotates anything or not: an unannotated program is not "unchecked", it is invalid.',
+          text: '`tools/typecheck.py` is static analysis over Python\'s `ast`: no execution, no imports evaluated. It runs whether the module annotates anything or not: an unannotated program is not "unchecked", it is invalid.',
         },
         {
           kind: "code",
@@ -303,7 +303,7 @@ $ echo $?
           kind: "note",
           tone: "note",
           title: "Two checkers, one frontend",
-          text: "The frontend (`src/frontend/frontend.py`) lowers to IR; the checker (`tools/typecheck.py`) is the gate. CI runs the checker **unconditionally** on every program — `check_typecheck_unconditional.py` enforces that no suite is allowed to skip it.",
+          text: "The frontend (`src/frontend/frontend.py`) lowers to IR; the checker (`tools/typecheck.py`) is the gate. CI runs the checker **unconditionally** on every program: `check_typecheck_unconditional.py` enforces that no suite is allowed to skip it.",
         },
       ],
     },
@@ -329,7 +329,7 @@ $ echo $?
             ],
             [
               "0.6.8",
-              "function contracts: parameters and return type mandatory and checked; call sites checked against the signature; declared return must be provably wide enough — never auto-widened",
+              "function contracts: parameters and return type mandatory and checked; call sites checked against the signature; declared return must be provably wide enough: never auto-widened",
             ],
             ["0.6.9", "`print()` is a fixed built-in, not a user function"],
             [
@@ -348,7 +348,7 @@ $ echo $?
         },
         {
           kind: "p",
-          text: "Bitwise and shift operators (`<<`, `>>`, `&`, `|`, `^`) are integer-only and **not** part of the arithmetic promotion rule: `2.5 & 1` is a type error, because Lithon has no float bit pattern to reinterpret. Their result takes the left operand's width. A literal shift count must be `0..63` — the machine word is 64 bits and x86 masks the count to 6 bits, so a count of 64 would silently execute as 0.",
+          text: "Bitwise and shift operators (`<<`, `>>`, `&`, `|`, `^`) are integer-only and **not** part of the arithmetic promotion rule: `2.5 & 1` is a type error, because Lithon has no float bit pattern to reinterpret. Their result takes the left operand's width. A literal shift count must be `0..63`: the machine word is 64 bits and x86 masks the count to 6 bits, so a count of 64 would silently execute as 0.",
         },
       ],
     },
@@ -370,7 +370,7 @@ print(x)`,
         },
         {
           kind: "p",
-          text: "Every diagnostic carries the failing construct, the name or expression at fault, the spec section (`V1_SPEC 0.6.x`) that makes it an error, and — where one exists — the spelling that would have been accepted. The full code table lives in [Errors](/docs/errors).",
+          text: "Every diagnostic carries the failing construct, the name or expression at fault, the spec section (`V1_SPEC 0.6.x`) that makes it an error, and: where one exists: the spelling that would have been accepted. The full code table lives in [Errors](/docs/errors).",
         },
       ],
     },
@@ -381,7 +381,7 @@ const pipeline: DocPage = {
   slug: "pipeline",
   title: "Optimizer & SSA pipeline",
   description:
-    "Mem2Reg, dominance, phi placement, liveness, and register allocation — each pass switchable so effects are measured, not assumed.",
+    "Mem2Reg, dominance, phi placement, liveness, and register allocation: each pass switchable so effects are measured, not assumed.",
   group: "engine",
   tags: [
     "pipeline",
@@ -396,7 +396,7 @@ const pipeline: DocPage = {
   sections: [
     {
       id: "measured-passes",
-      title: "Every pass is switchable — and measured",
+      title: "Every pass is switchable, and measured",
       blocks: [
         {
           kind: "p",
@@ -430,7 +430,7 @@ const pipeline: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "The IR keeps mutable variables in memory — a variable is written by a `Store` and read by a `Load` — so promotion means turning those into values that live in registers. The conversion is done one switchable phase at a time:",
+          text: "The IR keeps mutable variables in memory: a variable is written by a `Store` and read by a `Load`, so promotion means turning those into values that live in registers. The conversion is done one switchable phase at a time:",
         },
         {
           kind: "table",
@@ -443,7 +443,7 @@ const pipeline: DocPage = {
             ["2.2", "Phi placement by iterated dominance frontier · `ssa.h`"],
             [
               "2.3",
-              "Mem2Reg — promote, place phis, rewrite the memory traffic away · `ssa.h`",
+              "Mem2Reg: promote, place phis, rewrite the memory traffic away · `ssa.h`",
             ],
             [
               "2.4",
@@ -463,7 +463,7 @@ const pipeline: DocPage = {
             ],
             [
               "2.8",
-              "Register coalescing — a merge adopts its source's dead register · both halves",
+              "Register coalescing: a merge adopts its source's dead register · both halves",
             ],
           ],
         },
@@ -485,7 +485,7 @@ const pipeline: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "The SSA work happens on the same IR text the interpreter consumes. Optimizations that would change observable behaviour are refused rather than approximated — that is what lets `run_tier_diff.py` compare the two tiers byte for byte even when Tier-1 has run the full optimizer and Tier-0 has run none of it.",
+          text: "The SSA work happens on the same IR text the interpreter consumes. Optimizations that would change observable behaviour are refused rather than approximated, that is what lets `run_tier_diff.py` compare the two tiers byte for byte even when Tier-1 has run the full optimizer and Tier-0 has run none of it.",
         },
       ],
     },
@@ -514,7 +514,7 @@ const simd: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "The native backend can fuse a canonical elementwise or reduction loop over a fixed-capacity `int[32]` list into **8-wide AVX2** lanes. The compiler recognizes the range-loop shape the `while`/`for` lowering produces — a small rotatable header (`i < N`), a straight-line body with a single element read/write and one integer op, and an `i = i + 1` latch — and replaces it with:",
+          text: "The native backend can fuse a canonical elementwise or reduction loop over a fixed-capacity `int[32]` list into **8-wide AVX2** lanes. The compiler recognizes the range-loop shape the `while`/`for` lowering produces: a small rotatable header (`i < N`), a straight-line body with a single element read/write and one integer op, and an `i = i + 1` latch, and replaces it with:",
         },
         {
           kind: "steps",
@@ -557,11 +557,11 @@ const simd: DocPage = {
             ],
             [
               "Reduction accumulator checked",
-              "recognized only when the accumulator really is `int[32]` — verified from IR width annotations",
+              "recognized only when the accumulator really is `int[32]`: verified from IR width annotations",
             ],
             [
               "`vzeroupper` discipline",
-              "emitted before any `Call` or `Return` in a function that used the vector path — audited by `check_vex_transitions.py`",
+              "emitted before any `Call` or `Return` in a function that used the vector path: audited by `check_vex_transitions.py`",
             ],
             [
               "Escape hatches",
@@ -573,7 +573,7 @@ const simd: DocPage = {
           kind: "note",
           tone: "good",
           title: "The vectorizer refuses rather than guesses",
-          text: 'A loop the recognizer cannot prove safe is left scalar. There is no "probably fine" vector path — the same refuse-over-guess rule as the rest of the engine.',
+          text: 'A loop the recognizer cannot prove safe is left scalar. There is no "probably fine" vector path: the same refuse-over-guess rule as the rest of the engine.',
         },
       ],
     },
@@ -586,7 +586,7 @@ const simd: DocPage = {
           rows: [
             ["SIMD vectorizer loop cases", "6 / 6 passed"],
             ["SIMD vectorizer gate + fallback", "verified"],
-            ["AVX-512", "not emitted — Phase III"],
+            ["AVX-512", "not emitted, Phase III"],
           ],
         },
         {

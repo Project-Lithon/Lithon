@@ -22,7 +22,7 @@ const sourceToMachine: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "Every Lithon program leaves four artifacts on the way to execution. Each one is inspectable — nothing is hidden behind a debugger:",
+          text: "Every Lithon program leaves four artifacts on the way to execution. Each one is inspectable: nothing is hidden behind a debugger:",
         },
         {
           kind: "steps",
@@ -33,11 +33,11 @@ const sourceToMachine: DocPage = {
             },
             {
               title: "Typed IR (text)",
-              text: "`frontend.py` output — `%N = add %a, %b`, `store x, %v : int[64]`, `branch`, `call print`. This is what the engine parses; there is no Python left after this point.",
+              text: "`frontend.py` output: `%N = add %a, %b`, `store x, %v : int[64]`, `branch`, `call print`. This is what the engine parses; there is no Python left after this point.",
             },
             {
               title: "Verified SSA",
-              text: "After Mem2Reg and phi placement — loads and stores that provably stay in memory are the only ones that survive.",
+              text: "After Mem2Reg and phi placement: loads and stores that provably stay in memory are the only ones that survive.",
             },
             {
               title: "x86-64 bytes",
@@ -96,13 +96,13 @@ block2:
     jump block3
 block3:
     return`,
-              note: "Real frontend output. `branch` is the two-way conditional; both arms end in an unconditional `jump` to the join block — the shape the encoder turns into a `jcc` plus a `jmp`.",
+              note: "Real frontend output. `branch` is the two-way conditional; both arms end in an unconditional `jump` to the join block: the shape the encoder turns into a `jcc` plus a `jmp`.",
             },
           },
         },
         {
           kind: "p",
-          text: "The corresponding x86-64 keeps the same shape — one conditional branch, one shared join:",
+          text: "The corresponding x86-64 keeps the same shape: one conditional branch, one shared join:",
         },
         {
           kind: "code",
@@ -186,7 +186,7 @@ main:
     xor  eax, eax
     leave
     ret`,
-              note: "Real IR; hand-assembled listing in the encoder's style. After SSA and coalescing, the `add` body collapses to `rdi + rsi` in `rax` — the loads never reach the encoder.",
+              note: "Real IR; hand-assembled listing in the encoder's style. After SSA and coalescing, the `add` body collapses to `rdi + rsi` in `rax`: the loads never reach the encoder.",
             },
           },
         },
@@ -198,7 +198,7 @@ main:
       blocks: [
         {
           kind: "p",
-          text: "The fib(10) example — real IR, real output, and the benchmark that 189× speedup comes from at fib(30):",
+          text: "The fib(10) example: real IR, real output, and the benchmark that 189× speedup comes from at fib(30):",
         },
         {
           kind: "code",
@@ -286,25 +286,25 @@ const registersAbi: DocPage = {
             ["`RAX`", "accumulator / return value / scratch"],
             [
               "`RCX`",
-              "scratch — note: shift counts come in `CL`, a known hazard the bitwise fuzzer targets",
+              "scratch: note: shift counts come in `CL`, a known hazard the bitwise fuzzer targets",
             ],
             ["`RDX`", "scratch / div high half"],
             [
               "`RBX`, `R12`–`R15`",
-              "callee-saved — the allocator's long-lived homes",
+              "callee-saved: the allocator's long-lived homes",
             ],
-            ["`RSP`", "stack pointer — 16-byte aligned at every call"],
+            ["`RSP`", "stack pointer, 16-byte aligned at every call"],
             [
               "`RBP`",
-              "frame pointer — every function keeps it, which is what makes `[rbp-0x…]` slots readable in a dump",
+              "frame pointer: every function keeps it, which is what makes `[rbp-0x…]` slots readable in a dump",
             ],
             [
               "`RDI`, `RSI`",
-              "SysV argument 0 / argument 1 — the two-argument cap means these are always the whole argument list",
+              "SysV argument 0 / argument 1: the two-argument cap means these are always the whole argument list",
             ],
             [
               "`R8`, `R9`",
-              "SysV arguments 3–4 — unused today, reserved for the post-cap future",
+              "SysV arguments 3–4: unused today, reserved for the post-cap future",
             ],
             ["`XMM0`–`XMM15`", "SSE2 float; the vectorizer's `vmovdqu` lanes"],
           ],
@@ -332,7 +332,7 @@ const registersAbi: DocPage = {
             ["prologue", "`push rbp` · `mov rbp, rsp` · `sub rsp, N`"],
             [
               "alignment",
-              "`RSP` ≡ 0 (mod 16) at every `call` — the `push rbp` makes up the odd word",
+              "`RSP` ≡ 0 (mod 16) at every `call`: the `push rbp` makes up the odd word",
             ],
             ["callee-saved", "RBX/RBP/R12–R15 restored before `ret`"],
             [
@@ -365,11 +365,11 @@ const registersAbi: DocPage = {
     },
     {
       id: "win64",
-      title: "Win64 — implemented, unproven",
+      title: "Win64: implemented, unproven",
       blocks: [
         {
           kind: "p",
-          text: "The path exists behind `#if defined(_WIN32)` and compiles, but the 23-module ABI audit runs on SysV hosts only. Win64 differs where it always differs — 32-byte shadow space, different volatile set (`RAX RCX RDX R8 R9 R10 R11`), `XMM0`–`XMM5` volatile — and none of that has test evidence yet.",
+          text: "The path exists behind `#if defined(_WIN32)` and compiles, but the 23-module ABI audit runs on SysV hosts only. Win64 differs where it always differs, 32-byte shadow space, different volatile set (`RAX RCX RDX R8 R9 R10 R11`), `XMM0`–`XMM5` volatile, and none of that has test evidence yet.",
         },
         {
           kind: "note",
@@ -385,7 +385,7 @@ const registersAbi: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "Emitted code is written straight into memory the OS marked executable and called through a function pointer — `mmap` with `PROT_READ | PROT_EXEC` on Linux, `VirtualAlloc` on Windows. There is no temporary file, no loader, and no `as` invocation anywhere in the pipeline.",
+          text: "Emitted code is written straight into memory the OS marked executable and called through a function pointer: `mmap` with `PROT_READ | PROT_EXEC` on Linux, `VirtualAlloc` on Windows. There is no temporary file, no loader, and no `as` invocation anywhere in the pipeline.",
         },
       ],
     },
@@ -415,7 +415,7 @@ const instructionEncoding: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "No LLVM, no Cranelift, no assembler in the build. The backend emits bytes directly — every REX prefix, ModRM, SIB, and displacement chosen by code the project owns and can audit. The cost is that every byte is your responsibility; the benefit is that the whole native tier is ~a C++ codebase you can read in an afternoon.",
+          text: "No LLVM, no Cranelift, no assembler in the build. The backend emits bytes directly: every REX prefix, ModRM, SIB, and displacement chosen by code the project owns and can audit. The cost is that every byte is your responsibility; the benefit is that the whole native tier is ~a C++ codebase you can read in an afternoon.",
         },
         {
           kind: "p",
@@ -429,7 +429,7 @@ const instructionEncoding: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: '`tools/check_encoder_vs_as.py` is the answer to "how do you know your bytes are right?". It enumerates operand shapes, asks the encoder for bytes, assembles the same instruction with GNU `as`, and compares — not naively, because x86-64 often has multiple valid encodings for one instruction:',
+          text: '`tools/check_encoder_vs_as.py` is the answer to "how do you know your bytes are right?". It enumerates operand shapes, asks the encoder for bytes, assembles the same instruction with GNU `as`, and compares: not naively, because x86-64 often has multiple valid encodings for one instruction:',
         },
         {
           kind: "code",
@@ -446,7 +446,7 @@ WRONG = 0`,
         },
         {
           kind: "p",
-          text: 'The 1,290 "different" cases are where the encoder chose a different-but-equivalent form — a different REX prefix ordering, a displacement width — and the harness decodes both to confirm they mean the same instruction. The only number that matters is `WRONG = 0`.',
+          text: 'The 1,290 "different" cases are where the encoder chose a different-but-equivalent form: a different REX prefix ordering, a displacement width, and the harness decodes both to confirm they mean the same instruction. The only number that matters is `WRONG = 0`.',
         },
       ],
     },
@@ -469,13 +469,13 @@ vmovdqu [rbp+r8*4-64], ymm12     ; C4 21 7E 7F 64 85 C0`,
         },
         {
           kind: "p",
-          text: "Two details worth pausing on: the `[rbp+rcx*4]` form is the 4-byte-scaled addressing the 32-bit lanes need, and the second form uses the `R8` REX prefix — the encoder handles the full register range, not just the low eight.",
+          text: "Two details worth pausing on: the `[rbp+rcx*4]` form is the 4-byte-scaled addressing the 32-bit lanes need, and the second form uses the `R8` REX prefix: the encoder handles the full register range, not just the low eight.",
         },
         {
           kind: "table",
           caption: "the vector instruction set the encoder emits",
           rows: [
-            ["`vmovdqu`", "unaligned 256-bit load/store — the lane mover"],
+            ["`vmovdqu`", "unaligned 256-bit load/store: the lane mover"],
             [
               "`vpaddd` / `vpsubd` / `vpmulld`",
               "the three integer ops the recognizer fuses",
@@ -487,7 +487,7 @@ vmovdqu [rbp+r8*4-64], ymm12     ; C4 21 7E 7F 64 85 C0`,
             ],
             [
               "`vzeroupper`",
-              "emitted before every `Call`/`Return` in a VEX function — audited by check_vex_transitions.py",
+              "emitted before every `Call`/`Return` in a VEX function: audited by check_vex_transitions.py",
             ],
           ],
         },
@@ -505,7 +505,7 @@ vmovdqu [rbp+r8*4-64], ymm12     ; C4 21 7E 7F 64 85 C0`,
       blocks: [
         {
           kind: "p",
-          text: "A worked example — `push rbp`, the first byte of every prologue:",
+          text: "A worked example: `push rbp`, the first byte of every prologue:",
         },
         {
           kind: "table",
@@ -513,7 +513,7 @@ vmovdqu [rbp+r8*4-64], ymm12     ; C4 21 7E 7F 64 85 C0`,
           rows: [
             [
               "`0x55`",
-              "one byte, no REX, no ModRM — `push` of the low half of the register file encodes as a single opcode byte",
+              "one byte, no REX, no ModRM: `push` of the low half of the register file encodes as a single opcode byte",
             ],
             [
               "`RBP` is register 5",
@@ -523,7 +523,7 @@ vmovdqu [rbp+r8*4-64], ymm12     ; C4 21 7E 7F 64 85 C0`,
         },
         {
           kind: "p",
-          text: "That is the whole encoding. The interesting instructions — anything with a memory operand — are where REX, ModRM, SIB, and displacement interleave, and that is exactly the surface `check_encoder_vs_as.py` brute-forces 9,239 ways.",
+          text: "That is the whole encoding. The interesting instructions: anything with a memory operand: are where REX, ModRM, SIB, and displacement interleave, and that is exactly the surface `check_encoder_vs_as.py` brute-forces 9,239 ways.",
         },
       ],
     },

@@ -44,6 +44,17 @@
     --sidebar-accent-foreground: #474350;
     --sidebar-border: #47435024;
     --sidebar-ring: #a8500f;
+
+    --code-keyword: #a8500f;
+    --code-type: #7a3ea8;
+    --code-builtin: #0f6b6b;
+    --code-string: #4a7a1f;
+    --code-number: #a8500f;
+    --code-comment: #8b8794;
+    --code-operator: #474350;
+    --code-bracket: #6b6478;
+    --code-variable: #2f6bb0;
+    --code-variable-2: #474350;
     color-scheme: light;
 }
 
@@ -80,6 +91,17 @@
     --sidebar-accent-foreground: #fecdaa;
     --sidebar-border: #f8fff41f;
     --sidebar-ring: #fecdaa;
+
+    --code-keyword: #fecdaa;
+    --code-type: #e3b7f5;
+    --code-builtin: #8fd8d8;
+    --code-string: #b8e08a;
+    --code-number: #fecdaa;
+    --code-comment: #9c98a8;
+    --code-operator: #f8fff4;
+    --code-bracket: #cfcada;
+    --code-variable: #a8c8f0;
+    --code-variable-2: #f8fff4;
     color-scheme: dark;
 }
 

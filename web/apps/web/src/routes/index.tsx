@@ -95,7 +95,7 @@ const CONVICTIONS = [
       ["guards emitted", "0"],
       ["runtime dispatch", "none"],
     ] as const,
-    text: "Types are settled before the code runs. Once a program is verified, the hot path carries no guards and no dynamic lookups — the machine executes exactly what the verifier promised it would.",
+    text: "Types are settled before the code runs. Once a program is verified, the hot path carries no guards and no dynamic lookups: the machine executes exactly what the verifier promised it would.",
   },
   {
     index: "03",
@@ -117,7 +117,7 @@ const CONVICTIONS = [
       ["issues", "welcome"],
       ["roadmap", "public"],
     ] as const,
-    text: "The engine, the verifier, and the roadmap sit in public from the first commit. Read it, disagree with it, and open the pull request — the roadmap here is a conversation, not a surprise.",
+    text: "The engine, the verifier, and the roadmap sit in public from the first commit. Read it, disagree with it, and open the pull request: the roadmap here is a conversation, not a surprise.",
   },
 ] as const
 
@@ -267,7 +267,7 @@ function Contributors() {
       })
       .catch(() =>
         setStatus(
-          "Could not reach GitHub — see the full contributor graph on the repository."
+          "Could not reach GitHub: see the full contributor graph on the repository."
         )
       )
       .finally(() => window.clearTimeout(timeout))
@@ -517,7 +517,7 @@ function Home() {
                 </span>
               </>
             }
-            lede="Lithon is not a bag of features. It is four convictions about what a language owes the person writing the code — and every layer of the engine exists to serve one of them."
+            lede="Lithon is not a bag of features. It is four convictions about what a language owes the person writing the code, and every layer of the engine exists to serve one of them."
           />
           <div className="grid gap-4 md:grid-cols-2">
             {CONVICTIONS.map((item) => (
@@ -567,7 +567,7 @@ function Home() {
               <span className="text-muted-foreground">left a mark.</span>
             </>
           }
-          lede="Lithon is built in the open, so the credits are read straight from the commit history — fetched live from GitHub rather than hand-written into this page."
+          lede="Lithon is built in the open, so the credits are read straight from the commit history: fetched live from GitHub rather than hand-written into this page."
         />
         <Card>
           <CardHeader>
@@ -622,7 +622,7 @@ function Home() {
         <Alert className="mt-10 text-start">
           <AlertTitle>Zero dependencies</AlertTitle>
           <AlertDescription>
-            No LLVM, no Cranelift, no runtime package — just C++20 and the
+            No LLVM, no Cranelift, no runtime package: just C++20 and the
             machine.
           </AlertDescription>
         </Alert>

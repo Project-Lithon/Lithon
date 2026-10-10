@@ -11,10 +11,10 @@ export type ExampleSpec = {
   title?: string
   lang?: "lithon" | "bash" | "text" | "asm"
   source: string
-  /** Path inside the Lithon repo — the verification agent checks the source
+  /** Path inside the Lithon repo: the verification agent checks the source
    *  against this file byte-for-byte (modulo trailing whitespace). */
   sourceRef?: string
-  /** Path to the expected stdout in the repo — agent checks it exists. */
+  /** Path to the expected stdout in the repo: agent checks it exists. */
   expectedRef?: string
   /** Real program output (from tests/.../expected or a real run). */
   output?: string

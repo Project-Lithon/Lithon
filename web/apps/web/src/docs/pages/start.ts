@@ -22,7 +22,7 @@ const welcome: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "Lithon is a **Python library and native x86-64 execution engine** that runs `.py` source using an extended PEP-526 static typing syntax. Python remains the source language — Lithon is not a separate language — but every supported program is statically verified and can execute as generated machine code, with no LLVM, no Cranelift, and no runtime package.",
+          text: "Lithon is a **Python library and native x86-64 execution engine** that runs `.py` source using an extended PEP-526 static typing syntax. Python remains the source language, Lithon is not a separate language, but every supported program is statically verified and can execute as generated machine code, with no LLVM, no Cranelift, and no runtime package.",
         },
         {
           kind: "code",
@@ -52,7 +52,7 @@ print(result)`,
           items: [
             {
               title: "Mandatory static typing",
-              text: "Types are verified before execution. Removing annotations does not disable verification — it makes the program invalid.",
+              text: "Types are verified before execution. Removing annotations does not disable verification: it makes the program invalid.",
             },
             {
               title: "Fixed-width values",
@@ -68,7 +68,7 @@ print(result)`,
             },
             {
               title: "Honest fallback",
-              text: "What the native tier cannot prove runs through the Tier-0 interpreter in automatic mode — and `--strict` turns that fallback into a refusal.",
+              text: "What the native tier cannot prove runs through the Tier-0 interpreter in automatic mode, and `--strict` turns that fallback into a refusal.",
             },
             {
               title: "Explicit unsafe memory",
@@ -80,7 +80,7 @@ print(result)`,
           kind: "note",
           tone: "note",
           title: "The load-bearing rule",
-          text: 'If Lithon cannot prove that a program satisfies the rules required by its native backend, it refuses native compilation rather than guessing. Unknown or unprovable → REFUSE — never "generate potentially incorrect machine code".',
+          text: 'If Lithon cannot prove that a program satisfies the rules required by its native backend, it refuses native compilation rather than guessing. Unknown or unprovable → REFUSE: never "generate potentially incorrect machine code".',
         },
       ],
     },
@@ -106,10 +106,10 @@ print(result)`,
               "Raw typed pointers",
               "Built in (`ptr[T]`, `addressof`, `valueof`)",
             ],
-            ["Native backend", "Custom x86-64 emitter — no LLVM"],
+            ["Native backend", "Custom x86-64 emitter: no LLVM"],
             [
               "Interpreter fallback",
-              "Yes — Tier-0, same program, refused under `--strict`",
+              "Yes, Tier-0, same program, refused under `--strict`",
             ],
             ["Target", "x86-64 today (ARM64 is roadmap Phase III)"],
           ],
@@ -202,7 +202,7 @@ print(result)`,
         },
         {
           kind: "p",
-          text: "The same shape from the regression corpus — three operations, three lines of output:",
+          text: "The same shape from the regression corpus: three operations, three lines of output:",
         },
         {
           kind: "code",
@@ -232,7 +232,7 @@ print(x * y)`,
       blocks: [
         {
           kind: "p",
-          text: "Dropping the annotations is not an option — the type checker runs **unconditionally**, on every module, whether it annotates anything or not:",
+          text: "Dropping the annotations is not an option: the type checker runs **unconditionally**, on every module, whether it annotates anything or not:",
         },
         {
           kind: "code",
@@ -248,7 +248,7 @@ print(x)`,
         },
         {
           kind: "p",
-          text: "This is not ceremony. The annotation is the contract that lets the backend skip boxing, dynamic dispatch, and hot-path checks — it is what makes the native tier possible at all.",
+          text: "This is not ceremony. The annotation is the contract that lets the backend skip boxing, dynamic dispatch, and hot-path checks: it is what makes the native tier possible at all.",
         },
       ],
     },
@@ -261,15 +261,15 @@ print(x)`,
           items: [
             {
               title: "Type-check only",
-              text: "`tools/typecheck.py hello.py` — static analysis over the AST, no execution. Exits non-zero with an `RCR error` on the first violation.",
+              text: "`tools/typecheck.py hello.py`: static analysis over the AST, no execution. Exits non-zero with an `RCR error` on the first violation.",
             },
             {
               title: "Compile to IR",
-              text: "`src/frontend/frontend.py hello.py` — lowers the typed AST to Lithon's text IR on stdout. No engine needed, pure Python.",
+              text: "`src/frontend/frontend.py hello.py`: lowers the typed AST to Lithon's text IR on stdout. No engine needed, pure Python.",
             },
             {
               title: "Run natively",
-              text: "`lithon hello.py --strict` — the two-step dance: frontend to IR, then `tier_runner` emits x86-64 and calls it. `--strict` refuses rather than falling back to the interpreter.",
+              text: "`lithon hello.py --strict`: the two-step dance: frontend to IR, then `tier_runner` emits x86-64 and calls it. `--strict` refuses rather than falling back to the interpreter.",
             },
           ],
         },
@@ -287,7 +287,7 @@ print(x)`,
           kind: "note",
           tone: "good",
           title: "`[tier1] native` is the proof",
-          text: "`[tier1] native` goes to stderr; the program's own output goes to stdout. Under `--strict`, a clean exit status means the code was really emitted and executed — a fallback cannot hide behind success.",
+          text: "`[tier1] native` goes to stderr; the program's own output goes to stdout. Under `--strict`, a clean exit status means the code was really emitted and executed: a fallback cannot hide behind success.",
         },
       ],
     },
@@ -321,12 +321,12 @@ const installation: DocPage = {
             ["Compiler", "C++20 (gcc, clang, or MSVC)"],
             [
               "Python",
-              "≥ 3.10 (frontend only — the native tier never touches CPython)",
+              "≥ 3.10 (frontend only: the native tier never touches CPython)",
             ],
             ["Architecture", "x86-64 Linux or Windows"],
             [
               "Third-party libraries",
-              "none — no LLVM, no Cranelift, no runtime package",
+              "none: no LLVM, no Cranelift, no runtime package",
             ],
           ],
         },
@@ -349,7 +349,7 @@ $ cmake --build build -j$(nproc)`,
         },
         {
           kind: "p",
-          text: "There is no Makefile to hand-edit — CMake drives everything. Python appears at exactly one step, turning a `.py` file into IR; once IR exists the native program never touches CPython.",
+          text: "There is no Makefile to hand-edit, CMake drives everything. Python appears at exactly one step, turning a `.py` file into IR; once IR exists the native program never touches CPython.",
         },
       ],
     },
@@ -407,7 +407,7 @@ $ bash tools/verify_all.sh                       # all of the above`,
         },
         {
           kind: "p",
-          text: '`run_tier_diff.py` is the highest-value of these: it runs every program through both tiers and requires byte-identical stdout, then reports which tier actually ran — so a green run cannot hide "everything silently fell back to the interpreter".',
+          text: '`run_tier_diff.py` is the highest-value of these: it runs every program through both tiers and requires byte-identical stdout, then reports which tier actually ran, so a green run cannot hide "everything silently fell back to the interpreter".',
         },
       ],
     },
@@ -435,7 +435,7 @@ const mentalModel: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "A block whose types are provably static takes the **Tier-1** native path and is compiled straight to x86-64. Anything the verifier cannot establish falls to the **Tier-0** C++ interpreter — a real fallback rather than a guess — and `--strict` turns that fallback into a refusal.",
+          text: "A block whose types are provably static takes the **Tier-1** native path and is compiled straight to x86-64. Anything the verifier cannot establish falls to the **Tier-0** C++ interpreter: a real fallback rather than a guess, and `--strict` turns that fallback into a refusal.",
         },
         {
           kind: "cards",
@@ -450,7 +450,7 @@ const mentalModel: DocPage = {
             },
             {
               title: "Fall back honestly",
-              text: "Tier-0 runs the same program when the native tier refuses. `--strict` refuses instead — success cannot hide a fallback.",
+              text: "Tier-0 runs the same program when the native tier refuses. `--strict` refuses instead: success cannot hide a fallback.",
             },
           ],
         },
@@ -481,7 +481,7 @@ Unknown
         },
         {
           kind: "p",
-          text: "Every strange-looking rule in the language — mandatory annotations, fixed widths, no narrowing, definite assignment, shift-count ranges — exists to keep the verifier on the left path. Each one turns something the backend would have to guess about into something it knows.",
+          text: "Every strange-looking rule in the language: mandatory annotations, fixed widths, no narrowing, definite assignment, shift-count ranges: exists to keep the verifier on the left path. Each one turns something the backend would have to guess about into something it knows.",
         },
         {
           kind: "note",
@@ -523,7 +523,7 @@ Unknown
             {
               title: "The verification gate",
               href: "/docs/verification",
-              text: "How the claims get checked — layer by layer.",
+              text: "How the claims get checked: layer by layer.",
             },
           ],
         },

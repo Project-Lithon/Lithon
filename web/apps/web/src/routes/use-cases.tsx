@@ -18,7 +18,7 @@ const CASES = [
     type: "Case 01",
     tag: "Signal processing",
     title: "When every millisecond has a destination.",
-    text: "A typed, low-latency data path can turn a prototype into a dependable edge workload — without adding an interpreter to the critical loop.",
+    text: "A typed, low-latency data path can turn a prototype into a dependable edge workload: without adding an interpreter to the critical loop.",
     metric: { value: "< 1ms", label: "target startup overhead" },
   },
   {

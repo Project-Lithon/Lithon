@@ -4,7 +4,7 @@ const types: DocPage = {
   slug: "types",
   title: "Types & widths",
   description:
-    "Fixed-width integers, floats, bool — and the three rules the verifier enforces on every conversion.",
+    "Fixed-width integers, floats, bool, and the three rules the verifier enforces on every conversion.",
   group: "language",
   tags: [
     "types",
@@ -23,7 +23,7 @@ const types: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "Integers carry their width in the type. There is no bare `int` — it is rejected — and no arbitrary-precision integer behind your back:",
+          text: "Integers carry their width in the type. There is no bare `int`: it is rejected, and no arbitrary-precision integer behind your back:",
         },
         {
           kind: "code",
@@ -51,7 +51,7 @@ print(i64)`,
             ["`bool`", "one byte, `True` / `False`"],
             [
               "`ptr[T]`",
-              "typed pointer to a scalar `T` — see [Pointers](/docs/pointers)",
+              "typed pointer to a scalar `T`: see [Pointers](/docs/pointers)",
             ],
           ],
         },
@@ -59,13 +59,13 @@ print(i64)`,
           kind: "note",
           tone: "note",
           title: "Signed only, 64-bit floats only",
-          text: "There is no unsigned `uint` type — `uint[8]` is rejected as an unknown type, so masking with `&` is how you get unsigned behaviour, explicitly. `float[32]` is rejected too (`LITHON-E0105: unsupported float width 32`): every float is `float[64]`.",
+          text: "There is no unsigned `uint` type: `uint[8]` is rejected as an unknown type, so masking with `&` is how you get unsigned behaviour, explicitly. `float[32]` is rejected too (`LITHON-E0105: unsupported float width 32`): every float is `float[64]`.",
         },
         {
           kind: "note",
           tone: "note",
           title: "Why fixed widths are load-bearing",
-          text: "A fixed width is a fact the backend can plan around: the register, the memory slot, the overflow instruction. An unbounded `int` would mean boxing, big-integer fallbacks, and guards — exactly what the native tier is built to not have.",
+          text: "A fixed width is a fact the backend can plan around: the register, the memory slot, the overflow instruction. An unbounded `int` would mean boxing, big-integer fallbacks, and guards: exactly what the native tier is built to not have.",
         },
       ],
     },
@@ -75,7 +75,7 @@ print(i64)`,
       blocks: [
         {
           kind: "p",
-          text: "A value may be widened to a provably larger width of the same signedness class, automatically. Narrowing — the reverse — is rejected even when you are certain the value fits:",
+          text: "A value may be widened to a provably larger width of the same signedness class, automatically. Narrowing, the reverse direction, is rejected even when you are certain the value fits:",
         },
         {
           kind: "code",
@@ -102,7 +102,7 @@ print(narrow)`,
         },
         {
           kind: "p",
-          text: "No cast syntax exists anywhere in the language. If you need a bit pattern reinterpreted, that is what pointers are for — explicitly, with the `_` prefix.",
+          text: "No cast syntax exists anywhere in the language. If you need a bit pattern reinterpreted, that is what pointers are for: explicitly, with the `_` prefix.",
         },
       ],
     },
@@ -112,13 +112,13 @@ print(narrow)`,
       blocks: [
         {
           kind: "p",
-          text: "`int[64]` into `float[64]` is a widening conversion and happens silently. The reverse is rejected — it would truncate, and truncation is not a conversion Lithon will perform for you.",
+          text: "`int[64]` into `float[64]` is a widening conversion and happens silently. The reverse is rejected: it would truncate, and truncation is not a conversion Lithon will perform for you.",
         },
         {
           kind: "note",
           tone: "warn",
           title: "The literal exception (V1_SPEC 0.6.11)",
-          text: "An int literal is not a float, so `j: float[64] = 0` is a type error — write `0.0`. The int→float conversion does not apply to a literal.",
+          text: "An int literal is not a float, so `j: float[64] = 0` is a type error: write `0.0`. The int→float conversion does not apply to a literal.",
         },
         {
           kind: "code",
@@ -173,13 +173,13 @@ print(i / 4)`,
       blocks: [
         {
           kind: "p",
-          text: "`int` without a width is rejected — the width is part of the type, not an implementation detail the compiler may pick for you. The same goes for `int[128]`: only 8/16/32/64 exist, matching the machine.",
+          text: "`int` without a width is rejected: the width is part of the type, not an implementation detail the compiler may pick for you. The same goes for `int[128]`: only 8/16/32/64 exist, matching the machine.",
         },
         {
           kind: "note",
           tone: "note",
           title: "Provable overflow is a compile-time error",
-          text: "Integer literal overflow and provable-range overflow for binary operations are compile-time errors (V1_SPEC 0.6.5) — the checker points you at `wrap_add()`/`wrap_sub()`/`wrap_mul()` when wrap-around is what you want. Overflow the verifier cannot prove at compile time executes as the machine's two's-complement wrap; nothing traps at run time.",
+          text: "Integer literal overflow and provable-range overflow for binary operations are compile-time errors (V1_SPEC 0.6.5): the checker points you at `wrap_add()`/`wrap_sub()`/`wrap_mul()` when wrap-around is what you want. Overflow the verifier cannot prove at compile time executes as the machine's two's-complement wrap; nothing traps at run time.",
         },
       ],
     },
@@ -208,7 +208,7 @@ const declarations: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "A name is declared once with an explicit type. Re-assignment is checked against that declared type — you cannot quietly reuse the name for a different width or a different type:",
+          text: "A name is declared once with an explicit type. Re-assignment is checked against that declared type: you cannot quietly reuse the name for a different width or a different type:",
         },
         {
           kind: "code",
@@ -242,7 +242,7 @@ print(narrow)`,
       blocks: [
         {
           kind: "p",
-          text: "Every use of a variable must be dominated by an assignment whose value the verifier can trace. You may declare first and assign later — but you may not read before the first assignment.",
+          text: "Every use of a variable must be dominated by an assignment whose value the verifier can trace. You may declare first and assign later, but you may not read before the first assignment.",
         },
         {
           kind: "code",
@@ -271,7 +271,7 @@ print(i)`,
         {
           kind: "note",
           tone: "note",
-          title: "Declaration is not initialization — except for containers",
+          title: "Declaration is not initialization: except for containers",
           text: "For a scalar, a bare `i: int[64]` only records the type. For containers the bare declaration **is** real work: it reserves the run/table and zeroes it. See [Containers](/docs/containers).",
         },
       ],
@@ -311,7 +311,7 @@ const controlFlow: DocPage = {
   slug: "control-flow",
   title: "Control flow",
   description:
-    "if / elif / else, while, for over range — and the one construct that does not exist.",
+    "if / elif / else, while, for over range, and the one construct that does not exist.",
   group: "language",
   tags: [
     "control flow",
@@ -330,7 +330,7 @@ const controlFlow: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "Exactly the Python you know. Conditions are boolean expressions; there is no truthiness conversion — a condition must be a `bool`.",
+          text: "Exactly the Python you know. Conditions are boolean expressions; there is no truthiness conversion: a condition must be a `bool`.",
         },
         {
           kind: "code",
@@ -397,7 +397,7 @@ print(total)`,
           kind: "note",
           tone: "warn",
           title: "The checker does not cover `while` yet",
-          text: "`tools/typecheck.py` still answers `statement While not supported by the type-checker yet` — including for the repo's own `while.py`. The engine lowers and executes `while` correctly (Tier-0 and Tier-1 both); it is the standalone Python checker that lags. Until it catches up, `while` programs are verified through the regression suites rather than the checker.",
+          text: "`tools/typecheck.py` still answers `statement While not supported by the type-checker yet`: including for the repo's own `while.py`. The engine lowers and executes `while` correctly (Tier-0 and Tier-1 both); it is the standalone Python checker that lags. Until it catches up, `while` programs are verified through the regression suites rather than the checker.",
         },
       ],
     },
@@ -450,7 +450,7 @@ block3:
     %12 = load total
     call print, %12
     return`,
-              note: "The `for` lowers to an init / test / body / increment block structure — a pre-test loop with an explicit back edge, exactly what the encoder emits a `jcc` for.",
+              note: "The `for` lowers to an init / test / body / increment block structure: a pre-test loop with an explicit back edge, exactly what the encoder emits a `jcc` for.",
             },
           },
         },
@@ -462,7 +462,7 @@ block3:
       blocks: [
         {
           kind: "p",
-          text: "An `if` used where a value is expected is an **if-expression** with `else` mandatory. Both arms are fully evaluated expressions — statements inside the arms are rejected:",
+          text: "An `if` used where a value is expected is an **if-expression** with `else` mandatory. Both arms are fully evaluated expressions: statements inside the arms are rejected:",
         },
         {
           kind: "code",
@@ -493,7 +493,7 @@ print(1 if x < y else 2 if x == 5 else 3)`,
       blocks: [
         {
           kind: "p",
-          text: '`for`/`else` — where the `else` runs when the loop completes without `break` — is rejected. The `else` binds to `if`, not to `for`; if you need the "loop finished" signal, test the loop variable after the loop.',
+          text: '`for`/`else`: where the `else` runs when the loop completes without `break`: is rejected. The `else` binds to `if`, not to `for`; if you need the "loop finished" signal, test the loop variable after the loop.',
         },
         {
           kind: "code",
@@ -513,7 +513,7 @@ else:
         },
         {
           kind: "p",
-          text: "It is rejected loudly rather than dropped, because the alternative — binding the `else` to the `if` — would silently change what the program means.",
+          text: "It is rejected loudly rather than dropped, because the alternative: binding the `else` to the `if`: would silently change what the program means.",
         },
       ],
     },
@@ -541,7 +541,7 @@ const functions: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "Every parameter and the return type are mandatory and checked (V1_SPEC 0.6.8). A call site is checked against the declared signature, and a declared return type must be provably wide enough for what is returned — the compiler never auto-widens your return.",
+          text: "Every parameter and the return type are mandatory and checked (V1_SPEC 0.6.8). A call site is checked against the declared signature, and a declared return type must be provably wide enough for what is returned: the compiler never auto-widens your return.",
         },
         {
           kind: "code",
@@ -589,7 +589,7 @@ block0:
 x: int[64] = add(3, 4)
 print(x)`,
             output:
-              "RCR error: function 'add': return type is mandatory — write '-> int[64]' (V1_SPEC 0.6.8)",
+              "RCR error: function 'add': return type is mandatory: write '-> int[64]' (V1_SPEC 0.6.8)",
           },
         },
       ],
@@ -600,7 +600,7 @@ print(x)`,
       blocks: [
         {
           kind: "p",
-          text: "Recursion works like it does in Python — each call gets its own frame. The verifier checks each call against the declared signature, including recursive calls to the function being defined:",
+          text: "Recursion works like it does in Python: each call gets its own frame. The verifier checks each call against the declared signature, including recursive calls to the function being defined:",
         },
         {
           kind: "code",
@@ -683,7 +683,7 @@ block0:
       blocks: [
         {
           kind: "p",
-          text: "Functions are limited to two arguments today. This is a temporary restriction of the current encoder's calling convention support, not a design position — it will be lifted as the ABI handling matures.",
+          text: "Functions are limited to two arguments today. This is a temporary restriction of the current encoder's calling convention support, not a design position: it will be lifted as the ABI handling matures.",
         },
         {
           kind: "note",
@@ -700,7 +700,7 @@ const operators: DocPage = {
   slug: "operators",
   title: "Operators",
   description:
-    "Arithmetic, comparison, boolean, bitwise and shift — including C-style `%` and two's-complement wrap.",
+    "Arithmetic, comparison, boolean, bitwise and shift: including C-style `%` and two's-complement wrap.",
   group: "language",
   tags: [
     "operators",
@@ -728,11 +728,11 @@ const operators: DocPage = {
             ],
             [
               "`/`",
-              "float division producing `float[64]` — **not** C-style truncation",
+              "float division producing `float[64]`, **not** C-style truncation",
             ],
             ["`%`", "C-style remainder: sign follows the **left** operand"],
-            ["`**`", "power — see the limitation note below"],
-            ["`//`", "not yet implemented — rejected at parse time"],
+            ["`**`", "power: see the limitation note below"],
+            ["`//`", "not yet implemented: rejected at parse time"],
           ],
         },
         {
@@ -757,7 +757,7 @@ print(-7 % 3)`,
       blocks: [
         {
           kind: "p",
-          text: "`==` `<` `>` and the other comparisons produce `bool`. `and` `or` `not` operate on `bool`. Note what is *not* here yet: `!=` (`NotEq`) is the one comparison the frontend has not lowered — write `not (a == b)` in the meantime.",
+          text: "`==` `<` `>` and the other comparisons produce `bool`. `and` `or` `not` operate on `bool`. Note what is *not* here yet: `!=` (`NotEq`) is the one comparison the frontend has not lowered: write `not (a == b)` in the meantime.",
         },
         {
           kind: "code",
@@ -779,7 +779,7 @@ print(c < b)`,
           kind: "note",
           tone: "note",
           title: "int and float compare across widths",
-          text: "The fourth line compares a `float[64]` against an `int[64]` and returns `True` — the int is widened to float for the comparison, the same promotion rule as arithmetic.",
+          text: "The fourth line compares a `float[64]` against an `int[64]` and returns `True`: the int is widened to float for the comparison, the same promotion rule as arithmetic.",
         },
       ],
     },
@@ -793,7 +793,7 @@ print(c < b)`,
         },
         {
           kind: "p",
-          text: "A literal shift count must be `0..63` — the machine word is 64 bits and x86 masks the count to 6 bits, so a count of 64 would silently execute as 0. A non-literal count is checked at runtime instead. This is a deliberate divergence from CPython, where ints are unbounded and `1 << 64` is a valid 65-bit result:",
+          text: "A literal shift count must be `0..63`: the machine word is 64 bits and x86 masks the count to 6 bits, so a count of 64 would silently execute as 0. A non-literal count is checked at runtime instead. This is a deliberate divergence from CPython, where ints are unbounded and `1 << 64` is a valid 65-bit result:",
         },
         {
           kind: "code",
@@ -838,7 +838,7 @@ print(z)`,
       blocks: [
         {
           kind: "p",
-          text: 'Plain `+`/`-`/`*` on fixed-width ints wraps in two\'s complement at run time, but overflow the verifier can prove statically is rejected at compile time (E0303) and points you at the `wrap_*` family. `wrap_add`/`wrap_sub`/`wrap_mul` are the explicit way to say "wrap-around is what I want" — the same wrapped value in both tiers:',
+          text: 'Plain `+`/`-`/`*` on fixed-width ints wraps in two\'s complement at run time, but overflow the verifier can prove statically is rejected at compile time (E0303) and points you at the `wrap_*` family. `wrap_add`/`wrap_sub`/`wrap_mul` are the explicit way to say "wrap-around is what I want": the same wrapped value in both tiers:',
         },
         {
           kind: "code",
@@ -894,7 +894,7 @@ const containers: DocPage = {
   slug: "containers",
   title: "Containers",
   description:
-    "Fixed-capacity lists, tuples, and constant-keyed dicts — declared, reserved, sized at compile time.",
+    "Fixed-capacity lists, tuples, and constant-keyed dicts: declared, reserved, sized at compile time.",
   group: "language",
   tags: [
     "containers",
@@ -909,11 +909,11 @@ const containers: DocPage = {
   sections: [
     {
       id: "list",
-      title: "list — fixed capacity",
+      title: "list: fixed capacity",
       blocks: [
         {
           kind: "p",
-          text: "A `list[T, N]` has a compile-time capacity `N` that is part of the type. The element type is a fixed-width scalar. The bare declaration `xs: list[int[64], 6]` **is** real work: it reserves the run and zeroes it — drop it and the first store writes to a name that was never allocated.",
+          text: "A `list[T, N]` has a compile-time capacity `N` that is part of the type. The element type is a fixed-width scalar. The bare declaration `xs: list[int[64], 6]` **is** real work: it reserves the run and zeroes it: drop it and the first store writes to a name that was never allocated.",
         },
         {
           kind: "code",
@@ -948,11 +948,11 @@ print(xs[2])`,
             ],
             [
               "Index bound",
-              "checked against `N` — a runtime index is checked, not a literal the compiler happened to see",
+              "checked against `N`: a runtime index is checked, not a literal the compiler happened to see",
             ],
             [
               "Element address",
-              "element `k` lands at `base + k * sizeof(T)` — packed, no pointers per element",
+              "element `k` lands at `base + k * sizeof(T)`: packed, no pointers per element",
             ],
           ],
         },
@@ -981,23 +981,23 @@ print(t[3])`,
           kind: "note",
           tone: "note",
           title: "One element type, a literal capacity",
-          text: "A tuple is `tuple[T, N]` — one element type and a literal length. Anything else is rejected: `tuple[int[64], float[64], bool]` fails with *needs an element type and a literal capacity*.",
+          text: "A tuple is `tuple[T, N]`: one element type and a literal length. Anything else is rejected: `tuple[int[64], float[64], bool]` fails with *needs an element type and a literal capacity*.",
         },
         {
           kind: "note",
           tone: "note",
           title: "Containers are ahead of the standalone checker",
-          text: "`tools/typecheck.py` answers `unknown type 'list'` — the container types are implemented in the engine (and covered by the regression suites) but the standalone Python checker has not been taught them yet.",
+          text: "`tools/typecheck.py` answers `unknown type 'list'`: the container types are implemented in the engine (and covered by the regression suites) but the standalone Python checker has not been taught them yet.",
         },
       ],
     },
     {
       id: "dict",
-      title: "dict — constant-keyed",
+      title: "dict: constant-keyed",
       blocks: [
         {
           kind: "p",
-          text: "A `dict[K, V, B]` is a fixed-capacity open-addressing table with `B` buckets, built from a constant-keyed literal. The valueless declaration reserves and zeroes the table, so the literal is a fill of a table that already exists — not an allocation trick. Literal keys are resolved while compiling; a runtime key takes the hash-and-probe path.",
+          text: "A `dict[K, V, B]` is a fixed-capacity open-addressing table with `B` buckets, built from a constant-keyed literal. The valueless declaration reserves and zeroes the table, so the literal is a fill of a table that already exists: not an allocation trick. Literal keys are resolved while compiling; a runtime key takes the hash-and-probe path.",
         },
         {
           kind: "code",
@@ -1032,7 +1032,7 @@ const pointers: DocPage = {
   slug: "pointers",
   title: "Pointers",
   description:
-    "Typed pointers with a mandatory `_` prefix — explicit unsafe memory, no hidden aliasing.",
+    "Typed pointers with a mandatory `_` prefix: explicit unsafe memory, no hidden aliasing.",
   group: "language",
   tags: [
     "pointers",
@@ -1050,7 +1050,7 @@ const pointers: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "Every pointer variable carries a **mandatory leading `_`**. This is not a naming convention the compiler happens to enforce — it is a source-level marker that raw memory is in play, greppable and impossible to miss in review.",
+          text: "Every pointer variable carries a **mandatory leading `_`**. This is not a naming convention the compiler happens to enforce: it is a source-level marker that raw memory is in play, greppable and impossible to miss in review.",
         },
         {
           kind: "code",
@@ -1110,7 +1110,7 @@ print(_p == _q)`,
             ],
             [
               "Deref",
-              "no `*_p` syntax — `valueof` / assignment through the pointer",
+              "no `*_p` syntax: `valueof` / assignment through the pointer",
             ],
             [
               "Null",
@@ -1122,7 +1122,7 @@ print(_p == _q)`,
           kind: "note",
           tone: "danger",
           title: "Pointers are unsafe by design",
-          text: "The `_` prefix marks the boundary. Inside it, the compiler's usual guarantees about definite assignment and type agreement do not extend through raw memory writes — that is the deal you take when you reach for `ptr`.",
+          text: "The `_` prefix marks the boundary. Inside it, the compiler's usual guarantees about definite assignment and type agreement do not extend through raw memory writes, that is the deal you take when you reach for `ptr`.",
         },
       ],
     },
@@ -1132,7 +1132,7 @@ print(_p == _q)`,
       blocks: [
         {
           kind: "p",
-          text: "`ptr` works for any scalar pointee — `float[32]`, `float[64]`, `bool`. Reading through a `ptr[float[64]]` after the pointee changed gives you the new value, because the pointer names a location, not a snapshot:",
+          text: "`ptr` works for any scalar pointee: `float[32]`, `float[64]`, `bool`. Reading through a `ptr[float[64]]` after the pointee changed gives you the new value, because the pointer names a location, not a snapshot:",
         },
         {
           kind: "code",

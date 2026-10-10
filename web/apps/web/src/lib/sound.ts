@@ -92,7 +92,7 @@ function tone(
 
 /** Schedules only once the context is actually running. A note queued while the
  *  context is still suspended is stamped with a time in the past and never
- *  plays — which is how the toggle used to go silent after a click. */
+ *  plays, which is how the toggle used to go silent after a click. */
 async function withAudio(run: (ctx: AudioContext) => void): Promise<void> {
   const ctx = context()
   if (ctx === null) return
@@ -139,7 +139,7 @@ export function playDismiss(): void {
   playSequence(DISMISS_FREQUENCIES_HZ, CHIME_GAIN, NOTE_DURATION_S, NOTE_GAP_S)
 }
 
-/** Flips the shared flag, remembers the choice, and answers the press —
+/** Flips the shared flag, remembers the choice, and answers the press,
  *  a rising chime when sound turns on, a falling one when it goes silent. */
 export function toggleSound(): boolean {
   sound = !sound

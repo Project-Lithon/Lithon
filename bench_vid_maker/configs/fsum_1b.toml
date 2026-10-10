@@ -3,7 +3,7 @@ subtitle = "same program, run as-is in each engine"
 
 [[tasks]]
 name = "CPython"
-command = ["{python}", "bench_vid_maker/tasks/python_sum.py"]
+command = ["{python}", "test_codes_python/test_1b_fsum.py"]
 
 [[tasks]]
 name = "Lithon"
