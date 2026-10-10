@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - master
+    paths:
+      - "web/**"
+      - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
 permissions:
@@ -16,24 +19,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
-      - name: Upload docs/public Artifact
+      - name: Install dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      # TanStack Start prerenders every route to static HTML, so Pages can
+      # host it. Sitemap and robots.txt come out of the same build.
+      - name: Build site
+        working-directory: web
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: bun run build
+
+      - name: Generate robots.txt
+        working-directory: web
+        run: bun run scripts/gen-seo.ts "${{ steps.deployment.outputs.page_url || format('https://{0}.github.io/{1}', github.repository_owner, github.event.repository.name) }}"
+
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          # Points directly to your built static files directory
-          path: 'docs/public'
+          path: "web/apps/web/dist/client"
 
+  deploy:
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4

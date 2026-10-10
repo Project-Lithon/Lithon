@@ -3,7 +3,7 @@ subtitle = "nested loop to i=1,000 -- same program, run as-is in each engine"
 
 [[tasks]]
 name = "CPython"
-command = ["{python}", "bench_vid_maker/tasks/python_euler.py"]
+command = ["{python}", "test_codes_python/test_eulars_constant_lim_def.py"]
 
 [[tasks]]
 name = "Lithon"

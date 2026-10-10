@@ -3,7 +3,7 @@ subtitle = "tiny workload -- for quickly checking the bench_vid_maker UI/video, 
 
 [[tasks]]
 name = "CPython"
-command = ["{python}", "bench_vid_maker/tasks/python_sum_1k.py"]
+command = ["{python}", "test_codes_python/test_1k_fsum.py"]
 
 [[tasks]]
 name = "Lithon"

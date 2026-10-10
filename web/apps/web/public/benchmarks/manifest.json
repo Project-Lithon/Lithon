@@ -1,0 +1,212 @@
+[
+  {
+    "id": "euler_lim",
+    "title": "Approximating e via the limit definition: CPython vs Lithon",
+    "subtitle": null,
+    "video": "/benchmarks/euler_lim.mp4",
+    "videoBytes": 922630,
+    "speedup": 0.6999611125214501,
+    "tasks": [
+      {
+        "name": "CPython",
+        "elapsed": 0.34217339999997876,
+        "stdout": "2.7169239322355985\n",
+        "returncode": 0,
+        "command": [
+          "test_codes_python/test_eulars_constant_lim_def.py"
+        ],
+        "script": "test_codes_python/test_eulars_constant_lim_def.py"
+      },
+      {
+        "name": "Lithon",
+        "elapsed": 0.4888462999999774,
+        "stdout": "2.7169239322355985\n",
+        "returncode": 0,
+        "command": [
+          "test_codes_lithon/test_eulars_constant_lim_def.py"
+        ],
+        "script": "test_codes_lithon/test_eulars_constant_lim_def.py"
+      }
+    ]
+  },
+  {
+    "id": "fsum_1b",
+    "title": "Summing 1,000,000,000 integers: CPython vs Lithon",
+    "subtitle": null,
+    "video": "/benchmarks/fsum_1b.mp4",
+    "videoBytes": 1329975,
+    "speedup": 143.53922194696355,
+    "tasks": [
+      {
+        "name": "CPython",
+        "elapsed": 188.56410270000003,
+        "stdout": "499999999500000000\n",
+        "returncode": 0,
+        "command": [
+          "test_codes_python/test_1b_fsum.py"
+        ],
+        "script": "test_codes_python/test_1b_fsum.py"
+      },
+      {
+        "name": "Lithon",
+        "elapsed": 1.3136764999999286,
+        "stdout": "499999999500000000\n",
+        "returncode": 0,
+        "command": [
+          "test_codes_lithon/test_1b_fsum.py"
+        ],
+        "script": "test_codes_lithon/test_1b_fsum.py"
+      }
+    ]
+  },
+  {
+    "id": "fsum_1b_1core",
+    "title": "Summing 1,000,000,000 integers: CPython vs Lithon",
+    "subtitle": null,
+    "video": "/benchmarks/fsum_1b_1core.mp4",
+    "videoBytes": 1316206,
+    "speedup": 28.429057636793615,
+    "tasks": [
+      {
+        "name": "CPython",
+        "elapsed": 109.21622060000016,
+        "stdout": "499999999500000000\n",
+        "returncode": 0,
+        "command": [
+          "test_codes_python/test_1b_fsum.py"
+        ],
+        "script": "test_codes_python/test_1b_fsum.py"
+      },
+      {
+        "name": "Lithon",
+        "elapsed": 3.8417109000000664,
+        "stdout": "499999999500000000\n",
+        "returncode": 0,
+        "command": [
+          "test_codes_lithon/test_1b_fsum.py"
+        ],
+        "script": "test_codes_lithon/test_1b_fsum.py"
+      }
+    ]
+  },
+  {
+    "id": "fsum_1b_4core",
+    "title": "Summing 1,000,000,000 integers: CPython vs Lithon",
+    "subtitle": null,
+    "video": "/benchmarks/fsum_1b_4core.mp4",
+    "videoBytes": 1355177,
+    "speedup": 98.69920563399832,
+    "tasks": [
+      {
+        "name": "CPython",
+        "elapsed": 140.4312235,
+        "stdout": "499999999500000000\n",
+        "returncode": 0,
+        "command": [
+          "test_codes_python/test_1b_fsum.py"
+        ],
+        "script": "test_codes_python/test_1b_fsum.py"
+      },
+      {
+        "name": "Lithon",
+        "elapsed": 1.4228201999999328,
+        "stdout": "499999999500000000\n",
+        "returncode": 0,
+        "command": [
+          "test_codes_lithon/test_1b_fsum.py"
+        ],
+        "script": "test_codes_lithon/test_1b_fsum.py"
+      }
+    ]
+  },
+  {
+    "id": "fsum_1b_6core",
+    "title": "Summing 1,000,000,000 integers: CPython vs Lithon",
+    "subtitle": null,
+    "video": "/benchmarks/fsum_1b_6core.mp4",
+    "videoBytes": 1327963,
+    "speedup": 9.570933088720365,
+    "tasks": [
+      {
+        "name": "CPython",
+        "elapsed": 93.2752195999999,
+        "stdout": "499999999500000000\n",
+        "returncode": 0,
+        "command": [
+          "test_codes_python/test_1b_fsum.py"
+        ],
+        "script": "test_codes_python/test_1b_fsum.py"
+      },
+      {
+        "name": "Lithon",
+        "elapsed": 9.745676699999876,
+        "stdout": "499999999500000000\n",
+        "returncode": 0,
+        "command": [
+          "test_codes_lithon/test_1b_fsum.py"
+        ],
+        "script": "test_codes_lithon/test_1b_fsum.py"
+      }
+    ]
+  },
+  {
+    "id": "fsum_1b_8core",
+    "title": "Summing 1,000,000,000 integers: CPython vs Lithon",
+    "subtitle": null,
+    "video": "/benchmarks/fsum_1b_8core.mp4",
+    "videoBytes": 1333541,
+    "speedup": 202.7693789788849,
+    "tasks": [
+      {
+        "name": "CPython",
+        "elapsed": 135.39179089999993,
+        "stdout": "499999999500000000\n",
+        "returncode": 0,
+        "command": [
+          "test_codes_python/test_1b_fsum.py"
+        ],
+        "script": "test_codes_python/test_1b_fsum.py"
+      },
+      {
+        "name": "Lithon",
+        "elapsed": 0.6677131999999801,
+        "stdout": "499999999500000000\n",
+        "returncode": 0,
+        "command": [
+          "test_codes_lithon/test_1b_fsum.py"
+        ],
+        "script": "test_codes_lithon/test_1b_fsum.py"
+      }
+    ]
+  },
+  {
+    "id": "fsum_1k",
+    "title": "Summing 1,000 integers: CPython vs Lithon",
+    "subtitle": null,
+    "video": "/benchmarks/fsum_1k.mp4",
+    "videoBytes": 735064,
+    "speedup": 0.386275295516722,
+    "tasks": [
+      {
+        "name": "CPython",
+        "elapsed": 0.15336739999997917,
+        "stdout": "499500\n",
+        "returncode": 0,
+        "command": [
+          "test_codes_python/test_1k_fsum.py"
+        ],
+        "script": "test_codes_python/test_1k_fsum.py"
+      },
+      {
+        "name": "Lithon",
+        "elapsed": 0.39704170000004524,
+        "stdout": "499500\n",
+        "returncode": 0,
+        "command": [
+          "test_codes_lithon/test_1k_fsum.py"
+        ],
+        "script": "test_codes_lithon/test_1k_fsum.py"
+      }
+    ]
+  }
+]
