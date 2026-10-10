@@ -10,6 +10,7 @@ import {
   DiscordLogo,
   GithubLogo,
   ListIcon,
+  MagnifyingGlassIcon,
   MoonIcon,
   SpeakerHighIcon,
   SpeakerXIcon,
@@ -18,6 +19,7 @@ import {
 
 import { Button } from "@workspace/ui/components/button"
 import { DirectionProvider } from "@workspace/ui/components/direction"
+import { Kbd } from "@workspace/ui/components/kbd"
 import { Separator } from "@workspace/ui/components/separator"
 import {
   Sheet,
@@ -34,6 +36,7 @@ import {
 } from "@workspace/ui/components/tooltip"
 import appCss from "@workspace/ui/globals.css?url"
 import { initSoundFeedback, readStoredSound, toggleSound } from "../lib/sound"
+import { SearchProvider, useSearch } from "../search/provider"
 
 export const Route = createRootRoute({
   head: () => ({
@@ -251,6 +254,24 @@ function BrandLinks() {
   )
 }
 
+function SearchButton() {
+  const { open } = useSearch()
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      className="hidden items-center gap-2 text-muted-foreground md:flex"
+      onClick={open}
+      aria-label="Search documentation and actions"
+    >
+      <MagnifyingGlassIcon />
+      <span className="text-xs">Search</span>
+      <Kbd>⌘</Kbd>
+      <Kbd>K</Kbd>
+    </Button>
+  )
+}
+
 function SiteHeader({
   dir,
   onToggleDir,
@@ -263,6 +284,7 @@ function SiteHeader({
       <div className="mx-auto flex h-14 w-full max-w-6xl items-center px-4">
         <BrandLinks />
         <div className="ms-auto flex items-center gap-1">
+          <SearchButton />
           <span className="hidden sm:flex">
             <IconButton
               href="https://github.com/Project-Lithon/Lithon"
@@ -408,17 +430,19 @@ function RootDocument({ children }: { children: React.ReactNode }) {
       </head>
       <body>
         <DirectionProvider direction={dir}>
-          <TooltipProvider>
-            <a
-              href="#main"
-              className="sr-only focus:not-sr-only focus:absolute focus:start-2 focus:top-2 focus:z-50 focus:rounded-md focus:bg-primary focus:px-3 focus:py-2"
-            >
-              Skip to content
-            </a>
-            <SiteHeader dir={dir} onToggleDir={toggleDir} />
-            <main id="main">{children}</main>
-            <SiteFooter />
-          </TooltipProvider>
+          <SearchProvider>
+            <TooltipProvider>
+              <a
+                href="#main"
+                className="sr-only focus:not-sr-only focus:absolute focus:start-2 focus:top-2 focus:z-50 focus:rounded-md focus:bg-primary focus:px-3 focus:py-2"
+              >
+                Skip to content
+              </a>
+              <SiteHeader dir={dir} onToggleDir={toggleDir} />
+              <main id="main">{children}</main>
+              <SiteFooter />
+            </TooltipProvider>
+          </SearchProvider>
         </DirectionProvider>
         <Scripts />
       </body>
