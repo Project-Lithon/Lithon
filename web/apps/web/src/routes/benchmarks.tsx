@@ -43,6 +43,7 @@ type Task = {
   stdout: string
   returncode: number
   command: string[]
+  script: string | null
 }
 
 type Entry = {
@@ -63,7 +64,8 @@ function fmtSeconds(s: number) {
 }
 
 function Bar({ value, max }: { value: number; max: number }) {
-  const pct = max > 0 ? Math.max(1, (value / max) * 100) : 0
+  // keep a floor so the winning bar is still a visible sliver, not a dot
+  const pct = max > 0 ? Math.min(100, Math.max(1.5, (value / max) * 100)) : 0
   return (
     <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
       <div
@@ -87,7 +89,7 @@ function BenchmarkCard({ entry }: { entry: Entry }) {
       <CardHeader className="border-b pb-3">
         <CardTitle className="flex flex-wrap items-start justify-between gap-2">
           <span className="font-heading text-base">{entry.title}</span>
-          {entry.speedup && (
+          {entry.speedup !== null && (
             <Badge
               variant="outline"
               className={
@@ -95,9 +97,14 @@ function BenchmarkCard({ entry }: { entry: Entry }) {
                   ? "text-accent-strong"
                   : "text-muted-foreground"
               }
+              title={
+                entry.speedup >= 1
+                  ? "Lithon was faster on this run"
+                  : "Lithon was slower on this run"
+              }
             >
               {entry.speedup >= 1 ? <TrendUpIcon /> : <TrendDownIcon />}
-              {entry.speedup.toFixed(1)}×
+              {entry.speedup.toFixed(1)}×{entry.speedup < 1 ? " slower" : ""}
             </Badge>
           )}
         </CardTitle>
@@ -149,12 +156,14 @@ function BenchmarkCard({ entry }: { entry: Entry }) {
                 </span>
               </div>
               <Bar value={task.elapsed} max={max} />
-              <p
-                dir="ltr"
-                className="truncate font-mono text-[11px] text-muted-foreground"
-              >
-                {task.command.join(" ")}
-              </p>
+              {task.script ? (
+                <p
+                  dir="ltr"
+                  className="truncate font-mono text-[11px] text-muted-foreground"
+                >
+                  {task.script}
+                </p>
+              ) : null}
             </div>
           ))}
         </div>
@@ -219,21 +228,25 @@ function Benchmarks() {
 
       <section className={`${WRAP} space-y-6 py-10`}>
         {headline && (
-          <div className="flex flex-wrap items-center gap-4 rounded-lg border p-4">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-3 rounded-lg border p-4">
             <Badge variant="outline" className="text-accent-strong">
               <TrendUpIcon />
               {headline.speedup?.toFixed(1)}×
             </Badge>
-            <p className="flex-1 text-sm text-muted-foreground">
-              {headline.title}: CPython{" "}
-              {fmtSeconds(
-                headline.tasks.find((t) => t.name === "CPython")?.elapsed ?? 0
-              )}{" "}
-              against Lithon{" "}
-              {fmtSeconds(
-                headline.tasks.find((t) => t.name === "Lithon")?.elapsed ?? 0
-              )}
-            </p>
+            <div className="flex-1 space-y-0.5">
+              <p className="text-sm font-medium">{headline.title}</p>
+              <p className="font-mono text-xs text-muted-foreground" dir="ltr">
+                CPython{" "}
+                {fmtSeconds(
+                  headline.tasks.find((t) => t.name === "CPython")?.elapsed ?? 0
+                )}
+                {"  vs  "}
+                Lithon{" "}
+                {fmtSeconds(
+                  headline.tasks.find((t) => t.name === "Lithon")?.elapsed ?? 0
+                )}
+              </p>
+            </div>
             <Button
               variant="outline"
               size="sm"

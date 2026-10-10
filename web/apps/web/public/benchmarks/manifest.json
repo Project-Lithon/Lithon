@@ -13,8 +13,9 @@
         "stdout": "2.7169239322355985\n",
         "returncode": 0,
         "command": [
-          "bench_vid_maker/tasks/python_euler.py"
-        ]
+          "test_codes_python/test_eulars_constant_lim_def.py"
+        ],
+        "script": "test_codes_python/test_eulars_constant_lim_def.py"
       },
       {
         "name": "Lithon",
@@ -23,10 +24,10 @@
         "returncode": 0,
         "command": [
           "test_codes_lithon/test_eulars_constant_lim_def.py"
-        ]
+        ],
+        "script": "test_codes_lithon/test_eulars_constant_lim_def.py"
       }
-    ],
-    "cores": null
+    ]
   },
   {
     "id": "fsum_1b",
@@ -42,8 +43,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "bench_vid_maker/tasks/python_sum.py"
-        ]
+          "test_codes_python/test_1b_fsum.py"
+        ],
+        "script": "test_codes_python/test_1b_fsum.py"
       },
       {
         "name": "Lithon",
@@ -52,10 +54,10 @@
         "returncode": 0,
         "command": [
           "test_codes_lithon/test_1b_fsum.py"
-        ]
+        ],
+        "script": "test_codes_lithon/test_1b_fsum.py"
       }
-    ],
-    "cores": null
+    ]
   },
   {
     "id": "fsum_1b_1core",
@@ -71,8 +73,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "bench_vid_maker/tasks/python_sum.py"
-        ]
+          "test_codes_python/test_1b_fsum.py"
+        ],
+        "script": "test_codes_python/test_1b_fsum.py"
       },
       {
         "name": "Lithon",
@@ -81,10 +84,10 @@
         "returncode": 0,
         "command": [
           "test_codes_lithon/test_1b_fsum.py"
-        ]
+        ],
+        "script": "test_codes_lithon/test_1b_fsum.py"
       }
-    ],
-    "cores": null
+    ]
   },
   {
     "id": "fsum_1b_4core",
@@ -100,8 +103,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "bench_vid_maker/tasks/python_sum.py"
-        ]
+          "test_codes_python/test_1b_fsum.py"
+        ],
+        "script": "test_codes_python/test_1b_fsum.py"
       },
       {
         "name": "Lithon",
@@ -110,10 +114,10 @@
         "returncode": 0,
         "command": [
           "test_codes_lithon/test_1b_fsum.py"
-        ]
+        ],
+        "script": "test_codes_lithon/test_1b_fsum.py"
       }
-    ],
-    "cores": null
+    ]
   },
   {
     "id": "fsum_1b_6core",
@@ -129,8 +133,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "bench_vid_maker/tasks/python_sum.py"
-        ]
+          "test_codes_python/test_1b_fsum.py"
+        ],
+        "script": "test_codes_python/test_1b_fsum.py"
       },
       {
         "name": "Lithon",
@@ -139,10 +144,10 @@
         "returncode": 0,
         "command": [
           "test_codes_lithon/test_1b_fsum.py"
-        ]
+        ],
+        "script": "test_codes_lithon/test_1b_fsum.py"
       }
-    ],
-    "cores": null
+    ]
   },
   {
     "id": "fsum_1b_8core",
@@ -158,8 +163,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "bench_vid_maker/tasks/python_sum.py"
-        ]
+          "test_codes_python/test_1b_fsum.py"
+        ],
+        "script": "test_codes_python/test_1b_fsum.py"
       },
       {
         "name": "Lithon",
@@ -168,10 +174,10 @@
         "returncode": 0,
         "command": [
           "test_codes_lithon/test_1b_fsum.py"
-        ]
+        ],
+        "script": "test_codes_lithon/test_1b_fsum.py"
       }
-    ],
-    "cores": null
+    ]
   },
   {
     "id": "fsum_1k",
@@ -187,8 +193,9 @@
         "stdout": "499500\n",
         "returncode": 0,
         "command": [
-          "bench_vid_maker/tasks/python_sum_1k.py"
-        ]
+          "test_codes_python/test_1k_fsum.py"
+        ],
+        "script": "test_codes_python/test_1k_fsum.py"
       },
       {
         "name": "Lithon",
@@ -197,9 +204,9 @@
         "returncode": 0,
         "command": [
           "test_codes_lithon/test_1k_fsum.py"
-        ]
+        ],
+        "script": "test_codes_lithon/test_1k_fsum.py"
       }
-    ],
-    "cores": null
+    ]
   }
 ]
