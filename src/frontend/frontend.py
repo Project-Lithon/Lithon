@@ -84,6 +84,11 @@ def parse_type_annotation(node):
     if isinstance(node, ast.Name):
         if node.id == "bool":
             return "bool", -1, None, None, None, None
+        if node.id in ("int", "float"):
+            opts = "8, 16, 32 or 64" if node.id == "int" else "64"
+            raise NotImplementedError(
+                f"LITHON-E0105: {node.id} requires an explicit width -- "
+                f"{node.id} must be {opts}")
         raise NotImplementedError(f"type '{node.id}' requires an explicit size, e.g. {node.id}[64]")
 
     if isinstance(node, ast.Subscript):
@@ -101,9 +106,28 @@ def parse_type_annotation(node):
         size_node = node.slice
         if not isinstance(size_node, ast.Constant) or not isinstance(size_node.value, int):
             raise NotImplementedError(f"{base}[N] requires a literal integer size")
+        _require_supported_width(base, size_node.value)
         return base, size_node.value, None, None, None, None
 
     raise NotImplementedError("unsupported type annotation form")
+
+
+# E0105 (docs/lithon_error_system.md 4c): only int[8|16|32|64] and float[64]
+# exist. Container capacities and dict bucket counts are not widths and are
+# exempt; this is called on scalar leaves only.
+_SCALAR_WIDTHS = {"int": (8, 16, 32, 64), "float": (64,)}
+
+
+def _require_supported_width(base, width):
+    allowed = _SCALAR_WIDTHS.get(base)
+    if allowed is None or width in allowed:
+        return
+    if base == "int":
+        raise NotImplementedError(
+            f"LITHON-E0105: unsupported integer width {width} -- "
+            "int must be 8, 16, 32 or 64")
+    raise NotImplementedError(
+        f"LITHON-E0105: unsupported float width {width} -- float must be 64")
 
 
 def _parse_dict_annotation(slice_node):
@@ -542,6 +566,27 @@ class IRBuilder:
                 r = self.new_reg()
                 self.emit(f"{r} = addressof {name}")
                 self.ptr_types[r] = self.var_types[name]
+                return r
+            if node.func.id in ("wrap_add", "wrap_sub", "wrap_mul"):
+                # E0303 opt-out. Compiler-recognized names like addressof/
+                # valueof: the call lowers to one wrapping IR op so the
+                # typechecker can enforce int[64]-only operands and the JIT can
+                # emit the same arithmetic WITHOUT the overflow trap. A user
+                # function of this name is shadowed, exactly like len/contains.
+                if len(node.args) != 2:
+                    raise NotImplementedError(
+                        f"{node.func.id}() takes exactly two int[64] operands, "
+                        f"e.g. {node.func.id}(a, b) (E0303)")
+                op = {"wrap_add": "wrapadd", "wrap_sub": "wrapsub",
+                      "wrap_mul": "wrapmul"}[node.func.id]
+                left = self.build_expr(node.args[0])
+                right = self.build_expr(node.args[1])
+                if left in self.ptr_types or right in self.ptr_types:
+                    raise NotImplementedError(
+                        f"{node.func.id}() is integer-only -- pointer arithmetic "
+                        f"is not wrapping arithmetic (E0303, int[64] operands only)")
+                r = self.new_reg()
+                self.emit(f"{r} = {op} {left}, {right}")
                 return r
             arg_regs = [self.build_expr(a) for a in node.args]
             callee = self.fn_rename.get(node.func.id, node.func.id)

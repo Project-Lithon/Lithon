@@ -137,6 +137,7 @@ public:
         bool has_return_type = !fn_.return_type_kind.empty();
         if (has_return_type) {
             return_type_ = LType{fn_.return_type_kind, fn_.return_type_width};
+            check_scalar_width(fn_.return_type_kind, fn_.return_type_width);
         }
         has_return_type_ = has_return_type;
 
@@ -148,6 +149,7 @@ public:
                 continue;
             }
             entry_scope[fn_.params[i]] = LType{fn_.param_type_kinds[i], fn_.param_type_widths[i]};
+            check_scalar_width(fn_.param_type_kinds[i], fn_.param_type_widths[i]);
         }
         // Entry points are exempt from the return-annotation rule: the frontend's
         // implicit top-level function is __main__, and hand-written IR may use main.
@@ -181,6 +183,32 @@ private:
 
     void error(const std::string& msg) {
         errors_.push_back(RCRError{msg});
+    }
+
+    // E0105 (docs/lithon_error_system.md 4c): only int[8|16|32|64] and
+    // float[64] exist. A hand-written module can spell any width in its type
+    // fields, so this is enforced here and not only in the frontend. Container
+    // capacities (list/tuple), dict bucket counts and the future str[N] are
+    // capacities, not bit widths, and are deliberately exempt; only scalar
+    // int/float -- including a pointer's pointee, which lives in the element
+    // slot -- is a width.
+    void check_scalar_width(const std::string& kind, int width) {
+        const std::string code = "LITHON-E0105: ";
+        if (kind == "int") {
+            if (width == 8 || width == 16 || width == 32 || width == 64) return;
+            if (width < 0)
+                error(code + "int requires an explicit width (8, 16, 32 or 64)");
+            else
+                error(code + "unsupported integer width " + std::to_string(width) +
+                      " -- int must be 8, 16, 32 or 64");
+        } else if (kind == "float") {
+            if (width == 64) return;
+            if (width < 0)
+                error(code + "float requires an explicit width (64)");
+            else
+                error(code + "unsupported float width " + std::to_string(width) +
+                      " -- float must be 64");
+        }
     }
 
     void add_edge(const std::string& from, const std::string& to) {
@@ -738,6 +766,13 @@ private:
     }
 
     void check_instr(const Instr& instr, Scope& scope) {
+        // E0105: refuse unsupported scalar widths wherever they appear on the
+        // instruction (a storage target, a value type such as valueof's pointee,
+        // a container element or a dict key/value). Runs before the op logic so
+        // the refusal can never be masked by a later, more specific check.
+        check_scalar_width(instr.type_kind, instr.type_width);
+        check_scalar_width(instr.type_elem_kind, instr.type_elem_width);
+        check_scalar_width(instr.type_key_kind, instr.type_key_width);
         switch (instr.op) {
             // 4.1. A const takes its width from the trailing " : T[N]" suffix
             // when one is present, and defaults to int[64] otherwise. Hardcoding
@@ -1036,8 +1071,61 @@ private:
                     return;
                 }
                 if (lhs.kind == "float" || rhs.kind == "float") reg_types_[instr.result] = LType{"float", 64};
-                else if (lhs.kind == "int" && rhs.kind == "int")
+                else if (lhs.kind == "int" && rhs.kind == "int") {
                     reg_types_[instr.result] = LType{"int", std::max(lhs.width, rhs.width)};
+                    // E0303 Tier 1: a constant add/sub/mul whose exact result
+                    // leaves int64 is refused HERE rather than ever reaching a
+                    // runtime trap or silently wrapping. This is also what keeps
+                    // the optimizer's fold_constants safe: it folds int adds
+                    // with wrap semantics (that is what the machine code did),
+                    // and can only ever see a non-overflowing pair after this
+                    // gate. Narrow ints are exempt by construction: their
+                    // declared range cannot fit an int64 overflow, and the
+                    // store-narrowing pass already refuses such results.
+                    if (lhs.width == 64 || rhs.width == 64) {
+                        const Instr* ca = find_producing_const(instr.args.at(0));
+                        const Instr* cb = find_producing_const(instr.args.at(1));
+                        if (ca && cb) {
+                            int64_t r = 0;
+                            const bool ovf =
+                                instr.op == Op::Add ? __builtin_add_overflow(ca->int_imm, cb->int_imm, &r)
+                                : instr.op == Op::Sub ? __builtin_sub_overflow(ca->int_imm, cb->int_imm, &r)
+                                                      : __builtin_mul_overflow(ca->int_imm, cb->int_imm, &r);
+                            if (ovf) {
+                                const char* opn = instr.op == Op::Add
+                                    ? "add" : instr.op == Op::Sub ? "sub" : "mul";
+                                const char* wrapn = instr.op == Op::Add
+                                    ? "wrap_add" : instr.op == Op::Sub ? "wrap_sub" : "wrap_mul";
+                                error("LITHON-E0303: constant " + std::string(opn) +
+                                      " overflows int[64] -- " + std::to_string(ca->int_imm) +
+                                      " and " + std::to_string(cb->int_imm) +
+                                      " combine outside the int64 range; use " + wrapn +
+                                      "() to wrap instead (E0303)");
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            case Op::WrapAdd:
+            case Op::WrapSub:
+            case Op::WrapMul: {
+                // E0303 opt-out. Wrapping arithmetic, int[64] operands only in
+                // v1: narrow ints can never overflow int64 so wrapping them is
+                // meaningless, and float wrap does not exist.
+                LType lhs, rhs;
+                if (!reg_type(instr.args.at(0), lhs) || !reg_type(instr.args.at(1), rhs)) return;
+                const char* name = instr.op == Op::WrapAdd ? "wrap_add"
+                                 : instr.op == Op::WrapSub ? "wrap_sub" : "wrap_mul";
+                if (lhs.kind == "ptr" || rhs.kind == "ptr" ||
+                    lhs.kind != "int" || rhs.kind != "int" ||
+                    lhs.width != 64 || rhs.width != 64) {
+                    error("LITHON-E0303: " + std::string(name) +
+                          "() needs two int[64] operands -- narrow ints never overflow "
+                          "and a float cannot wrap (E0303, v1 int[64] only)");
+                    return;
+                }
+                reg_types_[instr.result] = LType{"int", 64};
                 return;
             }
             case Op::Mod:

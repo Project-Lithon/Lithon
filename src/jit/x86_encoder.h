@@ -274,6 +274,10 @@ inline JumpPatch emit_jmp_rel32(CodeBuffer& buf) {
 // 0F 8x cd. The x86 condition codes come in complementary pairs that
 // differ only in the lowest bit, which invert() exploits.
 enum class Cond : uint8_t {
+    // 0F 80 = jo, 0F 81 = jno. Only these two read OF, and they are the pair
+    // the int64 overflow trap needs: add/sub/imul set OF exactly on signed
+    // overflow, so jno skipping the host trap is a one-instruction guard.
+    Overflow = 0x80, NotOverflow = 0x81,
     Less = 0x8C, GreaterEq = 0x8D, LessEq = 0x8E, Greater = 0x8F,
     Equal = 0x84, NotEqual = 0x85, NotZero = 0x85,
     // Unsigned-style conditions, named after the flags they read. These are

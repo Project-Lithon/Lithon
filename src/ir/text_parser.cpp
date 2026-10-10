@@ -418,6 +418,18 @@ Module parse_ir_text(const std::string& text) {
             instr.op = Op::Mul;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
             instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+        } else if (oa.op_name == "wrapadd") {
+            instr.op = Op::WrapAdd;
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+        } else if (oa.op_name == "wrapsub") {
+            instr.op = Op::WrapSub;
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+        } else if (oa.op_name == "wrapmul") {
+            instr.op = Op::WrapMul;
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
         } else if (oa.op_name == "div") {
             instr.op = Op::Div;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));

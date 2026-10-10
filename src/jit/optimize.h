@@ -92,10 +92,20 @@ inline void fold_constants(lithon::ir::Function& fn, OptimizeStats& stats) {
                 case Op::Add:
                 case Op::Sub:
                 case Op::Mul:
+                case Op::WrapAdd:
+                case Op::WrapSub:
+                case Op::WrapMul:
                     if (in.args.size() == 2 && as_const(in.args[0], a) && as_const(in.args[1], b)) {
-                        // Wrap-around arithmetic, matching the emitted machine code.
+                        // Wrap-around arithmetic, matching the emitted machine
+                        // code. The typechecker refuses a PLAIN add/sub/mul
+                        // whose constant result leaves int64 (LITHON-E0303,
+                        // Tier 1), so folding those only ever sees pairs that
+                        // fit; a Wrap* pair here is the opt-out and folds
+                        // through the same well-defined wrap below.
                         uint64_t ua = static_cast<uint64_t>(a), ub = static_cast<uint64_t>(b);
-                        uint64_t r = in.op == Op::Add ? ua + ub : in.op == Op::Sub ? ua - ub : ua * ub;
+                        uint64_t r = in.op == Op::Add || in.op == Op::WrapAdd ? ua + ub
+                                  : in.op == Op::Sub || in.op == Op::WrapSub ? ua - ub
+                                                                            : ua * ub;
                         rewrite(in, static_cast<int64_t>(r));
                     }
                     break;
@@ -188,24 +198,27 @@ inline bool is_pure_op(lithon::ir::Op op) {
     using lithon::ir::Op;
     switch (op) {
         case Op::ConstInt: case Op::ConstBool: case Op::ConstFloat: case Op::Load:
-        case Op::Add: case Op::Sub: case Op::Mul:
+        // WrapAdd/WrapSub/WrapMul only: the deliberate opt-outs are genuinely
+        // total, so hoisting or deleting them is unobservable.
+        case Op::WrapAdd: case Op::WrapSub: case Op::WrapMul:
         case Op::Lt: case Op::Gt: case Op::Eq:
         case Op::And: case Op::Or: case Op::Not:
         // BitAnd/BitOr/BitXor only: genuinely total, so hoisting or
-        // duplicating them is unobservable. Shl/Shr are deliberately NOT
-        // listed even though they usually do not trap -- a count outside
-        // 0..63 is a runtime error, and this predicate means "safe to MOVE"
-        // (LICM, DCE). Hoisting a trapping op out of a loop, or deleting it
-        // when its result is unused, changes whether it traps at all.
+        // duplicating them is unobservable. Shl/Shr and, since the E0303
+        // overflow trap, plain Add/Sub/Mul are deliberately NOT listed even
+        // though they usually do not trap -- a Shl count outside 0..63 or an
+        // int64 overflow is a runtime error, and this predicate means "safe to
+        // MOVE" (LICM, DCE). Hoisting a trapping op out of a loop, or deleting
+        // it when its result is unused, changes whether it traps at all.
         //
         // That is a different question from "safe to DUPLICATE", which is
-        // what the unroller asks. Shl/Shr are valid there; see
+        // what the unroller asks. Shl/Shr and Add/Sub/Mul are valid there; see
         // is_unrollable_op() in compile_function.h for why duplication
         // preserves trapping and movement does not.
         case Op::BitAnd: case Op::BitOr: case Op::BitXor:
             return true;
         default:
-            return false;   // Call/Return/Branch/Jump have effects; Div/Float/Phi stay untouched
+            return false;   // Call/Return/Branch/Jump have effects; Add/Sub/Mul/Div/Shl/Shr trap; Float/Phi stay untouched
     }
 }
 

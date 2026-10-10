@@ -15,6 +15,12 @@
 //     B:       acc = acc + (1 << k); i = i + 1;   jump  H        (11 instrs)
 //     exit:    return acc
 //
+// The accumulator add is WRAPADD on purpose: default Add now traps on int64
+// overflow (LITHON-E0303), and `n * (1 << k)` for k=62 and a large trip count
+// leaves int64. This test pins SHIFT unrolling -- duplication of a trapping
+// op must not change which execution traps -- so the sum must be explicitly
+// wrapping; that also exercises WrapAdd through the straight-line unroller.
+//
 // The count `k` comes from a Load, so codegen takes the dynamic path
 // (`shl dst, cl`), which is the path that exercises the scratch register and
 // the RCX-destination hazard. Three things are easy to get wrong:
@@ -66,7 +72,7 @@ int main() {
     { Instr i; i.op = Op::ConstInt; i.result = 6; i.int_imm = 1; body.instrs.push_back(i); }
     { Instr i; i.op = Op::Load; i.result = 7; i.name = "k"; body.instrs.push_back(i); }
     { Instr i; i.op = Op::Shl; i.result = 8; i.args = {6, 7}; body.instrs.push_back(i); }
-    { Instr i; i.op = Op::Add; i.result = 9; i.args = {5, 8}; body.instrs.push_back(i); }
+    { Instr i; i.op = Op::WrapAdd; i.result = 9; i.args = {5, 8}; body.instrs.push_back(i); }
     { Instr i; i.op = Op::Store; i.result = kInvalidValue; i.args = {9}; i.name = "acc"; body.instrs.push_back(i); }
     { Instr i; i.op = Op::Load; i.result = 10; i.name = "i"; body.instrs.push_back(i); }
     { Instr i; i.op = Op::ConstInt; i.result = 11; i.int_imm = 1; body.instrs.push_back(i); }

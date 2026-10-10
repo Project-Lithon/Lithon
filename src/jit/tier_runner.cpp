@@ -152,7 +152,12 @@ int main(int argc, char** argv) {
         {
             auto errors = lithon::typecheck::check_module(module);
             if (!errors.empty()) {
-                for (const auto& e : errors) std::cerr << "RCR error: " << e.message << "\n";
+                for (const auto& e : errors) {
+                    // LITHON-Exxxx messages are self-identifying; prose-only
+                    // messages keep the legacy "RCR error:" tag.
+                    const std::string& m = e.message;
+                    std::cerr << (m.rfind("LITHON-", 0) == 0 ? "" : "RCR error: ") << m << "\n";
+                }
                 return 1;
             }
         }
@@ -199,7 +204,10 @@ int main(int argc, char** argv) {
             run_interpreter(module);
         }
     } catch (const std::exception& e) {
-        std::cerr << "error: " << e.what() << "\n";
+        // LITHON-Exxxx messages (E0303 etc.) are self-identifying; prose-only
+        // runtime messages keep the legacy "error: " prefix.
+        const std::string m = e.what();
+        std::cerr << (m.rfind("LITHON-", 0) == 0 ? "" : "error: ") << m << "\n";
         return 1;
     }
     return 0;

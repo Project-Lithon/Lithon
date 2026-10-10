@@ -84,6 +84,9 @@ python3 tools/check_typecheck_unconditional.py
 step "uninitialized declarations (0.6.10): accept/reject and byte-identical codegen"
 python3 tools/check_uninit_decls.py
 
+step "error-code discipline + coded refusals (E0105)"
+python3 tools/check_error_codes.py
+
 step "regression suites (interpreter oracle vs CPython) + typed suite"
 python3 tools/run_regression.py
 python3 tools/run_typed_regression.py

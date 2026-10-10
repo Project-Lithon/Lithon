@@ -23,6 +23,16 @@ enum class Op : uint8_t {
     Mul,
     Div,
 
+    // Wrapping add/sub/mul (E0303 opt-out). Default Add/Sub/Mul trap on
+    // int64 overflow so a wrapped 64-bit result cannot pass silently; these
+    // are the deliberate escape hatch, compiled to the same machine code with
+    // the overflow trap elided and executed by the interpreter with wrapping
+    // arithmetic. int[64] operands only (v1; see docs/lithon_error_system.md
+    // section 3a).
+    WrapAdd,
+    WrapSub,
+    WrapMul,
+
     // Integer/float remainder. Typed like Mul (int iff both operands are
     // int, else float), NOT like Div: true division has to widen because a
     // quotient generally is not an integer, but a remainder never leaves the

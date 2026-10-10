@@ -73,6 +73,10 @@ def parse_annotation(node):
     if isinstance(node, ast.Name):
         if node.id == "bool":
             return LType("bool")
+        if node.id in ("int", "float"):
+            opts = "8, 16, 32 or 64" if node.id == "int" else "64"
+            raise RCRError(
+                f"LITHON-E0105: {node.id} requires an explicit width -- {node.id} must be {opts}")
         raise RCRError(f"type '{node.id}' requires an explicit size, e.g. {node.id}[64]")
 
     if isinstance(node, ast.Subscript):
@@ -90,9 +94,11 @@ def parse_annotation(node):
         width = size_node.value
 
         if base == "int" and width not in (8, 16, 32, 64):
-            raise RCRError(f"int[{width}] is not a valid width -- must be 8, 16, 32, or 64")
-        if base == "float" and width not in (32, 64):
-            raise RCRError(f"float[{width}] is not a valid width -- must be 32 or 64")
+            raise RCRError(
+                f"LITHON-E0105: unsupported integer width {width} -- int must be 8, 16, 32 or 64")
+        if base == "float" and width not in (64,):
+            raise RCRError(
+                f"LITHON-E0105: unsupported float width {width} -- float must be 64")
 
         return LType(base, width)
 
@@ -204,6 +210,22 @@ class TypeChecker:
             right_t = self.infer_expr_type(node.right, scope, context)
             if isinstance(node.op, (ast.LShift, ast.RShift, ast.BitAnd, ast.BitOr, ast.BitXor)):
                 return self.infer_bitop_type(node.op, left_t, right_t, node.right, context)
+            # E0303 Tier 1: mirror src/typecheck/typecheck.cpp's ordinary
+            # int64 constant-overflow refusal. -2**63..2**63-1 is the whole
+            # machine word, so a constant add/sub/mul that leaves it is refused
+            # here rather than silently wrapping; wrap_*() is the opt-out.
+            if isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)) and \
+                    literal_kind(node.left) == "int" and literal_kind(node.right) == "int":
+                a, b = node.left.value, node.right.value
+                r = a + b if isinstance(node.op, ast.Add) \
+                    else a - b if isinstance(node.op, ast.Sub) else a * b
+                if not (-(2**63) <= r <= 2**63 - 1):
+                    opn = "add" if isinstance(node.op, ast.Add) \
+                        else "sub" if isinstance(node.op, ast.Sub) else "mul"
+                    raise RCRError(
+                        f"LITHON-E0303: constant {opn} overflows int[64] -- {a} and {b} "
+                        f"combine outside the int64 range; use wrap_{opn}() to wrap instead "
+                        f"(E0303)")
             return self.infer_binop_type(node.op, left_t, right_t, context)
 
         if isinstance(node, ast.Compare):
@@ -238,6 +260,23 @@ class TypeChecker:
                         f"{context}: print() does not accept {arg_t} -- V1_SPEC 0.6.9's closed "
                         f"overload set is int[N], float[N], str[N], bool only")
                 return LType("bool")
+
+            if fname in ("wrap_add", "wrap_sub", "wrap_mul"):
+                # E0303 opt-out: int[64]-only wrapping arithmetic, mirroring the
+                # C++ checker's check_instr case.
+                if len(node.args) != 2:
+                    raise RCRError(
+                        f"{fname}() takes exactly two int[64] operands, "
+                        f"e.g. {fname}(a, b) (E0303)")
+                lt = self.infer_expr_type(node.args[0], scope, context)
+                rt = self.infer_expr_type(node.args[1], scope, context)
+                for t, side in ((lt, "left"), (rt, "right")):
+                    if t.kind != "int" or t.width != 64:
+                        raise RCRError(
+                            f"LITHON-E0303: {fname}() needs two int[64] operands -- "
+                            f"narrow ints never overflow and a float cannot wrap "
+                            f"(E0303, v1 int[64] only)")
+                return LType("int", 64)
 
             if fname not in self.functions:
                 raise RCRError(f"{context}: call to unknown function '{fname}'")

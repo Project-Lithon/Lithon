@@ -388,6 +388,8 @@ inline bool is_unrollable_op(lithon::ir::Op op) {
     switch (op) {
         case Op::ConstInt: case Op::ConstBool: case Op::Load: case Op::Store:
         case Op::Add: case Op::Sub: case Op::Mul:
+        // E0303 opt-outs never trap, so duplicating them is trivially safe.
+        case Op::WrapAdd: case Op::WrapSub: case Op::WrapMul:
         case Op::Lt: case Op::Gt: case Op::Eq:
         case Op::And: case Op::Or: case Op::Not:
         case Op::BitAnd: case Op::BitOr: case Op::BitXor:
@@ -888,6 +890,31 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
         // so reusing the division string here would show up as a diff.
         auto emit_int_zero_modulo_trap = [&]() {
             emit_host_error_trap("error: interpreter: modulo by zero\n");
+        };
+
+        // E0303. Emitted immediately after an int64 add/sub/imul, whose signed
+        // overflow is exactly the OF flag. jno skips a host trap carrying the
+        // SAME text the interpreter throws ("LITHON-E0303: integer overflow
+        // in <op> ..."), so -- like the zero-divisor traps above -- the two
+        // tiers produce identical stderr and run_tier_diff.py stays exact.
+        // The "LITHON-" prefix is what makes the interpreter's exception
+        // handler print it without its legacy "error: " tag.
+        //
+        // The guard is only ever elided for wrap_add/wrap_sub/wrap_mul, which
+        // exist precisely to opt out. Narrow (int[8..32]) results cannot reach
+        // an int64 overflow, so their guard is dead weight but never taken;
+        // pointer arithmetic offsets are scaled literal counts far below 2^63,
+        // so its guard is dead too. Both agree across tiers by construction.
+        auto emit_int_overflow_trap = [&](Op op) {
+            const char* msg =
+                op == Op::Add
+                    ? "LITHON-E0303: integer overflow in add -- use wrap_add() to wrap instead\n"
+                : op == Op::Sub
+                    ? "LITHON-E0303: integer overflow in sub -- use wrap_sub() to wrap instead\n"
+                    : "LITHON-E0303: integer overflow in mul -- use wrap_mul() to wrap instead\n";
+            JumpPatch no_overflow = emit_jcc_rel32(code, Cond::NotOverflow);
+            emit_host_error_trap(msg);
+            resolve_jump_patch(code, no_overflow, code.size());
         };
 
         // 4.1. Bounds check for a container access whose index is not a
@@ -2149,6 +2176,9 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             case Op::Add:
             case Op::Sub:
             case Op::Mul:
+            case Op::WrapAdd:
+            case Op::WrapSub:
+            case Op::WrapMul:
             case Op::Div:
             case Op::Mod: {
                 // The float path is a separate case body rather than extra
@@ -2192,34 +2222,44 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                                  "(V1_SPEC 0.2), so this is a bug in the value-kind "
                                  "lattice, not a valid operation");
                         }
+                        // E0303: plain Add/Sub/Mul trap on int64 overflow; the
+                        // Wrap* variants are the opt-out, same arithmetic with
+                        // the guard elided. Normalised once so the add/sub/mul
+                        // branches below match both spellings.
+                        const Op aop = instr.op == Op::WrapAdd ? Op::Add
+                                     : instr.op == Op::WrapSub ? Op::Sub
+                                     : instr.op == Op::WrapMul ? Op::Mul : instr.op;
+                        const bool is_wrap = aop != instr.op;
+
                         if (imm32_of(instr.args.at(1), imm)) {
-                            if (instr.op == Op::Mul) {
+                            if (aop == Op::Mul) {
                                 emit_imul_reg_reg_imm32(code, dst, lhs, imm);
                             } else {
                                 if (lhs != dst) emit_mov_reg_reg(code, dst, lhs);
-                                if (instr.op == Op::Add) emit_add_reg_imm32(code, dst, imm);
+                                if (aop == Op::Add) emit_add_reg_imm32(code, dst, imm);
                                 else emit_sub_reg_imm32(code, dst, imm);
                             }
                         } else {
                             Reg rhs = read_right(instr.args.at(1));
                             if (rhs == dst && lhs != dst) {
                                 // dst is about to be overwritten but is also the right operand.
-                                if (instr.op == Op::Sub) {
+                                if (aop == Op::Sub) {
                                     emit_mov_reg_reg(code, kR, lhs);
                                     emit_sub_reg_reg(code, kR, rhs);
                                     emit_mov_reg_reg(code, dst, kR);
-                                } else if (instr.op == Op::Add) {
+                                } else if (aop == Op::Add) {
                                     emit_add_reg_reg(code, dst, lhs);
                                 } else {
                                     emit_imul_reg_reg(code, dst, lhs);
                                 }
                             } else {
                                 if (lhs != dst) emit_mov_reg_reg(code, dst, lhs);
-                                if (instr.op == Op::Add) emit_add_reg_reg(code, dst, rhs);
-                                else if (instr.op == Op::Sub) emit_sub_reg_reg(code, dst, rhs);
+                                if (aop == Op::Add) emit_add_reg_reg(code, dst, rhs);
+                                else if (aop == Op::Sub) emit_sub_reg_reg(code, dst, rhs);
                                 else emit_imul_reg_reg(code, dst, rhs);
                             }
                         }
+                        if (!is_wrap) emit_int_overflow_trap(aop);
                         if (!fused) commit_result(instr.result, dst);
                         break;
                     }

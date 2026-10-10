@@ -40,6 +40,7 @@ int main() {
     const int32_t shift_imms[] = {0, 1, 7, 31, 32, 63};
     const int32_t disps[] = {-300, 1000, -100000};
     struct CC { Cond c; const char* n; } ccs[] = {
+        {Cond::Overflow,"o"},{Cond::NotOverflow,"no"},
         {Cond::Less,"l"},{Cond::GreaterEq,"ge"},{Cond::LessEq,"le"},{Cond::Greater,"g"},
         {Cond::Equal,"e"},{Cond::NotEqual,"ne"}};
 

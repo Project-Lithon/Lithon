@@ -1465,6 +1465,255 @@ block3:
     return
 )", "not definitely assigned");
 
+    // E0105 (docs/lithon_error_system.md 4c): only int[8|16|32|64] and
+    // float[64] exist. Hand-written IR carries widths too, so the checker must
+    // refuse unsupported ones wherever they appear: a scalar declaration, a
+    // container element, a pointer's pointee, a function signature.
+    expect_rejects("int[7] declaration", R"(
+function __main__():
+block0:
+    store x : int[7]
+    return
+)", "LITHON-E0105");
+    expect_rejects("int[3] declaration", R"(
+function __main__():
+block0:
+    store x : int[3]
+    return
+)", "LITHON-E0105");
+    expect_rejects("int[128] declaration", R"(
+function __main__():
+block0:
+    store x : int[128]
+    return
+)", "LITHON-E0105");
+    expect_rejects("float[128] declaration", R"(
+function __main__():
+block0:
+    store x : float[128]
+    return
+)", "LITHON-E0105");
+    expect_rejects("float[32] declaration", R"(
+function __main__():
+block0:
+    store x : float[32]
+    return
+)", "LITHON-E0105");
+    expect_rejects("list of int[7] elements", R"(
+function __main__():
+block0:
+    store xs : list[int[7], 4]
+    return
+)", "LITHON-E0105");
+    expect_rejects("pointer to int[7]", R"(
+function __main__():
+block0:
+    store _p : ptr[int[7]]
+    return
+)", "LITHON-E0105");
+    expect_rejects("int[7] parameter", R"(
+function f(x: int[7]) -> int[8]:
+block0:
+    return
+)", "LITHON-E0105");
+    expect_rejects("int[7] return type", R"(
+function f(x: int[8]) -> int[7]:
+block0:
+    return
+)", "LITHON-E0105");
+    expect_accepts("int[8] declaration", R"(
+function __main__():
+block0:
+    store x : int[8]
+    return
+)");
+    expect_accepts("int[16] declaration", R"(
+function __main__():
+block0:
+    store x : int[16]
+    return
+)");
+    expect_accepts("int[32] declaration", R"(
+function __main__():
+block0:
+    store x : int[32]
+    return
+)");
+    expect_accepts("int[64] declaration", R"(
+function __main__():
+block0:
+    store x : int[64]
+    return
+)");
+    expect_accepts("float[64] declaration", R"(
+function __main__():
+block0:
+    store x : float[64]
+    return
+)");
+    expect_accepts("list of int[64] elements", R"(
+function __main__():
+block0:
+    store xs : list[int[64], 4]
+    return
+)");
+
+    // E0303 (docs/lithon_error_system.md 3a): plain int64 add/sub/mul TRAP on
+    // overflow. Tier 1 bans the constant case at compile time; the dynamic
+    // case is a runtime jo in both tiers. wrap_add/wrap_sub/wrap_mul are the
+    // opt-out.
+    expect_rejects("constant add overflow", R"(
+function __main__():
+block0:
+    %0 = const_i64 9223372036854775807
+    %1 = const_i64 1
+    %2 = add %0, %1
+    store z, %2 : int[64]
+    %3 = load z
+    call print, %3
+    return
+)", "LITHON-E0303");
+    expect_rejects("constant sub underflow", R"(
+function __main__():
+block0:
+    %0 = const_i64 -9223372036854775808
+    %1 = const_i64 1
+    %2 = sub %0, %1
+    store z, %2 : int[64]
+    %3 = load z
+    call print, %3
+    return
+)", "LITHON-E0303");
+    expect_rejects("constant mul overflow", R"(
+function __main__():
+block0:
+    %0 = const_i64 3037000500
+    %1 = const_i64 3037000500
+    %2 = mul %0, %1
+    store z, %2 : int[64]
+    %3 = load z
+    call print, %3
+    return
+)", "LITHON-E0303");
+
+    // wrap_* is int[64]-only (v1). Floats, narrow ints and pointers are
+    // refused rather than silently coerced to a 64-bit wrap.
+    expect_rejects("wrap_add with float operands", R"(
+function __main__():
+block0:
+    %0 = const_f64 1.5
+    %1 = const_f64 2.5
+    %2 = wrapadd %0, %1
+    store z, %2 : int[64]
+    %3 = load z
+    call print, %3
+    return
+)", "LITHON-E0303");
+    expect_rejects("wrap_add with a narrow int operand", R"(
+function __main__():
+block0:
+    store a : int[8]
+    %0 = const_i64 100
+    store a, %0 : int[8]
+    %1 = load a
+    %2 = const_i64 100
+    %3 = wrapadd %1, %2
+    store z, %3 : int[64]
+    %4 = load z
+    call print, %4
+    return
+)", "LITHON-E0303");
+    expect_rejects("wrap_add with a pointer operand", R"(
+function __main__():
+block0:
+    %0 = const_i64 5
+    store x, %0 : int[64]
+    %1 = addressof x
+    %2 = const_i64 8
+    %3 = wrapadd %1, %2
+    store z, %3 : int[64]
+    %4 = load z
+    call print, %4
+    return
+)", "LITHON-E0303");
+
+    // The dynamic case is NOT statically refused: a runtime int[64] add that
+    // may or may not overflow is exactly what the Tier-3 jo guard exists for.
+    expect_accepts("dynamic int[64] add accepted (runtime trap)", R"(
+function __main__():
+block0:
+    %0 = const_i64 9223372036854775800
+    store x, %0 : int[64]
+    %1 = load x
+    %2 = const_i64 100
+    %3 = add %1, %2
+    store z, %3 : int[64]
+    %4 = load z
+    call print, %4
+    return
+)");
+
+    // Constants that FIT fold to a plain value; no trap is needed or emitted.
+    expect_accepts("constant add within range", R"(
+function __main__():
+block0:
+    %0 = const_i64 100
+    %1 = const_i64 200
+    %2 = add %0, %1
+    store z, %2 : int[64]
+    %3 = load z
+    call print, %3
+    return
+)");
+
+    // The opt-outs fold its overflow EXPLICITLY: the whole point is wrapping.
+    expect_accepts("wrap add of overflowing constants", R"(
+function __main__():
+block0:
+    %0 = const_i64 9223372036854775807
+    %1 = const_i64 1
+    %2 = wrapadd %0, %1
+    store z, %2 : int[64]
+    %3 = load z
+    call print, %3
+    return
+)");
+    expect_accepts("wrap sub of underflowing constants", R"(
+function __main__():
+block0:
+    %0 = const_i64 -9223372036854775808
+    %1 = const_i64 1
+    %2 = wrapsub %0, %1
+    store z, %2 : int[64]
+    %3 = load z
+    call print, %3
+    return
+)");
+    expect_accepts("wrap mul of overflowing constants", R"(
+function __main__():
+block0:
+    %0 = const_i64 3037000500
+    %1 = const_i64 3037000500
+    %2 = wrapmul %0, %1
+    store z, %2 : int[64]
+    %3 = load z
+    call print, %3
+    return
+)");
+    expect_accepts("dynamic wrap add accepted", R"(
+function __main__():
+block0:
+    %0 = const_i64 9223372036854775807
+    store x, %0 : int[64]
+    %1 = load x
+    %2 = const_i64 1
+    %3 = wrapadd %1, %2
+    store z, %3 : int[64]
+    %4 = load z
+    call print, %4
+    return
+)");
+
     if (failures) {
         std::printf("\n%d check(s) FAILED\n", failures);
         return 1;

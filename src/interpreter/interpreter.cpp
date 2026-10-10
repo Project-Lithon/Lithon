@@ -234,9 +234,42 @@ LithonValue apply_binop(Op op, LithonValue lhs, LithonValue rhs) {
     int64_t a = lhs.as_int();
     int64_t b = rhs.as_int();
     switch (op) {
-        case Op::Add: return LithonValue::make_int(a + b);
-        case Op::Sub: return LithonValue::make_int(a - b);
-        case Op::Mul: return LithonValue::make_int(a * b);
+        // Default int64 add/sub/mul TRAP on overflow (LITHON-E0303) rather
+        // than wrapping: a wrapped 64-bit answer is a silently wrong answer
+        // (the factorial bug, find_e.py 25!), and a bounded word has no wider
+        // type to widen to. The JIT emits the same check as a jo after the
+        // arithmetic, and the same text, so the two tiers agree byte for byte
+        // -- which is what run_tier_diff.py relies on. wrap_add/wrap_sub/
+        // wrap_mul are the deliberate opt-out: they wrap, exactly as Add/Sub/
+        // Mul did before this change, and the optimizer FOLDS constant wrap
+        // ops for them.
+        case Op::Add: {
+            int64_t r;
+            if (__builtin_add_overflow(a, b, &r))
+                throw std::runtime_error(
+                    "LITHON-E0303: integer overflow in add -- use wrap_add() to wrap instead");
+            return LithonValue::make_int(r);
+        }
+        case Op::Sub: {
+            int64_t r;
+            if (__builtin_sub_overflow(a, b, &r))
+                throw std::runtime_error(
+                    "LITHON-E0303: integer overflow in sub -- use wrap_sub() to wrap instead");
+            return LithonValue::make_int(r);
+        }
+        case Op::Mul: {
+            int64_t r;
+            if (__builtin_mul_overflow(a, b, &r))
+                throw std::runtime_error(
+                    "LITHON-E0303: integer overflow in mul -- use wrap_mul() to wrap instead");
+            return LithonValue::make_int(r);
+        }
+        case Op::WrapAdd: return LithonValue::make_int(
+            static_cast<int64_t>(static_cast<uint64_t>(a) + static_cast<uint64_t>(b)));
+        case Op::WrapSub: return LithonValue::make_int(
+            static_cast<int64_t>(static_cast<uint64_t>(a) - static_cast<uint64_t>(b)));
+        case Op::WrapMul: return LithonValue::make_int(
+            static_cast<int64_t>(static_cast<uint64_t>(a) * static_cast<uint64_t>(b)));
         case Op::Mod: {
             if (b == 0) throw std::runtime_error("interpreter: modulo by zero");
             // int64_t has no representable result for INT64_MIN % -1: it is 2^63,
@@ -576,6 +609,9 @@ LithonValue execute_function(const Module& module, const Function& fn,
                 case Op::Add:
                 case Op::Sub:
                 case Op::Mul:
+                case Op::WrapAdd:
+                case Op::WrapSub:
+                case Op::WrapMul:
                 case Op::Div:
                 case Op::Mod:
                     frame.regs[instr.result] = apply_binop(

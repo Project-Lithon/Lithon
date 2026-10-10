@@ -302,6 +302,16 @@ struct Analysis {
                         if (final_pass) check_arith_operands(st, block, in, verdict);
                         break;
                     }
+                    case Op::WrapAdd: case Op::WrapSub: case Op::WrapMul:
+                        // E0303 opt-out: int[64]-only wrapping arithmetic (the
+                        // typechecker refuses anything else), so the result is
+                        // Int unconditionally -- a pointer or float operand is
+                        // somebody's hand-written IR, and naming this
+                        // instruction as the source of the Int keeps that from
+                        // being blamed on an operand.
+                        raise(st.vals[in.result], Kind::Int);
+                        if (final_pass) check_arith_operands(st, block, in, verdict);
+                        break;
                     case Op::Div: {
                         const Kind k0 = val(st, in.args.at(0));
                         const Kind k1 = val(st, in.args.at(1));
@@ -407,6 +417,7 @@ struct Analysis {
                               const lithon::ir::Instr& in, GuardVerdict* verdict) {
         using lithon::ir::Op;
         if (in.op != Op::Add && in.op != Op::Sub && in.op != Op::Mul &&
+            in.op != Op::WrapAdd && in.op != Op::WrapSub && in.op != Op::WrapMul &&
             in.op != Op::Div && in.op != Op::Mod && in.op != Op::Lt &&
             in.op != Op::Gt && in.op != Op::Eq) {
             return;
@@ -423,6 +434,9 @@ struct Analysis {
                               in.op == Op::Add ? "add" :
                               in.op == Op::Sub ? "sub" :
                               in.op == Op::Mul ? "mul" :
+                              in.op == Op::WrapAdd ? "wrapadd" :
+                              in.op == Op::WrapSub ? "wrapsub" :
+                              in.op == Op::WrapMul ? "wrapmul" :
                               in.op == Op::Lt ? "lt" :
                               in.op == Op::Gt ? "gt" : "eq") +
                     " is " + kind_name(k) +
