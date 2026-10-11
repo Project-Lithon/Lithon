@@ -2,6 +2,7 @@
 #include "runtime/value.h"
 #include "jit/float_runtime.h"
 #include "jit/print_guard.h"
+#include "jit/stack_guard.h"
 #include "dict_hash.h"
 
 #include <cmath>
@@ -439,6 +440,24 @@ LithonValue execute_function(const Module& module, const Function& fn,
         throw std::runtime_error("interpreter: function '" + fn.name + "' has no blocks");
     }
 
+    // E0401 stack-depth guard. Bumps the SAME shared counter the JIT's
+    // prologues bump, and throws the SAME message at the SAME depth, so the
+    // two tiers trap identically. The RAII guard is what nests: the counter
+    // unwinds with the C++ call stack whether this call returns or throws.
+    //
+    // The guard must be active BEFORE the increment check's own throw, which
+    // is why DepthGuard is constructed first -- its destructor runs during
+    // the unwinding of that throw too, leaving the counter where the other
+    // 8192 frames' guards put it (back at zero once the whole recursion
+    // unwinds).
+    struct DepthGuard {
+        ~DepthGuard() { --lithon::jit::g_call_depth; }
+    } depth_guard;
+    if (++lithon::jit::g_call_depth > lithon::jit::kMaxCallDepth) {
+        throw std::runtime_error(
+            lithon::jit::format_stack_overflow_message(lithon::jit::g_call_depth));
+    }
+
     Frame frame;
     for (size_t i = 0; i < fn.params.size(); ++i) {
         frame.vars[fn.params[i]] = arg_values[i];
@@ -713,6 +732,9 @@ void run_main(const Module& module) {
     const auto kinds = lithon::jit::infer_value_kinds(module);
     g_value_kinds = &kinds;
     struct Reset { ~Reset() { g_value_kinds = nullptr; } } reset;
+    // E0401: a fresh program starts at depth 0; execute_function's own guard
+    // bumps it to 1 for __main__.
+    lithon::jit::g_call_depth = 0;
     execute_function(module, *main_fn, {});
 }
 

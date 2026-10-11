@@ -81,6 +81,9 @@ bool run_native(const lithon::ir::Module& m, lithon::jit::CompileOptions options
     std::fputs("[tier1] native\n", stderr);
     using Fn = void (*)();
     auto entry = reinterpret_cast<Fn>(static_cast<uint8_t*>(mem) + main_it->second);
+    // E0401: a fresh run starts recursion at depth 0; __main__'s own prologue
+    // bumps it to 1.
+    lithon::jit::g_call_depth = 0;
     entry();
     std::fflush(stdout);   // native print() goes through libc stdio
     munmap(mem, compiled.code.size());

@@ -48,6 +48,25 @@ inline constexpr std::array<Reg, 5> kPromotionPool = {
 inline constexpr Reg kScratchLeft = Reg::R10;
 inline constexpr Reg kScratchRight = Reg::R11;
 
+// Native parameter budget. The first two arguments arrive in registers
+// (kArgRegs[0..1] / kFloatArgRegs[0..1]); every argument past that travels in
+// an 8-byte outgoing-argument slot, exactly as SysV passes its 7th+ argument
+// on the stack. A function (or call) beyond this budget is refused natively
+// and runs in the interpreter, like every other unsupported slice.
+inline constexpr size_t kMaxParams = 32;
+
+// The callee sees its stack-passed parameter i>=2 at [rbp + kStackParamSlotBase
+// + (i-2)*8]. kStackParamSlotBase is 16 because the caller's RSP at the `call`
+// is 16-aligned: `call` pushes 8 (return address) and the callee's `push rbp`
+// pushes 8 more, so the caller's RSP is exactly 16 above the callee's RBP.
+inline constexpr int kStackParamSlotBase = 16;
+
+// Largest frame the native compiler will build. Frames are a few hundred bytes
+// in practice; anything bigger is a pathological input, so it is refused
+// natively and runs in the interpreter rather than risking a frame that can no
+// longer be reasoned about.
+inline constexpr int kMaxNativeFrame = 32768;
+
 // ---------------------------------------------------------------------
 // SSE2 double-precision register roles.
 //

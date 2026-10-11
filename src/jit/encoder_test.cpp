@@ -244,9 +244,122 @@ static int float_encoding_checks() {
     return 0;
 }
 
+// Register-indirect loads and stores: `mov dst, [addr]` / `mov [addr], src`.
+// The store form is new for E0401's stack-depth counter (both tiers write the
+// shared g_call_depth through it), so it is pinned byte-for-byte, including
+// the RSP/R12 SIB escape and the RBP/R13 zero-disp8 escape that a naive
+// mod=00 encoding would misread as SIB / RIP-relative.
+static int indirect_access_checks() {
+    std::printf("--- register-indirect load/store ---\n");
+    {
+        CodeBuffer c;
+        emit_store_reg_indirect(c, Reg::RAX, Reg::RCX, 8);   // mov [rcx], rax
+        expect_bytes("store [rcx], rax", c, {0x48, 0x89, 0x01});
+    }
+    {
+        CodeBuffer c;
+        emit_store_reg_indirect(c, Reg::R11, Reg::R10, 8);    // mov [r10], r11
+        expect_bytes("store [r10], r11 (REX.R+REX.B)", c, {0x4d, 0x89, 0x1a});
+    }
+    {
+        CodeBuffer c;
+        emit_store_reg_indirect(c, Reg::RAX, Reg::RSP, 8);    // mov [rsp], rax (SIB)
+        expect_bytes("store [rsp], rax (SIB escape)", c, {0x48, 0x89, 0x04, 0x24});
+    }
+    {
+        CodeBuffer c;
+        emit_store_reg_indirect(c, Reg::RAX, Reg::RBP, 8);    // mov [rbp], rax (disp8=0)
+        expect_bytes("store [rbp], rax (disp8 escape)", c, {0x48, 0x89, 0x45, 0x00});
+    }
+    {
+        CodeBuffer c;
+        emit_load_reg_indirect(c, Reg::RAX, Reg::RCX, 8);     // mov rax, [rcx]
+        expect_bytes("load rax, [rcx]", c, {0x48, 0x8b, 0x01});
+    }
+    {
+        CodeBuffer c;
+        emit_load_reg_indirect(c, Reg::R11, Reg::R10, 8);     // mov r11, [r10]
+        expect_bytes("load r11, [r10] (REX.R+REX.B)", c, {0x4d, 0x8b, 0x1a});
+    }
+
+    if (failures) {
+        std::fprintf(stderr, "FAIL: %d indirect access check(s) wrong\n", failures);
+        return 1;
+    }
+    std::printf("PASS: register-indirect load/store byte-exact\n");
+    return 0;
+}
+
+// Outgoing-argument stores: `mov [rsp + disp32], reg` and
+// `movsd [rsp + disp32], xmm`. Stack-passed call arguments (index >= 2) are
+// written into the caller's reserved outgoing-argument area at a constant
+// [rsp + (i-2)*8] and read back by the callee at [rbp+16+(i-2)*8]. RSP
+// always needs the SIB byte, and mod=10 is used unconditionally to match the
+// displacement model of every rbp form -- so each encoding is 4 + disp32 and
+// the widths differ only in prefix/REX. Expected bytes verified against GNU as
+// (the mod=00 disp8 forms objdump prefers are different and NOT what a constant
+// offset model wants).
+static int outgoing_arg_checks() {
+    std::printf("--- outgoing-argument stores ---\n");
+    {
+        CodeBuffer c;
+        emit_store_rsp_offset(c, Reg::RAX, 8);   // mov [rsp+8], rax
+        expect_bytes("store [rsp+8], rax", c, {0x48, 0x89, 0x84, 0x24, 0x08, 0x00, 0x00, 0x00});
+    }
+    {
+        CodeBuffer c;
+        emit_store_rsp_offset(c, Reg::R8, 24);   // mov [rsp+24], r8 (REX.R)
+        expect_bytes("store [rsp+24], r8 (REX.R)", c,
+                     {0x4c, 0x89, 0x84, 0x24, 0x18, 0x00, 0x00, 0x00});
+    }
+    {
+        CodeBuffer c;
+        emit_store_rsp_offset(c, Reg::RBX, 200);   // mov [rsp+200], rbx
+        expect_bytes("store [rsp+200], rbx", c, {0x48, 0x89, 0x9c, 0x24, 0xc8, 0x00, 0x00, 0x00});
+    }
+    {
+        CodeBuffer c;
+        emit_store_rsp_offset(c, Reg::RAX, 128, 1);   // mov [rsp+128], al
+        expect_bytes("store [rsp+128], al (byte)", c, {0x88, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00});
+    }
+    {
+        CodeBuffer c;
+        emit_store_rsp_offset(c, Reg::RAX, 130, 2);   // mov [rsp+130], ax
+        expect_bytes("store [rsp+130], ax (word)", c, {0x66, 0x89, 0x84, 0x24, 0x82, 0x00, 0x00, 0x00});
+    }
+    {
+        CodeBuffer c;
+        emit_movsd_rsp_mem(c, Xmm::XMM0, 8);   // movsd [rsp+8], xmm0
+        expect_bytes("movsd [rsp+8], xmm0", c, {0xf2, 0x0f, 0x11, 0x84, 0x24, 0x08, 0x00, 0x00, 0x00});
+    }
+    {
+        CodeBuffer c;
+        emit_movsd_rsp_mem(c, Xmm::XMM5, 16);   // movsd [rsp+16], xmm5
+        expect_bytes("movsd [rsp+16], xmm5", c, {0xf2, 0x0f, 0x11, 0xac, 0x24, 0x10, 0x00, 0x00, 0x00});
+    }
+    {
+        CodeBuffer c;
+        emit_movsd_rsp_mem(c, Xmm::XMM8, 24);   // movsd [rsp+24], xmm8 (REX)
+        expect_bytes("movsd [rsp+24], xmm8 (REX.R)", c,
+                     {0xf2, 0x44, 0x0f, 0x11, 0x84, 0x24, 0x18, 0x00, 0x00, 0x00});
+    }
+    {
+        CodeBuffer c;
+        emit_movsd_rsp_mem(c, Xmm::XMM15, 256);   // movsd [rsp+256], xmm15
+        expect_bytes("movsd [rsp+256], xmm15", c,
+                     {0xf2, 0x44, 0x0f, 0x11, 0xbc, 0x24, 0x00, 0x01, 0x00, 0x00});
+    }
+
+    if (failures) {
+        std::fprintf(stderr, "FAIL: %d outgoing-argument check(s) wrong\n", failures);
+        return 1;
+    }
+    std::printf("PASS: outgoing-argument stores byte-exact\n");
+    return 0;
+}
+
 int main() {
     CodeBuffer code;
-
     // System V AMD64: arg0 in rdi, arg1 in rsi, return in rax.
     emit_mov_reg_reg(code, Reg::RAX, Reg::RDI);  // rax = a
     emit_add_reg_reg(code, Reg::RAX, Reg::RSI);  // rax += b
@@ -277,5 +390,7 @@ int main() {
     }
     std::printf("PASS: reusable encoder confirmed working\n");
 
-    return float_encoding_checks();
+    if (float_encoding_checks()) return 1;
+    if (outgoing_arg_checks()) return 1;
+    return indirect_access_checks();
 }

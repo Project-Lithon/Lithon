@@ -566,6 +566,36 @@ inline void emit_store_rbp_offset(CodeBuffer& buf, Reg src, int32_t offset, int 
     emit_rbp_mov_narrow(buf, src, Reg::RBP, offset, bytes, /*store=*/true, /*scaled=*/false);
 }
 
+// mov [rsp + disp32], src -- an outgoing-argument store. The RSP counterpart
+// of emit_store_rbp_offset: stack-passed call arguments are written into the
+// caller's reserved outgoing-argument area, which is the bottom of THIS
+// function's frame (RSP stays at frame bottom for the whole body, so the
+// offset is constant), and the callee reads the same slot back at
+// [rbp + 16 + (i-2)*8]. Encoding is the mod=10 + SIB-no-index form: RSP always
+// needs the SIB byte (rm=100, base=100, scale 0, no index), and mod=10 is used
+// unconditionally so the displacement model matches every rbp form. Each field
+// below is verified against GNU as (see encoder_test.cpp).
+inline void emit_store_rsp_offset(CodeBuffer& buf, Reg src, int32_t offset, int bytes = 8) {
+    if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8)
+        throw std::logic_error("x86_encoder: rsp-relative store width " +
+                               std::to_string(bytes) + " is not 1, 2, 4 or 8");
+    const bool byte_form = bytes == 1;
+    const bool word_form = bytes == 2;
+    const bool wide = bytes == 8;
+    // spl/bpl/sil/dil have no 8-bit encoding without a REX byte.
+    const bool byte_reg_needs_rex =
+        byte_form && (src == Reg::RSP || src == Reg::RBP || src == Reg::RSI || src == Reg::RDI);
+    if (word_form) emit_u8(buf, 0x66);
+    if (wide || byte_reg_needs_rex || reg_is_extended(src))
+        emit_u8(buf, static_cast<uint8_t>(0x40 | (wide ? 8 : 0) |
+                                          (reg_is_extended(src) ? 4 : 0)));
+    emit_u8(buf, byte_form ? 0x88 : 0x89);
+    // ModRM mod=10, reg=src, rm=100 (SIB follows); SIB scale=0, index=100, base=RSP.
+    emit_u8(buf, static_cast<uint8_t>(0x80 | (reg_low3(src) << 3) | 0x4));
+    emit_u8(buf, 0x24);
+    emit_disp32_le(buf, offset);
+}
+
 // mov dst, [rbp + offset]   (load from a stack slot)
 // Encoding: REX.W + 8B /r, ModRM(mod=10, reg=dst, rm=RBP), disp32
 inline void emit_load_rbp_offset(CodeBuffer& buf, Reg dst, int32_t offset) {
@@ -628,6 +658,42 @@ inline void emit_load_reg_indirect_raw(CodeBuffer& buf, Reg data_reg, Reg addr_r
 // mov dst, [addr] at the pointee's own width (1/2/4 zero-extend, 8 wide).
 inline void emit_load_reg_indirect(CodeBuffer& buf, Reg data_reg, Reg addr_reg, int bytes) {
     emit_load_reg_indirect_raw(buf, data_reg, addr_reg, bytes, /*zero_extend=*/true);
+}
+
+// mov [addr], src  -- the store counterpart of emit_load_reg_indirect_raw.
+// Same encoding shape (REX.W + ModRM, opcode 0x89), same mod=00 collision
+// escapes through SIB / mod=01-zero-disp8. A width below 8 stores the low
+// bytes; E0401's stack-depth counter is an 8-byte store and that is the only
+// current caller. The value in data_reg is used whole, so there is no
+// zero-extension side channel the way loads have.
+inline void emit_store_reg_indirect(CodeBuffer& buf, Reg data_reg, Reg addr_reg, int bytes) {
+    if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8)
+        throw std::logic_error("x86_encoder: indirect store width " + std::to_string(bytes) +
+                               " is not 1, 2, 4 or 8");
+    const bool wide = bytes == 8;
+    const bool byte_form = bytes == 1;
+    const bool word_form = bytes == 2;
+    const bool byte_reg_needs_rex =
+        byte_form && (data_reg == Reg::RSP || data_reg == Reg::RBP ||
+                      data_reg == Reg::RSI || data_reg == Reg::RDI);
+    const uint8_t rm = reg_low3(addr_reg);
+    const bool needs_sib = rm == 4;                                  // RSP/R12
+    const bool fi_disp_escape = rm == 5;                             // RBP/R13
+    if (word_form) emit_u8(buf, 0x66);
+    if (wide || byte_reg_needs_rex || reg_is_extended(data_reg) || reg_is_extended(addr_reg))
+        emit_u8(buf, static_cast<uint8_t>(0x40 | (wide ? 8 : 0) |
+                                         (reg_is_extended(data_reg) ? 4 : 0) |
+                                         (reg_is_extended(addr_reg) ? 1 : 0)));
+    emit_u8(buf, byte_form ? 0x88 : 0x89);
+    if (needs_sib) {
+        emit_u8(buf, static_cast<uint8_t>((reg_low3(data_reg) << 3) | 0x4));
+        emit_u8(buf, static_cast<uint8_t>(0x20 | rm));
+    } else if (fi_disp_escape) {
+        emit_u8(buf, static_cast<uint8_t>(0x40 | (reg_low3(data_reg) << 3) | rm));
+        emit_u8(buf, 0);   // disp8 = 0
+    } else {
+        emit_u8(buf, static_cast<uint8_t>(reg_low3(data_reg) << 3 | rm));
+    }
 }
 
 // push reg / pop reg. Encoding: [41] 50+r / [41] 58+r.
@@ -1124,6 +1190,21 @@ inline void emit_movsd_rbp_mem(CodeBuffer& buf, Xmm src, int32_t offset) {
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x11);
     emit_u8(buf, static_cast<uint8_t>(0x80 | (xmm_low3(src) << 3) | reg_low3(Reg::RBP)));
+    emit_disp32_le(buf, offset);
+}
+
+// movsd [rsp + disp32], xmm -- store a stack-passed float argument into the
+// caller's outgoing-argument area, the float counterpart of
+// emit_store_rsp_offset. Same mod=10 + RSP SIB-no-index shape, F2 prefix.
+// The callee reads this slot back at [rbp + 16 + (i-2)*8] via
+// emit_movsd_xmm_rbp.
+inline void emit_movsd_rsp_mem(CodeBuffer& buf, Xmm src, int32_t offset) {
+    emit_u8(buf, 0xF2);
+    if (xmm_is_extended(src)) emit_u8(buf, rex_sse(src));
+    emit_u8(buf, 0x0F);
+    emit_u8(buf, 0x11);
+    emit_u8(buf, static_cast<uint8_t>(0x80 | (xmm_low3(src) << 3) | 0x4));
+    emit_u8(buf, 0x24);
     emit_disp32_le(buf, offset);
 }
 

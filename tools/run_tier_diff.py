@@ -377,6 +377,92 @@ block0:
     call print, %11
     return
 """, "tier1"),
+    # Stack-passed arguments (parameter index >= 2): the caller writes them into
+    # its outgoing-argument area at [rsp+(i-2)*8] and the callee reads them at
+    # [rbp+16+(i-2)*8]. A four-parameter call, a call from inside a caller, and
+    # a float parameter at index 2 must ALL run natively -- anything less is a
+    # relapse to the two-register-argument cap.
+    "stack_args_four": ("""
+function quad(a: int[64], b: int[64], c: int[64], d: int[64]) -> int[64]:
+block0:
+    %0 = load a
+    %1 = load b
+    %2 = add %0, %1
+    %3 = load c
+    %4 = add %2, %3
+    %5 = load d
+    %6 = add %4, %5
+    return %6
+    return
+
+function main():
+block0:
+    %0 = const_i64 1
+    %1 = const_i64 2
+    %2 = const_i64 3
+    %3 = const_i64 4
+    %4 = call quad, %0, %1, %2, %3
+    call print, %4
+    return
+""", "tier1"),
+    "stack_args_nested": ("""
+function quad(a: int[64], b: int[64], c: int[64], d: int[64]) -> int[64]:
+block0:
+    %0 = load a
+    %1 = load b
+    %2 = add %0, %1
+    %3 = load c
+    %4 = add %2, %3
+    %5 = load d
+    %6 = add %4, %5
+    return %6
+    return
+
+function tri(a: int[64], b: int[64], c: int[64]) -> int[64]:
+block0:
+    %0 = load a
+    %1 = load b
+    %2 = add %0, %1
+    %3 = load c
+    %4 = add %2, %3
+    return %4
+    return
+
+function main():
+block0:
+    %0 = const_i64 1
+    %1 = const_i64 2
+    %2 = const_i64 3
+    %3 = const_i64 4
+    %4 = call quad, %0, %1, %2, %3
+    %5 = const_i64 10
+    %6 = const_i64 20
+    %7 = const_i64 30
+    %8 = call tri, %5, %6, %7
+    %9 = add %4, %8
+    call print, %9
+    return
+""", "tier1"),
+    "stack_args_float_index2": ("""
+function f(a:int[64], b:int[64], c:float[64]) -> float[64]:
+block0:
+    %0 = load a
+    %1 = const_i64 2
+    %2 = mul %0, %1
+    %3 = load c
+    %4 = add %2, %3
+    return %4
+    return
+
+function __main__():
+block0:
+    %0 = const_i64 2
+    %1 = const_i64 100
+    %2 = const_f64 1.5
+    %3 = call f, %0, %1, %2
+    call print, %3
+    return
+""", "tier1"),
 }
 
 # Programs that must FAIL at run time, the same way in both tiers.

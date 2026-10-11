@@ -266,6 +266,9 @@ int main(int argc, char** argv) {
 
         auto main_fn = exec.entry<int64_t (*)()>(it->second);
         auto t2 = std::chrono::steady_clock::now();
+        // E0401: a fresh run starts recursion at depth 0; __main__'s own
+        // prologue bumps it to 1.
+        lithon::jit::g_call_depth = 0;
         main_fn();
         std::fflush(stdout);
         auto t3 = std::chrono::steady_clock::now();

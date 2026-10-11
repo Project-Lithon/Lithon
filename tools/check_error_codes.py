@@ -10,10 +10,12 @@ the discipline for the codes that are landed so far and grows as more land:
      failure -- ambiguous diagnostics regress to prose-only, which the doc
      explicitly forbids going forward.
   2. Functional checks for each coded refusal as its enforcement lands.
-     Today: E0105 (unsupported type width) and E0303 (int64 overflow: the
+     Today: E0105 (unsupported type width), E0303 (int64 overflow: the
      constant case refused at typecheck, the dynamic case trapping with
-     byte-identical messages in the interpreter and JIT). Both enforced in
-     the frontend/typechecker and pinned in both tiers.
+     byte-identical messages in the interpreter and JIT) and E0401 (the
+     stack-depth guard: unbounded recursion traps at the same depth with the
+     same bytes in both tiers). Both enforced in the frontend/typechecker and
+     pinned in both tiers.
 
     tools/check_error_codes.py
 """
@@ -199,6 +201,34 @@ E0303_TRAPS = [
      "LITHON-E0303: integer overflow in sub -- use wrap_sub() to wrap instead"),
 ]
 
+# E0401 (the stack-depth guard). The two tiers share one counter, so a
+# recursion that overflows must trap at exactly the same depth with exactly
+# the same bytes in both. A recursion comfortably under the cap must still run.
+E0401_ACCEPTS = [
+    ("recursion of depth 1000 under the 4096 cap (source)",
+     "def down(n: int[64]) -> int[64]:\n"
+     "    if n < 1:\n"
+     "        return 0\n"
+     "    x: int[64] = down(n - 1)\n"
+     "    return x + 1\n"
+     "\n"
+     "r: int[64] = down(1000)\n"
+     "print(r)\n",
+     "1000"),
+]
+
+E0401_TRAPS = [
+    ("unbounded recursion overflows (source)",
+     "def bomb(n: int[64]) -> int[64]:\n"
+     "    x: int[64] = bomb(n + 1)\n"
+     "    return x\n"
+     "\n"
+     "y: int[64] = bomb(0)\n"
+     "print(y)\n",
+     "LITHON-E0401: stack overflow -- call depth 4097 exceeded the 4096-frame "
+     "guard; rewrite the recursion as an explicit loop"),
+]
+
 
 def _run_source(tmp, tag, source, mode):
     """Compile a source program and run it under tier_runner in `mode`.
@@ -253,6 +283,38 @@ def check_e0303(failures):
                 failures.append(name)
             elif needle not in text_i or needle not in text_a:
                 print(f"  FAIL trap: {name}: interp has={needle in text_i} auto has={needle in text_a}")
+                failures.append(name)
+            else:
+                print(f"  ok   trap: {name} (byte-identical in both tiers)")
+
+
+def check_e0401(failures):
+    with tempfile.TemporaryDirectory() as td:
+        tmp = pathlib.Path(td)
+        for i, (name, source, expect) in enumerate(E0401_ACCEPTS):
+            rc_i, out_i, err_i = _run_source(tmp, f"a{i}", source, "--interp")
+            rc_a, out_a, err_a = _run_source(tmp, f"a{i}j", source, "--auto")
+            if rc_i != 0 or rc_a != 0 or out_i != expect or out_a != expect:
+                print(f"  FAIL accept: {name}: interp rc={rc_i} out={out_i!r}; "
+                      f"auto rc={rc_a} out={out_a!r} err={err_a.strip()!r}")
+                failures.append(name)
+            else:
+                print(f"  ok   accept: {name} ({out_i})")
+        for i, (name, source, needle) in enumerate(E0401_TRAPS):
+            rc_i, out_i, err_i = _run_source(tmp, f"t{i}", source, "--interp")
+            rc_a, out_a, err_a = _run_source(tmp, f"t{i}j", source, "--auto")
+            text_i = (out_i + "\n" + err_i)
+            text_a = (out_a + "\n" + err_a)
+            if rc_i == 0 or rc_a == 0:
+                print(f"  FAIL trap: {name}: interp rc={rc_i} auto rc={rc_a} (no trap)")
+                failures.append(name)
+            elif needle not in text_i or needle not in text_a:
+                print(f"  FAIL trap: {name}: interp has={needle in text_i} "
+                      f"auto has={needle in text_a}")
+                failures.append(name)
+            elif text_i != text_a:
+                print(f"  FAIL trap: {name}: tiers differ:\n    interp {text_i!r}\n"
+                      f"    auto   {text_a!r}")
                 failures.append(name)
             else:
                 print(f"  ok   trap: {name} (byte-identical in both tiers)")
@@ -339,8 +401,10 @@ def main() -> int:
     check_discipline(failures)
     check_e0105(failures)
     check_e0303(failures)
+    check_e0401(failures)
     total = len(E0105_REJECTS) + len(E0105_ACCEPTS) + 1
     total += len(E0303_REJECTS) + len(E0303_WRAPS) + len(E0303_TRAPS)
+    total += len(E0401_ACCEPTS) + len(E0401_TRAPS)
     done = total - len(failures)
     if failures:
         print(f"\n{len(failures)} of {total} check(s) FAILED")

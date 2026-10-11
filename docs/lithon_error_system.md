@@ -167,8 +167,8 @@ of this rule.
 **What it is:** a failure that indicates the *program's own logic* is
 wrong at this point in its execution — not the environment's fault.
 Already shipped: `Div`/`Mod` zero-check, `Shl`/`Shr` bounds check, `list`
-index bounds. (A stack-overflow guard is designed but **not built** — see
-section 9.) All route through one shared trap mechanism
+index bounds, and the `E0401` stack-depth guard (see section 9). All route
+through one shared trap mechanism
 (`host_report_error` / the `emit_host_error_trap` lambda already in
 `compile_function.h`) that prints a message and terminates — no recovery
 path is offered, by design, because a program fault means the program's
@@ -294,7 +294,7 @@ op below with an unlisted or undefined fourth case.
 | `Div`, `Mod` | Literal non-zero divisor | Dynamic divisor → **Tier 3** | Runtime zero-check + trap (`E0301`/`E0302`) — **shipped** |
 | `Shl`, `Shr` | Literal shift amount, `0 <= amount < width` | Dynamic amount → **Tier 3** | Runtime bounds check + trap (`E0304`) — **shipped** |
 | `IndexStore` (list/dict, capacity check) | Constant-provable index/length vs. declared capacity | Dynamic index/length → **Tier 3** | Runtime bounds check + trap (`E0305`) — **shipped for list**, dict TBD |
-| Stack depth (every function prologue) | N/A — always dynamic, no static proof form exists | Always **Tier 3** | Runtime depth check + trap (`E0401`) — **not built**: unbounded recursion is a raw `SIGSEGV` in both tiers (verified) |
+| Stack depth (every function prologue) | N/A — always dynamic, no static proof form exists | Always **Tier 3** | Runtime depth check + trap (`E0401`) — **shipped**: both tiers increment a shared call-depth counter and trap at 4096 with byte-identical output |
 | `addressof`, `valueof`, syscall raw op | N/A — Tier 0 by definition, proof never attempted | **Tier 0** | No check. `_`-prefix required on the declaring identifier — **shipped (addressof/valueof design); syscalls designed, not built** |
 | A syscall's return value | N/A — environmental by deliberate classification | **Tier 2** | `fallible[T]` return, use-before-check enforced — **designed, not built** |
 | `Not`, comparisons (`Lt`/`Gt`/`Eq`), `And`/`Or` | N/A — these ops cannot fail; not part of the tier system at all (see the "fifth case" in section 4) | — | No check of any kind, ever |
@@ -415,10 +415,12 @@ ad hoc handling per feature. Concretely:
 - **Phase 5.1 (syscalls)**: Tier 2, via `fallible[T]` — this document is
   what makes that design concrete and buildable rather than a stated
   preference with no representation.
-- **Retroactive fix, independent of any future phase:** dynamic integer
-  overflow on `Add`/`Sub`/`Mul` needs a Tier-3 runtime check added now —
-  this isn't gated on anything else in the roadmap, and it's the one item
-  here with a known live bug (`find_e.py`) demonstrating the gap.
+- **Retroactive fixes, landed independently of any future phase:**
+  - dynamic integer overflow on `Add`/`Sub`/`Mul` (`E0303`) — a Tier-3
+    runtime check with `wrap_*` opt-out; the one item with a known live bug
+    (`find_e.py`) demonstrating the gap;
+  - the `E0401` stack-depth guard, so unbounded recursion traps rather than
+    `SIGSEGV`.
 
 ---
 
@@ -427,11 +429,22 @@ ad hoc handling per feature. Concretely:
 **Already shipped, tested, real today:**
 - Tier 1 literal-range overflow checks (`int[8]` reassignment example)
 - Tier 1 literal-zero detection for `Div`/`Mod`
+- Tier 1 unsupported-width refusal (`E0105`): `int[8|16|32|64]`/`float[64]`
+  only, enforced in both the frontend and the type checker
 - Tier 3 runtime traps for `Div`/`Mod` zero-divisor, `Shl`/`Shr` bounds,
   `list` index/capacity
+- Tier 3 dynamic integer-overflow trap (`E0303`) for unproven `int[64]`
+  `Add`/`Sub`/`Mul`, with `wrap_add`/`wrap_sub`/`wrap_mul` as the explicit
+  opt-out; the constant case is refused statically at typecheck
+- Tier 3 stack-depth guard (`E0401`): every function prologue bumps a shared
+  call-depth counter and both tiers trap at depth 4096 with byte-identical
+  output
 - The shared trap mechanism itself (`host_report_error` /
-  `emit_host_error_trap`) that every Tier-3 check already routes through
+  `emit_host_error_trap`) that every Tier-3 check already routes through,
+  now including the `LITHON-Exxxx` coded renderings
 - Tier 0's `_`-prefix convention and the `addressof`/`valueof` boundary
+- `tools/check_error_codes.py` (the code-discipline gate wired into
+  `verify_all.sh`) and `tools/typecheck.py`'s mirror of the static checks
 
 **Designed in this document, not yet built:**
 - `fallible[T]` as a type (blocked on `struct`, roadmap 4.6)
@@ -439,30 +452,23 @@ ad hoc handling per feature. Concretely:
 - The tier-determination algorithm as an explicit, shared piece of
   compiler code — today, each op's handling is written independently, so
   there is no single place that *guarantees* every op lands somewhere
-- Dynamic-overflow trapping for `Add`/`Sub`/`Mul` (`E0303`) — the fix for
-  the live `find_e.py` gap, and the single highest-priority item in this
-  whole document, since it's the one piece with a demonstrated real bug
-  behind it rather than a hypothetical gap
-- The full numbered error-code table (today's error strings are prose
-  only, no codes)
+- The full numbered error-code table (E0105/E0303/E0401 are coded; the
+  older runtime traps — `Div`/`Mod`/shift/list — still render prose)
 - `dict` capacity trapping (list's equivalent exists; dict's doesn't yet)
-- `error_tier_test.cpp`, `tools/check_error_codes.py`, and the
-  overflow-specific fuzz mode
-- A **stack-depth guard** (`E0401`). An earlier revision of this document
-  listed it as shipped; that was wrong, and was never checked against the
-  source. Verified against the repo: no guard exists, and unbounded
-  recursion is a raw `SIGSEGV` (exit 139) in both the interpreter and the
-  native tier.
+- The overflow-specific fuzz mode
 
-**Verified open as of the last repo check** (each reproduced, not assumed):
-- Dynamic `int[64]` arithmetic wraps silently in both tiers
-  (`fact(25) = 7034535277573963776`, `fact(66) = 0`,
-  `INT64_MAX + INT64_MAX = -2`). Narrow ints are statically sound — RCR proves
-  every `int[8]`/`[16]`/`[32]` result fits — but `int[64]` has no wider type
-  to widen into, so it is exempt. The README does not document this.
-- Unsupported widths are accepted: `int[7]`, `int[128]`, `float[128]`.
-  `int[128]` is treated as 64-bit, so doubling `x: int[128]` a hundred times
-  prints `0` instead of `2^100`, in both tiers.
+**Closed since an earlier revision of this document** (each reproduced, then
+fixed and pinned in both tiers):
+- Dynamic `int[64]` arithmetic wrapped silently in both tiers
+  (`fact(25) = 7034535277573963776`, `INT64_MAX + INT64_MAX = -2`). Narrow
+  ints were always statically sound — RCR proves every `int[8]`/`[16]`/`[32]`
+  result fits — but `int[64]` has no wider type to widen into, so it needed
+  the runtime trap that `E0303` now provides.
+- Unsupported widths were accepted: `int[7]`, `int[128]`, `float[128]`.
+  `E0105` now refuses them.
+- Unbounded recursion was a raw `SIGSEGV` (exit 139) in both tiers. The
+  `E0401` guard, not the operating system, now ends it — identically in the
+  interpreter and the JIT.
 
 **What this means practically:** if asked "does Lithon have an error
 system," the honest answer is "yes, a real and tested one for the cases

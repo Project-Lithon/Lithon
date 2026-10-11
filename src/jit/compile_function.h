@@ -19,6 +19,7 @@
 #include "optimize.h"
 #include "print_guard.h"
 #include "register_alloc.h"
+#include "stack_guard.h"
 #include "x86_encoder.h"
 
 // The bridge from typed ir::Functions to runnable x86-64 machine code.
@@ -672,10 +673,12 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
         }
         function_offset[original_fn.name] = code.size();
 
-        if (original_fn.params.size() > 2) {
+        if (original_fn.params.size() > abi::kMaxParams) {
             throw std::runtime_error(
-                "compile_module: function '" + original_fn.name + "' has more than 2 "
-                "parameters -- only two register arguments are supported in this slice");
+                "compile_module: function '" + original_fn.name + "' has more than " +
+                std::to_string(abi::kMaxParams) +
+                " parameters -- 2 arrive in argument registers and the rest on the "
+                "call stack, and that budget is exhausted");
         }
 
         Function fn = original_fn;
@@ -779,8 +782,42 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
         for (ValueId id = 0; id < value_kinds.size(); ++id) {
             if (value_kinds[id] == Kind::Float) float_values.push_back(id);
         }
+        // ---- stack-passed parameter housing ----------------------------
+        // Functions over 2 parameters send the extras in the caller's
+        // outgoing-argument area (see jit_abi.h): callee sees parameter i>=2 at
+        // [rbp+16+(i-2)*8]. Decide each parameter's home ONCE, with both the
+        // declared types and the inferred kinds visible, so the allocator
+        // (which only sees fn_) and the prologue (which consumes float_params)
+        // cannot disagree about whether parameter i is a double.
+        std::vector<bool> float_params(fn.params.size(), false);
+        for (size_t i = 0; i < fn.params.size(); ++i) {
+            if (i < fn.param_type_kinds.size() && fn.param_type_kinds[i] == "float") {
+                float_params[i] = true;
+            } else if (i >= fn.param_type_kinds.size() || fn.param_type_kinds[i].empty()) {
+                const auto& pk = module_param_kinds[fn_index];
+                float_params[i] = i < pk.size() && pk[i] == Kind::Float;
+            }
+        }
+        // Conservative, one scan: any AddressOf anywhere marks the parameter.
+        const std::unordered_set<std::string> addressed = address_taken_variables(fn);
+        // The register arguments (i<2) always spill in the prologue -- the E0401
+        // guard clobbers their registers -- so this map covers only STACK-passed
+        // parameters: cold ones, whose only home is the slot the caller wrote,
+        // with no frame slot and no prologue spill. A float stack param always
+        // spills (floats are never register-promoted); a promoted one takes the
+        // hot register in the prologue; an address-taken one gets a real frame
+        // slot and an eager spill so a pointer into it stays coherent.
+        std::unordered_map<std::string, int> incoming_offsets;
+        for (size_t i = 2; i < fn.params.size(); ++i) {
+            if (float_params[i]) continue;
+            if (promoted.count(fn.params[i])) continue;
+            if (addressed.count(fn.params[i])) continue;
+            incoming_offsets[fn.params[i]] =
+                abi::kStackParamSlotBase + static_cast<int>((i - 2) * 8);
+        }
         RegisterAllocator alloc(fn, promoted, plan.virtual_temps,
-                                options.borrow_callee_saved, float_values);
+                                options.borrow_callee_saved, float_values,
+                                std::move(incoming_offsets));
 
         // 2.8. Counted from the allocator, which rewrote its own promotion map
         // while allocating -- see RegisterAllocator::coalesce_phi_registers.
@@ -788,6 +825,31 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
 
         constexpr Reg kL = abi::kScratchLeft;
         constexpr Reg kR = abi::kScratchRight;
+
+        // ---- outgoing-argument area -------------------------------------
+        // The bottom of this function's frame, sized for the largest 3+-argument
+        // call it makes. RSP never moves during the body, so a stack-passed
+        // argument is written at a constant [rsp + (i-2)*8] and the callee reads
+        // it at [rbp+16+(i-2)*8]; the area is genuinely the callee's parameter
+        // area, never a per-call sub/add. A function that makes no 3+-argument
+        // call reserves nothing, and every existing ≤2-argument call is byte-
+        // for-byte what it was.
+        size_t out_args = 0;
+        for (const auto& b : fn.blocks) {
+            for (const auto& in : b.instrs) {
+                if (in.op == Op::Call && in.args.size() > 2) {
+                    out_args = std::max(out_args, in.args.size() - 2);
+                }
+            }
+        }
+        const int out_area = ((static_cast<int>(out_args) * 8 + 15) / 16) * 16;
+        const int total_frame = alloc.frame_size() + out_area;
+        if (total_frame > abi::kMaxNativeFrame) {
+            throw std::runtime_error(
+                "compile_module: function '" + fn.name + "' needs a " +
+                std::to_string(total_frame) + "-byte frame, above the " +
+                std::to_string(abi::kMaxNativeFrame) + "-byte native frame limit");
+        }
 
         auto info_of = [&](ValueId id) -> const TempInfo& {
             static const TempInfo normal{};
@@ -1450,7 +1512,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
         };
 
         // ---- prologue ---------------------------------------------------
-        emit_prologue(code, alloc.frame_size());
+        emit_prologue(code, total_frame);
         for (const auto& saved : alloc.callee_saved_slots()) {
             emit_store_rbp_offset(code, saved.first, saved.second);
         }
@@ -1461,33 +1523,90 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             // caller sent -- which is how `def ident(x: float[64]) -> float[64]:
             // return x` came to return 0.0 for an argument of 9.75. Passing a
             // float and ignoring it worked, so nothing exercised this path.
-            // Declared type first, then the kind inferred from call sites, so an
-            // unannotated float parameter takes the XMM path too. Unknown falls
-            // through to the GP spill, which is the status quo ante.
-            bool float_param =
-                i < fn.param_type_kinds.size() && fn.param_type_kinds[i] == "float";
-            if (i >= fn.param_type_kinds.size() || fn.param_type_kinds[i].empty()) {
-                const auto& pk = module_param_kinds[fn_index];
-                float_param = i < pk.size() && pk[i] == Kind::Float;
-            }
-
-            if (float_param) {
-                if (i >= 2) {
-                    throw std::runtime_error(
-                        "compile_module: a float parameter past position 1 is not "
-                        "supported in this slice (only 2 argument registers exist)");
+            //
+            // Parameters 0 and 1 arrive in registers (kArgRegs / kFloatArgRegs);
+            // parameter i >= 2 arrives in the caller's outgoing-argument area at
+            // [rbp + 16 + (i-2)*8] and is handled by the stack-passed branch
+            // below -- promoted hot parameters load once into their register,
+            // address-taken ones spill eagerly into their real frame slot, and
+            // lazy ones get no prologue instruction at all because their incoming
+            // slot IS their home.
+            if (i < 2) {
+                if (float_params[i]) {
+                    // Float parameters are never promoted (see
+                    // select_promoted_variables), so the slot is the home.
+                    emit_movsd_rbp_mem(code, abi::kFloatArgRegs[i],
+                                       alloc.variable_offset(fn.params[i]));
+                } else if (alloc.variable_in_register(fn.params[i])) {
+                    emit_mov_reg_reg(code, alloc.variable_reg(fn.params[i]),
+                                     abi::kArgRegs[i]);
+                } else {
+                    emit_store_rbp_offset(code, abi::kArgRegs[i],
+                                          alloc.variable_offset(fn.params[i]));
                 }
-                // Float parameters are never promoted (see
-                // select_promoted_variables), so the slot is the home.
-                emit_movsd_rbp_mem(code, abi::kFloatArgRegs[i],
-                                   alloc.variable_offset(fn.params[i]));
                 continue;
             }
-            if (alloc.variable_in_register(fn.params[i])) {
-                emit_mov_reg_reg(code, alloc.variable_reg(fn.params[i]), abi::kArgRegs[i]);
-            } else {
-                emit_store_rbp_offset(code, abi::kArgRegs[i], alloc.variable_offset(fn.params[i]));
+            const int incoming = abi::kStackParamSlotBase + static_cast<int>((i - 2) * 8);
+            if (float_params[i]) {
+                // Never promoted: load from the incoming slot into the dead
+                // XMM0, then spill to the frame slot, which is the home.
+                emit_movsd_xmm_rbp(code, abi::kFloatArgReg, incoming);
+                emit_movsd_rbp_mem(code, abi::kFloatArgReg,
+                                   alloc.variable_offset(fn.params[i]));
+            } else if (alloc.variable_in_register(fn.params[i])) {
+                // Hot: promoted in the prologue, like any register parameter.
+                emit_load_rbp_offset(code, alloc.variable_reg(fn.params[i]), incoming);
+            } else if (addressed.count(fn.params[i])) {
+                // Address-taken: the slot is the home and reads through the
+                // pointer must see the argument, so copy it down eagerly. The
+                // frame cursor gave it a real slot; addressed.count is
+                // authoritative, so variable_offset is that slot.
+                emit_load_rbp_offset(code, abi::kArgRegs[0], incoming);
+                emit_store_rbp_offset(code, abi::kArgRegs[0],
+                                      alloc.variable_offset(fn.params[i]));
             }
+            // else: lazy -- no prologue instruction, the incoming slot is the home.
+        }
+
+        // ---- E0401 stack-depth guard (prologue) --------------------------
+        // Every function bumps the SHARED depth counter; more than
+        // kMaxCallDepth nesting traps with LITHON-E0401. Runs after the
+        // parameter spills, so kArgRegs[0] and kTempPool are dead here; the
+        // only live state at this point is the callee-saved slots which we
+        // never touch. The incremented depth stays in kArgRegs[0], which is
+        // exactly the register the trap host reads it back from -- no extra
+        // move. The guard never returns on a trap, so it cannot corrupt a
+        // caller's continuation.
+        //
+        // Register safety mirrors emit_host_error_trap: kArgRegs[0] and kR
+        // are the two registers emitted code is allowed to clobber at any
+        // point mid-function, and kTempPool[0] (RAX) holds no value before
+        // any block code has run.
+        //   movabs rax, &g_call_depth
+        //   mov    <arg0>, [rax]      ; load current depth
+        //   add    <arg0>, 1          ; this call enters
+        //   mov    [rax], <arg0>      ; publish it before the compare
+        //   cmp    <arg0>, kMaxCallDepth
+        //   jle    past
+        //   movabs kR, &host_report_stack_overflow ; arg0 already = depth
+        //   xor    eax, eax
+        //   call   kR                 ; never returns
+        // past:
+        {
+            Reg depth = abi::kArgRegs[0];
+            emit_mov_reg_imm(code, Reg::RAX, reinterpret_cast<int64_t>(&lithon::jit::g_call_depth));
+            emit_load_reg_indirect(code, depth, Reg::RAX, 8);
+            emit_add_reg_imm32(code, depth, 1);
+            emit_store_reg_indirect(code, depth, Reg::RAX, 8);
+            emit_cmp_reg_imm32(code, depth, static_cast<int32_t>(lithon::jit::kMaxCallDepth));
+            JumpPatch in_range = emit_jcc_rel32(code, Cond::LessEq);
+            emit_mov_reg_imm(code, kR,
+                             reinterpret_cast<int64_t>(&lithon::jit::host_report_stack_overflow));
+            emit_xor_zero(code, Reg::RAX);
+            if (abi::kShadowSpace) emit_sub_rsp_imm32(code, abi::kShadowSpace);
+            emit_call_reg(code, kR);
+            if (abi::kShadowSpace) emit_add_rsp_imm32(code, abi::kShadowSpace);
+            resolve_jump_patch(code, in_range, code.size());
         }
 
         struct PendingBlockPatch {
@@ -2674,12 +2793,46 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                             if (abi::kShadowSpace) emit_add_rsp_imm32(code, abi::kShadowSpace);
                             break;
                         }
-                        if (instr.args.size() > 2) {
+                        const size_t nargs = instr.args.size();
+                        if (nargs > abi::kMaxParams) {
                             throw std::runtime_error(
-                                "compile_module: calls with more than 2 arguments "
-                                "not supported in this slice");
+                                "compile_module: calls with more than " +
+                                std::to_string(abi::kMaxParams) +
+                                " arguments not supported in this slice");
                         }
-                        for (size_t i = 0; i < instr.args.size(); ++i) {
+                        // Fail loudly on arity mismatch, the way the
+                        // interpreter does, instead of reading a garbage value
+                        // out of the caller's outgoing-argument area.
+                        for (const auto& mf : module.functions) {
+                            if (mf.name != instr.name) continue;
+                            if (nargs != mf.params.size()) {
+                                throw std::runtime_error(
+                                    "compile_module: call to '" + instr.name + "' with " +
+                                    std::to_string(nargs) + " arguments but it has " +
+                                    std::to_string(mf.params.size()) + " parameters");
+                            }
+                            break;
+                        }
+                        // Arguments 3+ travel in this function's reserved
+                        // outgoing-argument area -- the bottom of its own frame,
+                        // which RSP never leaves during the body -- so arg i is
+                        // written at a constant [rsp + (i-2)*8] and the callee
+                        // reads it at [rbp+16+(i-2)*8]. Stack args go FIRST:
+                        // they live in memory, so marshalling the register args
+                        // afterwards cannot disturb them, and the register setup
+                        // remains the last thing before the call exactly as it
+                        // was for the 1-2 argument case.
+                        for (size_t i = 2; i < nargs; ++i) {
+                            const int32_t off = static_cast<int32_t>((i - 2) * 8);
+                            if (is_float_value(value_kinds, instr.args[i])) {
+                                Xmm fv = read_float(instr.args[i]);
+                                emit_movsd_rsp_mem(code, fv, off);
+                            } else {
+                                materialize_into(kR, instr.args[i]);
+                                emit_store_rsp_offset(code, kR, off);
+                            }
+                        }
+                        for (size_t i = 0; i < std::min(nargs, size_t(2)); ++i) {
                             // Marshal a float argument into XMM_i. Reading it
                             // through materialize_into() would put integer-shaped
                             // bits in a GP register, and the callee's prologue
@@ -2755,6 +2908,16 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                         for (const auto& saved : alloc.callee_saved_slots()) {
                             emit_load_rbp_offset(code, saved.first, saved.second);
                         }
+                        // E0401: this call is leaving. Decrement the shared
+                        // depth counter. RAX/XMM0 hold the return value and
+                        // must not move; kScratchLeft/kScratchRight (r10/r11)
+                        // are reserved and dead here, so they take the job.
+                        // r10 = &g_call_depth; r11 = [r10]; r11--; [r10] = r11.
+                        emit_mov_reg_imm(code, kL,
+                                         reinterpret_cast<int64_t>(&lithon::jit::g_call_depth));
+                        emit_load_reg_indirect(code, kR, kL, 8);
+                        emit_sub_reg_imm32(code, kR, 1);
+                        emit_store_reg_indirect(code, kR, kL, 8);
                         emit_epilogue(code);
                         emit_ret(code);
                         break;

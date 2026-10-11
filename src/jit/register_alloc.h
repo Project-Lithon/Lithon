@@ -29,6 +29,25 @@ struct ValueLocation {
 
 using PromotionMap = std::unordered_map<std::string, Reg>;
 
+// Every variable whose address is taken, computed conservatively and once: any
+// AddressOf anywhere in the function marks the variable, whether it happens
+// inside a loop or a branch, and there is no alias analysis to doubt whether
+// the pointer could be written through elsewhere -- so the set is the whole
+// burden. A pointed-at value must live in a real frame slot (that is what
+// AddressOf ladders to) and every read must come from memory, because a write
+// through the pointer can change it at any time. This is what keeps a
+// stack-passed parameter lazy: an unaddressed parameter can keep its incoming
+// [rbp+16+...] slot as its only home, but the instant another rule would point
+// at it, it moves to an eagerly-spilled frame slot instead.
+inline std::unordered_set<std::string> address_taken_variables(
+    const lithon::ir::Function& fn) {
+    std::unordered_set<std::string> out;
+    for (const auto& b : fn.blocks)
+        for (const auto& in : b.instrs)
+            if (in.op == lithon::ir::Op::AddressOf) out.insert(in.name);
+    return out;
+}
+
 // Chooses which variables to keep in registers. A variable's weight is
 // the number of its loads/stores, each scaled by 10^(loop depth). Only
 // variables that beat the cost of saving+restoring a register (two
@@ -184,11 +203,20 @@ public:
     // print_guard's Kind lattice). Empty means "no floats in this
     // function", which is every pre-float caller, so they keep working
     // unchanged and pay nothing.
+    //
+    // `incoming_offsets` names the stack-passed parameters (index >= 2) that
+    // the code generator decided are cold: their ONLY home is the slot the
+    // CALLER wrote them into -- the callee sees it at [rbp+16+(i-2)*8] -- and
+    // assigning a frame slot for them would be dead weight. The generator
+    // excludes from this map any parameter that is float, promoted, or
+    // address-taken, so a lazy parameter never has a pointer into it and never
+    // needs a spill in the prologue.
     RegisterAllocator(const lithon::ir::Function& fn, PromotionMap promoted,
                       const VirtualTemps& virtual_temps, bool borrow = true,
-                      const std::vector<lithon::ir::ValueId>& float_values = {})
+                      const std::vector<lithon::ir::ValueId>& float_values = {},
+                      std::unordered_map<std::string, int> incoming_offsets = {})
         : fn_(fn), liveness_(fn, virtual_temps), promoted_(std::move(promoted)),
-          borrow_(borrow) {
+          borrow_(borrow), incoming_offsets_(std::move(incoming_offsets)) {
         temp_pool_.assign(abi::kTempPool.begin(), abi::kTempPool.end());
         assign_variable_slots();
         assign_temporary_locations(virtual_temps);
@@ -364,6 +392,13 @@ private:
     PromotionMap promoted_;
 
     std::unordered_map<std::string, int> variable_offsets_;
+    // Stack-passed parameters (index >= 2) the code generator keeps lazy in
+    // their incoming slots. Keys are variable names, values are the positive
+    // rbp-relative offsets of those slots. See the constructor comment: these
+    // variables get NO frame slot, and variable_offset() answers their
+    // incoming slot instead. Threaded in from compile_function.h because the
+    // float / promoted / address-taken exclusions are all decided there.
+    std::unordered_map<std::string, int> incoming_offsets_;
     // 4.1. Containers record their capacity so Len can fold to a constant and
     // so Index can tell a real container from a scalar that happens to be
     // indexed by mistake.
@@ -528,6 +563,16 @@ private:
             if (!seen.insert(name).second) return;   // already handled
             variable_order_.push_back(name);
             if (promoted_.count(name)) return;
+
+            // A lazy stack-passed parameter lives entirely in its incoming
+            // slot, which is real storage the CALLER already wrote. It gets no
+            // frame slot: variable_offset() answers the incoming slot, and the
+            // prologue emits nothing for it. AddressOf of such a parameter is
+            // impossible by construction (the generator's exclusion list).
+            if (auto it = incoming_offsets_.find(name); it != incoming_offsets_.end()) {
+                variable_offsets_[name] = it->second;
+                return;
+            }
 
             // 4.1. A container declaration reserves cap*sizeof(T) bytes, packed,
             // and records the BASE. `variable_offset` alone would hand back the
