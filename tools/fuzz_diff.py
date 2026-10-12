@@ -71,6 +71,10 @@ ACCUM_UNROLL = False
 # did not change the answer, rather than only proving the pipeline agrees with
 # the interpreter on some other program's terms.
 SSA_MODE = False
+# --break: also compile with the direct-Phi backend, because break/continue add
+# extra loop edges and the direct-Phi emitter is where a mis-wired predecessor
+# would silently reset the counter (a hang, not a wrong number).
+DIRECT_PHI_MODE = False
 FRONTEND = ROOT / "src" / "frontend" / "frontend.py"
 HELLO = ROOT / "build" / "hello"
 TIER_RUNNER = ROOT / "build" / "tier_runner"
@@ -485,6 +489,48 @@ class Gen:
         self.emit(0, f"print({acc})")
         return "\n".join(self.lines) + "\n"
 
+    def program_break(self):
+        """break/continue inside range loops (1, 2 and 3 argument forms).
+
+        The trip counts straddle the break/continue indices (including
+        never-taken and always-taken), and the 3-argument forms cover both a
+        positive step and a negative one. The loop variable always advances, so
+        the body cannot spin; what this mode checks is that break/continue pick
+        the right target (loop exit vs. the increment/latch) and that the extra
+        loop edges survive the SSA pipeline and the direct-Phi backend.
+        """
+        self.lines = []
+        self.declared = set()
+        acc = VARS[0]
+        self.declare(0, acc, "0")
+        n = self.r.randint(0, 12)
+        brk = self.r.randint(0, n + 2)
+        cont = self.r.randint(0, n + 2)
+        form = self.r.choice(["1", "2", "3pos", "3neg"])
+        iv = LOOPVARS[0]
+        if form == "1":
+            self.emit(0, f"for {iv} in range({n}):")
+        elif form == "2":
+            lo = self.r.randint(0, 3)
+            self.emit(0, f"for {iv} in range({lo}, {lo + n}):")
+        elif form == "3pos":
+            lo = self.r.randint(0, 3)
+            st = self.r.choice([1, 2, 3])
+            hi = lo + n * st + self.r.randint(0, st)
+            self.emit(0, f"for {iv} in range({lo}, {hi}, {st}):")
+        else:
+            hi = n * self.r.choice([1, 2, 3]) + self.r.randint(1, 4)
+            st = self.r.choice([1, 2, 3])
+            self.emit(0, f"for {iv} in range({hi}, 0, {-st}):")
+        self.emit(1, f"{acc} = {acc} + {iv}")
+        self.emit(1, f"if {iv} == {cont}:")
+        self.emit(2, "continue")
+        self.emit(1, f"if {iv} == {brk}:")
+        self.emit(2, "break")
+        self.emit(1, f"{acc} = {acc} + 1")
+        self.emit(0, f"print({acc})")
+        return "\n".join(self.lines) + "\n"
+
     def program_bitwise(self):
         """Bitwise and shift-focused programs.
 
@@ -844,6 +890,12 @@ def evaluate(py_path: Path, tmp_ir: Path):
             return Result(False, interp.stdout, interp.returncode,
                           jit_ssa.stdout, jit_ssa.returncode,
                           cpy_out=None, cpy_rc=None, reason="jit_vs_interp")
+    if DIRECT_PHI_MODE:
+        jit_dp = run(jit_args + ["--direct-phis"])
+        if jit_dp.returncode != jit.returncode or jit_dp.stdout != jit.stdout:
+            return Result(False, interp.stdout, interp.returncode,
+                          jit_dp.stdout, jit_dp.returncode,
+                          cpy_out=None, cpy_rc=None, reason="jit_vs_interp")
     cpy = run([sys.executable, str(py_path)])
     seen = (interp.stdout, interp.returncode, jit.stdout, jit.returncode, cpy.stdout, cpy.returncode)
 
@@ -964,6 +1016,8 @@ def main():
                     help="use the modulo-focused generator (see Gen.program_mod)")
     ap.add_argument("--bitwise", action="store_true",
                     help="use the bitwise/shift-focused generator (see Gen.program_bitwise)")
+    ap.add_argument("--break", dest="break_mode", action="store_true",
+                    help="use the break/continue + range-focused generator (see Gen.program_break)")
     ap.add_argument("--mod-negatives", action="store_true",
                     help="let --mod generate negative dividends, where C's truncating %% and Python's "
                          "floored %% disagree; the CPython oracle then reports the known language gap")
@@ -972,10 +1026,11 @@ def main():
                          "with and without the SSA pipeline against the interpreter")
     args = ap.parse_args()
     TIMEOUT = args.timeout
-    global UNROLL_DIAMONDS, SSA_MODE, ACCUM_UNROLL
+    global UNROLL_DIAMONDS, SSA_MODE, ACCUM_UNROLL, DIRECT_PHI_MODE
     UNROLL_DIAMONDS = args.diamond and not args.no_diamond_unroll
     ACCUM_UNROLL = args.accum
     SSA_MODE = args.phi
+    DIRECT_PHI_MODE = args.break_mode
 
     for exe, name in ((HELLO, "hello"), (TIER_RUNNER, "tier_runner")):
         if not exe.exists():
@@ -999,6 +1054,8 @@ def main():
             src = gen.program_mod()
         elif args.bitwise:
             src = gen.program_bitwise()
+        elif args.break_mode:
+            src = gen.program_break()
         elif args.diamond:
             src = gen.program_diamond()
         elif args.lsr:

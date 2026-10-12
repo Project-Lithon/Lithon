@@ -291,6 +291,8 @@ struct Analysis {
                     case Op::InputInt:
                         raise(st.vals[in.result], Kind::Int);
                         break;
+                    case Op::GuardNonZero:
+                        break; // no result, side-effect only (trap)
 
                     case Op::Add: case Op::Sub: case Op::Mul:
                     // Mod is typed like Mul, NOT like Div: int % int stays int,

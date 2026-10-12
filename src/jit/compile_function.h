@@ -219,6 +219,16 @@ struct CompiledModule {
     // 3.1. Float add chains rotated under --ffast-math-equivalent. Reported so
     // the flag's effect is visible; it is zero unless that flag was passed.
     size_t float_adds_reassociated = 0;
+
+    // Loop-transform accounting, emitted by tier_runner --dump-hex. A loop with
+    // more than one exit (`break`/`continue`) must never be unrolled or
+    // vectorized: unrolling duplicates a body whose extra edge leaves the loop,
+    // and the vectorizer requires a single canonical exit. These counters let a
+    // test assert that shape stays scalar instead of eyeballing disassembly.
+    size_t loops_unrolled = 0;
+    size_t diamonds_unrolled = 0;
+    size_t loops_vectorized = 0;
+    size_t loops_rotated = 0;
 };
 
 namespace detail {
@@ -591,6 +601,10 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
     // 2.7: counts MOVES, documented on CompiledModule::phi_copies_direct.
     size_t phi_copies_direct = 0;
     size_t float_adds_reassociated = 0;
+    size_t loops_unrolled = 0;
+    size_t diamonds_unrolled = 0;
+    size_t loops_vectorized = 0;
+    size_t loops_rotated = 0;
 
     struct PendingCallPatch {
         JumpPatch patch;
@@ -901,6 +915,7 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
         };
         auto read_left = [&](ValueId id) { return read_in(id, kL); };
         auto read_right = [&](ValueId id) { return read_in(id, kR); };
+        auto compute_src = [&](ValueId id) -> Reg { return read_in(id, kL); };
 
         auto imm32_of = [&](ValueId id, int32_t& out) -> bool {
             const TempInfo& ti = info_of(id);
@@ -2143,6 +2158,14 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 commit_result(instr.result, dst);
                 break;
             }
+            case Op::GuardNonZero: {
+                Reg v = compute_src(instr.args.at(0));
+                emit_test_reg_reg(code, v);
+                JumpPatch nz = emit_jcc_rel32(code, Cond::NotZero);
+                emit_host_error_trap(lithon::jit::kE0310Message);
+                resolve_jump_patch(code, nz, code.size());
+                break;
+            }
 
             case Op::Store: {
                 // 4.1. A valueless container store is a declaration, not an
@@ -2877,6 +2900,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                             // its copies. An earlier draft did call it here,
                             // and no test could tell it apart from the no-op --
                             // so it was removed rather than left unverified.
+                            ++loops_rotated;
                             emit_block_body_fn(it->second, next_label, 0, detail::LocalBranch{});
                         } else {
                             emit_phi_copies(bi, instr.name);
@@ -3737,6 +3761,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 if (!detail::match_diamond_unroll(fn, block_index, latch, dia)) continue;
                 if (diamond_at_header.count(dia.header)) continue;   // first match wins
                 diamond_at_header.emplace(dia.header, dia);
+                ++diamonds_unrolled;
                 inlined_blocks.insert(dia.diamond);
                 inlined_blocks.insert(dia.arm_then);
                 inlined_blocks.insert(dia.arm_else);
@@ -3797,7 +3822,10 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             // header as the fallback, which rotates onto the body/latch blocks
             // this loop emits next in their normal positions.
             if (options.vectorize && options.rotate_loops) {
-                if (try_emit_vectorized(bi, next_label)) continue;
+                if (try_emit_vectorized(bi, next_label)) {
+                    ++loops_vectorized;
+                    continue;
+                }
             }
 
             // Unrolling: header H immediately precedes body B, H's branch
@@ -3822,6 +3850,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                             emit_block_body(hit->second, next_label,
                                             last ? 0u : detail::kExitOnlyBranch);
                         }
+                        ++loops_unrolled;
                         continue;
                     }
                 }
@@ -3926,6 +3955,10 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
     compiled.phi_copies_total = phi_copies_total;
     compiled.phis_forwarded = phis_forwarded;
     compiled.phi_copies_coalesced = phi_copies_coalesced;
+    compiled.loops_unrolled = loops_unrolled;
+    compiled.diamonds_unrolled = diamonds_unrolled;
+    compiled.loops_vectorized = loops_vectorized;
+    compiled.loops_rotated = loops_rotated;
     compiled.float_adds_reassociated = float_adds_reassociated;
     return compiled;
 }

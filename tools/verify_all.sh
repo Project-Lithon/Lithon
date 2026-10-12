@@ -110,6 +110,18 @@ python3 tools/fuzz_diff.py --count 200 --bitwise
 step "differential fuzzing: conditional-expression merges through the SSA pipeline"
 python3 tools/fuzz_diff.py --count 200 --phi
 python3 tools/fuzz_diff.py --count 200 --phi --floats
+# break/continue add extra loop edges. This mode also compiles every candidate
+# through the direct-Phi backend, where a merge wired to the wrong predecessor
+# would silently reset the loop counter and hang instead of printing a wrong
+# number.
+step "differential fuzzing: break/continue in range loops (direct-Phi backend too)"
+python3 tools/fuzz_diff.py --count 200 --break
+
+# break/continue make a loop multi-exit: the codegen transforms (unroller,
+# vectorizer, diamond unroller) must all decline it. Checked via the compile
+# counters --dump-hex prints, with a positive control proving they fire at all.
+step "loop-shape stats: break/continue loops are never unrolled/vectorized"
+python3 tools/check_loop_shape_stats.py
 # Accumulator unrolling reorders blocks (the jammed main loop is emitted after
 # the remainder), so it exercises a different liveness regime than anything else
 # here. It is off by default in production, which is exactly why it needs its

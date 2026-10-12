@@ -184,6 +184,12 @@ int main(int argc, char** argv) {
                 std::fputc((i % 16 == 15) ? '\n' : ' ', stderr);
             }
             if (cm.code.size() % 16 != 0) std::fputc('\n', stderr);
+            // Loop-transform accounting (see CompiledModule): a loop carrying
+            // break/continue has more than one exit, so assertion tools can
+            // require all three to be 0 here without disassembling the dump.
+            std::fprintf(stderr, "[stats] unrolled=%zu diamonds=%zu vectorized=%zu rotated=%zu\n",
+                         cm.loops_unrolled, cm.diamonds_unrolled,
+                         cm.loops_vectorized, cm.loops_rotated);
             return 0;
         }
 

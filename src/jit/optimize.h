@@ -222,7 +222,10 @@ inline bool is_pure_op(lithon::ir::Op op) {
         // would change whether the trap fires.
         case Op::ToFloat:
             return true;
-        default:
+        case Op::InputInt: return false;
+        case Op::ToInt: return false;
+        case Op::GuardNonZero: return false;
+        default: return false;
             return false;   // Call/Return/Branch/Jump have effects; Add/Sub/Mul/Div/Shl/Shr trap; Float/Phi stay untouched
     }
 }

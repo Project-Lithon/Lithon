@@ -442,6 +442,9 @@ Module parse_ir_text(const std::string& text) {
             instr.op = Op::InputInt;
             instr.name = oa.raw_args.empty() ? std::string()
                                              : decode_hex_prompt(oa.raw_args.at(0));
+        } else if (oa.op_name == "guardnonzero") {
+            instr.op = Op::GuardNonZero;
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
         } else if (oa.op_name == "add") {
             instr.op = Op::Add;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));

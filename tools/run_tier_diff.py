@@ -691,6 +691,20 @@ block0:
     call print, %3
     return
 """, "tier1", "LITHON-E0309: float-to-int conversion is out of range or not finite"),
+    # 6. range(a,b,step) with a dynamic step==0 must trap identically in both
+    # tiers. The frontend lowers the dynamic step to guardnonzero; literal
+    # `range(a,b,0)` is refused statically as E0107 and never reaches here.
+    "range_step_zero": ("""
+function main():
+block0:
+    %0 = const_i64 0
+    %1 = const_i64 1
+    call print, %1
+    guardnonzero %0
+    %2 = const_i64 2
+    call print, %2
+    return
+""", "tier1", "LITHON-E0310: range step is zero"),
 }
 
 # input(prompt) is impure, so --auto always falls back to the interpreter and

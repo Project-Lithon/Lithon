@@ -356,6 +356,59 @@ def check_discipline(failures):
         print(f"  ok   discipline: every used code is documented ({len(used)})")
 
 
+# E0107..E0125: every frontend refusal carries a LITHON-E01xx code and prints
+# one clean line (no Python traceback). A refusal that regresses to bare prose,
+# or leaks a traceback, fails here.
+FRONTEND_REFUSALS = [
+    ("break outside a loop (E0120)",
+     "break\nx: int[64] = 1\nprint(x)\n", "LITHON-E0120"),
+    ("continue outside a loop (E0120)",
+     "continue\nx: int[64] = 1\nprint(x)\n", "LITHON-E0120"),
+    ("and/or with three operands (E0114)",
+     "a: int[64] = 1\nb: int[64] = 2\nc: int[64] = 3\nx: int[64] = a and b and c\nprint(x)\n",
+     "LITHON-E0114"),
+    ("chained comparison (E0114)",
+     "a: int[64] = 1\nb: int[64] = 2\nc: int[64] = 3\nprint(a < b < c)\n",
+     "LITHON-E0114"),
+    ("for over a list, only range() exists (E0119)",
+     "xs: list[int[64], 4]\nfor i in xs:\n    print(i)\n",
+     "LITHON-E0119"),
+    ("while/else dropped eagerly (E0118)",
+     "x: int[64] = 0\nwhile x < 3:\n    x = x + 1\nelse:\n    print(x)\n",
+     "LITHON-E0118"),
+    ("pointer without the underscore prefix (E0122)",
+     "p: ptr[int[64]]\nprint(0)\n", "LITHON-E0122"),
+    ("dict key must be a literal (E0123)",
+     "d: dict[int[64], int[64], 8] = {x: 1}\nprint(0)\n", "LITHON-E0123"),
+    ("tuple literal on a plain assignment (E0123)",
+     "t: tuple[int[64], 2]\nt = (1, 2)\nprint(0)\n", "LITHON-E0123"),
+    ("range(a,b,0) literal step is E0107",
+     "for i in range(5, 1, 0):\n    print(i)\n", "LITHON-E0107"),
+]
+
+
+def check_frontend_refusals(failures):
+    with tempfile.TemporaryDirectory() as td:
+        tmp = pathlib.Path(td)
+        for i, (name, source, needle) in enumerate(FRONTEND_REFUSALS):
+            src = tmp / f"r{i}.py"
+            src.write_text(source)
+            r = run(["python3", str(FRONTEND), str(src)])
+            if r.returncode == 0:
+                print(f"  FAIL refusal: {name}: accepted when it must refuse")
+                failures.append(name)
+            elif needle not in r.stderr:
+                print(f"  FAIL refusal: {name}: refused without {needle!r}: "
+                      f"{r.stderr.strip()[:160]}")
+                failures.append(name)
+            elif "Traceback" in r.stderr:
+                print(f"  FAIL refusal: {name}: leaked a Python traceback "
+                      f"instead of one clean line")
+                failures.append(name)
+            else:
+                print(f"  ok   refusal: {name} ({needle})")
+
+
 def check_e0105(failures):
     with tempfile.TemporaryDirectory() as td:
         tmp = pathlib.Path(td)
@@ -400,9 +453,11 @@ def main() -> int:
     failures = []
     check_discipline(failures)
     check_e0105(failures)
+    check_frontend_refusals(failures)
     check_e0303(failures)
     check_e0401(failures)
     total = len(E0105_REJECTS) + len(E0105_ACCEPTS) + 1
+    total += len(FRONTEND_REFUSALS)
     total += len(E0303_REJECTS) + len(E0303_WRAPS) + len(E0303_TRAPS)
     total += len(E0401_ACCEPTS) + len(E0401_TRAPS)
     done = total - len(failures)

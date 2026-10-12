@@ -38,6 +38,8 @@ inline constexpr const char kE0308Message[] =
     "LITHON-E0308: input() reached end of input";
 inline constexpr const char kE0309Message[] =
     "LITHON-E0309: float-to-int conversion is out of range or not finite";
+inline constexpr const char kE0310Message[] =
+    "LITHON-E0310: range step is zero";
 
 // Prints `message` followed by a newline, flushes, and exits. The JIT twin of
 // stack_guard.h's host_report_stack_overflow, used for the conversion trap.

@@ -341,9 +341,9 @@ readable from the code alone.
 
 | Code | Tier | Trigger |
 |---|---|---|
-| `E01xx` | 1 (static refusal) | `E0101` overflow-on-reassignment, `E0102` literal zero divisor, `E0103` literal shift out of range, `E0104` literal-provable capacity overflow, `E0105` unsupported type width, `E0106` `float(64, x)` of int[64] refused (lossy: 53 bits cannot hold every int[64]) |
+| `E01xx` | 1 (static refusal) | `E0101` overflow-on-reassignment, `E0102` literal zero divisor, `E0103` literal shift out of range, `E0104` literal-provable capacity overflow, `E0105` unsupported type width, `E0106` `float(64, x)` of int[64] refused (lossy: 53 bits cannot hold every int[64]), `E0107` `range(a,b,0)` with literal zero step, `E0108` unsupported type-annotation form, `E0109` unknown or badly-sized annotation type name, `E0110` annotation missing a required field, `E0111` bad container capacity / literal count, `E0112` container element must be a plain scalar, `E0113` pointer (`ptr[T]`) declaration rules (4.4), `E0114` unsupported or restricted program construct, `E0115` unsupported builtin call form, `E0116` builtin argument rules (`valueof`/`addressof`/`wrap_*`), `E0117` indexing / container-subscript restrictions, `E0118` `else` clause on a `while`/`for` loop, `E0119` `for`-loop form restrictions, `E0120` `break`/`continue` outside a loop, `E0121` assignment / target restrictions, `E0122` declaration and re-declaration rules, `E0123` tuple/dict literal shape, `E0124` function-header restrictions, `E0125` pointer arithmetic form |
 | `E02xx` | 2 (environmental) | `E0201` fallible value read before `.ok` check |
-| `E03xx` | 3 (dynamic runtime trap, arithmetic/logic) | `E0301` division by zero, `E0302` modulo by zero, `E0303` dynamic integer overflow, `E0304` shift amount out of range, `E0305` dynamic index/capacity out of range, `E0306` invalid integer literal in input, `E0307` input value outside the target width, `E0308` end of input, `E0309` float-to-int conversion out of range or not finite |
+| `E03xx` | 3 (dynamic runtime trap, arithmetic/logic) | `E0301` division by zero, `E0302` modulo by zero, `E0303` dynamic integer overflow, `E0304` shift amount out of range, `E0305` dynamic index/capacity out of range, `E0306` invalid integer literal in input, `E0307` input value outside the target width, `E0308` end of input, `E0309` float-to-int conversion out of range or not finite, `E0310` `range(a,b,step)` with `step == 0` (dynamic) |
 | `E04xx` | 3 (dynamic runtime trap, resource) | `E0401` stack overflow |
 
 This table is the seed content for `docs/whitepaper.md`, which is
@@ -431,6 +431,11 @@ ad hoc handling per feature. Concretely:
 - Tier 1 literal-zero detection for `Div`/`Mod`
 - Tier 1 unsupported-width refusal (`E0105`): `int[8|16|32|64]`/`float[64]`
   only, enforced in both the frontend and the type checker
+- Tier 1 frontend refusal codes (`E0107`..`E0125`): every construct this
+  frontend slice refuses — unsupported annotation or expression shapes,
+  builtin/assignment/loop restrictions, `ptr` rules, tuple/dict literals —
+  now carries a documented `LITHON-E01xx` message instead of bare prose, and
+  the CLI prints one clean line rather than a Python traceback
 - Tier 3 runtime traps for `Div`/`Mod` zero-divisor, `Shl`/`Shr` bounds,
   `list` index/capacity
 - Tier 3 dynamic integer-overflow trap (`E0303`) for unproven `int[64]`
@@ -452,8 +457,9 @@ ad hoc handling per feature. Concretely:
 - The tier-determination algorithm as an explicit, shared piece of
   compiler code — today, each op's handling is written independently, so
   there is no single place that *guarantees* every op lands somewhere
-- The full numbered error-code table (E0105/E0303/E0401 are coded; the
-  older runtime traps — `Div`/`Mod`/shift/list — still render prose)
+- The full numbered error-code table (the `E01xx` static refusals are coded
+  end to end — `E0101`..`E0125` — and the Tier-3 traps are coded; a few
+  older runtime-trap paths still render prose)
 - `dict` capacity trapping (list's equivalent exists; dict's doesn't yet)
 - The overflow-specific fuzz mode
 

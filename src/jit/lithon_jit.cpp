@@ -286,6 +286,13 @@ int main(int argc, char** argv) {
             if (compiled.float_adds_reassociated)
                 std::fprintf(stderr, "[+] float adds reassociated: %zu\n",
                              compiled.float_adds_reassociated);
+            // Loop-transform accounting (see CompiledModule). A loop that
+            // carries a break/continue has more than one exit, so all three
+            // must read 0 there; this line lets a test assert that without
+            // disassembling the hex.
+            std::fprintf(stderr, "[+] loop transforms: unrolled=%zu diamonds=%zu vectorized=%zu rotated=%zu\n",
+                         compiled.loops_unrolled, compiled.diamonds_unrolled,
+                         compiled.loops_vectorized, compiled.loops_rotated);
             if (compiled.phi_copies_coalesced)
                 std::fprintf(stderr, "[+] phi copies deleted by coalescing: %zu\n",
                              compiled.phi_copies_coalesced);

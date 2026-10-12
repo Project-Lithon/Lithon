@@ -50,7 +50,7 @@ def render_type_suffix(kind, width, elem_kind=None, elem_width=None,
     if kind == "dict":
         if elem_kind is None or key_kind is None:
             raise NotImplementedError(
-                f"dict annotation is missing its key or value type")
+                f"LITHON-E0110: dict annotation is missing its key or value type")
         k = render_type_suffix(key_kind, key_width).lstrip(" :")
         v = render_type_suffix(elem_kind, elem_width).lstrip(" :")
         return f" : dict[{k}, {v}, {width}]"
@@ -60,12 +60,12 @@ def render_type_suffix(kind, width, elem_kind=None, elem_width=None,
         # the pointee back through the same recursion, so it stays in the same
         # element fields a container's element would use.
         if elem_kind is None:
-            raise NotImplementedError("ptr annotation is missing its pointee type")
+            raise NotImplementedError("LITHON-E0110: ptr annotation is missing its pointee type")
         inner = render_type_suffix(elem_kind, elem_width).lstrip(" :")
         return f" : ptr[{inner}]"
     if kind in CONTAINER_KINDS:
         if elem_kind is None:
-            raise NotImplementedError(f"{kind} annotation is missing its element type")
+            raise NotImplementedError(f"LITHON-E0110: {kind} annotation is missing its element type")
         inner = render_type_suffix(elem_kind, elem_width).lstrip(" :")
         return f" : {kind}[{inner}, {width}]"
     if width is None or width == -1:
@@ -89,11 +89,11 @@ def parse_type_annotation(node):
             raise NotImplementedError(
                 f"LITHON-E0105: {node.id} requires an explicit width -- "
                 f"{node.id} must be {opts}")
-        raise NotImplementedError(f"type '{node.id}' requires an explicit size, e.g. {node.id}[64]")
+        raise NotImplementedError(f"LITHON-E0109: type '{node.id}' requires an explicit size, e.g. {node.id}[64]")
 
     if isinstance(node, ast.Subscript):
         if not isinstance(node.value, ast.Name):
-            raise NotImplementedError("unsupported type annotation form")
+            raise NotImplementedError("LITHON-E0108: unsupported type annotation form")
         base = node.value.id
         if base == "dict":
             return _parse_dict_annotation(node.slice)
@@ -102,14 +102,14 @@ def parse_type_annotation(node):
         if base in CONTAINER_KINDS:
             return _parse_container_annotation(base, node.slice)
         if base not in ("int", "float", "str"):
-            raise NotImplementedError(f"unknown type '{base}'")
+            raise NotImplementedError(f"LITHON-E0109: unknown type '{base}'")
         size_node = node.slice
         if not isinstance(size_node, ast.Constant) or not isinstance(size_node.value, int):
-            raise NotImplementedError(f"{base}[N] requires a literal integer size")
+            raise NotImplementedError(f"LITHON-E0109: {base}[N] requires a literal integer size")
         _require_supported_width(base, size_node.value)
         return base, size_node.value, None, None, None, None
 
-    raise NotImplementedError("unsupported type annotation form")
+    raise NotImplementedError("LITHON-E0108: unsupported type annotation form")
 
 
 # E0105 (docs/lithon_error_system.md 4c): only int[8|16|32|64] and float[64]
@@ -141,24 +141,24 @@ def _parse_dict_annotation(slice_node):
     """
     if not isinstance(slice_node, ast.Tuple) or len(slice_node.elts) != 3:
         raise NotImplementedError(
-            "dict[K, V, N] needs a key type, a value type and a literal bucket "
+            "LITHON-E0111: dict[K, V, N] needs a key type, a value type and a literal bucket "
             "count, e.g. dict[int[64], int[64], 8]")
     key_node, val_node, cap_node = slice_node.elts
     if not isinstance(cap_node, ast.Constant) or not isinstance(cap_node.value, int) \
             or isinstance(cap_node.value, bool):
-        raise NotImplementedError("dict bucket count must be a literal integer")
+        raise NotImplementedError("LITHON-E0111: dict bucket count must be a literal integer")
     if cap_node.value <= 0:
         raise NotImplementedError(
-            f"dict bucket count must be positive, got {cap_node.value}")
+            f"LITHON-E0111: dict bucket count must be positive, got {cap_node.value}")
     if cap_node.value & (cap_node.value - 1):
         raise NotImplementedError(
-            f"dict bucket count must be a power of two, got {cap_node.value}")
+            f"LITHON-E0111: dict bucket count must be a power of two, got {cap_node.value}")
     key_kind, key_width, key_elem_kind, _, _, _ = parse_type_annotation(key_node)
     if key_elem_kind is not None:
-        raise NotImplementedError("a dict key cannot itself be a container")
+        raise NotImplementedError("LITHON-E0112: a dict key cannot itself be a container")
     val_kind, val_width, val_elem_kind, _, _, _ = parse_type_annotation(val_node)
     if val_elem_kind is not None:
-        raise NotImplementedError("a dict value cannot itself be a container")
+        raise NotImplementedError("LITHON-E0112: a dict value cannot itself be a container")
     return "dict", cap_node.value, val_kind, val_width, key_kind, key_width
 
 
@@ -174,16 +174,16 @@ def _parse_ptr_annotation(slice_node):
     valueof needs to know how many bytes to read.
     """
     if not isinstance(slice_node, (ast.Name, ast.Subscript)):
-        raise NotImplementedError("ptr[T] needs a scalar pointee, e.g. ptr[int[64]] (4.4)")
+        raise NotImplementedError("LITHON-E0113: ptr[T] needs a scalar pointee, e.g. ptr[int[64]] (4.4)")
     elem_kind, elem_width, elem_elem_kind, elem_elem_width, _, _ = \
         parse_type_annotation(slice_node)
     if elem_elem_kind is not None:
         raise NotImplementedError(
-            f"a ptr pointee is a scalar, not a container (4.4); "
+            f"LITHON-E0113: a ptr pointee is a scalar, not a container (4.4); "
             f"ptr[{elem_kind}[...]] does not point at anything single")
     if elem_kind not in ("int", "float", "bool"):
         raise NotImplementedError(
-            f"ptr pointees are int, float or bool only, got {elem_kind} (4.4)")
+            f"LITHON-E0113: ptr pointees are int, float or bool only, got {elem_kind} (4.4)")
     return "ptr", -1, elem_kind, elem_width, None, None
 
 
@@ -198,14 +198,14 @@ def _parse_container_annotation(base, slice_node):
     """
     if not isinstance(slice_node, ast.Tuple) or len(slice_node.elts) != 2:
         raise NotImplementedError(
-            f"{base}[T, N] needs an element type and a literal capacity, "
+            f"LITHON-E0111: {base}[T, N] needs an element type and a literal capacity, "
             f"e.g. {base}[int[64], 4]")
     elem_node, cap_node = slice_node.elts
     if not isinstance(cap_node, ast.Constant) or not isinstance(cap_node.value, int) \
             or isinstance(cap_node.value, bool):
-        raise NotImplementedError(f"{base}[T, N] requires a literal integer capacity")
+        raise NotImplementedError(f"LITHON-E0111: {base}[T, N] requires a literal integer capacity")
     if cap_node.value <= 0:
-        raise NotImplementedError(f"{base} capacity must be positive, got {cap_node.value}")
+        raise NotImplementedError(f"LITHON-E0111: {base} capacity must be positive, got {cap_node.value}")
     elem_kind, elem_width, _unused_key_kind, _unused_key_width, \
         elem_elem_kind, elem_elem_width = parse_type_annotation(elem_node)
     if elem_elem_kind is not None:
@@ -274,10 +274,10 @@ def scalar_cell_bytes(kind, width):
     if kind in ("int", "float"):
         if width is None or width <= 0:
             raise NotImplementedError(
-                f"{kind} needs a stated width to be pointed at, e.g. {kind}[64] (4.4)")
+                f"LITHON-E0113: {kind} needs a stated width to be pointed at, e.g. {kind}[64] (4.4)")
         return width // 8
     raise NotImplementedError(
-        f"only a scalar cell can be pointed at, got {kind} (4.4)")
+        f"LITHON-E0113: only a scalar cell can be pointed at, got {kind} (4.4)")
 
 
 BINARY_OPS = {
@@ -310,35 +310,12 @@ class IRBuilder:
         self.ifexpr_counter = 0
         self.blocks = []
         self.current = None
-        # 4.3. Names declared as a dict, so a subscript on one lowers to a hash
-        # and a probe instead of an array address. Recorded here rather than
-        # looked up, because the frontend does not otherwise track a variable's
-        # type and a wrong guess would pick the wrong opcode silently.
+        self.terminated = False
+        self.loop_stack = []  # list of (continue_target, break_target)
         self.dict_names = set()
-        # 4.4. Names declared as a pointer, and -- for the two things the
-        # frontend must know about a pointer's pointee without consulting a
-        # type table -- the scalar type of every annotated scalar variable and
-        # the pointee carried by every register that holds a pointer.
-        #
-        # var_types: name -> (kind, width) for annotated scalar variables. It is
-        # what addressof needs to know how big a cell it points at, and tracing
-        # through _p requires the same cell size at every pointer arithmetic.
-        #
-        # ptr_types: register -> (kind, width) of the pointee of the pointer
-        # that register holds. A pointer value only enters the world through
-        # addressof(x) (whose pointee is var_types[x]) and load of a pointer
-        # name (whose pointee is the declaration), and add/sub keep their
-        # operand's pointee, so this stays complete by construction.
         self.var_types = {}
         self.ptr_types = {}
         self.ptr_names = set()
-        # 0.6.10. Every `name: T` written in this function, recorded as the raw
-        # parse_type_annotation tuple. An annotation-only declaration emits no
-        # store, so this is where the declaration lives: it is what lets a
-        # later plain `name = ...` carry the declared type into the IR (the
-        # checker range-checks the first assignment against it, 0.6.5) and
-        # what makes a second `name: OtherType` a re-declaration error. Since
-        # each function gets a fresh IRBuilder, this is per-function.
         self.declared = {}
 
     def new_reg(self):
@@ -355,10 +332,22 @@ class IRBuilder:
         b = Block(label)
         self.blocks.append(b)
         self.current = b
+        self.terminated = False
         return b
 
     def emit(self, line):
+        # A block ends at its first terminator. Source after `break`,
+        # `continue`, or `return` is unreachable, and an `if`/loop that appends
+        # its own trailing jump onto a body that already terminated would give
+        # the block two terminators. build_cfg reads only the last one, so the
+        # CFG would disagree with the code the emitter actually lays down.
+        if self.terminated:
+            return
         self.current.lines.append(f"    {line}")
+        stripped = line.strip()
+        if stripped.startswith("jump ") or stripped.startswith("branch ") \
+                or stripped == "return" or stripped.startswith("return "):
+            self.terminated = True
 
     def literal_int(self, node):
         """The integer value of a literal expression node, or None. Used by
@@ -387,7 +376,7 @@ class IRBuilder:
                 and isinstance(call.args[0].value, str):
             return call.args[0].value
         raise NotImplementedError(
-            "input() takes an optional string literal prompt, e.g. "
+            "LITHON-E0115: input() takes an optional string literal prompt, e.g. "
             'input("Enter x: ")')
 
     def build_expr(self, node):
@@ -419,7 +408,7 @@ class IRBuilder:
             op_type = type(node.op)
             op_map = BITWISE_OPS if op_type in BITWISE_OPS else BINARY_OPS
             if op_type not in op_map:
-                raise NotImplementedError(f"operator {op_type.__name__} not supported yet")
+                raise NotImplementedError(f"LITHON-E0114: operator {op_type.__name__} not supported yet")
             if op_type in (ast.Add, ast.Sub):
                 # 4.4. Pointer arithmetic. If either side is a pointer register
                 # the other side must be a literal ELEMENT count, because a byte
@@ -457,7 +446,7 @@ class IRBuilder:
                 right = self.build_expr(node.right)
                 if left in self.ptr_types or right in self.ptr_types:
                     raise NotImplementedError(
-                        "a pointer offset must be a literal integer, e.g. `_p + 1` (4.4)")
+                        "LITHON-E0125: a pointer offset must be a literal integer, e.g. `_p + 1` (4.4)")
                 r = self.new_reg()
                 self.emit(f"{r} = {op_map[op_type]} {left}, {right}")
                 return r
@@ -469,20 +458,20 @@ class IRBuilder:
 
         if isinstance(node, ast.Compare):
             if len(node.ops) != 1 or len(node.comparators) != 1:
-                raise NotImplementedError("chained comparisons (a < b < c) not supported yet")
+                raise NotImplementedError("LITHON-E0114: chained comparisons (a < b < c) not supported yet")
             left = self.build_expr(node.left)
             right = self.build_expr(node.comparators[0])
             op_map = {ast.Lt: "lt", ast.Gt: "gt", ast.Eq: "eq"}
             op_type = type(node.ops[0])
             if op_type not in op_map:
-                raise NotImplementedError(f"comparison {op_type.__name__} not supported yet")
+                raise NotImplementedError(f"LITHON-E0114: comparison {op_type.__name__} not supported yet")
             r = self.new_reg()
             self.emit(f"{r} = {op_map[op_type]} {left}, {right}")
             return r
 
         if isinstance(node, ast.BoolOp):
             if len(node.values) != 2:
-                raise NotImplementedError("and/or with exactly two operands supported for now")
+                raise NotImplementedError("LITHON-E0114: and/or with exactly two operands supported for now")
             left = self.build_expr(node.values[0])
             right = self.build_expr(node.values[1])
             op_name = "and" if isinstance(node.op, ast.And) else "or"
@@ -523,15 +512,15 @@ class IRBuilder:
 
         if isinstance(node, ast.Call):
             if not isinstance(node.func, ast.Name):
-                raise NotImplementedError("only direct name calls are supported")
+                raise NotImplementedError("LITHON-E0115: only direct name calls are supported")
             if node.func.id == "print":
-                raise NotImplementedError("print() is a statement in this slice, not an expression")
+                raise NotImplementedError("LITHON-E0115: print() is a statement in this slice, not an expression")
             if node.func.id == "len":
                 # Op::Len names a container variable and returns the capacity.
                 # It is not a call: there is no `len` function to emit a `call`
                 # for, and a user function named `len` would otherwise collide.
                 if len(node.args) != 1 or not isinstance(node.args[0], ast.Name):
-                    raise NotImplementedError("len() takes exactly one variable")
+                    raise NotImplementedError("LITHON-E0115: len() takes exactly one variable")
                 r = self.new_reg()
                 self.emit(f"{r} = Len {node.args[0].id}")
                 return r
@@ -541,7 +530,7 @@ class IRBuilder:
                 # that name would collide and is rejected by the checker instead.
                 if len(node.args) != 2 or not isinstance(node.args[0], ast.Name):
                     raise NotImplementedError(
-                        "contains() takes a dict variable and a key, e.g. contains(d, k)")
+                        "LITHON-E0115: contains() takes a dict variable and a key, e.g. contains(d, k)")
                 key_reg = self.build_expr(node.args[1])
                 r = self.new_reg()
                 self.emit(f"{r} = DictContains {node.args[0].id}, {key_reg}")
@@ -555,11 +544,11 @@ class IRBuilder:
                 # suffix. That suffix is what names the width of the load.
                 if len(node.args) != 1:
                     raise NotImplementedError(
-                        "valueof() takes exactly one pointer, e.g. valueof(_p) (4.4)")
+                        "LITHON-E0116: valueof() takes exactly one pointer, e.g. valueof(_p) (4.4)")
                 arg_reg = self.build_expr(node.args[0])
                 if arg_reg not in self.ptr_types:
                     raise NotImplementedError(
-                        "valueof() needs a pointer, e.g. valueof(_p) (4.4)")
+                        "LITHON-E0116: valueof() needs a pointer, e.g. valueof(_p) (4.4)")
                 k, w = self.ptr_types[arg_reg]
                 r = self.new_reg()
                 self.emit(f"{r} = valueof {arg_reg}{render_type_suffix(k, w)}")
@@ -571,12 +560,12 @@ class IRBuilder:
                 # the pointer would not know its own stride.
                 if len(node.args) != 1 or not isinstance(node.args[0], ast.Name):
                     raise NotImplementedError(
-                        "addressof() takes exactly one plain variable, e.g. "
+                        "LITHON-E0116: addressof() takes exactly one plain variable, e.g. "
                         "addressof(x) (4.4)")
                 name = node.args[0].id
                 if name not in self.var_types:
                     raise NotImplementedError(
-                        f"addressof('{name}') needs the size of '{name}', so "
+                        f"LITHON-E0116: addressof('{name}') needs the size of '{name}', so "
                         f"annotate it first, e.g. `{name}: int[64] = ...` (4.4)")
                 r = self.new_reg()
                 self.emit(f"{r} = addressof {name}")
@@ -590,7 +579,7 @@ class IRBuilder:
                 # function of this name is shadowed, exactly like len/contains.
                 if len(node.args) != 2:
                     raise NotImplementedError(
-                        f"{node.func.id}() takes exactly two int[64] operands, "
+                        f"LITHON-E0116: {node.func.id}() takes exactly two int[64] operands, "
                         f"e.g. {node.func.id}(a, b) (E0303)")
                 op = {"wrap_add": "wrapadd", "wrap_sub": "wrapsub",
                       "wrap_mul": "wrapmul"}[node.func.id]
@@ -598,7 +587,7 @@ class IRBuilder:
                 right = self.build_expr(node.args[1])
                 if left in self.ptr_types or right in self.ptr_types:
                     raise NotImplementedError(
-                        f"{node.func.id}() is integer-only -- pointer arithmetic "
+                        f"LITHON-E0116: {node.func.id}() is integer-only -- pointer arithmetic "
                         f"is not wrapping arithmetic (E0303, int[64] operands only)")
                 r = self.new_reg()
                 self.emit(f"{r} = {op} {left}, {right}")
@@ -613,12 +602,12 @@ class IRBuilder:
                 # function of the same name rather than emitting a `call`.
                 if len(node.args) != 2:
                     raise NotImplementedError(
-                        f"{node.func.id}() takes a bit width and a value, e.g. "
+                        f"LITHON-E0115: {node.func.id}() takes a bit width and a value, e.g. "
                         f"{node.func.id}(64, x)")
                 width = self.literal_int(node.args[0])
                 if width is None:
                     raise NotImplementedError(
-                        f"{node.func.id}() needs a literal bit width, e.g. "
+                        f"LITHON-E0115: {node.func.id}() needs a literal bit width, e.g. "
                         f"{node.func.id}(64, x)")
                 if node.func.id == "float":
                     arg_reg = self.build_expr(node.args[1])
@@ -659,7 +648,7 @@ class IRBuilder:
         if isinstance(node, ast.Subscript):
             if not isinstance(node.value, ast.Name):
                 raise NotImplementedError(
-                    "only a plain variable can be indexed, e.g. xs[i]; there is no "
+                    "LITHON-E0117: only a plain variable can be indexed, e.g. xs[i]; there is no "
                     "value that denotes a container yet")
             idx = self.build_expr(node.slice)
             r = self.new_reg()
@@ -704,7 +693,7 @@ class IRBuilder:
             self.emit(f"{r} = load {temp}")
             return r
 
-        raise NotImplementedError(f"expression node {type(node).__name__} not supported yet")
+        raise NotImplementedError(f"LITHON-E0114: expression node {type(node).__name__} not supported yet")
 
     def build_if(self, node):
         cond_reg = self.build_expr(node.test)
@@ -716,6 +705,7 @@ class IRBuilder:
 
         target_else = else_label if else_label else merge_label
         branch_block.lines.append(f"    branch {cond_reg}, {then_label}, {target_else}")
+        self.terminated = True
 
         self.start_block(then_label)
         for stmt in node.body:
@@ -732,7 +722,7 @@ class IRBuilder:
 
     def build_while(self, node):
         if node.orelse:
-            raise NotImplementedError("while/else is not supported (the else clause would be silently dropped)")
+            raise NotImplementedError("LITHON-E0118: while/else is not supported (the else clause would be silently dropped)")
         header_label = self.reserve_label()
         body_label = self.reserve_label()
         exit_label = self.reserve_label()
@@ -744,61 +734,172 @@ class IRBuilder:
         self.emit(f"branch {cond_reg}, {body_label}, {exit_label}")
 
         self.start_block(body_label)
+        self.loop_stack.append((header_label, exit_label))
         for stmt in node.body:
             self.build_stmt(stmt)
+        self.loop_stack.pop()
         self.emit(f"jump {header_label}")
 
         self.start_block(exit_label)
 
     def build_for(self, node):
         if node.orelse:
-            raise NotImplementedError("for/else is not supported (the else clause would be silently dropped)")
+            raise NotImplementedError("LITHON-E0118: for/else is not supported (the else clause would be silently dropped)")
         if not isinstance(node.target, ast.Name):
-            raise NotImplementedError("only a single name for-target is supported")
+            raise NotImplementedError("LITHON-E0119: only a single name for-target is supported")
         if not (isinstance(node.iter, ast.Call)
                 and isinstance(node.iter.func, ast.Name)
-                and node.iter.func.id == "range"
-                and len(node.iter.args) == 1):
-            raise NotImplementedError("only for x in range(N) is supported in this slice")
+                and node.iter.func.id == "range"):
+            raise NotImplementedError("LITHON-E0119: only for x in range(...) is supported")
+        args = node.iter.args
+        if len(args) not in (1, 2, 3):
+            raise NotImplementedError("LITHON-E0119: range takes 1, 2, or 3 arguments")
 
         loop_var = node.target.id
-        limit_reg = self.build_expr(node.iter.args[0])
+        # For now, all int[64] as per decision (user said i:int[64])
+        start_reg = None
+        limit_reg = None
+        step_reg = None
 
-        zero_reg = self.new_reg()
-        self.emit(f"{zero_reg} = const_i64 0")
-        # A range() counter is an int by construction: it is compared against
-        # the limit and post-incremented, never anything else. The annotation
-        # has to be emitted HERE rather than asked of the source, because the
-        # source has no way to annotate a for-target -- `for k: int[64] in
-        # range(n)` is not valid Python. With the type checker now
-        # unconditional, leaving this store unannotated made every `for` loop
-        # in the language a type error.
-        self.emit(f"store {loop_var}, {zero_reg} : int[64]")
+        if len(args) == 1:
+            start_reg = self.new_reg()
+            self.emit(f"{start_reg} = const_i64 0")
+            limit_reg = self.build_expr(args[0])
+            step_reg = self.new_reg()
+            self.emit(f"{step_reg} = const_i64 1")
+        elif len(args) == 2:
+            start_reg = self.build_expr(args[0])
+            limit_reg = self.build_expr(args[1])
+            step_reg = self.new_reg()
+            self.emit(f"{step_reg} = const_i64 1")
+        elif len(args) == 3:
+            start_reg = self.build_expr(args[0])
+            limit_reg = self.build_expr(args[1])
+            step_reg = self.build_expr(args[2])
+            # check if literal step is 0
+            # try to detect const_i64 0 in value? easier: check AST literal
+            pass
 
-        header_label = self.reserve_label()
+        # handle step==0 literal
+        if len(args) == 3 and isinstance(args[2], ast.Constant) and isinstance(args[2].value, (int, float)):
+            sv = int(args[2].value)
+            if sv == 0:
+                raise NotImplementedError("LITHON-E0107: range(a,b,0): step is zero")
+            # normalize to int[64] if small
+
+        self.emit("store " + loop_var + ", " + start_reg + " : int[64]")
+
         body_label = self.reserve_label()
         exit_label = self.reserve_label()
+        latch_label = self.reserve_label()
 
-        self.emit(f"jump {header_label}")
+        if len(args) in (1, 2):
+            header_label = self.reserve_label()
+            self.emit(f"jump {header_label}")
 
-        self.start_block(header_label)
-        i_reg = self.new_reg()
-        self.emit(f"{i_reg} = load {loop_var}")
-        cond_reg = self.new_reg()
-        self.emit(f"{cond_reg} = lt {i_reg}, {limit_reg}")
-        self.emit(f"branch {cond_reg}, {body_label}, {exit_label}")
+            self.start_block(header_label)
+            i_reg = self.new_reg()
+            self.emit(f"{i_reg} = load {loop_var}")
+            cond_reg = self.new_reg()
+            self.emit(f"{cond_reg} = lt {i_reg}, {limit_reg}")
+            self.emit(f"branch {cond_reg}, {body_label}, {exit_label}")
+
+            self.start_block(body_label)
+            self.loop_stack.append((latch_label, exit_label))
+            for stmt in node.body:
+                self.build_stmt(stmt)
+            self.loop_stack.pop()
+            self.emit(f"jump {latch_label}")
+
+            self.start_block(latch_label)
+            i_reg2 = self.new_reg()
+            self.emit(f"{i_reg2} = load {loop_var}")
+            one_reg = self.new_reg()
+            self.emit(f"{one_reg} = const_i64 1")
+            inc_reg = self.new_reg()
+            self.emit(f"{inc_reg} = add {i_reg2}, {one_reg}")
+            self.emit(f"store {loop_var}, {inc_reg}")
+            self.emit(f"jump {header_label}")
+
+            self.start_block(exit_label)
+            return
+
+        # 3 args: rotated form. The element test guards the first iteration;
+        # thereafter the latch exits as soon as the unsigned remaining distance
+        # is <= the step magnitude, so the increment is only performed when it
+        # provably stays strictly inside the range (no signed overflow / E0303).
+        if not (isinstance(args[2], ast.Constant)):
+            self.emit(f"guardnonzero {step_reg}")
+
+        zstep = self.new_reg()
+        self.emit(f"{zstep} = const_i64 0")
+        step_gt0 = self.new_reg()
+        self.emit(f"{step_gt0} = gt {step_reg}, {zstep}")
+
+        pre_pos = self.reserve_label()
+        pre_neg = self.reserve_label()
+        self.emit(f"branch {step_gt0}, {pre_pos}, {pre_neg}")
+
+        self.start_block(pre_pos)
+        pc = self.new_reg()
+        self.emit(f"{pc} = lt {start_reg}, {limit_reg}")
+        self.emit(f"branch {pc}, {body_label}, {exit_label}")
+
+        self.start_block(pre_neg)
+        nc = self.new_reg()
+        self.emit(f"{nc} = gt {start_reg}, {limit_reg}")
+        self.emit(f"branch {nc}, {body_label}, {exit_label}")
 
         self.start_block(body_label)
+        self.loop_stack.append((latch_label, exit_label))
         for stmt in node.body:
             self.build_stmt(stmt)
-        i_reg2 = self.new_reg()
-        self.emit(f"{i_reg2} = load {loop_var}")
-        one_reg = self.new_reg()
-        self.emit(f"{one_reg} = const_i64 1")
-        inc_reg = self.new_reg()
-        self.emit(f"{inc_reg} = add {i_reg2}, {one_reg}")
-        self.emit(f"store {loop_var}, {inc_reg}")
-        self.emit(f"jump {header_label}")
+        self.loop_stack.pop()
+        self.emit(f"jump {latch_label}")
+
+        self.start_block(latch_label)
+        li = self.new_reg()
+        self.emit(f"{li} = load {loop_var}")
+        lat_pos = self.reserve_label()
+        lat_neg = self.reserve_label()
+        self.emit(f"branch {step_gt0}, {lat_pos}, {lat_neg}")
+
+        self.start_block(lat_pos)
+        pM = self.new_reg()
+        self.emit(f"{pM} = const_i64 -9223372036854775808")
+        pd = self.new_reg()
+        self.emit(f"{pd} = wrapsub {limit_reg}, {li}")
+        pd2 = self.new_reg()
+        ps2 = self.new_reg()
+        self.emit(f"{pd2} = bxor {pd}, {pM}")
+        self.emit(f"{ps2} = bxor {step_reg}, {pM}")
+        pcont = self.new_reg()
+        self.emit(f"{pcont} = gt {pd2}, {ps2}")
+        pinc = self.reserve_label()
+        self.emit(f"branch {pcont}, {pinc}, {exit_label}")
+
+        self.start_block(lat_neg)
+        nM = self.new_reg()
+        self.emit(f"{nM} = const_i64 -9223372036854775808")
+        nd = self.new_reg()
+        self.emit(f"{nd} = wrapsub {li}, {limit_reg}")
+        nstep = self.new_reg()
+        self.emit(f"{nstep} = sub {zstep}, {step_reg}")
+        nd2 = self.new_reg()
+        ns2 = self.new_reg()
+        self.emit(f"{nd2} = bxor {nd}, {nM}")
+        self.emit(f"{ns2} = bxor {nstep}, {nM}")
+        ncont = self.new_reg()
+        self.emit(f"{ncont} = gt {nd2}, {ns2}")
+        self.emit(f"branch {ncont}, {pinc}, {exit_label}")
+
+        self.start_block(pinc)
+        vi = self.new_reg()
+        self.emit(f"{vi} = load {loop_var}")
+        ni = self.new_reg()
+        self.emit(f"{ni} = add {vi}, {step_reg}")
+        self.emit(f"store {loop_var}, {ni}")
+        self.emit(f"jump {body_label}")
 
         self.start_block(exit_label)
 
@@ -825,11 +926,11 @@ class IRBuilder:
             return
         if not isinstance(value_node, ast.Tuple):
             raise NotImplementedError(
-                f"a tuple is built from a tuple literal, so `{name}: ... = <expr>` "
+                f"LITHON-E0123: a tuple is built from a tuple literal, so `{name}: ... = <expr>` "
                 f"needs (a, b, ...), not a single expression (4.2)")
         if len(value_node.elts) != capacity:
             raise NotImplementedError(
-                f"`{name}: tuple[..., {capacity}]` needs exactly {capacity} element"
+                f"LITHON-E0123: `{name}: tuple[..., {capacity}]` needs exactly {capacity} element"
                 f"{'' if capacity == 1 else 's'}, got {len(value_node.elts)}")
         for i, elt in enumerate(value_node.elts):
             # A nested container literal would need the outer stride to be the
@@ -837,11 +938,11 @@ class IRBuilder:
             # that rejects nested containers as a type.
             if isinstance(elt, (ast.Tuple, ast.List)):
                 raise NotImplementedError(
-                    f"tuple element {i} is a container literal; 4.2 tuples hold "
+                    f"LITHON-E0123: tuple element {i} is a container literal; 4.2 tuples hold "
                     f"int, float or bool elements only")
             if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
                 raise NotImplementedError(
-                    f"tuple element {i} is a string literal; 4.2 tuples hold "
+                    f"LITHON-E0123: tuple element {i} is a string literal; 4.2 tuples hold "
                     f"int, float or bool elements only")
             idx_reg = self.new_reg()
             self.emit(f"{idx_reg} = const_i64 {i}")
@@ -873,11 +974,11 @@ class IRBuilder:
             return
         if not isinstance(value_node, ast.Dict):
             raise NotImplementedError(
-                f"a dict is built from a dict literal, so `{name}: ... = <expr>` "
+                f"LITHON-E0123: a dict is built from a dict literal, so `{name}: ... = <expr>` "
                 f"needs {{k: v, ...}}, not a single expression (4.3)")
         if len(value_node.keys) > capacity:
             raise NotImplementedError(
-                f"`{name}: dict[..., {capacity}]` has {capacity} bucket"
+                f"LITHON-E0123: `{name}: dict[..., {capacity}]` has {capacity} bucket"
                 f"{'' if capacity == 1 else 's'}, so at most {capacity} entrie"
                 f"{'' if capacity == 1 else 's'} fit, got {len(value_node.keys)}")
         for i, (key_node, val_node) in enumerate(zip(value_node.keys, value_node.values)):
@@ -896,14 +997,14 @@ class IRBuilder:
                 key_node = ast.Constant(value=-key_node.operand.value)
             if not isinstance(key_node, ast.Constant):
                 raise NotImplementedError(
-                    f"dict key {i} is not a literal; a dict key must be a "
+                    f"LITHON-E0123: dict key {i} is not a literal; a dict key must be a "
                     f"constant, because the bucket is decided from it (4.3)")
             if isinstance(key_node.value, str):
                 raise NotImplementedError(
-                    f"dict key {i} is a string; 4.3 keys are int or bool only")
+                    f"LITHON-E0123: dict key {i} is a string; 4.3 keys are int or bool only")
             if isinstance(key_node.value, float):
                 raise NotImplementedError(
-                    f"dict key {i} is a float; 4.3 keys are int or bool only")
+                    f"LITHON-E0123: dict key {i} is a float; 4.3 keys are int or bool only")
             key_reg = self.new_reg()
             # A bool key is emitted as a bool constant, not as int(key). The type
             # of the key register is what the checker compares against the
@@ -936,7 +1037,7 @@ class IRBuilder:
     def build_stmt(self, node):
         if isinstance(node, ast.AnnAssign):
             if not isinstance(node.target, ast.Name):
-                raise NotImplementedError("only simple name targets are supported for annotations")
+                raise NotImplementedError("LITHON-E0121: only simple name targets are supported for annotations")
             name = node.target.id
             kind, width, elem_kind, elem_width, key_kind, key_width = \
                 parse_type_annotation(node.annotation)
@@ -954,7 +1055,7 @@ class IRBuilder:
                 def spell(d):
                     return render_type_suffix(*d).lstrip(" :") or "?"
                 raise NotImplementedError(
-                    f"`{name}` is re-declared with a different type: first "
+                    f"LITHON-E0122: `{name}` is re-declared with a different type: first "
                     f"declared {spell(prev_decl)}, now {spell(decl_key)} -- "
                     f"a name has one type (V1_SPEC 0.6.10)")
             self.declared[name] = decl_key
@@ -971,7 +1072,7 @@ class IRBuilder:
                 # backstop on hand-written IR.
                 if not name.startswith("_"):
                     raise NotImplementedError(
-                        f"a pointer is named with a leading underscore, write "
+                        f"LITHON-E0122: a pointer is named with a leading underscore, write "
                         f"`_{name}: ptr[...]` or pick a name that starts with "
                         f"'_' (4.4)")
                 self.ptr_names.add(name)
@@ -992,7 +1093,7 @@ class IRBuilder:
                 # not take a pointer's reserved first character.
                 if name.startswith("_"):
                     raise NotImplementedError(
-                        f"a name that starts with '_' must be a pointer, but "
+                        f"LITHON-E0122: a name that starts with '_' must be a pointer, but "
                         f"`{name}` is declared {suffix.lstrip() or kind} (4.4)")
                 self.var_types[name] = (kind, width)
             if node.value is not None:
@@ -1023,21 +1124,21 @@ class IRBuilder:
 
         if isinstance(node, ast.Assign):
             if len(node.targets) != 1:
-                raise NotImplementedError("only single-target assignment is supported")
+                raise NotImplementedError("LITHON-E0121: only single-target assignment is supported")
             target = node.targets[0]
             if isinstance(target, ast.Subscript):
                 # `xs[i] = v`. Op::IndexStore carries the container name in `name`
                 # and only the index and value as ValueIds.
                 if not isinstance(target.value, ast.Name):
                     raise NotImplementedError(
-                        "only a plain variable can be index-assigned, e.g. xs[i] = v")
+                        "LITHON-E0117: only a plain variable can be index-assigned, e.g. xs[i] = v")
                 # 4.3. A dict subscript read is DictIndex, but there is no dict
                 # subscript WRITE, so `d[k] = v` would quietly become an
                 # IndexStore into a dict and be reported as a missing index
                 # operation rather than as the immutability violation it is.
                 if target.value.id in self.dict_names:
                     raise NotImplementedError(
-                        f"cannot store into '{target.value.id}': a dict is "
+                        f"LITHON-E0117: cannot store into '{target.value.id}': a dict is "
                         f"immutable (4.3); it is filled by its own literal, and "
                         f"after that the only operations are a read and contains")
                 idx = self.build_expr(target.slice)
@@ -1045,14 +1146,14 @@ class IRBuilder:
                 self.emit(f"IndexStore {target.value.id}, {idx}, {val}")
                 return
             if not isinstance(target, ast.Name):
-                raise NotImplementedError("only single-name assignment targets are supported")
+                raise NotImplementedError("LITHON-E0121: only single-name assignment targets are supported")
             if isinstance(node.value, ast.Tuple):
                 # 4.2. A tuple literal belongs to its annotated declaration, where
                 # the element type and the capacity are known. Naming the form
                 # beats letting it fall through to the generic "expression node
                 # Tuple not supported yet", which is true and useless.
                 raise NotImplementedError(
-                    f"a tuple is built on its annotation, so write "
+                    f"LITHON-E0123: a tuple is built on its annotation, so write "
                     f"`{target.id}: tuple[int[64], {len(node.value.elts)}] = "
                     f"({', '.join(['1'] * len(node.value.elts))})` (4.2)")
             value_reg = self.build_expr(node.value)
@@ -1070,11 +1171,11 @@ class IRBuilder:
             # left-to-right evaluation order, so the type-checker and
             # both execution tiers see one canonical shape.
             if not isinstance(node.target, ast.Name):
-                raise NotImplementedError("only simple name targets are supported for augmented assignment")
+                raise NotImplementedError("LITHON-E0121: only simple name targets are supported for augmented assignment")
             op_map = BITWISE_OPS if type(node.op) in BITWISE_OPS else BINARY_OPS
             op_type = type(node.op)
             if op_type not in op_map:
-                raise NotImplementedError(f"augmented operator {op_type.__name__} not supported yet")
+                raise NotImplementedError(f"LITHON-E0114: augmented operator {op_type.__name__} not supported yet")
             name = node.target.id
             current = self.new_reg()
             self.emit(f"{current} = load {name}")
@@ -1085,12 +1186,12 @@ class IRBuilder:
                 # the register below is the pointer's new value.
                 if op_type not in (ast.Add, ast.Sub):
                     raise NotImplementedError(
-                        "a pointer only walks add and sub, got an augmented " +
+                        "LITHON-E0125: a pointer only walks add and sub, got an augmented " +
                         f"operator for `{name}` (4.4)")
                 rhs_lit = self.literal_int(node.value)
                 if rhs_lit is None:
                     raise NotImplementedError(
-                        f"a pointer offset must be a literal integer, e.g. "
+                        f"LITHON-E0125: a pointer offset must be a literal integer, e.g. "
                         f"`{name} += 1` (4.4)")
                 k, w = self.var_types[name]
                 off = self.new_reg()
@@ -1109,7 +1210,7 @@ class IRBuilder:
             call = node.value
             if isinstance(call.func, ast.Name) and call.func.id == "print":
                 if len(call.args) != 1:
-                    raise NotImplementedError("print() with exactly one argument is supported")
+                    raise NotImplementedError("LITHON-E0115: print() with exactly one argument is supported")
                 arg_reg = self.build_expr(call.args[0])
                 self.emit(f"call print, {arg_reg}")
                 return
@@ -1136,7 +1237,21 @@ class IRBuilder:
                 self.emit("return")
             return
 
-        raise NotImplementedError(f"statement node {type(node).__name__} not supported yet")
+        if isinstance(node, ast.Break):
+            if not self.loop_stack:
+                raise NotImplementedError("LITHON-E0120: break outside of a loop")
+            _, break_target = self.loop_stack[-1]
+            self.emit(f"jump {break_target}")
+            return
+
+        if isinstance(node, ast.Continue):
+            if not self.loop_stack:
+                raise NotImplementedError("LITHON-E0120: continue outside of a loop")
+            continue_target, _ = self.loop_stack[-1]
+            self.emit(f"jump {continue_target}")
+            return
+
+        raise NotImplementedError(f"LITHON-E0114: statement node {type(node).__name__} not supported yet")
 
     def render(self, header_line):
         out = [header_line]
@@ -1177,7 +1292,7 @@ def build_program(tree):
                         # address that nothing could valueof. Refused at source
                         # rather than by the checker's header review.
                         raise NotImplementedError(
-                            f"parameter '{arg.arg}' cannot be a pointer: the "
+                            f"LITHON-E0124: parameter '{arg.arg}' cannot be a pointer: the "
                             f"function header records no pointee, so pointers "
                             f"are not passed by value (4.4)")
                     suffix = render_type_suffix(kind, width, elem_kind, elem_width,
@@ -1192,7 +1307,7 @@ def build_program(tree):
                     parse_type_annotation(stmt.returns)
                 if kind == "ptr":
                     raise NotImplementedError(
-                        f"function '{stmt.name}' cannot return a pointer: like "
+                        f"LITHON-E0124: function '{stmt.name}' cannot return a pointer: like "
                         f"parameters, the header records no pointee (4.4)")
                 # " : " is stripped because the return suffix uses " -> " and the
                 # scalar path below writes the brackets itself.
@@ -1223,8 +1338,18 @@ def main():
     with open(sys.argv[1], "r") as f:
         source = f.read()
 
-    tree = ast.parse(source)
-    ir_text = build_program(tree)
+    try:
+        tree = ast.parse(source)
+        # build_program raises NotImplementedError for every construct this
+        # frontend slice refuses. Those messages are self-identifying
+        # ("LITHON-E01xx: ..."), so they print bare on stderr like a tier
+        # refusal would, instead of leaking a Python traceback -- one clean
+        # line, a nonzero exit, nothing else.
+        ir_text = build_program(tree)
+    except NotImplementedError as e:
+        print(f"{e}", file=sys.stderr)
+        return 1
+
     sys.stdout.write(ir_text)
     return 0
 

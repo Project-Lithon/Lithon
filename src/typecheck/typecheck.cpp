@@ -918,6 +918,22 @@ private:
                 reg_types_[instr.result] = LType{"int", instr.type_width};
                 return;
             }
+            case Op::GuardNonZero: {
+                if (instr.args.empty()) {
+                    error("guardnonzero needs an argument");
+                    return;
+                }
+                LType st;
+                if (!reg_type(instr.args.at(0), st)) {
+                    error("guardnonzero needs an int value, got unresolved");
+                    return;
+                }
+                if (st.kind != "int") {
+                    error("guardnonzero needs an int value, got " + type_str(st));
+                    return;
+                }
+                return;
+            }
 
             // 4.1. Container access. The shared preconditions are: the name must
             // be a live binding, it must actually BE a container (indexing a

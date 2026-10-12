@@ -155,7 +155,9 @@ enum class Op : uint8_t {
     // fusion in the frontend is the only way these are spelled.
     ToFloat,
     ToInt,
-    InputInt
+    InputInt,
+    // Range guard: dynamic step == 0 traps with E0310.
+    GuardNonZero
 };
 
 using ValueId = uint32_t;

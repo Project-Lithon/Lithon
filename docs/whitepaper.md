@@ -16,6 +16,25 @@ kind of failure is this" readable from the code alone.
 | `E0104` | 1 (static refusal) | Literal-provable capacity overflow |
 | `E0105` | 1 (static refusal) | Unsupported type width |
 | `E0106` | 1 (static refusal) | int[64] to float[64] through `float(64, x)` (lossy: 53 bits cannot hold every int[64]) |
+| `E0107` | 1 (static refusal) | `range(a,b,0)` with a literal zero step |
+| `E0108` | 1 (static refusal) | Unsupported type-annotation form |
+| `E0109` | 1 (static refusal) | Unknown or badly-sized annotation type name |
+| `E0110` | 1 (static refusal) | Annotation missing a required field |
+| `E0111` | 1 (static refusal) | Bad container capacity / literal count |
+| `E0112` | 1 (static refusal) | Container element must be a plain scalar |
+| `E0113` | 1 (static refusal) | Pointer (`ptr[T]`) declaration rules (4.4) |
+| `E0114` | 1 (static refusal) | Unsupported or restricted program construct |
+| `E0115` | 1 (static refusal) | Unsupported builtin call form |
+| `E0116` | 1 (static refusal) | Builtin argument rules (`valueof`/`addressof`/`wrap_*`) |
+| `E0117` | 1 (static refusal) | Indexing / container-subscript restrictions |
+| `E0118` | 1 (static refusal) | `else` clause on a `while`/`for` loop |
+| `E0119` | 1 (static refusal) | `for`-loop form restrictions |
+| `E0120` | 1 (static refusal) | `break`/`continue` outside a loop |
+| `E0121` | 1 (static refusal) | Assignment / target restrictions |
+| `E0122` | 1 (static refusal) | Declaration and re-declaration rules |
+| `E0123` | 1 (static refusal) | Tuple/dict literal shape |
+| `E0124` | 1 (static refusal) | Function-header restrictions |
+| `E0125` | 1 (static refusal) | Pointer arithmetic form |
 | `E0201` | 2 (environmental) | Fallible value read before `.ok` check |
 | `E0301` | 3 (dynamic runtime trap) | Division by zero |
 | `E0302` | 3 (dynamic runtime trap) | Modulo by zero |
@@ -26,4 +45,5 @@ kind of failure is this" readable from the code alone.
 | `E0307` | 3 (dynamic runtime trap) | Input value outside the target width |
 | `E0308` | 3 (dynamic runtime trap) | End of input |
 | `E0309` | 3 (dynamic runtime trap) | float-to-int conversion out of range or not finite |
+| `E0310` | 3 (dynamic runtime trap) | `range(a,b,step)` where `step == 0` (dynamic) |
 | `E0401` | 3 (dynamic runtime trap, resource) | Stack overflow |

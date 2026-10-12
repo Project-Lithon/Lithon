@@ -294,6 +294,19 @@ LithonValue apply_compare(Op op, LithonValue lhs, LithonValue rhs) {
     if ((!lhs.is_int() && !lhs.is_float()) || (!rhs.is_int() && !rhs.is_float())) {
         throw std::runtime_error("interpreter: comparison on a non-numeric value");
     }
+    // Both sides int means an exact int64 comparison, matching the JIT's
+    // integer cmp/setcc path. Converting to double first would round away
+    // differences past 2^53 and disagree with native for large integers.
+    if (lhs.is_int() && rhs.is_int()) {
+        int64_t a = lhs.as_int(), b = rhs.as_int();
+        switch (op) {
+            case Op::Lt: return LithonValue::make_bool(a < b);
+            case Op::Gt: return LithonValue::make_bool(a > b);
+            case Op::Eq: return LithonValue::make_bool(a == b);
+            default:
+                throw std::runtime_error("interpreter: not a comparison op");
+        }
+    }
     double a = lhs.is_float() ? lhs.as_float() : static_cast<double>(lhs.as_int());
     double b = rhs.is_float() ? rhs.as_float() : static_cast<double>(rhs.as_int());
     switch (op) {
@@ -642,6 +655,16 @@ LithonValue execute_function(const Module& module, const Function& fn,
                         throw std::runtime_error(err);
                     }
                     frame.regs[instr.result] = LithonValue::make_int(value);
+                    break;
+                }
+                case Op::GuardNonZero: {
+                    LithonValue v = frame.get_reg(instr.args.at(0));
+                    if (!v.is_int()) {
+                        throw std::runtime_error("interpreter: guardnonzero requires int");
+                    }
+                    if (v.as_int() == 0) {
+                        throw std::runtime_error(lithon::jit::kE0310Message);
+                    }
                     break;
                 }
                 case Op::Index:
