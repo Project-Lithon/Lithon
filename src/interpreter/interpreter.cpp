@@ -1,6 +1,7 @@
 #include "interpreter.h"
 #include "runtime/value.h"
 #include "jit/float_runtime.h"
+#include "jit/input_runtime.h"
 #include "jit/print_guard.h"
 #include "jit/stack_guard.h"
 #include "dict_hash.h"
@@ -410,6 +411,29 @@ void do_print(LithonValue v) {
     else throw std::runtime_error("interpreter: print() of an unsupported value kind in this slice");
 }
 
+// Hardening item 5. Explicit numeric conversions. Both mirror the JIT's
+// machine forms exactly so the tiers agree: ToFloat is a (possibly identity)
+// widening, ToInt is a truncation-toward-zero with the SAME range test the JIT
+// emits (x in [-2^(w-1), 2^(w-1))), which is what makes NaN, +/-inf and an
+// out-of-width magnitude trap E0309 identically in both engines.
+LithonValue convert_to_float(LithonValue v) {
+    if (v.is_float()) return v;
+    if (!v.is_int())
+        throw std::runtime_error("interpreter: float(...) of a non-numeric value");
+    return LithonValue::make_float(static_cast<double>(v.as_int()));
+}
+
+LithonValue convert_to_int(LithonValue v, int width) {
+    if (!v.is_float())
+        throw std::runtime_error("interpreter: int(...) of a non-float value");
+    const double x = v.as_float();
+    const double bound = std::ldexp(1.0, width - 1);
+    if (!(x >= -bound && x < bound)) {
+        throw std::runtime_error(lithon::jit::kE0309Message);
+    }
+    return LithonValue::make_int(static_cast<int64_t>(std::trunc(x)));
+}
+
 const Function* find_function(const Module& module, const std::string& name) {
     for (const auto& fn : module.functions) {
         if (fn.name == name) return &fn;
@@ -599,6 +623,25 @@ LithonValue execute_function(const Module& module, const Function& fn,
                             "interpreter: dereference of a pointer with no live variable behind it");
                     }
                     frame.regs[instr.result] = frame.get_var(back->second);
+                    break;
+                }
+                // Hardening item 5. Explicit conversions and terminal input.
+                case Op::ToFloat:
+                    frame.regs[instr.result] =
+                        convert_to_float(frame.get_reg(instr.args.at(0)));
+                    break;
+                case Op::ToInt:
+                    frame.regs[instr.result] =
+                        convert_to_int(frame.get_reg(instr.args.at(0)), instr.type_width);
+                    break;
+                case Op::InputInt: {
+                    int64_t value = 0;
+                    const char* err = nullptr;
+                    if (!lithon::jit::read_int_line(instr.name.c_str(), instr.type_width,
+                                                    &value, &err)) {
+                        throw std::runtime_error(err);
+                    }
+                    frame.regs[instr.result] = LithonValue::make_int(value);
                     break;
                 }
                 case Op::Index:

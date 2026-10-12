@@ -216,6 +216,11 @@ inline bool is_pure_op(lithon::ir::Op op) {
         // is_unrollable_op() in compile_function.h for why duplication
         // preserves trapping and movement does not.
         case Op::BitAnd: case Op::BitOr: case Op::BitXor:
+        // Hardening item 5. ToFloat is total -- an int[8|16|32] widens exactly
+        // and a float passes through -- so it is safe to move or delete. ToInt
+        // is deliberately NOT here: it traps E0309, and moving or deleting it
+        // would change whether the trap fires.
+        case Op::ToFloat:
             return true;
         default:
             return false;   // Call/Return/Branch/Jump have effects; Add/Sub/Mul/Div/Shl/Shr trap; Float/Phi stay untouched

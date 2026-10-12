@@ -1122,6 +1122,23 @@ inline void emit_movsd_mem_rip(CodeBuffer& buf, Xmm src) {
 // emitters put nothing after the disp32.
 inline size_t movsd_rip_disp_offset(CodeBuffer& buf) { return buf.size() - 4; }
 
+// lea dst, [rip + disp32] -- the ADDRESS of an embedded constant (currently
+// an input() prompt string in the string pool), not its contents. Encoding:
+// REX.W 8D /r, ModRM(mod=00, reg=dst, rm=101), disp32. Like the movsd pool
+// emitters the disp32 is a zero placeholder the caller patches once the pool's
+// final position is known; the rm=101 + mod=00 combination is RIP-relative,
+// which keeps the code position-independent inside the mmap'd buffer.
+inline void emit_lea_rip(CodeBuffer& buf, Reg dst) {
+    emit_u8(buf, static_cast<uint8_t>(0x48 | (reg_is_extended(dst) ? 4 : 0)));
+    emit_u8(buf, 0x8D);
+    emit_u8(buf, static_cast<uint8_t>(0x05 | ((static_cast<uint8_t>(dst) & 7) << 3)));
+    emit_disp32_le(buf, 0);
+}
+
+// The disp32 offset of the RIP-relative displacement emit_lea_rip just wrote.
+// Must be called immediately after the emitter, like movsd_rip_disp_offset.
+inline size_t lea_rip_disp_offset(CodeBuffer& buf) { return buf.size() - 4; }
+
 // movsd xmm, xmm -- register-to-register double move. Encoding:
 // F2 0F 10 /r. This is how a double gets from the register it was
 // computed in to the register it is consumed from.

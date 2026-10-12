@@ -223,6 +223,32 @@ ParamSpec parse_param(const std::string& raw) {
     return ParamSpec{name, pt.kind, pt.width};
 }
 
+// Hardening item 5. Decodes the hex-encoded input() prompt carried in the IR.
+// The frontend renders the prompt's raw bytes as hex so that any character --
+// comma, space, bracket, newline -- survives the comma-split text format. The
+// "-" sentinel (or an empty string) means no prompt.
+std::string decode_hex_prompt(const std::string& hex) {
+    if (hex == "-" || hex.empty()) return std::string();
+    if (hex.size() % 2 != 0)
+        throw std::runtime_error("inputint: prompt hex has an odd number of digits");
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::string out;
+    out.reserve(hex.size() / 2);
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        const int hi = nibble(hex[i]);
+        const int lo = nibble(hex[i + 1]);
+        if (hi < 0 || lo < 0)
+            throw std::runtime_error("inputint: prompt hex has a non-hex digit");
+        out.push_back(static_cast<char>((hi << 4) | lo));
+    }
+    return out;
+}
+
 } // namespace
 
 Module parse_ir_text(const std::string& text) {
@@ -406,6 +432,16 @@ Module parse_ir_text(const std::string& text) {
         } else if (oa.op_name == "valueof") {
             instr.op = Op::ValueOf;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+        } else if (oa.op_name == "tofloat") {
+            instr.op = Op::ToFloat;
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+        } else if (oa.op_name == "toint") {
+            instr.op = Op::ToInt;
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+        } else if (oa.op_name == "inputint") {
+            instr.op = Op::InputInt;
+            instr.name = oa.raw_args.empty() ? std::string()
+                                             : decode_hex_prompt(oa.raw_args.at(0));
         } else if (oa.op_name == "add") {
             instr.op = Op::Add;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));

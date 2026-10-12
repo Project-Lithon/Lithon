@@ -375,6 +375,21 @@ class IRBuilder:
             return -node.operand.value
         return None
 
+    def _input_prompt_literal(self, call):
+        """The prompt string of an input() call, or "" when there is none.
+
+        Only a string literal prompt is accepted: input() has no value of its
+        own in this slice (that would need str[N]), so the prompt must be
+        knowable at compile time to be hex-encoded into the IR."""
+        if len(call.args) == 0:
+            return ""
+        if len(call.args) == 1 and isinstance(call.args[0], ast.Constant) \
+                and isinstance(call.args[0].value, str):
+            return call.args[0].value
+        raise NotImplementedError(
+            "input() takes an optional string literal prompt, e.g. "
+            'input("Enter x: ")')
+
     def build_expr(self, node):
         if isinstance(node, ast.Constant) and isinstance(node.value, bool):
             r = self.new_reg()
@@ -587,6 +602,46 @@ class IRBuilder:
                         f"is not wrapping arithmetic (E0303, int[64] operands only)")
                 r = self.new_reg()
                 self.emit(f"{r} = {op} {left}, {right}")
+                return r
+            if node.func.id in ("int", "float"):
+                # Hardening item 5. Explicit conversions and terminal input
+                # (V1_SPEC 0.6.11). Two-argument form with an explicit width:
+                #   float(64, v)              -- int[8|16|32] or float[64]
+                #   int(w, v)                 -- float[64] -> int[w]
+                #   int(w, input("prompt"))   -- read int[w] from stdin
+                # Like len/contains/addressof, these builtins shadow a user
+                # function of the same name rather than emitting a `call`.
+                if len(node.args) != 2:
+                    raise NotImplementedError(
+                        f"{node.func.id}() takes a bit width and a value, e.g. "
+                        f"{node.func.id}(64, x)")
+                width = self.literal_int(node.args[0])
+                if width is None:
+                    raise NotImplementedError(
+                        f"{node.func.id}() needs a literal bit width, e.g. "
+                        f"{node.func.id}(64, x)")
+                if node.func.id == "float":
+                    arg_reg = self.build_expr(node.args[1])
+                    r = self.new_reg()
+                    self.emit(f"{r} = tofloat {arg_reg}"
+                              f"{render_type_suffix('float', width)}")
+                    return r
+                src = node.args[1]
+                if isinstance(src, ast.Call) and isinstance(src.func, ast.Name) \
+                        and src.func.id == "input":
+                    prompt = self._input_prompt_literal(src)
+                    # Hex-encode so any prompt character (comma, space,
+                    # bracket, newline) survives the comma-split text IR. The
+                    # "-" sentinel means no prompt.
+                    hex_prompt = prompt.encode("utf-8").hex() if prompt else "-"
+                    r = self.new_reg()
+                    self.emit(f"{r} = inputint {hex_prompt}"
+                              f"{render_type_suffix('int', width)}")
+                    return r
+                arg_reg = self.build_expr(src)
+                r = self.new_reg()
+                self.emit(f"{r} = toint {arg_reg}"
+                          f"{render_type_suffix('int', width)}")
                 return r
             arg_regs = [self.build_expr(a) for a in node.args]
             callee = self.fn_rename.get(node.func.id, node.func.id)

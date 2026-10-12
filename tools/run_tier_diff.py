@@ -94,6 +94,56 @@ block0:
     call print, %2
     return
 """, "tier1"),
+    # int(w, x) truncates toward zero and, on success, must agree byte for
+    # byte with the interpreter -- including the sign of zero and exact
+    # integer arguments, which must pass through unchanged.
+    "toint_truncates_toward_zero": ("""
+function main():
+block0:
+    %0 = const_f64 7.9
+    %1 = toint %0 : int[64]
+    call print, %1
+    %2 = const_f64 -3.7
+    %3 = toint %2 : int[64]
+    call print, %3
+    %4 = const_f64 -0.9
+    %5 = toint %4 : int[64]
+    call print, %5
+    %6 = const_f64 0.9
+    %7 = toint %6 : int[64]
+    call print, %7
+    %8 = const_f64 -7.0
+    %9 = toint %8 : int[8]
+    call print, %9
+    return
+""", "tier1"),
+    # float(64, x) of a narrow int is exact: int[8|16|32] fit in a double's
+    # 53 significant bits, so these must render as exact .0 values.
+    "int_to_float_is_exact": ("""
+function main():
+block0:
+    %0 = const_i64 5
+    store a, %0 : int[8]
+    %1 = load a
+    %2 = tofloat %1 : float[64]
+    call print, %2
+    %3 = const_i64 300
+    store b, %3 : int[16]
+    %4 = load b
+    %5 = tofloat %4 : float[64]
+    call print, %5
+    %6 = const_i64 16777217
+    store c, %6 : int[32]
+    %7 = load c
+    %8 = tofloat %7 : float[64]
+    call print, %8
+    %9 = const_i64 -12345
+    store d, %9 : int[32]
+    %10 = load d
+    %11 = tofloat %10 : float[64]
+    call print, %11
+    return
+""", "tier1"),
     # Float modulo, including the trunc-vs-floor cases that CPython's own %
     # gets differently and so cannot live in tests/programs/float.py, which is
     # compared against CPython. The two tiers must agree byte for byte.
@@ -617,11 +667,145 @@ TRAPS = {
                   "error: interpreter: dict key not found"),
     "dict_miss_after_store": (TRAP_DICT_MISS.replace("@K@", "2"), "tier1",
                               "error: interpreter: dict key not found"),
+    # float -> int out of the target's range. No print happens before the trap
+    # (the result would not exist), so both tiers must produce identical bytes:
+    # just the LITHON-E0309 line and exit 1.
+    "float_to_int_out_of_range": ("""
+function main():
+block0:
+    %0 = const_f64 9.223372036854776e18
+    %1 = toint %0 : int[64]
+    %2 = const_f64 1.0
+    %3 = toint %2 : int[64]
+    call print, %3
+    return
+""", "tier1", "LITHON-E0309: float-to-int conversion is out of range or not finite"),
+    # The `jp` in the JIT coverage test: a NaN must trap the same way.
+    "float_to_int_nan_trap": ("""
+function main():
+block0:
+    %0 = const_f64 nan
+    %1 = toint %0 : int[64]
+    %2 = const_f64 1.0
+    %3 = toint %2 : int[64]
+    call print, %3
+    return
+""", "tier1", "LITHON-E0309: float-to-int conversion is out of range or not finite"),
+}
+
+# input(prompt) is impure, so --auto always falls back to the interpreter and
+# would never exercise the JIT's host call. These run the JIT directly with
+# --native and compare it against --interp, feeding the same stdin to both.
+# Every byte on stdout and stderr (minus tier markers) must agree.
+E0306 = "LITHON-E0306: input() expected an integer literal"
+E0307 = "LITHON-E0307: input value does not fit in the target int width"
+E0308 = "LITHON-E0308: input() reached end of input"
+
+# name -> (ir_text, stdin_text, expected_trap_message_or_None)
+INPUT_PINS = {
+    "input_with_prompt": ("""
+function main():
+block0:
+    %0 = inputint 456e7465723a20 : int[64]
+    %1 = add %0, %0
+    store v, %1 : int[64]
+    %2 = load v
+    call print, %2
+    return
+""", "42\n", None),
+    "input_empty_prompt": ("""
+function main():
+block0:
+    %0 = inputint - : int[64]
+    store v, %0 : int[64]
+    %1 = load v
+    call print, %1
+    return
+""", "7\n", None),
+    "input_negative_narrow_ok": ("""
+function main():
+block0:
+    %0 = inputint - : int[8]
+    store v, %0 : int[8]
+    %1 = load v
+    call print, %1
+    return
+""", "-5\n", None),
+    "input_bad_literal": ("""
+function main():
+block0:
+    %0 = inputint - : int[64]
+    store v, %0 : int[64]
+    %1 = load v
+    call print, %1
+    return
+""", "abc\n", E0306),
+    "input_does_not_fit_width": ("""
+function main():
+block0:
+    %0 = inputint - : int[8]
+    store v, %0 : int[8]
+    %1 = load v
+    call print, %1
+    return
+""", "200\n", E0307),
+    "input_eof": ("""
+function main():
+block0:
+    %0 = inputint - : int[64]
+    store v, %0 : int[64]
+    %1 = load v
+    call print, %1
+    return
+""", "", E0308),
 }
 
 
-def run(args):
-    return subprocess.run([str(RUNNER)] + args, capture_output=True, text=True)
+def check_input(label, ir_path, stdin_text, expected_message=None):
+    """The JIT's own input path must match the interpreter byte for byte."""
+    ref = run([str(ir_path), "--interp"], stdin_text)
+    native = run([str(ir_path), "--native"], stdin_text)
+    ref_err = without_tier_markers(ref.stderr)
+    native_err = without_tier_markers(native.stderr)
+
+    problems = []
+    if expected_message is None:
+        want_exit = 0
+        if ref.returncode != want_exit:
+            problems.append(f"interpreter exit {ref.returncode}, want {want_exit}: "
+                            f"{ref_err[:200]!r}")
+        if native.returncode != want_exit:
+            problems.append(f"native exit {native.returncode}, want {want_exit}: "
+                            f"{native_err[:200]!r}")
+    else:
+        if ref.returncode != TRAP_EXIT:
+            problems.append(f"interpreter exit {ref.returncode}, want {TRAP_EXIT}: "
+                            f"{ref_err[:200]!r}")
+        if native.returncode != TRAP_EXIT:
+            problems.append(f"native exit {native.returncode}, want {TRAP_EXIT}: "
+                            f"{native_err[:200]!r}")
+        for tag, err in (("interpreter", ref_err), ("native", native_err)):
+            if expected_message not in err:
+                problems.append(f"{tag} stderr lacks {expected_message!r}: {err!r}")
+    if ref.stdout != native.stdout:
+        problems.append("STDOUT MISMATCH\n"
+                        f"      interp : {ref.stdout!r}\n"
+                        f"      native : {native.stdout!r}")
+    if ref_err != native_err:
+        problems.append("STDERR MISMATCH\n"
+                        f"      interp : {ref_err!r}\n"
+                        f"      native : {native_err!r}")
+
+    status = "PASS" if not problems else "FAIL"
+    print(f"[{status}] {label:<42} interp vs native")
+    for p in problems:
+        print(f"      {p}")
+    return not problems
+
+
+def run(args, stdin_text=None):
+    return subprocess.run([str(RUNNER)] + args, capture_output=True, text=True,
+                          input=stdin_text)
 
 
 def tier_of(stderr):
@@ -791,6 +975,12 @@ def main():
             ok, tier = check_trap(f"traps/{name}", ir, want, message)
             results.append(ok)
             tiers[tier] += 1
+
+        print("--- input (JIT via --native vs interpreter, same stdin) ---")
+        for name, (ir_text, stdin_text, message) in INPUT_PINS.items():
+            ir = pathlib.Path(tmp) / f"input_{name}.ir"
+            ir.write_text(ir_text)
+            results.append(check_input(f"input/{name}", ir, stdin_text, message))
 
     print("--- direct float Op::Phi (2.7: direct path vs memory path) ---")
     phi = {"match": 0, "gap": 0, "mismatch": 0}

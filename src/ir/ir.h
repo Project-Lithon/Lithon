@@ -128,7 +128,34 @@ enum class Op : uint8_t {
     // narrow zero-extend, and the value's kind feeds both the typechecker's
     // compare rules and the print guard.
     AddressOf,
-    ValueOf
+    ValueOf,
+
+    // Hardening item 5. Explicit numeric conversions and terminal input.
+    //
+    //   ToFloat   args = {value}   result = float[64]
+    //   ToInt     args = {value}   result = int[type_width]
+    //   InputInt  args = {}        result = int[type_width]
+    //
+    // ToFloat widens an int[8|16|32] EXACTLY to float[64] (the value is
+    // sign-extended in its slot, so a single cvtsi2sd is exact) or passes a
+    // float[64] through unchanged. int[64] -> float[64] is refused at compile
+    // time as lossy (E0106): a 64-bit integer has up to 64 significant bits
+    // and a double only 53, so the conversion would silently round.
+    //
+    // ToInt truncates a float[64] toward zero into int[type_width] and traps
+    // (E0309) on a NaN, an infinity, or a magnitude outside the target width.
+    // This is the ONLY float -> int direction that exists: there is no
+    // int -> int narrowing (see the conversion matrix in V1_SPEC 0.6.11).
+    //
+    // InputInt reads one line from stdin and parses it as int[type_width].
+    // `name` carries the prompt, HEX-ENCODED so an arbitrary prompt (spaces,
+    // commas, brackets, newlines) survives the comma-split text IR; the empty
+    // string means no prompt. It traps E0306 (not an integer), E0307 (out of
+    // the target width) and E0308 (end of input). The `int(w, input(prompt))`
+    // fusion in the frontend is the only way these are spelled.
+    ToFloat,
+    ToInt,
+    InputInt
 };
 
 using ValueId = uint32_t;

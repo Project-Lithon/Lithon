@@ -843,6 +843,82 @@ private:
                 reg_types_[instr.result] = p.element();
                 return;
             }
+            // Hardening item 5. Explicit numeric conversions (V1_SPEC 0.6.11).
+            //
+            // float(64, v) widens an int[8|16|32] EXACTLY to float[64] (every
+            // such integer has at most 32 significant bits, far below the 53 a
+            // double represents) and passes a float[64] through unchanged. An
+            // int[64] is refused as lossy (E0106): a 64-bit integer can need 64
+            // significant bits and the conversion would silently round. There
+            // is no float[N] other than 64.
+            case Op::ToFloat: {
+                LType src;
+                if (!reg_type(instr.args.at(0), src)) {
+                    error("float(...) needs an int or float value, got an unresolved value");
+                    return;
+                }
+                if (instr.type_kind != "float" || instr.type_width != 64) {
+                    error("float(...) only produces float[64], got " +
+                          type_str(LType{instr.type_kind, instr.type_width}));
+                    return;
+                }
+                if (src.kind == "float") {
+                    if (src.width != 64) {
+                        error("float(...) of " + type_str(src) + " -- only float[64] exists");
+                        return;
+                    }
+                } else if (src.kind == "int") {
+                    if (src.width == 64) {
+                        error("LITHON-E0106: float(64, ...) of " + type_str(src) +
+                              " is refused -- a double has 53 significant bits and cannot "
+                              "hold every int[64] exactly; convert an int[8|16|32] or keep "
+                              "it an int");
+                        return;
+                    }
+                    if (src.width != 8 && src.width != 16 && src.width != 32) {
+                        error("float(...) of " + type_str(src) + " -- only int[8|16|32] widen");
+                        return;
+                    }
+                } else {
+                    error("float(...) takes an int or a float, got " + type_str(src));
+                    return;
+                }
+                reg_types_[instr.result] = LType{"float", 64};
+                return;
+            }
+            // int(w, v) truncates a float[64] toward zero into int[w]. This is
+            // the ONLY conversion into an int: there is no int -> int narrowing,
+            // so an int operand is refused here with a message that says so.
+            case Op::ToInt: {
+                LType src;
+                if (!reg_type(instr.args.at(0), src)) {
+                    error("int(...) needs a float value, got an unresolved value");
+                    return;
+                }
+                if (src.kind != "float" || src.width != 64) {
+                    error("int(...) takes a float[64], got " + type_str(src) +
+                          " -- there is no int-to-int narrowing; float -> int is the "
+                          "only conversion in this direction (V1_SPEC 0.6.11)");
+                    return;
+                }
+                if (instr.type_kind != "int" || instr.type_width < 0) {
+                    error("int(...) needs an explicit target width, e.g. int[64]");
+                    return;
+                }
+                reg_types_[instr.result] = LType{"int", instr.type_width};
+                return;
+            }
+            // int(w, input(prompt)): reads one line of stdin and parses
+            // int[w]. The width was validated by check_scalar_width above.
+            case Op::InputInt: {
+                if (instr.type_kind != "int" || instr.type_width < 0) {
+                    error("input() needs an explicit target width, e.g. int[64]");
+                    return;
+                }
+                reg_types_[instr.result] = LType{"int", instr.type_width};
+                return;
+            }
+
             // 4.1. Container access. The shared preconditions are: the name must
             // be a live binding, it must actually BE a container (indexing a
             // scalar is a type error, not an address-of-value accident), and a

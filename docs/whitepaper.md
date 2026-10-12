@@ -15,6 +15,7 @@ kind of failure is this" readable from the code alone.
 | `E0103` | 1 (static refusal) | Literal shift out of range |
 | `E0104` | 1 (static refusal) | Literal-provable capacity overflow |
 | `E0105` | 1 (static refusal) | Unsupported type width |
+| `E0106` | 1 (static refusal) | int[64] to float[64] through `float(64, x)` (lossy: 53 bits cannot hold every int[64]) |
 | `E0201` | 2 (environmental) | Fallible value read before `.ok` check |
 | `E0301` | 3 (dynamic runtime trap) | Division by zero |
 | `E0302` | 3 (dynamic runtime trap) | Modulo by zero |
@@ -24,4 +25,5 @@ kind of failure is this" readable from the code alone.
 | `E0306` | 3 (dynamic runtime trap) | Invalid integer literal in input |
 | `E0307` | 3 (dynamic runtime trap) | Input value outside the target width |
 | `E0308` | 3 (dynamic runtime trap) | End of input |
+| `E0309` | 3 (dynamic runtime trap) | float-to-int conversion out of range or not finite |
 | `E0401` | 3 (dynamic runtime trap, resource) | Stack overflow |

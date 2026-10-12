@@ -341,9 +341,9 @@ readable from the code alone.
 
 | Code | Tier | Trigger |
 |---|---|---|
-| `E01xx` | 1 (static refusal) | `E0101` overflow-on-reassignment, `E0102` literal zero divisor, `E0103` literal shift out of range, `E0104` literal-provable capacity overflow, `E0105` unsupported type width |
+| `E01xx` | 1 (static refusal) | `E0101` overflow-on-reassignment, `E0102` literal zero divisor, `E0103` literal shift out of range, `E0104` literal-provable capacity overflow, `E0105` unsupported type width, `E0106` `float(64, x)` of int[64] refused (lossy: 53 bits cannot hold every int[64]) |
 | `E02xx` | 2 (environmental) | `E0201` fallible value read before `.ok` check |
-| `E03xx` | 3 (dynamic runtime trap, arithmetic/logic) | `E0301` division by zero, `E0302` modulo by zero, `E0303` dynamic integer overflow, `E0304` shift amount out of range, `E0305` dynamic index/capacity out of range, `E0306` invalid integer literal in input, `E0307` input value outside the target width, `E0308` end of input |
+| `E03xx` | 3 (dynamic runtime trap, arithmetic/logic) | `E0301` division by zero, `E0302` modulo by zero, `E0303` dynamic integer overflow, `E0304` shift amount out of range, `E0305` dynamic index/capacity out of range, `E0306` invalid integer literal in input, `E0307` input value outside the target width, `E0308` end of input, `E0309` float-to-int conversion out of range or not finite |
 | `E04xx` | 3 (dynamic runtime trap, resource) | `E0401` stack overflow |
 
 This table is the seed content for `docs/whitepaper.md`, which is

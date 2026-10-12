@@ -13,6 +13,7 @@
 #include "dict_hash.h"
 #include "cpu_features.h"
 #include "float_runtime.h"
+#include "input_runtime.h"
 #include "ir/ir.h"
 #include "jit_abi.h"
 #include "liveness.h"
@@ -630,6 +631,21 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
         size_t tail;
     };
     std::vector<PendingIntPoolRef> pending_int_pool_refs;
+
+    // Hardening item 5. The string literal pool: the bytes of every input()
+    // prompt, appended once after the code with a trailing NUL so a host
+    // C-string consumer can use it directly. Each prompt is loaded with an
+    // `lea reg, [rip+disp32]` whose disp32 is patched here once the pool's
+    // final position is known, exactly like the float/int pools. Deduped by
+    // exact byte string so a repeated prompt shares one copy. Codegen and the
+    // interpreter both receive the decoded prompt in Instr::name.
+    std::vector<char> string_pool;
+    std::unordered_map<std::string, size_t> string_pool_index_;
+    struct PendingStringPoolRef {
+        size_t disp_offset;
+        size_t byte_offset;
+    };
+    std::vector<PendingStringPoolRef> pending_string_pool_refs;
 
     // One source of truth for "this value is a double": the same Kind
     // lattice that gates print(). Codegen and the gate therefore cannot
@@ -1252,6 +1268,25 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             }
             emit_movsd_xmm_rip(code, dst);
             pending_float_pool_refs.push_back({movsd_rip_disp_offset(code), index});
+        };
+
+        // Emit `lea dst, [rip+pool_string]` for an input() prompt, appending
+        // the bytes (plus NUL) to the string pool on first use and deferring
+        // the displacement until the pool is placed. Mirrors
+        // emit_load_pool_double.
+        auto emit_lea_pool_string = [&](Reg dst, const std::string& s) {
+            size_t offset;
+            auto it = string_pool_index_.find(s);
+            if (it != string_pool_index_.end()) {
+                offset = it->second;
+            } else {
+                offset = string_pool.size();
+                string_pool.insert(string_pool.end(), s.begin(), s.end());
+                string_pool.push_back('\0');
+                string_pool_index_[s] = offset;
+            }
+            emit_lea_rip(code, dst);
+            pending_string_pool_refs.push_back({lea_rip_disp_offset(code), offset});
         };
 
         // Materialize a float value into dst, whatever it currently lives in.
@@ -2019,6 +2054,92 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 }
                 Reg dst = compute_dest(instr.result);
                 emit_load_reg_indirect(code, dst, ptr, pointee_bytes);
+                commit_result(instr.result, dst);
+                break;
+            }
+
+            // Hardening item 5. Explicit numeric conversions. The typechecker
+            // already pinned the source/target widths (int[8|16|32] or float[64]
+            // source, float[64] or int[w] target, E0106 for a lossy int[64] ->
+            // float), so codegen only has to pick the machine form.
+            //
+            // ToFloat: an int source is sign-extended in its slot, so a single
+            // cvtsi2sd is exact for every width up to 32. A float source is a
+            // pass-through copy. Reusing coerce_to_float gets the int/float case
+            // split from the one place that already knows it.
+            case Op::ToFloat: {
+                Xmm dst = float_dest(instr.result);
+                coerce_to_float(dst, instr.args.at(0));
+                commit_float_result(instr.result, dst);
+                break;
+            }
+
+            // ToInt: float[64] -> int[type_width], truncating toward zero, with
+            // an E0309 trap on NaN, an infinity, or a magnitude outside the
+            // target width. The bounds are powers of two (2^(w-1)), exactly
+            // representable, and checked with ucomisd against pool doubles. NaN
+            // is rejected first (jp), then `x >= -2^(w-1)` fails (jb), then
+            // `x < 2^(w-1)` fails (jae) -- each skips the inlined trap with the
+            // inverted condition, so a valid value falls straight through.
+            case Op::ToInt: {
+                if (instr.type_width < 8 || instr.type_width > 64) {
+                    throw std::runtime_error(
+                        "compile_module: int conversion with an unsupported width");
+                }
+                const double bound = std::ldexp(1.0, instr.type_width - 1);
+                uint64_t lo_bits, hi_bits;
+                const double lo = -bound;
+                std::memcpy(&lo_bits, &lo, sizeof(lo_bits));
+                std::memcpy(&hi_bits, &bound, sizeof(hi_bits));
+                emit_load_pool_double(abi::kScratchFloatB, lo_bits);
+                emit_load_pool_double(abi::kScratchFloatC, hi_bits);
+
+                Xmm x = read_float(instr.args.at(0));
+
+                // NaN: ucomisd x, x sets PF, so jnp skips the trap when ordered.
+                emit_ucomisd(code, x, x);
+                JumpPatch nan_ok = emit_jcc_rel32(code, Cond::JumpNotParity);
+                emit_host_error_trap(lithon::jit::kE0309Message);
+                resolve_jump_patch(code, nan_ok, code.size());
+
+                // x < lo -> trap. ucomisd lo, x reads lo vs x, so lo > x is
+                // "above"; jbe (lo <= x) is the skip.
+                emit_ucomisd(code, abi::kScratchFloatB, x);
+                JumpPatch lo_ok = emit_jcc_rel32(code, Cond::JumpBelowEq);
+                emit_host_error_trap(lithon::jit::kE0309Message);
+                resolve_jump_patch(code, lo_ok, code.size());
+
+                // x >= hi -> trap. ucomisd hi, x reads hi vs x, so hi > x is
+                // "above"; ja is the skip.
+                emit_ucomisd(code, abi::kScratchFloatC, x);
+                JumpPatch hi_ok = emit_jcc_rel32(code, Cond::JumpAbove);
+                emit_host_error_trap(lithon::jit::kE0309Message);
+                resolve_jump_patch(code, hi_ok, code.size());
+
+                Reg dst = compute_dest(instr.result);
+                emit_cvttsd2si(code, dst, x);
+                commit_result(instr.result, dst);
+                break;
+            }
+
+            // Hardening item 5. int(w, input(prompt)): print the prompt (the
+            // host helper writes it to stdout and flushes first), read a line,
+            // parse it as int[type_width], and trap E0306/E0307/E0308 inside the
+            // helper. The prompt bytes live in the string pool and are reached
+            // with a RIP-relative lea; the width is a runtime argument so one
+            // helper serves every width.
+            case Op::InputInt: {
+                emit_lea_pool_string(abi::kArgRegs[0], instr.name);
+                emit_mov_reg_imm(code, abi::kArgRegs[1],
+                                 static_cast<int64_t>(instr.type_width));
+                emit_mov_reg_imm(code, kR,
+                                 reinterpret_cast<int64_t>(&lithon::jit::host_input_int));
+                emit_xor_zero(code, Reg::RAX);
+                if (abi::kShadowSpace) emit_sub_rsp_imm32(code, abi::kShadowSpace);
+                emit_call_reg(code, kR);
+                if (abi::kShadowSpace) emit_add_rsp_imm32(code, abi::kShadowSpace);
+                Reg dst = compute_dest(instr.result);
+                emit_mov_reg_reg(code, dst, Reg::RAX);
                 commit_result(instr.result, dst);
                 break;
             }
@@ -3779,6 +3900,21 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             code.push_back(static_cast<uint8_t>((bits >> (8 * i)) & 0xFF));
         }
     }
+
+    // Hardening item 5. Append the string literal pool (input() prompts, NUL
+    // terminated) and resolve every pending `lea rip` reference to it. Same
+    // RIP-relative arithmetic as the two pools above.
+    for (const auto& site : pending_string_pool_refs) {
+        const size_t pool_base = code.size();
+        const int64_t rel = static_cast<int64_t>(pool_base + site.byte_offset) -
+                            static_cast<int64_t>(site.disp_offset + 4);
+        if (rel < INT32_MIN || rel > INT32_MAX) {
+            throw std::runtime_error(
+                "compile_module: string constant pool is out of reach");
+        }
+        patch_u32_at(code, site.disp_offset, static_cast<uint32_t>(rel));
+    }
+    for (char ch : string_pool) code.push_back(static_cast<uint8_t>(ch));
 
     CompiledModule compiled;
     compiled.code = std::move(code);

@@ -279,6 +279,19 @@ struct Analysis {
                         break;
                     }
 
+                    // Hardening item 5. Conversions are exact in the kind
+                    // lattice -- ToFloat is always a float and ToInt/InputInt
+                    // always an int -- so the results keep a storage class the
+                    // print guard and codegen can trust, independent of operand
+                    // inference.
+                    case Op::ToFloat:
+                        raise(st.vals[in.result], Kind::Float);
+                        break;
+                    case Op::ToInt:
+                    case Op::InputInt:
+                        raise(st.vals[in.result], Kind::Int);
+                        break;
+
                     case Op::Add: case Op::Sub: case Op::Mul:
                     // Mod is typed like Mul, NOT like Div: int % int stays int,
                     // so it must go through arith() unmodified. Routing it
