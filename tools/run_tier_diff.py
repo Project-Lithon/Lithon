@@ -220,6 +220,72 @@ block2:
     call print, %4
     return
 """, "tier1"),
+    # Float compare-and-branch fusion. The integer case above folds into
+    # cmp+jcc; the float case folds into ucomisd+jcc, and unlike the integer
+    # one it cannot always use a single jcc, because ucomisd raises ZF and CF
+    # for an unordered (NaN) operand. So this pins the whole flag contract:
+    #   * eq against a NaN must be False -- a bare `je` would take the ZF that
+    #     ucomisd sets for unordered, so it is guarded by a `jp`.
+    #   * lt against a NaN must be False -- handled by comparing with the
+    #     operands swapped and branching on `ja`, which needs CF=0.
+    #   * an ordinary ordered lt must still be True.
+    # Expected output is 0, 0, 1 and both tiers must agree byte for byte.
+    "float_compare_used_only_for_branch": ("""
+function eqnan(a: float[64], b: float[64]) -> int[64]:
+block0:
+    %0 = load a
+    %1 = load b
+    %2 = eq %0, %1
+    branch %2, block1, block2
+block1:
+    %3 = const_i64 1
+    return %3
+    jump block2
+block2:
+    %4 = const_i64 0
+    return %4
+    return
+
+function ltlow(a: float[64], b: float[64]) -> int[64]:
+block0:
+    %0 = load a
+    %1 = load b
+    %2 = lt %0, %1
+    branch %2, block1, block2
+block1:
+    %3 = const_i64 1
+    return %3
+    jump block2
+block2:
+    %4 = const_i64 0
+    return %4
+    return
+
+function main():
+block0:
+    %0 = const_f64 1e308
+    store big, %0 : float[64]
+    %1 = load big
+    %2 = load big
+    %3 = mul %1, %2
+    %4 = load big
+    %5 = load big
+    %6 = mul %4, %5
+    %7 = sub %3, %6
+    store nan, %7 : float[64]
+    %8 = load nan
+    %9 = call eqnan, %8, %8
+    call print, %9
+    %10 = load nan
+    %11 = const_f64 1.0
+    %12 = call ltlow, %10, %11
+    call print, %12
+    %13 = const_f64 1.5
+    %14 = const_f64 2.5
+    %15 = call ltlow, %13, %14
+    call print, %15
+    return
+""", "tier1"),
     "int_recursion": ("""
 function fact(n: int[64]) -> int[64]:
 block0:

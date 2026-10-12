@@ -307,6 +307,13 @@ enum class Cond : uint8_t {
     // Cond::Above and hoping.
     JumpAbove = 0x87,   // ja: unsigned lhs > rhs. Jcc space. emit_jcc_rel32 only.
     JumpBelowEq = 0x86, // jbe: unsigned lhs <= rhs. Jcc space. emit_jcc_rel32 only.
+    // jp/jnp are the Jcc forms of the parity flag. They exist because a fused
+    // float equality (ucomisd; je) is wrong for a NaN operand -- ucomisd
+    // raises ZF for unordered too -- so the branch has to test parity first and
+    // skip the equality test. Like the two above, these are Jcc-space only and
+    // must not be confused with Cond::Parity/Cond::NotParity, which are SETcc.
+    JumpParity = 0x8A,    // jp:  PF. Jcc space. emit_jcc_rel32 only.
+    JumpNotParity = 0x8B, // jnp: !PF. Jcc space. emit_jcc_rel32 only.
 };
 
 inline Cond invert(Cond c) {
@@ -592,6 +599,17 @@ inline void emit_store_rsp_offset(CodeBuffer& buf, Reg src, int32_t offset, int 
     emit_u8(buf, byte_form ? 0x88 : 0x89);
     // ModRM mod=10, reg=src, rm=100 (SIB follows); SIB scale=0, index=100, base=RSP.
     emit_u8(buf, static_cast<uint8_t>(0x80 | (reg_low3(src) << 3) | 0x4));
+    emit_u8(buf, 0x24);
+    emit_disp32_le(buf, offset);
+}
+
+// mov dst, [rsp + disp32] -- the load counterpart of emit_store_rsp_offset.
+// Same mod=10 + SIB-no-index shape; used to read a staged argument back out of
+// the outgoing-argument area.
+inline void emit_load_rsp_offset(CodeBuffer& buf, Reg dst, int32_t offset) {
+    emit_u8(buf, rex(true, dst, Reg::RSP));
+    emit_u8(buf, 0x8B);
+    emit_u8(buf, static_cast<uint8_t>(0x80 | (reg_low3(dst) << 3) | 0x4));
     emit_u8(buf, 0x24);
     emit_disp32_le(buf, offset);
 }
@@ -1204,6 +1222,17 @@ inline void emit_movsd_rsp_mem(CodeBuffer& buf, Xmm src, int32_t offset) {
     emit_u8(buf, 0x0F);
     emit_u8(buf, 0x11);
     emit_u8(buf, static_cast<uint8_t>(0x80 | (xmm_low3(src) << 3) | 0x4));
+    emit_u8(buf, 0x24);
+    emit_disp32_le(buf, offset);
+}
+
+// movsd xmm, [rsp + disp32] -- the load counterpart of emit_movsd_rsp_mem.
+inline void emit_movsd_rsp_to_xmm(CodeBuffer& buf, Xmm dst, int32_t offset) {
+    emit_u8(buf, 0xF2);
+    if (xmm_is_extended(dst)) emit_u8(buf, rex_sse(dst));
+    emit_u8(buf, 0x0F);
+    emit_u8(buf, 0x10);
+    emit_u8(buf, static_cast<uint8_t>(0x80 | (xmm_low3(dst) << 3) | 0x4));
     emit_u8(buf, 0x24);
     emit_disp32_le(buf, offset);
 }

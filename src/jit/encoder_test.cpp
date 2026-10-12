@@ -169,6 +169,35 @@ static int float_encoding_checks() {
                      {0x40, 0x0f, 0x9a, 0xc0});
     }
 
+    // The unsigned Jcc forms the float compare-and-branch fusion branches on.
+    // These are the Jcc-space siblings of the SETcc values just above and must
+    // NOT be the SETcc opcodes: emit_jcc_rel32 with Cond::Parity (0x9A) would
+    // emit 0F 9A, which is `setp m8` -- a byte store to a computed address --
+    // not `jp`. So each is pinned to its 0F 8x Jcc byte with a zero rel32
+    // placeholder. ja/jbe are what a fused `<`/`>` branches on; jp is the
+    // parity guard a fused `==` needs so a NaN does not take the ZF it sets.
+    {
+        CodeBuffer c;
+        (void)emit_jcc_rel32(c, Cond::JumpAbove);
+        expect_bytes("ja rel32 (Jcc 0F 87)", c, {0x0f, 0x87, 0, 0, 0, 0});
+    }
+    {
+        CodeBuffer c;
+        (void)emit_jcc_rel32(c, Cond::JumpBelowEq);
+        expect_bytes("jbe rel32 (Jcc 0F 86)", c, {0x0f, 0x86, 0, 0, 0, 0});
+    }
+    {
+        CodeBuffer c;
+        (void)emit_jcc_rel32(c, Cond::JumpParity);
+        expect_bytes("jp rel32 (Jcc 0F 8A, not the 0F 9A SETcc form)", c,
+                     {0x0f, 0x8a, 0, 0, 0, 0});
+    }
+    {
+        CodeBuffer c;
+        (void)emit_jcc_rel32(c, Cond::JumpNotParity);
+        expect_bytes("jnp rel32 (Jcc 0F 8B)", c, {0x0f, 0x8b, 0, 0, 0, 0});
+    }
+
     // and dst, src is AND r/m, r: src goes in ModRM.reg and dst in rm.
     // Getting these the other way round computed `tmp &= dst` and left
     // the comparison result untouched, which is how a NaN comparison came
@@ -290,17 +319,19 @@ static int indirect_access_checks() {
     return 0;
 }
 
-// Outgoing-argument stores: `mov [rsp + disp32], reg` and
-// `movsd [rsp + disp32], xmm`. Stack-passed call arguments (index >= 2) are
-// written into the caller's reserved outgoing-argument area at a constant
-// [rsp + (i-2)*8] and read back by the callee at [rbp+16+(i-2)*8]. RSP
+// Outgoing-argument stores and loads: `mov [rsp + disp32], reg` /
+// `mov reg, [rsp + disp32]` and the `movsd` pair. Stack-passed call arguments
+// (index >= 2) are written into the caller's reserved outgoing-argument area at
+// a constant [rsp + (i-2)*8] and read back by the callee at [rbp+16+(i-2)*8];
+// the loads also stage arguments past the register budget at a self tail-jump.
+// RSP
 // always needs the SIB byte, and mod=10 is used unconditionally to match the
 // displacement model of every rbp form -- so each encoding is 4 + disp32 and
 // the widths differ only in prefix/REX. Expected bytes verified against GNU as
 // (the mod=00 disp8 forms objdump prefers are different and NOT what a constant
 // offset model wants).
 static int outgoing_arg_checks() {
-    std::printf("--- outgoing-argument stores ---\n");
+    std::printf("--- outgoing-argument loads and stores ---\n");
     {
         CodeBuffer c;
         emit_store_rsp_offset(c, Reg::RAX, 8);   // mov [rsp+8], rax
@@ -349,12 +380,34 @@ static int outgoing_arg_checks() {
         expect_bytes("movsd [rsp+256], xmm15", c,
                      {0xf2, 0x44, 0x0f, 0x11, 0xbc, 0x24, 0x00, 0x01, 0x00, 0x00});
     }
+    {
+        CodeBuffer c;
+        emit_load_rsp_offset(c, Reg::RAX, 8);   // mov rax, [rsp+8]
+        expect_bytes("load rax, [rsp+8]", c, {0x48, 0x8b, 0x84, 0x24, 0x08, 0x00, 0x00, 0x00});
+    }
+    {
+        CodeBuffer c;
+        emit_load_rsp_offset(c, Reg::R10, 32);   // mov r10, [rsp+32] (REX.R)
+        expect_bytes("load r10, [rsp+32] (REX.R)", c,
+                     {0x4c, 0x8b, 0x94, 0x24, 0x20, 0x00, 0x00, 0x00});
+    }
+    {
+        CodeBuffer c;
+        emit_movsd_rsp_to_xmm(c, Xmm::XMM0, 8);   // movsd xmm0, [rsp+8]
+        expect_bytes("movsd xmm0, [rsp+8]", c, {0xf2, 0x0f, 0x10, 0x84, 0x24, 0x08, 0x00, 0x00, 0x00});
+    }
+    {
+        CodeBuffer c;
+        emit_movsd_rsp_to_xmm(c, Xmm::XMM15, 256);   // movsd xmm15, [rsp+256]
+        expect_bytes("movsd xmm15, [rsp+256]", c,
+                     {0xf2, 0x44, 0x0f, 0x10, 0xbc, 0x24, 0x00, 0x01, 0x00, 0x00});
+    }
 
     if (failures) {
         std::fprintf(stderr, "FAIL: %d outgoing-argument check(s) wrong\n", failures);
         return 1;
     }
-    std::printf("PASS: outgoing-argument stores byte-exact\n");
+    std::printf("PASS: outgoing-argument loads and stores byte-exact\n");
     return 0;
 }
 

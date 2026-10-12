@@ -94,6 +94,9 @@ python3 tools/run_typed_regression.py
 step "tier diff: native output must equal interpreter output"
 python3 tools/run_tier_diff.py
 
+step "codegen self-tail-call elimination (--no-opt) vs the optimizer's pass, vs the interpreter"
+python3 tools/check_tco_noopt.py
+
 step "differential fuzzing: interpreter vs JIT on random typed programs"
 python3 tools/fuzz_diff.py --count 300
 

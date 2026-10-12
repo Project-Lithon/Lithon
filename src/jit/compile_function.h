@@ -244,12 +244,7 @@ struct FunctionPlan {
     std::vector<std::vector<uint8_t>> skip_instr;   // [block][pos]: instruction fused away
 };
 
-// `float_kinds`, when given, is the caller's per-value "is a double" table
-// (see infer_value_kinds). Only the compare fusion consults it: the branch it
-// fuses into re-uses the compare's integer flags, which is only the same
-// comparison when both operands are integers.
-inline FunctionPlan plan_function(const lithon::ir::Function& fn, const PromotionMap& promoted,
-                                  const std::vector<bool>* float_kinds = nullptr) {
+inline FunctionPlan plan_function(const lithon::ir::Function& fn, const PromotionMap& promoted) {
     using namespace lithon::ir;
     FunctionPlan plan;
     plan.skip_instr.resize(fn.blocks.size());
@@ -264,14 +259,6 @@ inline FunctionPlan plan_function(const lithon::ir::Function& fn, const Promotio
     auto set = [&](ValueId id, TempInfo ti) {
         plan.info[id] = ti;
         plan.virtual_temps.insert(id);
-    };
-
-    // A float operand makes the compare unfusable: the branch would compare
-    // the raw bit patterns with an integer cmp, which orders doubles by their
-    // encoding, so 1.5 > 2.5 becomes true. The value then materialises as a
-    // real 0/1 bool and the branch tests that instead.
-    auto operand_is_float = [&](ValueId id) {
-        return float_kinds != nullptr && id < float_kinds->size() && (*float_kinds)[id];
     };
 
     for (size_t b = 0; b < fn.blocks.size(); ++b) {
@@ -320,10 +307,14 @@ inline FunctionPlan plan_function(const lithon::ir::Function& fn, const Promotio
 
             const bool has_next = p + 1 < ins.size();
 
+            // A comparison whose only use is the immediately following Branch
+            // is folded into that branch, for integer AND float operands. The
+            // integer case emits cmp+jcc directly; the float case emits
+            // ucomisd and then a branch that reads CF/ZF/PF, so neither ever
+            // materialises the 0/1 boolean the standalone comparison would.
             if ((in.op == Op::Lt || in.op == Op::Gt || in.op == Op::Eq) && has_next &&
                 ins[p + 1].op == Op::Branch && ins[p + 1].args.size() == 1 &&
-                ins[p + 1].args[0] == in.result && uses[in.result].size() == 1 &&
-                !operand_is_float(in.args.at(0)) && !operand_is_float(in.args.at(1))) {
+                ins[p + 1].args[0] == in.result && uses[in.result].size() == 1) {
                 TempInfo ti; ti.kind = TempInfo::Kind::FusedCmp;
                 set(in.result, ti);
                 continue;
@@ -774,7 +765,7 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
                 if (is_phi_var(kv.first)) ++phi_copies_in_registers;
         }
 
-        detail::FunctionPlan plan = detail::plan_function(fn, promoted, &is_float_kinds);
+        detail::FunctionPlan plan = detail::plan_function(fn, promoted);
         // Every value the guard proved is a double, in one list. Handing the
         // allocator that list -- rather than letting it re-derive kinds --
         // is what keeps allocation and codegen reading the same lattice.
@@ -1609,6 +1600,14 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             resolve_jump_patch(code, in_range, code.size());
         }
 
+        // 4.6. Self tail-call elimination. A self-call whose result is
+        // returned directly becomes a back-jump to the top of block0: this
+        // offset is that target. It is captured in the block loop below, at
+        // the exact point block0's code starts (block_offset for block0), so
+        // the jump lands on the first body instruction with the frame, the
+        // callee-saved slots and the incoming-argument area all unchanged.
+        size_t self_tail_reentry = 0;
+
         struct PendingBlockPatch {
             JumpPatch patch;
             std::string target_label;
@@ -1617,18 +1616,6 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
         std::unordered_map<std::string, size_t> block_offset;
         std::unordered_map<std::string, size_t> block_index;
         for (size_t b = 0; b < fn.blocks.size(); ++b) block_index[fn.blocks[b].label] = b;
-
-        auto emit_branch_to = [&](Cond cond, const std::string& then_label,
-                                  const std::string& else_label, const std::string& next_label) {
-            if (then_label == next_label) {
-                pending_blocks.push_back({emit_jcc_rel32(code, invert(cond)), else_label});
-            } else if (else_label == next_label) {
-                pending_blocks.push_back({emit_jcc_rel32(code, cond), then_label});
-            } else {
-                pending_blocks.push_back({emit_jcc_rel32(code, cond), then_label});
-                pending_blocks.push_back({emit_jmp_rel32(code), else_label});
-            }
-        };
 
         // 2.7. Direct Phi emission. A Phi is an EDGE copy: operand i arrives
         // on the edge out of pred(s)[i]. So the copy for `from -> to` is the
@@ -2593,36 +2580,107 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                         if (targets.size() != 2) throw std::runtime_error("compile_module: malformed branch");
                         ValueId cond_id = instr.args.at(0);
                         Cond cond = Cond::NotZero;
+                        // Fused float compare. ucomisd leaves its result in
+                        // CF/ZF/PF rather than a register, and unlike the
+                        // integer path a single jcc cannot always decide it,
+                        // because ucomisd raises CF and ZF for an unordered
+                        // pair (NaN). The rules below are chosen so every NaN
+                        // comparison is False, matching Python:
+                        //
+                        //   x < y   -> ucomisd(y, x); ja   (ja needs CF=0, which
+                        //              unordered does not have, so it is already
+                        //              ordered -- hence the operand swap)
+                        //   x > y   -> ucomisd(x, y); ja
+                        //   x == y  -> ucomisd(x, y); jp <skip>; je; <skip>
+                        //   !(x<y)  -> ucomisd(y, x); jbe
+                        //   !(x>y)  -> ucomisd(x, y); jbe
+                        //   x != y  -> jp <taken>; jne <taken>
+                        //
+                        // The equality forms are the only ones that need a
+                        // parity guard: je and jne would otherwise fire on a
+                        // NaN. Note the compare operands (args) still have their
+                        // last use at the compare's own slot, so they are read
+                        // here exactly as the integer fused path reads its own.
+                        bool fused_float = false;
+                        Op fop = Op::Eq;
                         if (info_of(cond_id).kind == TempInfo::Kind::FusedCmp) {
                             // The compare producing this condition is the previous instruction.
                             const Instr& cmp = block.instrs[pos - 1];
-                            Reg lhs = read_left(cmp.args.at(0));
-                            int32_t imm = 0;
-                            if (imm32_of(cmp.args.at(1), imm)) emit_cmp_reg_imm32(code, lhs, imm);
-                            else emit_cmp_reg_reg(code, lhs, read_right(cmp.args.at(1)));
-                            cond = cmp.op == Op::Lt ? Cond::Less
-                                 : cmp.op == Op::Gt ? Cond::Greater : Cond::Equal;
+                            if (is_float_value(value_kinds, cmp.args.at(0)) ||
+                                is_float_value(value_kinds, cmp.args.at(1))) {
+                                fused_float = true;
+                                fop = cmp.op;
+                                const Xmm xa = abi::kScratchFloat;
+                                const Xmm xb = abi::kScratchFloatB;
+                                if (cmp.op == Op::Lt) {
+                                    coerce_to_float(xb, cmp.args.at(0));
+                                    coerce_to_float(xa, cmp.args.at(1));
+                                } else {
+                                    coerce_to_float(xa, cmp.args.at(0));
+                                    coerce_to_float(xb, cmp.args.at(1));
+                                }
+                                emit_ucomisd(code, xa, xb);
+                            } else {
+                                Reg lhs = read_left(cmp.args.at(0));
+                                int32_t imm = 0;
+                                if (imm32_of(cmp.args.at(1), imm)) emit_cmp_reg_imm32(code, lhs, imm);
+                                else emit_cmp_reg_reg(code, lhs, read_right(cmp.args.at(1)));
+                                cond = cmp.op == Op::Lt ? Cond::Less
+                                     : cmp.op == Op::Gt ? Cond::Greater : Cond::Equal;
+                            }
                         } else {
                             emit_test_reg_reg(code, read_left(cond_id));
                         }
+
+                        // Emit a jump to the caller's label that is taken when
+                        // the branch condition is `taken` (true) or false. For
+                        // an integer fused compare or a plain test this is one
+                        // jcc; for a fused float equality it is up to two, so
+                        // `push` is a callback that records each JumpPatch in the
+                        // list the caller's target lives in.
+                        auto emit_cond_jump = [&](bool taken, auto&& push) {
+                            if (!fused_float) {
+                                push(emit_jcc_rel32(code, taken ? cond : invert(cond)));
+                                return;
+                            }
+                            if (fop == Op::Eq) {
+                                if (taken) {
+                                    JumpPatch skip = emit_jcc_rel32(code, Cond::JumpParity);
+                                    push(emit_jcc_rel32(code, Cond::Equal));
+                                    resolve_jump_patch(code, skip, code.size());
+                                } else {
+                                    push(emit_jcc_rel32(code, Cond::JumpParity));
+                                    push(emit_jcc_rel32(code, Cond::NotEqual));
+                                }
+                            } else {
+                                // Lt and Gt are both decided by ja / its inverse
+                                // jbe; the operand order chosen above already
+                                // put the comparison the right way round.
+                                push(emit_jcc_rel32(code, taken ? Cond::JumpAbove : Cond::JumpBelowEq));
+                            }
+                        };
+                        auto jump_block = [&](const std::string& label) {
+                            return [&, label](JumpPatch p) { pending_blocks.push_back({p, label}); };
+                        };
+
                         if (lb.active()) {
                             // This block was inlined, so its targets are
                             // positions in this straight-line body rather than
                             // IR blocks. Whichever arm is left unset simply
                             // falls through to the next thing emitted.
                             if (lb.on_false != detail::kNoLocal)
-                                pending_locals.push_back({emit_jcc_rel32(code, invert(cond)), lb.on_false});
+                                emit_cond_jump(false, [&](JumpPatch p) { pending_locals.push_back({p, lb.on_false}); });
                             if (lb.on_true != detail::kNoLocal)
-                                pending_locals.push_back({emit_jcc_rel32(code, cond), lb.on_true});
+                                emit_cond_jump(true, [&](JumpPatch p) { pending_locals.push_back({p, lb.on_true}); });
                             if (!lb.exit_label.empty() && lb.exit_label != next_label)
-                                pending_blocks.push_back({emit_jcc_rel32(code, invert(cond)), lb.exit_label});
+                                emit_cond_jump(false, jump_block(lb.exit_label));
                         } else if (flags & detail::kExitOnlyBranch) {
-                            pending_blocks.push_back({emit_jcc_rel32(code, invert(cond)), targets[1]});
+                            emit_cond_jump(false, jump_block(targets[1]));
                         } else if (has_phis(targets[0]) || has_phis(targets[1])) {
                             // 2.7. A conditional branch with a merge on either
-                            // arm cannot use emit_branch_to: the two arms need
-                            // DIFFERENT copies, and only one of them can be the
-                            // fall-through. So the else arm is given a real
+                            // arm cannot use the plain two-arm form: the two arms
+                            // need DIFFERENT copies, and only one of them can be
+                            // the fall-through. So the else arm is given a real
                             // local label and both arms are materialised:
                             //
                             //     jcc  L_else          ; !cond -> else arm
@@ -2637,7 +2695,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                             // before the next block's, so that block's offset is
                             // bound after it either way.
                             const size_t l_else = new_local();
-                            pending_locals.push_back({emit_jcc_rel32(code, invert(cond)), l_else});
+                            emit_cond_jump(false, [&](JumpPatch p) { pending_locals.push_back({p, l_else}); });
                             emit_phi_copies(bi, targets[0]);
                             pending_blocks.push_back({emit_jmp_rel32(code), targets[0]});
                             bind_local(l_else);
@@ -2645,7 +2703,14 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                             if (targets[1] != next_label)
                                 pending_blocks.push_back({emit_jmp_rel32(code), targets[1]});
                         } else {
-                            emit_branch_to(cond, targets[0], targets[1], next_label);
+                            if (targets[0] == next_label) {
+                                emit_cond_jump(false, jump_block(targets[1]));
+                            } else if (targets[1] == next_label) {
+                                emit_cond_jump(true, jump_block(targets[0]));
+                            } else {
+                                emit_cond_jump(true, jump_block(targets[0]));
+                                pending_blocks.push_back({emit_jmp_rel32(code), targets[1]});
+                            }
                         }
                         break;
                     }
@@ -2700,6 +2765,154 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     }
 
                     case Op::Call: {
+                        // 4.6. Self tail-call elimination. The exact shape the
+                        // frontend lowers `return f(...)` into -- `%r = call f`
+                        // immediately followed by `return %r` as the block's last
+                        // instruction -- becomes a back-jump to the top of block0
+                        // instead of a call plus a return. Nothing is pushed and
+                        // RSP never moves, so the recursion is O(1) stack, which
+                        // is what makes a 10,000,000-deep tail recursion runnable
+                        // at all.
+                        //
+                        // The new arguments are copied into the exact landing
+                        // spots the prologue established for each parameter (a
+                        // register for a promoted one, its slot for a float or an
+                        // address-taken one, the incoming area for a lazy i>=2
+                        // one), the same spots block0 re-reads on the next
+                        // iteration.
+                        //
+                        // The copy is a PARALLEL copy and is emitted in two
+                        // passes for that reason: a call `f(b, a)` has arg 0
+                        // aliasing param 1's home, so writing param 0's landing
+                        // before reading arg 1 corrupts arg 1. Pass 1 reads every
+                        // argument into a reserved staging register that is never
+                        // a value's home (r10/r11 and the argument registers are
+                        // outside both the temporary pool and the promotion pool),
+                        // pass 2 writes the landings. No cycle can form.
+                        //
+                        // Declines to a real call -- never a compile error --
+                        // if the staging plan would not fit (the guard below).
+                        // The real call and the jump are indistinguishable in
+                        // program output; only stack use differs.
+                        if ((flags & detail::kStopBeforeTerminator) == 0 &&
+                            instr.name == fn.name &&
+                            instr.args.size() == fn.params.size() &&
+                            instr.result != kInvalidValue &&
+                            pos + 1 < block.instrs.size() &&
+                            block.instrs[pos + 1].op == Op::Return &&
+                            block.instrs[pos + 1].args.size() == 1 &&
+                            block.instrs[pos + 1].args.at(0) == instr.result) {
+                            // Only terminators may follow the returned call --
+                            // a real instruction after it would mean the result
+                            // is observable somewhere the jump would skip.
+                            bool only_terminators_after = true;
+                            for (size_t t = pos + 2; t < block.instrs.size(); ++t) {
+                                if (block.instrs[t].op != Op::Return) {
+                                    only_terminators_after = false;
+                                    break;
+                                }
+                            }
+                            // Staging plan. The first four int and four float
+                            // arguments stage through reserved registers: the
+                            // two argument registers plus r10/r11, and the four
+                            // scratch XMMs (XMM12-XMM15) -- none of which is
+                            // ever a live value's home. Every further argument
+                            // stages through the outgoing-argument area, which
+                            // is dead at a self-jump because no callee is being
+                            // entered; at most (nargs-2) slots are needed and
+                            // out_area reserves at least that many.
+                            //
+                            // Each parameter's landing is the spot the prologue
+                            // established for it: its register for a promoted
+                            // int, its slot for anything else -- a float, a lazy
+                            // i>=2 int, or an address-taken one.
+                            const size_t nparams = fn.params.size();
+                            const Xmm kFloatStage[4] = {
+                                abi::kScratchFloat, abi::kScratchFloatB,
+                                abi::kScratchFloatZero, abi::kScratchFloatC};
+                            const Reg kIntStage[4] = {
+                                abi::kArgRegs[0], abi::kArgRegs[1],
+                                abi::kScratchLeft, abi::kScratchRight};
+                            std::vector<int32_t> mem_off(nparams, -1);
+                            std::vector<Xmm> flt_stage(nparams, abi::kScratchFloat);
+                            std::vector<Reg> int_stage(nparams, kL);
+                            size_t int_reg = 0, flt_reg = 0, mem_slot = 0;
+                            for (size_t i = 0; i < nparams; ++i) {
+                                if (float_params[i]) {
+                                    if (flt_reg < 4) flt_stage[i] = kFloatStage[flt_reg++];
+                                    else mem_off[i] = static_cast<int32_t>(mem_slot++ * 8);
+                                } else {
+                                    if (int_reg < 4) int_stage[i] = kIntStage[int_reg++];
+                                    else mem_off[i] = static_cast<int32_t>(mem_slot++ * 8);
+                                }
+                            }
+                            const bool fits = static_cast<int>(mem_slot) * 8 <= out_area;
+                            if (only_terminators_after && fits) {
+                                // Pass 1: read every argument into its stage.
+                                // Memory-staged arguments go first, through the
+                                // reserved scratch transients, so those
+                                // registers are free again by the time the
+                                // register-staged reads below reuse them.
+                                for (size_t i = 0; i < nparams; ++i) {
+                                    if (mem_off[i] < 0) continue;
+                                    if (float_params[i]) {
+                                        load_float_value(abi::kScratchFloat, instr.args[i]);
+                                        emit_movsd_rsp_mem(code, abi::kScratchFloat, mem_off[i]);
+                                    } else {
+                                        materialize_into(kL, instr.args[i]);
+                                        emit_store_rsp_offset(code, kL, mem_off[i]);
+                                    }
+                                }
+                                for (size_t i = 0; i < nparams; ++i) {
+                                    if (mem_off[i] >= 0) continue;
+                                    if (float_params[i]) {
+                                        load_float_value(flt_stage[i], instr.args[i]);
+                                    } else {
+                                        materialize_into(int_stage[i], instr.args[i]);
+                                    }
+                                }
+                                // Pass 2: write the register-staged landings,
+                                // draining every stage register.
+                                for (size_t i = 0; i < nparams; ++i) {
+                                    if (mem_off[i] >= 0) continue;
+                                    if (float_params[i]) {
+                                        emit_movsd_rbp_mem(code, flt_stage[i],
+                                                           alloc.variable_offset(fn.params[i]));
+                                    } else if (alloc.variable_in_register(fn.params[i])) {
+                                        const Reg home = alloc.variable_reg(fn.params[i]);
+                                        if (home != int_stage[i])
+                                            emit_mov_reg_reg(code, home, int_stage[i]);
+                                    } else {
+                                        emit_store_rbp_offset(code, int_stage[i],
+                                                              alloc.variable_offset(fn.params[i]));
+                                    }
+                                }
+                                // Pass 3: write the memory-staged landings; the
+                                // scratch transients are free now, so they carry
+                                // the value out of memory.
+                                for (size_t i = 0; i < nparams; ++i) {
+                                    if (mem_off[i] < 0) continue;
+                                    if (float_params[i]) {
+                                        emit_movsd_rsp_to_xmm(code, abi::kScratchFloat, mem_off[i]);
+                                        emit_movsd_rbp_mem(code, abi::kScratchFloat,
+                                                           alloc.variable_offset(fn.params[i]));
+                                    } else if (alloc.variable_in_register(fn.params[i])) {
+                                        emit_load_rsp_offset(code, alloc.variable_reg(fn.params[i]),
+                                                             mem_off[i]);
+                                    } else {
+                                        emit_load_rsp_offset(code, kL, mem_off[i]);
+                                        emit_store_rbp_offset(code, kL,
+                                                              alloc.variable_offset(fn.params[i]));
+                                    }
+                                }
+                                resolve_jump_patch(code, emit_jmp_rel32(code),
+                                                   self_tail_reentry);
+                                // The `return %r` that follows is now dead: the
+                                // jump replaces both it and the call.
+                                pos += 1;
+                                break;
+                            }
+                        }
                         // 4.5. An AVX2 transition out of a ymm block into a
                         // callee must first zero the ymm upper halves or the
                         // callee's SSE works with stale state (and pays the
@@ -3412,6 +3625,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
 
         for (size_t bi = 0; bi < fn.blocks.size(); ++bi) {
             block_offset[fn.blocks[bi].label] = code.size();
+            if (bi == 0) self_tail_reentry = code.size();
             const std::string next_label = bi + 1 < fn.blocks.size() ? fn.blocks[bi + 1].label : "";
 
             if (inlined_blocks.count(bi)) continue;   // already inside an unrolled copy

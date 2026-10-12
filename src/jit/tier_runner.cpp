@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: tier_runner <file.ir> [--interp|--native|--auto|--strict]\n"
                      "                  [--no-lsr] [--accum-unroll] [--unroll-diamonds] [--dump-hex]\n"
-                     "                  [--ssa] [--no-vectorize]\n"
+                     "                  [--ssa] [--no-vectorize] [--no-opt]\n"
                      "       --ffast-math-equivalent reassociates FLOAT addition, shortening the\n"
                      "       dependency chain. NOT bit-exact: IEEE754 addition is not associative,\n"
                      "       so results can differ from the interpreter's in the last bit. Off by\n"
@@ -131,6 +131,11 @@ int main(int argc, char** argv) {
             dump_hex = true;
         } else if (a == "--ssa") {
             options.ssa_pipeline = true;
+        } else if (a == "--no-opt") {
+            // Disable the optimizer, which also disables its IR-level
+            // self-tail-call elimination, so the codegen-level tail-call
+            // elimination is the one that runs.
+            options.optimize = false;
         } else if (a == "--no-vectorize") {
             options.vectorize = false;
         } else if (a == "--direct-phis") {
