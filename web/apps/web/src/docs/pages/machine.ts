@@ -134,7 +134,7 @@ block3:
       blocks: [
         {
           kind: "p",
-          text: "User functions get the SysV treatment: arguments in `rdi`/`rsi` (the two-argument cap makes this exact), return value in `rax`, and a frame that `check_stack_alignment.py` audits for 16-byte alignment at every call site:",
+          text: "User functions get the SysV treatment: the first two arguments in `rdi`/`rsi` (XMM0/XMM1 for floats), any further arguments on the stack, the return value in `rax`, and a frame that `check_stack_alignment.py` audits for 16-byte alignment at every call site:",
         },
         {
           kind: "code",
@@ -154,7 +154,6 @@ block0:
     %1 = load b
     %2 = add %0, %1
     return %2
-    return
 
 function __main__():
 block0:
@@ -224,7 +223,6 @@ block0:
 block1:
     %3 = load n
     return %3
-    jump block2
 block2:
     %4 = load n
     %5 = load n
@@ -238,7 +236,6 @@ block2:
     %13 = call fib, %12
     %14 = add %8, %13
     return %14
-    return
 
 function __main__():
 block0:
@@ -300,11 +297,11 @@ const registersAbi: DocPage = {
             ],
             [
               "`RDI`, `RSI`",
-              "SysV argument 0 / argument 1: the two-argument cap means these are always the whole argument list",
+              "SysV argument 0 / argument 1 (RCX/RDX on Windows); arguments past the second are passed on the stack",
             ],
             [
               "`R8`, `R9`",
-              "SysV arguments 3–4: unused today, reserved for the post-cap future",
+              "SysV temporary pool (`check_stack_alignment` scrutinee); not argument registers in this ABI",
             ],
             ["`XMM0`–`XMM15`", "SSE2 float; the vectorizer's `vmovdqu` lanes"],
           ],

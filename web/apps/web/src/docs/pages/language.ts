@@ -428,27 +428,30 @@ block0:
     store total, %0 : int[64]
     %1 = const_i64 0
     store i, %1 : int[64]
-    %2 = const_i64 10
-    %3 = const_i64 0
-    store i, %3 : int[64]
-    jump block1
+    %2 = const_i64 0
+    %3 = const_i64 10
+    %4 = const_i64 1
+    store i, %2 : int[64]
+    jump block4
+block4:
+    %5 = load i
+    %6 = lt %5, %3
+    branch %6, block1, block2
 block1:
-    %4 = load i
-    %5 = lt %4, %2
-    branch %5, block2, block3
-block2:
-    %6 = load total
-    %7 = load i
-    %8 = add %6, %7
-    store total, %8 : int[64]
-    %9 = load i
-    %10 = const_i64 1
-    %11 = add %9, %10
-    store i, %11
-    jump block1
+    %7 = load total
+    %8 = load i
+    %9 = add %7, %8
+    store total, %9 : int[64]
+    jump block3
 block3:
-    %12 = load total
-    call print, %12
+    %10 = load i
+    %11 = const_i64 1
+    %12 = add %10, %11
+    store i, %12
+    jump block4
+block2:
+    %13 = load total
+    call print, %13
     return`,
               note: "The `for` lowers to an init / test / body / increment block structure: a pre-test loop with an explicit back edge, exactly what the encoder emits a `jcc` for.",
             },
@@ -523,7 +526,7 @@ else:
 const functions: DocPage = {
   slug: "functions",
   title: "Functions",
-  description: "Mandatory contracts, the two-argument limit, and recursion.",
+  description: "Mandatory contracts, the calling convention, and recursion.",
   group: "language",
   tags: [
     "functions",
@@ -562,7 +565,6 @@ block0:
     %1 = load b
     %2 = add %0, %1
     return %2
-    return
 
 function __main__():
 block0:
@@ -647,7 +649,6 @@ block0:
 block1:
     %3 = load n
     return %3
-    jump block2
 block2:
     %4 = load n
     %5 = load n
@@ -661,7 +662,6 @@ block2:
     %13 = call fib, %12
     %14 = add %8, %13
     return %14
-    return
 
 function __main__():
 block0:
@@ -678,18 +678,18 @@ block0:
       ],
     },
     {
-      id: "argument-limit",
-      title: "The two-argument limit",
+      id: "calling-convention",
+      title: "The calling convention",
       blocks: [
         {
           kind: "p",
-          text: "Functions are limited to two arguments today. This is a temporary restriction of the current encoder's calling convention support, not a design position: it will be lifted as the ABI handling matures.",
+          text: "A native call passes the first two arguments in registers (`rdi`/`rsi`, or `XMM0`/`XMM1` for floats) and every further argument in an 8-byte stack slot, exactly as SysV passes its later arguments. Up to 32 parameters are supported; a call or function past that budget is refused by the native tier and runs in the interpreter rather than mis-passing arguments.",
         },
         {
           kind: "note",
           tone: "note",
-          title: "Workaround",
-          text: "Bundle arguments into a container (`list`/`tuple`) or split the function. Both patterns appear in the regression corpus.",
+          title: "beyond the budget",
+          text: "If a signature genuinely needs more than 32 parameters, run that function under the interpreter (the native tier refuses automatically) or restructure the call.",
         },
       ],
     },
@@ -1153,6 +1153,207 @@ print(valueof(_pf))`,
   ],
 }
 
+const structs: DocPage = {
+  slug: "structs",
+  title: "Structs",
+  description:
+    "A named run of typed fields packed into one byte blob: declared offsets, no padding, no struct value.",
+  group: "language",
+  tags: [
+    "structs",
+    "struct",
+    "fields",
+    "layout",
+    "offsets",
+    "packed",
+    "records",
+  ],
+  sections: [
+    {
+      id: "what-a-struct-is",
+      title: "A struct is storage, not a value",
+      blocks: [
+        {
+          kind: "p",
+          text: "A `struct` is a named run of typed fields laid out end to end in one blob of bytes. Declaring `p: Point` reserves and zeroes those bytes, exactly the way a list declaration reserves its element run. A struct **has no value**: the only operations are reading a field and writing a field, and the whole struct is never an expression you can print or assign.",
+        },
+        {
+          kind: "p",
+          text: "The spelling is Lithon's own: a struct is a class deriving from `Struct`, whose body is nothing but field annotations.",
+        },
+      ],
+    },
+    {
+      id: "declaring-and-fields",
+      title: "Declaring a struct and writing fields",
+      blocks: [
+        {
+          kind: "p",
+          text: "Each `name: type` line is a field. The declaration `p: Point` zeroes the blob; writing a field is a partial write into that blob at a fixed offset the frontend computed, not a rebinding of the name.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/programs/struct_basic.py (excerpt)",
+            sourceRef: "tests/programs/struct_basic.py",
+            expectedRef: "tests/programs/expected/struct_basic.out",
+            typecheck: false,
+            source: `class Point(Struct):
+    x: int[64]
+    y: int[64]
+
+
+p: Point
+p.x = 3
+p.y = 4
+print(p.x)
+print(p.y)`,
+            output: "3\n4",
+          },
+        },
+        {
+          kind: "p",
+          text: "A field nobody wrote reads back as the zero of its kind: `0` for an int, `False` for a bool, `0.0` for a float. This is the struct analogue of an unwritten list element reading zero.",
+        },
+        {
+          kind: "note",
+          tone: "note",
+          title: "narrow fields are signed",
+          text: "An `int[8]`/`int[16]`/`int[32]` field is signed: writing `-3` into an `int[16]` field and reading it back yields `-3`, not the zero-extended `65533`. `bool` is the exception and reads back as `0`/`1`. This is the same rule as a list element or a pointer dereference of the same width.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "unwritten fields read zero (struct_basic.py excerpt)",
+            sourceRef: "tests/programs/struct_basic.py",
+            typecheck: false,
+            source: `class SockAddrIn(Struct):
+    family: int[16]
+    port: int[16]
+    addr: int[64]
+    active: bool
+
+
+s: SockAddrIn
+s.family = 2
+s.port = 80
+print(s.family)
+print(s.port)
+print(s.addr)
+print(s.active)`,
+          },
+        },
+      ],
+    },
+    {
+      id: "layout",
+      title: "Layout: packed, no padding",
+      blocks: [
+        {
+          kind: "p",
+          text: "Fields sit at exactly the offsets their sizes imply: the first field at 0, each next field immediately after the previous. **No padding is inserted**, so the size of a struct is the sum of its field sizes. `bool` is 1 byte, `float[64]` is 8, and `int[w]` is `w / 8`.",
+        },
+        {
+          kind: "table",
+          caption: "SockAddrIn · 13 bytes, no padding",
+          rows: [
+            ["0", "family : int[16]"],
+            ["2", "port : int[16]"],
+            ["4", "addr : int[64]"],
+            ["12", "active : bool"],
+          ],
+        },
+        {
+          kind: "p",
+          text: "Because the layout is a pure sum, the `struct[N]` size the frontend bakes into the declaration is exactly what a C `offsetof` / `sizeof` computation over a `#pragma pack(1)` struct would produce. `tools/check_struct_layout.py` compiles the same struct definitions with `cc`, runs the frontend, and asserts that equality field by field.",
+        },
+        {
+          kind: "note",
+          tone: "note",
+          title: "A field is a scalar or an earlier struct",
+          text: "A field type is `int[w]`, `float[64]`, `bool`, or a struct declared **before** this one. A field may not be a list, tuple, dict, or pointer. A nested struct field is flattened: `seg.a.x` resolves to a single leaf read at the summed byte offset, so there is never an intermediate struct value.",
+        },
+      ],
+    },
+    {
+      id: "float-fields",
+      title: "Float fields",
+      blocks: [
+        {
+          kind: "p",
+          text: "A `float[64]` field always occupies the full eight bytes and goes through the double path, so an arithmetic read is exact and a negative value survives unchanged.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "float fields (struct_basic.py excerpt)",
+            sourceRef: "tests/programs/struct_basic.py",
+            typecheck: false,
+            source: `class Vec(Struct):
+    x: float[64]
+    y: float[64]
+
+
+v: Vec
+v.x = 1.5
+v.y = -2.25
+print(v.x)
+print(v.y)
+print(v.x + v.y)`,
+          },
+        },
+      ],
+    },
+    {
+      id: "restrictions",
+      title: "What structs cannot do",
+      blocks: [
+        {
+          kind: "table",
+          caption: "Restrictions",
+          rows: [
+            ["Whole value", "a struct is never an expression; `print(p)` and `q = p` are refused"],
+            ["Field kind", "no list/tuple/dict/pointer fields: only scalars and earlier structs"],
+            ["Field as value", "`seg.inner` alone is refused; flatten to a leaf (`seg.inner.x`)"],
+            ["Narrowing", "a value wider than the field is refused, exactly as for a list element"],
+            ["Parameters", "structs are not passed to or returned from functions"],
+          ],
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected · a container field",
+            expect: "error",
+            tool: "frontend",
+            typecheck: false,
+            errorMatch: "LITHON-E0127",
+            source: `class Foo(Struct):
+    xs: list[int[64], 4]
+
+f: Foo
+print(0)`,
+          },
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected · the whole struct as a value",
+            expect: "error",
+            tool: "frontend",
+            typecheck: false,
+            errorMatch: "LITHON-E0128",
+            source: `class Foo(Struct):
+    x: int[64]
+
+f: Foo
+print(f)`,
+          },
+        },
+      ],
+    },
+  ],
+}
+
 export const LANGUAGE_PAGES: DocPage[] = [
   types,
   declarations,
@@ -1161,4 +1362,5 @@ export const LANGUAGE_PAGES: DocPage[] = [
   operators,
   containers,
   pointers,
+  structs,
 ]

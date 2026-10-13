@@ -279,6 +279,23 @@ struct Analysis {
                         break;
                     }
 
+                    // 4.6. A field load's kind is the field's declared type,
+                    // which is exactly the instruction's trailing suffix (the
+                    // typechecker insists on it). Like ValueOf, this is not
+                    // inferred from any operand, so the print guard can trust it
+                    // without knowing which run of bytes the field lives in.
+                    case Op::FieldLoad: {
+                        const Kind field = declared_kind(in.type_kind);
+                        raise(st.vals[in.result], field);
+                        break;
+                    }
+                    // A field store has no result; the value it writes was
+                    // checked against the field type by the typechecker, and the
+                    // load above reads the kind back from the field's suffix, so
+                    // there is no running kind to update here.
+                    case Op::FieldStore:
+                        break;
+
                     // Hardening item 5. Conversions are exact in the kind
                     // lattice -- ToFloat is always a float and ToInt/InputInt
                     // always an int -- so the results keep a storage class the

@@ -237,6 +237,63 @@ int main() {
                 }
             }
         }
+        // 4.6. Signed narrow loads: the exact movsx / movsxd forms the JIT emits
+        // so a negative int[8|16|32] lane reads back negative. GNU as and the
+        // encoder must agree byte-for-byte on the REX.W + 0F BE/0F BF / 0x63
+        // shapes just as they do on the zero-extending mov forms above.
+        for (int wb : {1, 2, 4}) {
+            const int wbytes = wb;
+            const std::string wsz_p = wsz(wbytes);
+            const std::string mnem = (wbytes == 4) ? "movsxd " : "movsx ";
+            for (int d = 0; d < 16; ++d) {
+                const Reg rd = static_cast<Reg>(d);
+                const std::string D = R64[d];
+                for (auto v : disps) {
+                    const std::string at = "[rbp" + std::string(v < 0 ? "" : "+") +
+                                           std::to_string(v) + "]";
+                    { CodeBuffer b; emit_load_rbp_sext(b, rd, v, wbytes);
+                      line(mnem + D + ", " + wsz_p + " " + at, b); }
+                }
+                for (int i : {1, 9, 13}) {
+                    const Reg ri = static_cast<Reg>(i);
+                    const std::string I = R64[i];
+                    for (auto v : disps) {
+                        const std::string at = "[rbp" + std::string(v < 0 ? "" : "+") +
+                                               std::to_string(v) + "+" + I + "*" +
+                                               std::to_string(wbytes) + "]";
+                        { CodeBuffer b; emit_load_rbp_scaled_sext(b, rd, ri, v, wbytes);
+                          line(mnem + D + ", " + wsz_p + " " + at, b); }
+                    }
+                }
+            }
+        }
+        // 4.4/4.6. Register-indirect loads (pointer dereference). `ValueOf` of
+        // a narrow int pointee emits the sign-extending form. The base
+        // registers cover all three addressing shapes: no SIB and no escape
+        // (rcx), SIB because the base is r12, and the mod=01 disp8 escape
+        // because the base is rbp/r13.
+        for (int wb : {1, 2, 4, 8}) {
+            const int wbytes = wb;
+            const std::string wsz_p = wsz(wbytes);
+            const std::string mov_m = "mov ";
+            const std::string sx_m = (wbytes == 4) ? "movsxd " : "movsx ";
+            for (int d : {0, 8, 15}) {
+                const Reg rd = static_cast<Reg>(d);
+                const std::string D = wname(wbytes, d);
+                const std::string D64 = R64[d];
+                for (int bi : {1, 4, 5, 12}) {   // rcx, rsp, rbp, r12
+                    const Reg rb = static_cast<Reg>(bi);
+                    const std::string B = R64[bi];
+                    const std::string at = "[" + B + "]";
+                    { CodeBuffer b; emit_load_reg_indirect_raw(b, rd, rb, wbytes, /*zero_extend=*/false);
+                      line(mov_m + D + ", " + wsz_p + " " + at, b); }
+                    if (wbytes != 8) {
+                        { CodeBuffer b; emit_load_reg_indirect_sext(b, rd, rb, wbytes);
+                          line(sx_m + D64 + ", " + wsz_p + " " + at, b); }
+                    }
+                }
+            }
+        }
     }
     // 4.5. VEX / AVX2 byte coverage. The vectorizing pass emits these exact
     // forms, and a prefix-W/R/B/X mistake here is a wrong program (reads wild

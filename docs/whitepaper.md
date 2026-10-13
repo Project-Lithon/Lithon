@@ -35,6 +35,9 @@ kind of failure is this" readable from the code alone.
 | `E0123` | 1 (static refusal) | Tuple/dict literal shape |
 | `E0124` | 1 (static refusal) | Function-header restrictions |
 | `E0125` | 1 (static refusal) | Pointer arithmetic form |
+| `E0126` | 1 (static refusal) | Struct definition (must derive from `Struct`; fields are annotations only) |
+| `E0127` | 1 (static refusal) | Struct field type (int[w]/float[64]/bool or an earlier struct; no containers/pointers) |
+| `E0128` | 1 (static refusal) | Struct field access (unknown field, or a whole struct used where a value is needed) |
 | `E0201` | 2 (environmental) | Fallible value read before `.ok` check |
 | `E0301` | 3 (dynamic runtime trap) | Division by zero |
 | `E0302` | 3 (dynamic runtime trap) | Modulo by zero |

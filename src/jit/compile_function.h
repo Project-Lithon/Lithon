@@ -2048,11 +2048,12 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
 
             // 4.4. Load the pointee through the pointer. The width is the
             // pointee type from the instruction's trailing suffix: int[64] is
-            // an 8-byte move, int[32]/int[16]/int[8]/bool are narrow
-            // zero-extending loads, and a float pointee goes through the XMM
-            // machinery like every other double. The typechecker guarantees the
-            // suffix matches the pointer's pointee, so the width cannot lie
-            // about what the pointer points at.
+            // an 8-byte move, int[32]/int[16]/int[8] are narrow SIGN-extending
+            // loads (a Lithon int is signed, so a negative pointee reads back
+            // negative), bool is a zero-extending byte, and a float pointee
+            // goes through the XMM machinery like every other double. The
+            // typechecker guarantees the suffix matches the pointer's pointee,
+            // so the width cannot lie about what the pointer points at.
             case Op::ValueOf: {
                 Reg ptr = read_left(instr.args.at(0));
                 if (is_float_value(value_kinds, instr.result)) {
@@ -2068,7 +2069,10 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     pointee_bytes = instr.type_width / 8;
                 }
                 Reg dst = compute_dest(instr.result);
-                emit_load_reg_indirect(code, dst, ptr, pointee_bytes);
+                if (instr.type_kind == "bool")
+                    emit_load_reg_indirect(code, dst, ptr, pointee_bytes);
+                else
+                    emit_load_reg_indirect_sext(code, dst, ptr, pointee_bytes);
                 commit_result(instr.result, dst);
                 break;
             }
@@ -2234,6 +2238,32 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     }
                     break;
                 }
+                // 4.6. A struct declaration reserves its byte run (laid out by
+                // the allocator) and zeroes it, so an unwritten field reads back
+                // as zero exactly as it does in the interpreter. Zero is 0 for
+                // an int, False for a bool and +0.0 for a double, so one all
+                // zero fill is right for every field kind.
+                if (instr.args.empty() && instr.type_kind == "struct") {
+                    const int size = alloc.struct_size(instr.name);
+                    if (size > 0) {
+                        const int base = alloc.variable_offset(instr.name);
+                        const int slots = (size + 7) / 8;
+                        emit_xor_zero(code, kR);
+                        if (slots <= 16) {
+                            for (int i = 0; i < slots; ++i)
+                                emit_store_rbp_offset(code, kR, base + 8 * i, 8);
+                        } else {
+                            emit_xor_zero(code, kL);
+                            const size_t top = code.size();
+                            emit_store_rbp_scaled(code, kR, kL, base, 8);
+                            emit_add_reg_imm32(code, kL, 1);
+                            emit_cmp_reg_imm32(code, kL, slots);
+                            JumpPatch again = emit_jcc_rel32(code, Cond::Less);
+                            resolve_jump_patch(code, again, top);
+                        }
+                    }
+                    break;
+                }
                 // 0.6.10. Any valueless store left after the container
                 // declarations above is a type-only scalar or pointer
                 // declaration: the typechecker consumed it, there is no
@@ -2299,7 +2329,13 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     commit_float_result(instr.result, dst);
                 } else {
                     Reg dst = compute_dest(instr.result);
-                    emit_load_rbp_scaled(code, dst, idx, disp, stride);
+                    // A Lithon int[w] is signed, so a negative int[8|16|32]
+                    // element must read back negative. bool is 0/1 and stays
+                    // zero-extended; 64-bit lanes are a plain mov either way.
+                    if (value_kinds[instr.result] == Kind::Bool)
+                        emit_load_rbp_scaled(code, dst, idx, disp, stride);
+                    else
+                        emit_load_rbp_scaled_sext(code, dst, idx, disp, stride);
                     commit_result(instr.result, dst);
                 }
                 break;
@@ -2322,6 +2358,59 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     // is holding the index.
                     Reg src = read_in(instr.args.at(1), kR);
                     emit_store_rbp_scaled(code, src, idx, disp, stride);
+                }
+                break;
+            }
+
+            // 4.6. Struct field access. The field is at a fixed byte offset the
+            // frontend computed (carried in int_imm), so there is no running
+            // index and no runtime bounds check: the typechecker proved the
+            // access lies inside the declared size. The access width is the
+            // field's own packed size; a store writes only the field's low
+            // bytes and a load SIGN-extends an int field (a Lithon int is
+            // signed) or zero-extends a bool, exactly like a list element of
+            // the same width.
+            case Op::FieldLoad: {
+                if (alloc.struct_size(instr.name) == 0) {
+                    throw std::runtime_error("compile_module: field load from '" +
+                                             instr.name + "' which is not a struct");
+                }
+                const int disp = alloc.variable_offset(instr.name) +
+                                 static_cast<int>(instr.int_imm);
+                if (is_float_value(value_kinds, instr.result)) {
+                    Xmm dst = float_dest(instr.result);
+                    emit_movsd_xmm_rbp(code, dst, disp);
+                    commit_float_result(instr.result, dst);
+                } else {
+                    const int bytes = instr.type_kind == "bool" ? 1 : instr.type_width / 8;
+                    Reg dst = compute_dest(instr.result);
+                    // int fields are signed; bool fields are 0/1 and stay
+                    // zero-extended.
+                    if (instr.type_kind == "bool")
+                        emit_load_rbp_narrow(code, dst, disp, bytes);
+                    else
+                        emit_load_rbp_sext(code, dst, disp, bytes);
+                    commit_result(instr.result, dst);
+                }
+                break;
+            }
+            case Op::FieldStore: {
+                if (alloc.struct_size(instr.name) == 0) {
+                    throw std::runtime_error("compile_module: field store into '" +
+                                             instr.name + "' which is not a struct");
+                }
+                const int disp = alloc.variable_offset(instr.name) +
+                                 static_cast<int>(instr.int_imm);
+                if (is_float_value(value_kinds, instr.args.at(0))) {
+                    Xmm src = read_float(instr.args.at(0));
+                    emit_movsd_rbp_mem(code, src, disp);
+                } else {
+                    const int bytes = instr.type_kind == "bool" ? 1 : instr.type_width / 8;
+                    // kR, not read_left: a field store names no result, but the
+                    // value must not land in kL, which the zero-fill loop and
+                    // other scratch users may be holding across this case.
+                    Reg src = read_in(instr.args.at(0), kR);
+                    emit_store_rbp_offset(code, src, disp, bytes);
                 }
                 break;
             }

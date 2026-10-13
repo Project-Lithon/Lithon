@@ -43,9 +43,10 @@ static Instr mk(Op op, ValueId res, std::vector<ValueId> args) {
 enum class Mode { Add, Sub, Mul, Reduce };
 
 static int64_t expected_value(Mode m, int N, int64_t c) {
-    // ys[k] == k+1 for k in 0..N-1. Each element read back is a uint32
-    // (Index zero-extends 32-bit int elements), so a negative element
-    // contributes 2^32 to the int64 checksum the exit block folds.
+    // ys[k] == k+1 for k in 0..N-1. A Lithon int is signed, so each element
+    // read back is a SIGNED int32 (Index sign-extends a narrow int element)
+    // and a negative result contributes its signed value to the int64
+    // checksum the exit block folds.
     int64_t sum = 0;
     for (int k = 0; k < N; ++k) {
         int64_t v = (int64_t)(k + 1);
@@ -53,7 +54,7 @@ static int64_t expected_value(Mode m, int N, int64_t c) {
         else if (m == Mode::Add) v = v + c;
         else if (m == Mode::Sub) v = v - c;
         else v = v * c;
-        sum += (int64_t)(uint32_t)(int32_t)v;
+        sum += (int64_t)(int32_t)v;
     }
     if (m == Mode::Reduce) return (int64_t)N * (N + 1) / 2;
     return sum;

@@ -5,9 +5,9 @@
 #include <vector>
 #include <memory>
 
-// Basic-block IR with PHI nodes. Do not add instructions beyond
-// M1's required set without updating docs/V1_SPEC.md and
-// docs/ROADMAP.md first.
+// Basic-block IR with PHI nodes. Do not add instructions beyond the current
+// required set without documenting them first (README.md and the web docs under
+// web/apps/web/src/docs/).
 
 namespace lithon::ir {
 
@@ -125,10 +125,31 @@ enum class Op : uint8_t {
     // it. The RESULT is the pointee, so the trailing " : T" instruction suffix
     // names the pointee type directly (e.g. `%v = valueof %p : int[64]`): the
     // compiler needs to know whether the load is an 8-byte move, a movsd, or a
-    // narrow zero-extend, and the value's kind feeds both the typechecker's
+    // narrow movsx/movsxd (a Lithon int is signed, so a narrow int load
+    // sign-extends), and the value's kind feeds both the typechecker's
     // compare rules and the print guard.
     AddressOf,
     ValueOf,
+
+    // 4.6. Struct field access. A struct variable is a byte blob whose layout
+    // the FRONTEND decides, so the runtime never needs the field table: each
+    // field op carries the field's byte offset directly and the field type in
+    // the trailing " : T" suffix. Both tiers read/write raw little-endian
+    // bytes at `base + offset`, truncating a store to the field width and
+    // sign-extending an int load (zero-extending a bool) -- the exact
+    // semantics of a packed container lane.
+    //
+    //   FieldLoad   args = {}   result = field value     name = struct var
+    //   FieldStore  args = {value}   no result           name = struct var
+    //
+    // The byte offset is a compile-time layout artifact, so it is carried in
+    // `int_imm` rather than as a ValueId the way a list index is. Field access
+    // is only ever to a SCALAR run: a struct has no value, so a struct field
+    // is reachable only as the base of a deeper `a.b.c` chain, which the
+    // frontend resolves to a single leaf field op. `valueof` of a struct is
+    // refused.
+    FieldLoad,
+    FieldStore,
 
     // Hardening item 5. Explicit numeric conversions and terminal input.
     //

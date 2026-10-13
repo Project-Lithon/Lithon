@@ -492,7 +492,36 @@ inline void emit_xor_zero(CodeBuffer& buf, Reg reg);
 
 inline void emit_rbp_mov_narrow(CodeBuffer& buf, Reg data_reg, Reg addr_reg, int32_t disp,
                                 int bytes, bool store, bool scaled,
-                                bool zero_extend = true) {
+                                bool zero_extend = true, bool sign_extend = false) {
+    if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8)
+        throw std::logic_error("x86_encoder: element width " + std::to_string(bytes) +
+                               " is not 1, 2, 4 or 8");
+    // A Lithon int[w] is SIGNED, so a negative value stored in a narrow lane
+    // must read back negative. A movsx/movsxd load with REX.W sign-extends the
+    // lane into the full 64-bit register -- the one form that makes element -5
+    // (0xFFFB at int[16]) read back as -5 rather than 65531. 8 and 16 use the
+    // two-byte 0F BE/0F BF forms; 32 uses the dedicated movsxd (0x63), which
+    // exists precisely because a signed 32->64 widening is not a mov. There is
+    // no 0x66 prefix: REX.W already picks the 64-bit destination. bool lanes
+    // stay zero-extended and never take this path.
+    if (sign_extend && !store && bytes != 8) {
+        const bool rex_r = reg_is_extended(data_reg);
+        const bool rex_x = scaled && reg_is_extended(addr_reg);
+        emit_u8(buf, static_cast<uint8_t>(0x40 | 8 | (rex_r ? 4 : 0) | (rex_x ? 2 : 0)));
+        if (bytes == 4) {
+            emit_u8(buf, 0x63);
+        } else {
+            emit_u8(buf, 0x0F);
+            emit_u8(buf, static_cast<uint8_t>(bytes == 1 ? 0xBE : 0xBF));
+        }
+        if (scaled)
+            emit_sib_tail(buf, data_reg, addr_reg, checked_sib_scale(bytes));
+        else
+            emit_u8(buf, static_cast<uint8_t>(0x80 | (reg_low3(data_reg) << 3) |
+                                              reg_low3(Reg::RBP)));
+        emit_disp32_le(buf, disp);
+        return;
+    }
     // An 8- or 16-bit load is a PARTIAL register write: `mov al, [mem]` writes
     // AL and leaves bits 8..63 of the destination exactly as they were. A
     // 32-bit load zero-extends for free, which is why only the 1- and 2-byte
@@ -501,9 +530,6 @@ inline void emit_rbp_mov_narrow(CodeBuffer& buf, Reg data_reg, Reg addr_reg, int
     // garbage from whatever used that register last. Zero the destination first.
     // A store is unaffected: only the low bits of the source are written.
     if (zero_extend && !store && (bytes == 1 || bytes == 2)) emit_xor_zero(buf, data_reg);
-    if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8)
-        throw std::logic_error("x86_encoder: element width " + std::to_string(bytes) +
-                               " is not 1, 2, 4 or 8");
     const bool wide = bytes == 8;
     const bool byte_form = bytes == 1;
     const bool word_form = bytes == 2;
@@ -545,6 +571,14 @@ inline void emit_load_rbp_narrow(CodeBuffer& buf, Reg dst, int32_t disp, int byt
                         zero_extend);
 }
 
+// Signed narrow load: sign-extends a negative int[w] (w < 64) into the full
+// 64-bit register. Used for every int lane; bool lanes keep the zero-extending
+// form.
+inline void emit_load_rbp_sext(CodeBuffer& buf, Reg dst, int32_t disp, int bytes) {
+    emit_rbp_mov_narrow(buf, dst, Reg::RBP, disp, bytes, /*store=*/false,
+                        /*scaled=*/false, /*zero_extend=*/true, /*sign_extend=*/true);
+}
+
 inline void emit_store_rbp_narrow(CodeBuffer& buf, Reg src, int32_t disp, int bytes) {
     emit_rbp_mov_narrow(buf, src, Reg::RBP, disp, bytes, /*store=*/true, /*scaled=*/false);
 }
@@ -554,6 +588,14 @@ inline void emit_load_rbp_scaled(CodeBuffer& buf, Reg dst, Reg index_reg, int32_
                                  int stride = 8, bool zero_extend = true) {
     emit_rbp_mov_narrow(buf, dst, index_reg, disp, stride, /*store=*/false, /*scaled=*/true,
                         zero_extend);
+}
+
+// Signed scaled narrow load: sign-extends a negative int[w] element into the
+// full 64-bit register.
+inline void emit_load_rbp_scaled_sext(CodeBuffer& buf, Reg dst, Reg index_reg, int32_t disp,
+                                      int stride = 8) {
+    emit_rbp_mov_narrow(buf, dst, index_reg, disp, stride, /*store=*/false,
+                        /*scaled=*/true, /*zero_extend=*/true, /*sign_extend=*/true);
 }
 
 // mov [rbp + disp + index*stride], src, at the element's own width
@@ -638,10 +680,37 @@ inline void emit_load_rbp_offset(CodeBuffer& buf, Reg dst, int32_t offset) {
 // R13 needs the same escape RBP does; the allocator hands out R13 as a scratch
 // register, so this is not a theoretical case.
 inline void emit_load_reg_indirect_raw(CodeBuffer& buf, Reg data_reg, Reg addr_reg,
-                                       int bytes, bool zero_extend = true) {
+                                       int bytes, bool zero_extend = true,
+                                       bool sign_extend = false) {
     if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8)
         throw std::logic_error("x86_encoder: indirect element width " + std::to_string(bytes) +
                                " is not 1, 2, 4 or 8");
+    const uint8_t rm = reg_low3(addr_reg);
+    const bool needs_sib = rm == 4;                                  // RSP/R12
+    const bool fi_disp_escape = rm == 5;                             // RBP/R13
+    // A signed narrow pointee (int[8|16|32]) reads back sign-extended, matching
+    // the rbp forms and the interpreter. Same movsx/movsxd shapes.
+    if (sign_extend && bytes != 8) {
+        emit_u8(buf, static_cast<uint8_t>(0x40 | 8 |
+                                         (reg_is_extended(data_reg) ? 4 : 0) |
+                                         (reg_is_extended(addr_reg) ? 1 : 0)));
+        if (bytes == 4) {
+            emit_u8(buf, 0x63);
+        } else {
+            emit_u8(buf, 0x0F);
+            emit_u8(buf, static_cast<uint8_t>(bytes == 1 ? 0xBE : 0xBF));
+        }
+        if (needs_sib) {
+            emit_u8(buf, static_cast<uint8_t>((reg_low3(data_reg) << 3) | 0x4));
+            emit_u8(buf, static_cast<uint8_t>(0x20 | rm));
+        } else if (fi_disp_escape) {
+            emit_u8(buf, static_cast<uint8_t>(0x40 | (reg_low3(data_reg) << 3) | rm));
+            emit_u8(buf, 0);   // disp8 = 0
+        } else {
+            emit_u8(buf, static_cast<uint8_t>(reg_low3(data_reg) << 3 | rm));
+        }
+        return;
+    }
     // An 8- or 16-bit load is a partial register write: `mov al, [addr]`
     // leaves bits 8..63 of the destination untouched. Zero the destination
     // first, exactly as the rbp forms do for per-element access.
@@ -652,9 +721,6 @@ inline void emit_load_reg_indirect_raw(CodeBuffer& buf, Reg data_reg, Reg addr_r
     const bool byte_reg_needs_rex =
         byte_form && (data_reg == Reg::RSP || data_reg == Reg::RBP ||
                       data_reg == Reg::RSI || data_reg == Reg::RDI);
-    const uint8_t rm = reg_low3(addr_reg);
-    const bool needs_sib = rm == 4;                                  // RSP/R12
-    const bool fi_disp_escape = rm == 5;                             // RBP/R13
     if (word_form) emit_u8(buf, 0x66);
     if (wide || byte_reg_needs_rex || reg_is_extended(data_reg) || reg_is_extended(addr_reg))
         emit_u8(buf, static_cast<uint8_t>(0x40 | (wide ? 8 : 0) |
@@ -673,9 +739,16 @@ inline void emit_load_reg_indirect_raw(CodeBuffer& buf, Reg data_reg, Reg addr_r
     }
 }
 
-// mov dst, [addr] at the pointee's own width (1/2/4 zero-extend, 8 wide).
+// mov dst, [addr] at the pointee's own width (1/2/4 zero-extend, 8 wide). bool
+// pointers use this; int pointers use the sign-extending _sext form below.
 inline void emit_load_reg_indirect(CodeBuffer& buf, Reg data_reg, Reg addr_reg, int bytes) {
     emit_load_reg_indirect_raw(buf, data_reg, addr_reg, bytes, /*zero_extend=*/true);
+}
+
+// Signed indirect narrow load: sign-extends a negative int[w] pointee.
+inline void emit_load_reg_indirect_sext(CodeBuffer& buf, Reg data_reg, Reg addr_reg, int bytes) {
+    emit_load_reg_indirect_raw(buf, data_reg, addr_reg, bytes, /*zero_extend=*/true,
+                               /*sign_extend=*/true);
 }
 
 // mov [addr], src  -- the store counterpart of emit_load_reg_indirect_raw.

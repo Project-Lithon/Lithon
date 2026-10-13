@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -49,6 +50,23 @@ public:
         int key_width = 64;
     };
     std::unordered_map<std::string, DictTable> dicts;
+
+    // 4.6. A struct is a packed run of bytes, not a value and not a run of
+    // values: it is storage whose layout the frontend computed. Keeping it as
+    // raw bytes here (rather than as a map of field name -> value) is what makes
+    // the interpreter agree with the JIT byte for byte -- a field write truncates
+    // to the field's low bytes and a read sign-extends an int field (the same
+    // packed-lane semantics as a list element of that width).
+    std::unordered_map<std::string, std::vector<uint8_t>> structs;
+
+    std::vector<uint8_t>& get_struct(const std::string& name, const char* what) {
+        auto it = structs.find(name);
+        if (it == structs.end()) {
+            throw std::runtime_error(std::string("interpreter: ") + what + " '" + name +
+                                     "' which is not a struct");
+        }
+        return it->second;
+    }
 
     std::vector<LithonValue>& get_list(const std::string& name, const char* what) {
         auto it = lists.find(name);
@@ -138,6 +156,52 @@ bool is_container_declaration(const Instr& in) {
 
 bool is_dict_declaration(const Instr& in) {
     return in.args.empty() && in.type_kind == "dict";
+}
+
+// 4.6. A valueless `store s : struct[N]` is a struct declaration: it reserves N
+// zero bytes. There is no field list in the IR -- the layout lives in the frontend
+// and reaches the field ops as byte offsets -- so the interpreter needs only the
+// total size, exactly like the allocator.
+bool is_struct_declaration(const Instr& in) {
+    return in.args.empty() && in.type_kind == "struct";
+}
+
+// 4.6. Little-endian byte access, matching the packed lanes the JIT writes. A
+// load sign-extends an int field (zero-extends a bool) and a store truncates to
+// the field's low bytes, so a struct field of width w behaves exactly like a
+// list[int[w]] element. The interpreter works in bytes rather than in a
+// field-name -> value map precisely so that this truncation is forced, not
+// chosen.
+int64_t struct_load_int(const std::vector<uint8_t>& bytes, int offset, int width,
+                        bool is_bool) {
+    if (offset < 0 || width <= 0 ||
+        static_cast<size_t>(offset) + static_cast<size_t>(width) > bytes.size()) {
+        throw std::runtime_error("interpreter: struct field read out of range");
+    }
+    uint64_t v = 0;
+    for (int i = 0; i < width; ++i)
+        v |= static_cast<uint64_t>(bytes[static_cast<size_t>(offset + i)]) << (8 * i);
+    if (is_bool) return v != 0 ? 1 : 0;
+    // A Lithon int[w] is SIGNED: a negative lane must read back negative, the
+    // same result the JIT's movsx/movsxd produces. Signing here and
+    // zero-extending there was a real tier disagreement -- list[int[16]] element
+    // -5 printed -5 in the interpreter and 65531 natively.
+    switch (width) {
+        case 1: return static_cast<int8_t>(v);
+        case 2: return static_cast<int16_t>(v);
+        case 4: return static_cast<int32_t>(v);
+        default: return static_cast<int64_t>(v);
+    }
+}
+
+void struct_store_int(std::vector<uint8_t>& bytes, int offset, int width, int64_t value) {
+    if (offset < 0 || width <= 0 ||
+        static_cast<size_t>(offset) + static_cast<size_t>(width) > bytes.size()) {
+        throw std::runtime_error("interpreter: struct field write out of range");
+    }
+    const uint64_t raw = static_cast<uint64_t>(value);
+    for (int i = 0; i < width; ++i)
+        bytes[static_cast<size_t>(offset + i)] = static_cast<uint8_t>((raw >> (8 * i)) & 0xFF);
 }
 
 // 4.3. Two keys are the same key when they are the same after normalization, so
@@ -561,6 +625,18 @@ LithonValue execute_function(const Module& module, const Function& fn,
                                                        zero_of_kind(instr.type_elem_kind));
                         break;
                     }
+                    // 4.6. A struct declaration reserves its byte run and zeroes
+                    // it. Re-executing (inside a loop) resets it, like a
+                    // container. Zero bytes are zero for every field kind.
+                    if (is_struct_declaration(instr)) {
+                        if (instr.type_width <= 0) {
+                            throw std::runtime_error("interpreter: struct '" + instr.name +
+                                                     "' declared with a non-positive size");
+                        }
+                        frame.structs[instr.name].assign(
+                            static_cast<size_t>(instr.type_width), 0);
+                        break;
+                    }
                     // 0.6.10. A valueless scalar or pointer store is a
                     // type-only declaration: the typechecker consumed it, so
                     // there is no value to read into the variable and no
@@ -636,6 +712,58 @@ LithonValue execute_function(const Module& module, const Function& fn,
                             "interpreter: dereference of a pointer with no live variable behind it");
                     }
                     frame.regs[instr.result] = frame.get_var(back->second);
+                    break;
+                }
+                // 4.6. Struct field access. The offset (int_imm) and the field's
+                // type come straight from the frontend's layout, so there is no
+                // lookup and no bounds check beyond the byte run itself. A float
+                // field is stored as its IEEE-754 bits in the same little-endian
+                // order the JIT's movsd writes, so a field read back bit-for-bit
+                // agrees across the tiers.
+                case Op::FieldLoad: {
+                    const std::vector<uint8_t>& bytes =
+                        frame.get_struct(instr.name, "read from");
+                    const int off = static_cast<int>(instr.int_imm);
+                    if (instr.type_kind == "float") {
+                        if (off < 0 || static_cast<size_t>(off) + 8 > bytes.size()) {
+                            throw std::runtime_error("interpreter: struct field read out of range");
+                        }
+                        uint64_t bits = 0;
+                        for (int i = 0; i < 8; ++i)
+                            bits |= static_cast<uint64_t>(bytes[static_cast<size_t>(off + i)]) << (8 * i);
+                        double d = 0.0;
+                        std::memcpy(&d, &bits, sizeof(d));
+                        frame.regs[instr.result] = LithonValue::make_float(d);
+                    } else {
+                        const int width = instr.type_kind == "bool" ? 1 : instr.type_width / 8;
+                        const int64_t raw = struct_load_int(bytes, off, width,
+                                                            instr.type_kind == "bool");
+                        frame.regs[instr.result] = instr.type_kind == "bool"
+                            ? LithonValue::make_bool(raw != 0)
+                            : LithonValue::make_int(raw);
+                    }
+                    break;
+                }
+                case Op::FieldStore: {
+                    std::vector<uint8_t>& bytes = frame.get_struct(instr.name, "write to");
+                    const int off = static_cast<int>(instr.int_imm);
+                    LithonValue v = frame.get_reg(instr.args.at(0));
+                    if (instr.type_kind == "float") {
+                        if (off < 0 || static_cast<size_t>(off) + 8 > bytes.size()) {
+                            throw std::runtime_error("interpreter: struct field write out of range");
+                        }
+                        const double d = v.as_float();
+                        uint64_t bits = 0;
+                        std::memcpy(&bits, &d, sizeof(bits));
+                        for (int i = 0; i < 8; ++i)
+                            bytes[static_cast<size_t>(off + i)] =
+                                static_cast<uint8_t>((bits >> (8 * i)) & 0xFF);
+                    } else {
+                        const int width = instr.type_kind == "bool" ? 1 : instr.type_width / 8;
+                        const int64_t raw = (instr.type_kind == "bool") ? (v.as_int() != 0 ? 1 : 0)
+                                                                        : v.as_int();
+                        struct_store_int(bytes, off, width, raw);
+                    }
                     break;
                 }
                 // Hardening item 5. Explicit conversions and terminal input.

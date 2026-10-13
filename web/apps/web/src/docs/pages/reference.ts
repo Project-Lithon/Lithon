@@ -536,7 +536,7 @@ const limits: DocPage = {
   slug: "limits",
   title: "Honest limits",
   description:
-    "The gaps as they stand: two-argument functions, Phi not emitted, Win64 unproven, x86-64 only.",
+    "The gaps as they stand: Phi not emitted, Win64 unproven, x86-64 only.",
   group: "reference",
   tags: ["limits", "gaps", "roadmap", "not supported", "honest", "TODO"],
   sections: [
@@ -556,7 +556,7 @@ const limits: DocPage = {
               "`Phi`",
               "lowered, not emitted: blocks if-as-expression merges without a memory round-trip",
             ],
-            ["arguments per function / call", "capped at 2"],
+            ["arguments per function / call", "two in registers, the rest on the stack · budget 32"],
             ["float merges", "never promoted · needs an XMM pool"],
             ["Win64 ABI", "implemented, no test evidence yet"],
             ["AOT binary emit", "none · everything runs in-process"],
@@ -575,8 +575,8 @@ const limits: DocPage = {
         {
           kind: "note",
           tone: "note",
-          title: "The two blockers worth knowing",
-          text: "`Phi` is the single unemitted opcode. The two-argument cap is the other: most of the remaining test programs are waiting on it. Both are engineering, not research.",
+          title: "The blocker worth knowing",
+          text: "`Phi` is the single unemitted opcode: blocks if-as-expression merges without a memory round-trip, and most of the remaining test programs are waiting on it. It is engineering, not research.",
         },
       ],
     },

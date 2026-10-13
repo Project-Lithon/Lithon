@@ -432,6 +432,20 @@ Module parse_ir_text(const std::string& text) {
         } else if (oa.op_name == "valueof") {
             instr.op = Op::ValueOf;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+        // 4.6. Struct field ops. Same `name`-carries-the-variable convention as
+        // the container ops; the byte offset is a compile-time layout constant
+        // and is read straight into int_imm, and the field type arrives in the
+        // trailing " : T" suffix (parsed above). `%r = fieldload s, 4 : int[16]`
+        // and `fieldstore s, 4, %v`.
+        } else if (oa.op_name == "fieldload") {
+            instr.op = Op::FieldLoad;
+            instr.name = oa.raw_args.at(0);
+            instr.int_imm = std::stoll(oa.raw_args.at(1));
+        } else if (oa.op_name == "fieldstore") {
+            instr.op = Op::FieldStore;
+            instr.name = oa.raw_args.at(0);
+            instr.int_imm = std::stoll(oa.raw_args.at(1));
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(2)));
         } else if (oa.op_name == "tofloat") {
             instr.op = Op::ToFloat;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));

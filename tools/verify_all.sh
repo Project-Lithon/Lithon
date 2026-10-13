@@ -64,6 +64,9 @@ done
 step "encoder vs GNU as"
 python3 tools/check_encoder_vs_as.py
 
+step "struct layout: frontend offsets == C packed sizeof/offsetof"
+python3 tools/check_struct_layout.py
+
 step "CPU target features: CPUID detection must match the kernel's own view"
 python3 tools/check_cpu_features.py
 

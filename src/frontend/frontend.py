@@ -264,6 +264,120 @@ IF_EXPR_TEMP = "__ifexpr"
 # the shared path, because the shared path cannot express a second type.
 CONTAINER_KINDS = ("list", "tuple", "dict")
 
+# 4.6. A struct is declared by subclassing the builtin `Struct` marker and
+# annotating its fields. The marker has no behaviour; it is the spelling that
+# distinguishes a struct definition from a class this frontend does not support.
+STRUCT_BASE = "Struct"
+
+
+class StructLayout:
+    """The packed byte layout of one struct type.
+
+    The C++ side deliberately carries no field table: the IR only sees a struct
+    as a byte blob sized on its declaration, with each field access naming a byte
+    offset. So this layout is the canonical one -- offsets computed once here and
+    frozen into the fieldload/fieldstore instructions -- which is what keeps the
+    interpreter and the JIT reading the same bytes without either of them knowing
+    what a field is called.
+    """
+
+    __slots__ = ("name", "fields", "size")
+
+    def __init__(self, name):
+        self.name = name
+        self.fields = {}   # field name -> {kind, width, offset, byte_size, struct_name}
+        self.size = 0
+
+
+def _struct_field_type(struct_name, field_name, ann, registry):
+    """Resolves a field annotation to (kind, width, struct_name, byte_size).
+
+    A field is int[w], float[64], bool, or a struct that was declared EARLIER.
+    Requiring earlier declaration is what makes the size of a nested struct
+    known here and, at the same time, makes a cycle impossible: a struct that
+    cannot name itself or a later struct has no way to be infinitely large.
+    """
+    if isinstance(ann, ast.Name):
+        if ann.id in registry:
+            return "struct", -1, ann.id, registry[ann.id].size
+        if ann.id not in ("int", "float", "bool"):
+            raise NotImplementedError(
+                f"LITHON-E0127: field '{field_name}' of struct '{struct_name}' has unknown type "
+                f"'{ann.id}' -- a field is int[w], float[64], bool, or a struct declared "
+                f"earlier (4.6)")
+    kind, width, elem_kind, elem_width, _key_kind, _key_width = parse_type_annotation(ann)
+    if kind in CONTAINER_KINDS or kind == "ptr" or elem_kind is not None:
+        raise NotImplementedError(
+            f"LITHON-E0127: field '{field_name}' of struct '{struct_name}' is a {kind}; 4.6 "
+            f"fields are int[w], float[64], bool, or a plain struct -- a container or pointer "
+            f"cannot be stored in a struct")
+    if kind not in ("int", "float", "bool"):
+        raise NotImplementedError(
+            f"LITHON-E0127: field '{field_name}' of struct '{struct_name}' has unsupported "
+            f"type {kind} (4.6)")
+    if kind == "bool":
+        return "bool", -1, None, 1
+    if width is None or width <= 0:
+        raise NotImplementedError(
+            f"LITHON-E0127: field '{field_name}' of struct '{struct_name}' needs a width, "
+            f"e.g. {kind}[64] (4.6)")
+    return kind, width, None, width // 8
+
+
+def build_struct_registry(tree):
+    """Collects every `class Foo(Struct)` definition into a {name: StructLayout}.
+
+    Runs before any function is built, so a struct declared at module level is
+    visible as a field type to any later struct and as a variable type to any
+    function. Struct definitions may reference only EARLIER ones (see
+    _struct_field_type); the registry is built in source order to make that the
+    natural case rather than a checked one.
+    """
+    registry = {}
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.ClassDef):
+            continue
+        bases = stmt.bases
+        if len(bases) != 1 or not isinstance(bases[0], ast.Name) \
+                or bases[0].id != STRUCT_BASE:
+            raise NotImplementedError(
+                f"LITHON-E0126: class '{stmt.name}' must derive from Struct, e.g. "
+                f"`class {stmt.name}(Struct):` -- other bases and inheritance are not "
+                f"supported (4.6)")
+        if stmt.name in registry:
+            raise NotImplementedError(
+                f"LITHON-E0126: struct '{stmt.name}' is declared more than once (4.6)")
+        layout = StructLayout(stmt.name)
+        offset = 0
+        for member in stmt.body:
+            if not isinstance(member, ast.AnnAssign):
+                raise NotImplementedError(
+                    f"LITHON-E0126: struct '{stmt.name}' may contain only field annotations "
+                    f"(`name: type`); found a {type(member).__name__} (4.6)")
+            if not isinstance(member.target, ast.Name):
+                raise NotImplementedError(
+                    f"LITHON-E0126: a field of struct '{stmt.name}' must be a plain name, not "
+                    f"a subscript or attribute (4.6)")
+            field_name = member.target.id
+            if field_name in layout.fields:
+                raise NotImplementedError(
+                    f"LITHON-E0127: struct '{stmt.name}' declares field '{field_name}' more "
+                    f"than once (4.6)")
+            kind, width, struct_ref, byte_size = _struct_field_type(
+                stmt.name, field_name, member.annotation, registry)
+            layout.fields[field_name] = {
+                "kind": kind, "width": width, "offset": offset,
+                "byte_size": byte_size, "struct_name": struct_ref,
+            }
+            offset += byte_size
+        if not layout.fields:
+            raise NotImplementedError(
+                f"LITHON-E0126: struct '{stmt.name}' has no fields -- a struct needs at least "
+                f"one int[w], float[64], bool or nested struct field (4.6)")
+        layout.size = offset
+        registry[stmt.name] = layout
+    return registry
+
 
 def scalar_cell_bytes(kind, width):
     """Bytes a scalar cell occupies in a frame: int[N] and float[N] are N/8
@@ -303,8 +417,9 @@ BITWISE_OPS = {
 
 
 class IRBuilder:
-    def __init__(self, fn_rename=None):
+    def __init__(self, fn_rename=None, structs=None):
         self.fn_rename = fn_rename or {}
+        self.structs = structs or {}
         self.reg_counter = 0
         self.block_counter = 0
         self.ifexpr_counter = 0
@@ -317,6 +432,12 @@ class IRBuilder:
         self.ptr_types = {}
         self.ptr_names = set()
         self.declared = {}
+        # 4.6. Local variables that hold a struct, mapped to their struct TYPE
+        # name (a key into self.structs). A struct variable is not a value, so
+        # the only things that can be done to it are field reads and writes, and
+        # this is what tells `.field` apart from an attribute this frontend does
+        # not support.
+        self.struct_vars = {}
 
     def new_reg(self):
         r = self.reg_counter
@@ -396,6 +517,15 @@ class IRBuilder:
             return r
 
         if isinstance(node, ast.Name):
+            # 4.6. A struct variable is storage, not a value: it has no value to
+            # load and nothing that could consume one. Reading it as a whole
+            # (print(s), s + 1, passing it to a function) is refused here, where
+            # the source names it, rather than emitting a `load` that would read
+            # the first field as though it were the struct.
+            if node.id in self.struct_vars:
+                raise NotImplementedError(
+                    f"LITHON-E0128: '{node.id}' is a struct and has no value -- read or write "
+                    f"one of its fields, e.g. {node.id}.<field> (4.6)")
             r = self.new_reg()
             self.emit(f"{r} = load {node.id}")
             # 4.4. A load of a pointer variable brings the pointer's pointee
@@ -693,7 +823,66 @@ class IRBuilder:
             self.emit(f"{r} = load {temp}")
             return r
 
+        # 4.6. `s.field` and nested `s.inner.field`. The byte offset is resolved
+        # from the struct layout and baked into the instruction, so the tiers see
+        # one leaf field read rather than a chain of intermediate structs (which
+        # have no values to be intermediate). A struct-typed field therefore has
+        # no standalone value, only its own fields do.
+        if isinstance(node, ast.Attribute):
+            var, offset, kind, width = self._resolve_struct_field(node)
+            r = self.new_reg()
+            self.emit(f"{r} = fieldload {var}, {offset}{render_type_suffix(kind, width)}")
+            return r
+
         raise NotImplementedError(f"LITHON-E0114: expression node {type(node).__name__} not supported yet")
+
+    def _resolve_struct_field(self, node):
+        """Resolves an attribute chain `a.b.c...` to (variable, byte_offset,
+        leaf_kind, leaf_width), or raises the E0128 refusal that explains why it
+        is not a field access.
+
+        The chain must bottom out at a plain struct VARIABLE, and every step but
+        the last must be a struct-typed field (so the offset walk is meaningful).
+        The leaf must be a scalar: a struct-typed leaf has no value, which is the
+        same rule that refuses a bare struct name.
+        """
+        parts = []
+        cur = node
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if not isinstance(cur, ast.Name):
+            raise NotImplementedError(
+                "LITHON-E0128: field access must start from a plain struct variable (4.6)")
+        var = cur.id
+        if var not in self.struct_vars:
+            raise NotImplementedError(
+                f"LITHON-E0128: '{var}' is not a struct, so it has no fields (4.6)")
+        parts.reverse()
+
+        layout = self.structs[self.struct_vars[var]]
+        offset = 0
+        kind = width = None
+        for i, field_name in enumerate(parts):
+            field = layout.fields.get(field_name)
+            if field is None:
+                raise NotImplementedError(
+                    f"LITHON-E0128: struct '{layout.name}' has no field '{field_name}' (4.6)")
+            offset += field["offset"]
+            last = (i == len(parts) - 1)
+            if field["kind"] == "struct":
+                if last:
+                    raise NotImplementedError(
+                        f"LITHON-E0128: '{field_name}' is a struct field with no value -- read "
+                        f"one of ITS fields, e.g. .{field_name}.<field> (4.6)")
+                layout = self.structs[field["struct_name"]]
+                continue
+            if not last:
+                raise NotImplementedError(
+                    f"LITHON-E0128: '{field_name}' is a {field['kind']}, not a struct, so it "
+                    f"has no fields (4.6)")
+            kind, width = field["kind"], field["width"]
+        return var, offset, kind, width
 
     def build_if(self, node):
         cond_reg = self.build_expr(node.test)
@@ -1039,6 +1228,27 @@ class IRBuilder:
             if not isinstance(node.target, ast.Name):
                 raise NotImplementedError("LITHON-E0121: only simple name targets are supported for annotations")
             name = node.target.id
+            # 4.6. A struct declaration names the type on the left of the colon:
+            # `s: SockAddrIn`. It is recognised before the scalar path because a
+            # struct name is not a type string parse_type_annotation knows -- it
+            # is a user-declared type, and only this builder's registry says so.
+            if isinstance(node.annotation, ast.Name) and node.annotation.id in self.structs:
+                layout = self.structs[node.annotation.id]
+                decl_key = ("struct", layout.size, node.annotation.id, None, None, None)
+                prev_decl = self.declared.get(name)
+                if prev_decl is not None and prev_decl != decl_key:
+                    raise NotImplementedError(
+                        f"LITHON-E0122: `{name}` is re-declared with a different type -- a name "
+                        f"has one type (V1_SPEC 0.6.10)")
+                self.declared[name] = decl_key
+                if node.value is not None:
+                    raise NotImplementedError(
+                        f"LITHON-E0128: `{name}: {node.annotation.id}` cannot take a value -- a "
+                        f"struct has no value; declare it and assign its fields one at a "
+                        f"time (4.6)")
+                self.struct_vars[name] = node.annotation.id
+                self.emit(f"store {name} : struct[{layout.size}]")
+                return
             kind, width, elem_kind, elem_width, key_kind, key_width = \
                 parse_type_annotation(node.annotation)
             suffix = render_type_suffix(kind, width, elem_kind, elem_width,
@@ -1145,8 +1355,23 @@ class IRBuilder:
                 val = self.build_expr(node.value)
                 self.emit(f"IndexStore {target.value.id}, {idx}, {val}")
                 return
+            # 4.6. `s.field = v`, and nested `s.inner.field = v`, resolve to one
+            # fieldstore at the summed byte offset. The value is a scalar (a
+            # struct-typed leaf is refused by the resolver), so no whole-struct
+            # assignment can arise here.
+            if isinstance(target, ast.Attribute):
+                var, offset, kind, width = self._resolve_struct_field(target)
+                val_reg = self.build_expr(node.value)
+                self.emit(f"fieldstore {var}, {offset}, {val_reg}{render_type_suffix(kind, width)}")
+                return
             if not isinstance(target, ast.Name):
                 raise NotImplementedError("LITHON-E0121: only single-name assignment targets are supported")
+            # 4.6. A whole-struct assignment has no meaning: there is no struct
+            # value to copy. The fields are the only writable surface.
+            if target.id in self.struct_vars:
+                raise NotImplementedError(
+                    f"LITHON-E0128: `{target.id} = ...` cannot assign a whole struct -- assign "
+                    f"its fields, e.g. {target.id}.<field> = ... (4.6)")
             if isinstance(node.value, ast.Tuple):
                 # 4.2. A tuple literal belongs to its annotated declaration, where
                 # the element type and the capacity are known. Naming the form
@@ -1177,6 +1402,10 @@ class IRBuilder:
             if op_type not in op_map:
                 raise NotImplementedError(f"LITHON-E0114: augmented operator {op_type.__name__} not supported yet")
             name = node.target.id
+            if name in self.struct_vars:
+                raise NotImplementedError(
+                    f"LITHON-E0128: cannot use `{name} <op>=` on a struct -- assign its fields "
+                    f"one at a time, e.g. {name}.<field> += ... (4.6)")
             current = self.new_reg()
             self.emit(f"{current} = load {name}")
             if name in self.ptr_names:
@@ -1264,6 +1493,12 @@ class IRBuilder:
 def build_program(tree):
     module_parts = []
 
+    # 4.6. Struct definitions are collected before anything is built, so a struct
+    # is visible to every function and to later struct definitions. A ClassDef
+    # that is not a `class Foo(Struct)` is refused here (E0126), which is what
+    # lets the statement loop below skip every ClassDef without a second check.
+    structs = build_struct_registry(tree)
+
     user_fn_names = {s.name for s in tree.body if isinstance(s, ast.FunctionDef)}
     fn_rename = {}
     if ENTRY_POINT in user_fn_names:
@@ -1272,17 +1507,30 @@ def build_program(tree):
             mangled = MANGLED_PREFIX + mangled
         fn_rename[ENTRY_POINT] = mangled
 
-    main_builder = IRBuilder(fn_rename)
+    main_builder = IRBuilder(fn_rename, structs)
     main_builder.start_block(main_builder.reserve_label())
 
     for stmt in tree.body:
+        if isinstance(stmt, ast.ClassDef):
+            # Already validated and registered; a struct definition emits no code.
+            continue
         if isinstance(stmt, ast.FunctionDef):
-            fb = IRBuilder(fn_rename)
+            fb = IRBuilder(fn_rename, structs)
             fb.start_block(fb.reserve_label())
 
             param_strs = []
             for arg in stmt.args.args:
                 if arg.annotation is not None:
+                    # 4.6. A struct is storage, not a value, so it cannot be
+                    # passed or returned: the function header names a kind and a
+                    # width, and a struct has neither. Refused at source with a
+                    # name for the reason rather than by the generic unknown-type
+                    # path, which would read as a typo.
+                    if isinstance(arg.annotation, ast.Name) and arg.annotation.id in structs:
+                        raise NotImplementedError(
+                            f"LITHON-E0124: parameter '{arg.arg}' cannot be a struct -- a struct "
+                            f"has no value to pass; a function takes int, float, bool, str or a "
+                            f"container (4.6)")
                     kind, width, elem_kind, elem_width, key_kind, key_width = \
                         parse_type_annotation(arg.annotation)
                     if kind == "ptr":
@@ -1303,6 +1551,10 @@ def build_program(tree):
 
             return_suffix = ""
             if stmt.returns is not None:
+                if isinstance(stmt.returns, ast.Name) and stmt.returns.id in structs:
+                    raise NotImplementedError(
+                        f"LITHON-E0124: function '{stmt.name}' cannot return a struct -- a "
+                        f"struct has no value to return (4.6)")
                 kind, width, elem_kind, elem_width, key_kind, key_width = \
                     parse_type_annotation(stmt.returns)
                 if kind == "ptr":

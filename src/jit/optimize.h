@@ -290,7 +290,14 @@ inline void eliminate_dead_code(lithon::ir::Function& fn, OptimizeStats& stats) 
                 // unassigned name is an error) and in the frame (where the JIT
                 // pushes it only when a store reserves a slot), so the target
                 // must be kept alive exactly as if it were loaded.
-                in.op == Op::AddressOf) {
+                in.op == Op::AddressOf ||
+                // 4.6. Field ops name their struct VARIABLE, exactly as Index
+                // names its container, so the same walk is needed: a struct
+                // whose fields are written and read only through field ops would
+                // otherwise look dead and its declaration -- the reservation of
+                // the byte run -- would be deleted, leaving every field op
+                // addressing unclaimed frame.
+                in.op == Op::FieldLoad || in.op == Op::FieldStore) {
                 mark_var(in.name);
                 for (auto arg : in.args) mark_temp(arg);
             }
@@ -316,7 +323,7 @@ inline void eliminate_dead_code(lithon::ir::Function& fn, OptimizeStats& stats) 
             // turn every element access into an address into unclaimed frame.
             if (in.op == Op::Store && in.args.empty() &&
                 (in.type_kind == "list" || in.type_kind == "tuple" ||
-                 in.type_kind == "dict")) {
+                 in.type_kind == "dict" || in.type_kind == "struct")) {
                 return false;
             }
             if (in.op == Op::Store) return live_vars.count(in.name) == 0;

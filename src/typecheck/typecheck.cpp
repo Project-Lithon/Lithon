@@ -50,10 +50,20 @@ struct LType {
     //
     // 4.3. A dict's width is a BUCKET COUNT, not a capacity, so it must never
     // reach int_range either. key_kind being set is what keeps it out.
-    bool is_scalar() const { return elem_kind.empty() && key_kind.empty(); }
+    //
+    // 4.6. A struct is deliberately NOT a scalar even though it carries no
+    // element or key: `width` is a byte size, not a bit width, so int_range()
+    // must never see it, and a struct has no single cell that addressof or a
+    // value store could name. Keeping it out of is_scalar() is what routes a
+    // valueless struct store down the same "binds storage" path a container
+    // takes rather than the type-only scalar path.
+    bool is_scalar() const {
+        return elem_kind.empty() && key_kind.empty() && kind != "struct";
+    }
     bool is_list() const { return kind == "list"; }
     bool is_dict() const { return kind == "dict"; }
     bool is_ptr() const { return kind == "ptr"; }
+    bool is_struct() const { return kind == "struct"; }
 
     // 4.4. The element stride a pointer offset is scaled by, in BYTES. The
     // frontend lowers `_p + 1` to `add _p, sizeof(T)`, so an offset is a byte
@@ -92,6 +102,10 @@ std::string wide_str(__int128 v) {
 }
 
 std::string type_str(const LType& t) {
+    // 4.6. A struct's width is a byte size and it is never a scalar, so it must
+    // be rendered before the scalar branch (which would print it as a width)
+    // and before the container branch (which would invent a phantom element).
+    if (t.is_struct()) return "struct[" + std::to_string(t.width) + "]";
     if (t.is_scalar()) {
         if (t.width < 0) return t.kind;
         return t.kind + "[" + std::to_string(t.width) + "]";
@@ -640,6 +654,16 @@ private:
     }
 
     void check_value_into_target(ValueId id, const LType& target, const std::string& context) {
+        // 4.6. A struct has no value: it is storage, written one field at a
+        // time. This is the backstop for hand-written IR, where a value store
+        // into a struct-typed variable would otherwise be silently accepted
+        // (and then only move the first word of the blob natively). The
+        // frontend never emits such a store.
+        if (target.is_struct()) {
+            error(context + ": a struct has no value -- its fields are assigned one "
+                  "at a time (4.6)");
+            return;
+        }
         if (const Instr* c = find_producing_const(id)) {
             if (target.kind == "int") {
                 auto [lo, hi] = int_range(target.width);
@@ -843,6 +867,62 @@ private:
                 reg_types_[instr.result] = p.element();
                 return;
             }
+            // 4.6. Struct field access. The runtime validates nothing (there is
+            // no field table in the IR): the check here is the whole guarantee
+            // that a field op addresses a real byte range of the struct, so the
+            // offset must be a compile-time constant inside the declared size
+            // and the field must be a scalar whose width fits from that offset.
+            case Op::FieldLoad:
+            case Op::FieldStore: {
+                auto it = scope.find(instr.name);
+                if (it == scope.end()) {
+                    error("'" + instr.name + "' is not definitely assigned here (V1_SPEC 0.6.10)");
+                    return;
+                }
+                const LType& st = it->second;
+                if (!st.is_struct()) {
+                    error(instr.name + " is " + type_str(st) +
+                          ", not a struct -- a field is read as s.field, so this "
+                          "instruction names a struct variable (4.6)");
+                    return;
+                }
+                const int64_t off = instr.int_imm;
+                if (off < 0 || off >= st.width) {
+                    error("field offset " + std::to_string(off) + " is out of range for " +
+                          type_str(st) + " -- valid offsets are 0.." +
+                          std::to_string(st.width - 1) + " (4.6)");
+                    return;
+                }
+                const LType field{instr.type_kind, instr.type_width, "", -1, "", -1};
+                if (field.kind != "int" && field.kind != "float" && field.kind != "bool") {
+                    error("a struct field is a scalar, got " +
+                          (field.kind.empty() ? std::string("an untyped field")
+                                              : type_str(field)) + " (4.6)");
+                    return;
+                }
+                // The load/store width is the field's own size, so the access
+                // must lie entirely inside the struct. The frontend lays fields
+                // out so this always holds; the checker is the backstop for a
+                // hand-written offset that would run past the blob.
+                int field_bytes = 1;
+                if (field.kind == "int" || field.kind == "float") field_bytes = field.width / 8;
+                if (off + field_bytes > st.width) {
+                    error("field at offset " + std::to_string(off) + " with type " +
+                          type_str(field) + " overruns " + type_str(st) + " (4.6)");
+                    return;
+                }
+                if (instr.op == Op::FieldLoad) {
+                    reg_types_[instr.result] = field;
+                } else {
+                    if (instr.args.empty()) {
+                        error("FieldStore needs a value");
+                        return;
+                    }
+                    check_value_into_target(instr.args.at(0), field,
+                                            "store into field of '" + instr.name + "'");
+                }
+                return;
+            }
             // Hardening item 5. Explicit numeric conversions (V1_SPEC 0.6.11).
             //
             // float(64, v) widens an int[8|16|32] EXACTLY to float[64] (every
@@ -965,6 +1045,15 @@ private:
                         error(instr.name + " is a dict, which has no index and no "
                               "length (4.3) -- read it as " + instr.name +
                               "[key] or ask contains(" + instr.name + ", key)");
+                        return;
+                    }
+                    // 4.6. A struct is neither a list nor a dict, but its field
+                    // access is name-based, so index/len is a different error
+                    // from "not a container" and worth naming concretely.
+                    if (ct.is_struct()) {
+                        error(instr.name + " is " + type_str(ct) +
+                              " -- a struct's fields are read by name (`" +
+                              instr.name + ".field`), not by index or len() (4.6)");
                         return;
                     }
                     error(instr.name + " is " + type_str(ct) + ", not a container -- " +
@@ -1507,6 +1596,22 @@ private:
             error("'" + instr.name + ": ptr pointees are int, float or bool only, got " +
                   type_str(t.element()) + " (4.4)");
             return LType{};
+        }
+        // 4.6. A struct's width is its total byte size, so it must be positive
+        // and carry no element/key (its shape lives entirely in the frontend's
+        // layout, not in the IR type). Zero or negative would size a frame run
+        // to nothing and let every field op report out of range.
+        if (t.kind == "struct") {
+            if (t.width <= 0) {
+                error("'" + instr.name + ": struct size must be positive, got " +
+                      std::to_string(t.width));
+                return LType{};
+            }
+            if (!t.elem_kind.empty() || !t.key_kind.empty()) {
+                error("'" + instr.name + ": struct carries no element or key type "
+                      "-- its layout is decided by the frontend (4.6)");
+                return LType{};
+            }
         }
         (void)container;
         return t;

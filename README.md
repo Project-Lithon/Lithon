@@ -56,7 +56,8 @@ print(result)
 The compiler is already executing substantial typed programs natively and has
 a verification suite covering machine-code encoding, ABI correctness, static
 analysis, SSA, register allocation, floating point, containers, pointers,
-AVX2 auto-vectorization, differential testing, and randomized fuzzing.
+structs, AVX2 auto-vectorization, differential testing, and randomized
+fuzzing.
 
 It is **not yet a stable production library** and should not be treated as a
 drop-in Python replacement.
@@ -118,6 +119,12 @@ z:int[64] = 9223372036854775807
 
 Lithon does not silently turn these into arbitrary-precision Python integers.
 
+Every integer width is **signed**: there is no `uint`. A negative `int[8]` /
+`int[16]` / `int[32]` keeps its value when it is read back out of a list
+element, a struct field, or a pointer, so `-5` stored into an `int[16]` prints
+`-5`, never the zero-extended bit pattern `65531`. `bool` is the one narrow type
+that is not signed: it reads back as `0` or `1`.
+
 ---
 
 ## 🧠 Static Typing
@@ -150,6 +157,7 @@ The compiler also checks:
 * function parameters
 * container element types
 * pointer types
+* struct field types
 * shift bounds
 * container capacities
 
@@ -651,6 +659,58 @@ Mutation after construction is intentionally not currently supported.
 
 ---
 
+## 🧱 Structs
+
+A struct is a named run of typed fields packed into one blob of bytes. It is
+spelled as a class deriving from `Struct`, whose body is nothing but field
+annotations:
+
+```python
+class Point(Struct):
+    x: int[64]
+    y: int[64]
+
+p: Point
+p.x = 3
+p.y = 4
+print(p.x)
+print(p.y)
+```
+
+The declaration `p: Point` reserves and zeroes the bytes. A struct **has no
+value** — the only operations are reading and writing fields, and the whole
+struct is never an expression you can print or assign.
+
+Fields are laid out end to end at exactly the offsets their sizes imply, with
+**no padding** (a `bool` is 1 byte, `float[64]` is 8, `int[w]` is `w / 8`), so
+the layout is a pure sum of field sizes and matches a C `#pragma pack(1)`
+struct byte for byte.
+
+```python
+class SockAddrIn(Struct):
+    family: int[16]   # offset 0
+    port: int[16]     # offset 2
+    addr: int[64]     # offset 4
+    active: bool      # offset 12
+
+s: SockAddrIn
+s.family = 2
+s.port = 80
+s.addr = 16909060
+s.active = True
+```
+
+A field may be a scalar (`int[w]`, `float[64]`, `bool`) or a struct declared
+earlier; a nested struct is flattened, so `seg.a.x` is a single read at the
+summed byte offset. Containers, pointers, whole-struct values, and struct
+parameters/returns are refused.
+
+`tools/check_struct_layout.py` compiles the same struct definitions with a C
+compiler and asserts the frontend's offsets and sizes equal the C
+`offsetof`/`sizeof` values, field by field.
+
+---
+
 ## 🧠 SSA and Optimization
 
 Lithon's compiler is progressively moving from a memory-based IR toward SSA.
@@ -832,6 +892,7 @@ Examples include:
 * static narrowing checks
 * definite-assignment analysis
 * fixed container capacities
+* packed, statically-laid-out structs
 * typed pointers
 * explicit `_` pointer naming
 * compile-time shift validation
@@ -933,6 +994,7 @@ than CPython, PyPy, Cython, Rust, or C++.
 * [x] Tuples
 * [x] Fixed dictionaries
 * [x] Typed pointers
+* [x] Packed structs
 * [x] ABI verification
 * [x] Differential testing
 * [x] Randomized compiler fuzzing
@@ -966,8 +1028,9 @@ Current limitations include:
 
 * x86-64 is the primary native backend.
 * ARM64 is not yet implemented.
-* More than two function arguments are not yet supported by the current native
-  calling pipeline.
+* Native calls carry the first two arguments in registers and the rest on the
+  stack, up to `kMaxParams` (currently 32); a call with more arguments than that
+  makes the native tier refuse rather than mis-pass them.
 * Some container operations remain intentionally restricted.
 * Pointer values have strict restrictions around function boundaries and
   container access.

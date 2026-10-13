@@ -112,7 +112,7 @@ inline PromotionMap select_promoted_variables(
             for (const auto& in : b.instrs) {
                 if (in.op == Op::Store && in.name == name &&
                     (in.type_kind == "list" || in.type_kind == "tuple" ||
-                     in.type_kind == "dict"))
+                     in.type_kind == "dict" || in.type_kind == "struct"))
                     return true;
                 if (in.op == Op::AddressOf && in.name == name) addressed = true;
             }
@@ -267,6 +267,17 @@ public:
         return dict_layouts_.count(name) != 0;
     }
 
+    // 4.6. A struct is a packed run of bytes, not a value and not a container:
+    // Index/IndexStore do not apply to it, but it is likewise kept out of
+    // register promotion and its byte size is what a field op indexes into.
+    bool is_struct(const std::string& name) const {
+        return struct_sizes_.count(name) != 0;
+    }
+    int struct_size(const std::string& name) const {
+        auto it = struct_sizes_.find(name);
+        return it == struct_sizes_.end() ? 0 : it->second;
+    }
+
     int variable_offset(const std::string& name) const {
         auto it = variable_offsets_.find(name);
         return it != variable_offsets_.end() ? it->second : 0;
@@ -406,6 +417,10 @@ private:
     std::unordered_map<std::string, int> container_stride_;
 
     std::unordered_map<std::string, DictLayout> dict_layouts_;
+    // 4.6. A struct variable's total byte size. Its base is recorded in
+    // variable_offsets_ like a container's; field ops address base + byte
+    // offset, so this is only needed to size the run and to answer is_struct.
+    std::unordered_map<std::string, int> struct_sizes_;
     std::vector<std::string> variable_order_;
     std::vector<std::pair<Reg, int>> callee_saved_slots_;
     // Callee-saved registers the TEMPORARIES borrowed (they must survive a call,
@@ -596,6 +611,26 @@ private:
             // not meaningful for it. Reusing element_offset here would silently
             // address bucket 0 of the key array for every element.
             if (assign_dict_slots(name)) return;
+
+            // 4.6. A struct is a packed run of bytes rounded up to whole slots.
+            // Unlike a container, no stride is registered: field access carries
+            // its own byte offset, so the only things needed are the base (in
+            // variable_offsets_) and the size (in struct_sizes_, which is also
+            // what is_struct tests). The run is zeroed at the declaration like
+            // a container's, so a struct declared inside a loop resets.
+            int struct_size = 0;
+            for (const auto& b2 : fn_.blocks)
+                for (const auto& in2 : b2.instrs)
+                    if (in2.op == lithon::ir::Op::Store && in2.name == name &&
+                        in2.type_kind == "struct")
+                        struct_size = in2.type_width;
+            if (struct_size > 0) {
+                const int slots = (struct_size + 7) / 8;
+                for (int i = 0; i < slots; ++i) allocate_new_slot();
+                variable_offsets_[name] = next_slot_offset_;
+                struct_sizes_[name] = struct_size;
+                return;
+            }
 
             if (cap > 1) {
                 const int stride = container_element_stride(elem_kind, elem_width);
