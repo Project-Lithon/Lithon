@@ -579,6 +579,32 @@ block0:
     call print, %3
     return
 """, "tier1"),
+    # Phase III. The raw syscall primitive. The result is the kernel's raw
+    # return, and getuid(2) is the same in both tier processes, so the printed
+    # value proves the interpreter and the JIT agree on the call. A single
+    # integer argument like this is tier-neutral by construction: no pointer
+    # crosses the boundary, so nothing depends on the interpreter's synthetic
+    # address space (pointer-taking syscalls are refused at typecheck).
+    "syscall_getuid": ("""
+function main():
+block0:
+    %0 = const_i64 102
+    %1 = syscall %0
+    call print, %1
+    return
+""", "tier1"),
+    # The number itself may be computed, not a literal: the op takes ordinary
+    # values, and the constant-folded result still reaches the same trampoline.
+    "syscall_computed_number": ("""
+function main():
+block0:
+    %0 = const_i64 100
+    %1 = const_i64 2
+    %2 = add %0, %1
+    %3 = syscall %2
+    call print, %3
+    return
+""", "tier1"),
 }
 
 # Programs that must FAIL at run time, the same way in both tiers.
@@ -652,7 +678,7 @@ block0:
     return
 """
 
-TRAP_MESSAGE = "error: interpreter: list index out of range"
+TRAP_MESSAGE = "error: list index out of range"
 TRAP_EXIT = 1
 
 # name -> (ir_text, expected_tier_for_auto, expected_stderr_substring)
@@ -664,9 +690,9 @@ TRAPS = {
     "load_index_eq_capacity": (TRAP_LOAD.replace("@N@", "4"), "tier1", TRAP_MESSAGE),
     "load_index_far_out": (TRAP_LOAD.replace("@N@", "99"), "tier1", TRAP_MESSAGE),
     "dict_miss": (TRAP_DICT_MISS.replace("@K@", "1"), "tier1",
-                  "error: interpreter: dict key not found"),
+                  "error: dict key not found"),
     "dict_miss_after_store": (TRAP_DICT_MISS.replace("@K@", "2"), "tier1",
-                              "error: interpreter: dict key not found"),
+                              "error: dict key not found"),
     # float -> int out of the target's range. No print happens before the trap
     # (the result would not exist), so both tiers must produce identical bytes:
     # just the LITHON-E0309 line and exit 1.
@@ -705,6 +731,42 @@ block0:
     call print, %2
     return
 """, "tier1", "LITHON-E0310: range step is zero"),
+    # A shift count that is dynamic (here a parameter, so the typechecker
+    # cannot prove it in range) traps in both tiers with the same text. This
+    # pins the shift trap's text and tier-neutrality; a literal count would be
+    # refused statically as E0103 and never reach the runtime guard.
+    "shift_left_count_out_of_range": ("""
+function sh(x: int[64], c: int[64]) -> int[64]:
+block0:
+    %0 = load x
+    %1 = load c
+    %2 = shl %0, %1
+    return %2
+
+function main():
+block0:
+    %0 = const_i64 1
+    %1 = const_i64 70
+    %2 = call sh, %0, %1
+    call print, %2
+    return
+""", "tier1", "error: shift count out of range 0..63 for `<<`"),
+    "shift_right_count_out_of_range": ("""
+function sh(x: int[64], c: int[64]) -> int[64]:
+block0:
+    %0 = load x
+    %1 = load c
+    %2 = shr %0, %1
+    return %2
+
+function main():
+block0:
+    %0 = const_i64 1
+    %1 = const_i64 70
+    %2 = call sh, %0, %1
+    call print, %2
+    return
+""", "tier1", "error: shift count out of range 0..63 for `>>`"),
 }
 
 # input(prompt) is impure, so --auto always falls back to the interpreter and
@@ -897,6 +959,14 @@ def check_trap(label, ir_path, expected_tier, expected_message):
         problems.append("STDOUT MISMATCH (output before the trap)\n"
                         f"      interp: {ref.stdout!r}\n"
                         f"      auto  : {auto.stdout!r}")
+    # The text a trap prints must be tier-neutral: the same sentence is shown
+    # whichever engine traps first, so it must never claim to come from the
+    # interpreter (or from the native tier). A message that names a tier is a
+    # lie half the time, and the banner line already says which engine ran.
+    for tag, err in (("interpreter", ref_err), ("auto", auto_err)):
+        for tier_word in ("interpreter:", "native:"):
+            if tier_word in err:
+                problems.append(f"{tag} stderr names a tier ({tier_word!r}): {err!r}")
     if expected_tier and tier != expected_tier:
         problems.append(f"expected {expected_tier}, ran {tier}")
 

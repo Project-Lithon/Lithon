@@ -156,10 +156,12 @@ public:
         has_return_type_ = has_return_type;
 
         Scope entry_scope;
+        bool header_invalid = false;
         for (size_t i = 0; i < fn_.params.size(); ++i) {
             if (fn_.param_type_kinds[i].empty()) {
                 error("function '" + fn_.name + "': parameter '" + fn_.params[i] +
                       "' has no type annotation (V1_SPEC 0.6.1, 0.6.8)");
+                header_invalid = true;
                 continue;
             }
             entry_scope[fn_.params[i]] = LType{fn_.param_type_kinds[i], fn_.param_type_widths[i]};
@@ -169,7 +171,16 @@ public:
         // implicit top-level function is __main__, and hand-written IR may use main.
         if (fn_.name != "main" && fn_.name != "__main__" && !has_return_type) {
             error("function '" + fn_.name + "' has no return type annotation (V1_SPEC 0.6.8)");
+            header_invalid = true;
         }
+
+        // A header with a missing annotation is already the one error worth
+        // reporting. Walking the body after it produces only consequences of
+        // that error -- an unannotated parameter is not in the entry scope, so
+        // each read of it becomes a spurious "not definitely assigned", and a
+        // call that returns the still-untyped value grows more of the same.
+        // Stop here so the user sees exactly the root cause.
+        if (header_invalid) return;
 
         build_block_graph();
         exempt_increment_stores_ = find_loop_increment_stores();
@@ -666,6 +677,21 @@ private:
         }
         if (const Instr* c = find_producing_const(id)) {
             if (target.kind == "int") {
+                // A bool literal is NOT an int literal. `True` carries
+                // int_imm == 1, so the range check below used to wave it
+                // straight through and return, and `v: int[64] = True` typed
+                // clean: the declaration became a contract about nothing, the
+                // register stayed bool-tagged, and both tiers happily printed
+                // True out of a name declared int. It never reached
+                // check_assignment_compatible, because this branch returns
+                // before it. Reject it here, where the constant is in hand.
+                if (c->op == Op::ConstBool) {
+                    error(context + ": " + std::string(c->int_imm ? "True" : "False") +
+                          " is a bool, but " + type_str(target) +
+                          " must hold an int -- Lithon does not convert bool to int on "
+                          "assignment; write 1 or 0 (V1_SPEC 0.6.11)");
+                    return;
+                }
                 auto [lo, hi] = int_range(target.width);
                 if (c->int_imm < lo || c->int_imm > hi) {
                     error(context + ": literal " + std::to_string(c->int_imm) + " does not fit " +
@@ -781,6 +807,11 @@ private:
             return;
         }
         for (size_t i = 0; i < instr.args.size(); ++i) {
+            // A callee parameter with no annotation is the callee's own header
+            // error, already reported there. Type-arguing the call against an
+            // empty type would only echo it as a nameless "cannot convert to "
+            // -- the cascade this skip exists to stop.
+            if (callee.param_types[i].kind.empty()) continue;
             check_value_into_target(instr.args[i], callee.param_types[i],
                 "argument " + std::to_string(i + 1) + " to '" + instr.name + "'");
         }
@@ -837,11 +868,13 @@ private:
                           " -- a pointer is an address with no storage of its own (4.4)");
                     return;
                 }
-                if (!t.is_scalar()) {
+                if (!t.is_scalar() && !t.is_struct()) {
                     error("cannot take the address of " + type_str(t) +
-                          " -- addressof takes a plain scalar variable (4.4)");
+                          " -- addressof takes a plain scalar variable or a struct (4.4)");
                     return;
                 }
+                // A struct's width IS its byte size, so ptr[struct[N]] carries
+                // the stride that pointer arithmetic scales by.
                 reg_types_[instr.result] = LType{"ptr", -1, t.kind, t.width, "", -1};
                 return;
             }
@@ -874,6 +907,33 @@ private:
             // and the field must be a scalar whose width fits from that offset.
             case Op::FieldLoad:
             case Op::FieldStore: {
+                // 4.4, second half. A field op whose subject starts with '%'
+                // goes through a POINTER: the last operand is the base, which
+                // must be a ptr[struct[N]], and the offset is bounded by that
+                // struct's size rather than by any named variable's. The named
+                // form below is unchanged.
+                if (instr.name.empty() && !instr.args.empty()) {
+                    const size_t base_arg =
+                        instr.op == Op::FieldStore ? instr.args.size() - 1 : 0;
+                    LType bt;
+                    if (!reg_type(instr.args[base_arg], bt)) {
+                        error("field access through a base that is unresolved (4.4)");
+                        return;
+                    }
+                    if (!bt.is_ptr() || bt.element().kind != "struct") {
+                        error("field access through " + type_str(bt) +
+                              " -- the base of a pointer-based field is a "
+                              "ptr[struct], e.g. addressof(p) (4.4)");
+                        return;
+                    }
+                    const int64_t poff = instr.int_imm;
+                    if (poff < 0 || poff >= bt.element().width) {
+                        error("field offset " + std::to_string(poff) + " is out of range for " +
+                              type_str(bt.element()) + " (4.4, 4.6)");
+                        return;
+                    }
+                    return;
+                }
                 auto it = scope.find(instr.name);
                 if (it == scope.end()) {
                     error("'" + instr.name + "' is not definitely assigned here (V1_SPEC 0.6.10)");
@@ -1012,6 +1072,44 @@ private:
                     error("guardnonzero needs an int value, got " + type_str(st));
                     return;
                 }
+                return;
+            }
+
+            // Phase III. The raw syscall primitive. `args` is the number
+            // followed by up to six arguments; each argument must be an int.
+            // A pointer is rejected on purpose: it would name an address in
+            // the interpreter's synthetic address space, so a kernel syscall
+            // that takes a pointer (write/read) could not behave the same in
+            // both tiers. Integer-only keeps the primitive tier-neutral. The
+            // result is the kernel's raw int64 return, unchecked: no fallible
+            // wrapper and no use-before-check rule in this slice, so it types
+            // as int[64].
+            case Op::Syscall: {
+                if (instr.args.empty()) {
+                    error("syscall() needs a syscall number");
+                    return;
+                }
+                if (instr.args.size() > 7) {
+                    error("syscall() takes a number and at most six arguments, got " +
+                          std::to_string(instr.args.size() - 1));
+                    return;
+                }
+                for (size_t i = 0; i < instr.args.size(); ++i) {
+                    LType at;
+                    if (!reg_type(instr.args[i], at)) {
+                        error("syscall() argument " + std::to_string(i) +
+                              " is unresolved");
+                        return;
+                    }
+                    if (at.kind != "int") {
+                        error("syscall() argument " + std::to_string(i) + " has type " +
+                              type_str(at) + " -- a raw syscall argument must be an "
+                              "integer in this slice; pointer-taking syscalls "
+                              "(write/read) are not yet supported (Phase III)");
+                        return;
+                    }
+                }
+                reg_types_[instr.result] = LType{"int", 64};
                 return;
             }
 
@@ -1591,10 +1689,21 @@ private:
             error("'" + instr.name + ": ptr needs an element type, e.g. ptr[int[64]]");
             return LType{};
         }
+        // 4.4, second half. A struct is a legal pointee: its bytes ARE its
+        // storage, so a pointer to one names the blob and `addressof(p)` is the
+        // base of the run. Its width is the byte size, which is what pointer
+        // arithmetic scales by. A container is still refused -- an address to a
+        // container would have to carry the container's shape, which a pointer
+        // cannot.
         if (t.kind == "ptr" && t.elem_kind != "int" && t.elem_kind != "float" &&
-            t.elem_kind != "bool") {
-            error("'" + instr.name + ": ptr pointees are int, float or bool only, got " +
+            t.elem_kind != "bool" && t.elem_kind != "struct") {
+            error("'" + instr.name + ": ptr pointees are int, float, bool or struct, got " +
                   type_str(t.element()) + " (4.4)");
+            return LType{};
+        }
+        if (t.kind == "ptr" && t.elem_kind == "struct" && t.elem_width <= 0) {
+            error("'" + instr.name + ": ptr[" + type_str(t.element()) + "] needs a struct "
+                  "with a known byte size, since pointer arithmetic scales by it (4.4)");
             return LType{};
         }
         // 4.6. A struct's width is its total byte size, so it must be positive

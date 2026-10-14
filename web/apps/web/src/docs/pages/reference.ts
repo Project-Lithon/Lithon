@@ -505,7 +505,7 @@ $ python3 tools/fuzz_diff.py --phi --count 300        # merges, with and without
           kind: "note",
           tone: "warn",
           title: "What a green run does not prove",
-          text: "Opcode coverage is not operand coverage. 25 of 26 opcodes are emitted and exercised, but that does not prove every operand shape is right: `Mod` is the standing example: the general fuzzer only emits finite constants, so it cannot generate `1.0 % inf`, which was returning NaN natively while the interpreter was correct.",
+          text: "Opcode coverage is not operand coverage. 26 of 27 opcodes are emitted and exercised, but that does not prove every operand shape is right: `Mod` is the standing example: the general fuzzer only emits finite constants, so it cannot generate `1.0 % inf`, which was returning NaN natively while the interpreter was correct.",
         },
       ],
     },
@@ -551,7 +551,7 @@ const limits: DocPage = {
         {
           kind: "table",
           rows: [
-            ["IR opcodes emitted", "25 of 26"],
+            ["IR opcodes emitted", "26 of 27"],
             [
               "`Phi`",
               "lowered, not emitted: blocks if-as-expression merges without a memory round-trip",

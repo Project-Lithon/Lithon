@@ -632,7 +632,14 @@ private:
                 return;
             }
 
-            if (cap > 1) {
+            // `cap == 0` is the "this is not a container" sentinel, so the test
+            // is `> 0`, not `> 1`. Using `> 1` sent a capacity-ONE list down the
+            // scalar path, where no container capacity is recorded: Index and
+            // IndexStore then failed the `container_capacity(name) == 0` check
+            // and the native tier refused with "index store into 'xs' which is
+            // not a container" for a list the typechecker and the interpreter
+            // both accept. One element is still a list.
+            if (cap > 0) {
                 const int stride = container_element_stride(elem_kind, elem_width);
                 if (stride <= 0) {
                     // The type layer deliberately accepts a nested container so
@@ -955,13 +962,18 @@ private:
                 bool store_seen = false;
                 for (const auto& in : fn_.blocks[pb].instrs) {
                     if (in.op == Op::Store && in.name == var) { store_seen = true; continue; }
-                    if (store_seen && in.op == Op::Call) { spans_call = true; break; }
+                    if (store_seen && (in.op == Op::Call || in.op == Op::Syscall)) {
+                        spans_call = true;
+                        break;
+                    }
                 }
                 if (spans_call) break;
             }
             if (!spans_call) {
-                for (int i = 0; i < load_pos; ++i)
-                    if (fn_.blocks[join].instrs[i].op == Op::Call) { spans_call = true; break; }
+                for (int i = 0; i < load_pos; ++i) {
+                    const Op op = fn_.blocks[join].instrs[i].op;
+                    if (op == Op::Call || op == Op::Syscall) { spans_call = true; break; }
+                }
             }
 
             for (size_t pb : g.pred[join]) {

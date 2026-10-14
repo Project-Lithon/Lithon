@@ -73,6 +73,29 @@ void expect_rejects(const char* what, const std::string& ir, const char* needle)
     }
 }
 
+// A header with a missing annotation is one root cause. The checker must
+// report it and stop, not walk the body and emit the consequences of the same
+// mistake (each unannotated read as "not definitely assigned", each call
+// result as a nameless conversion error). This asserts the documented error
+// appears while none of the cascade strings do.
+void expect_no_cascade(const char* what, const std::string& ir,
+                       const char* documented, const std::vector<std::string>& banned) {
+    const std::string errs = errors_for(ir);
+    if (errs.find(documented) == std::string::npos) {
+        std::printf("  FAIL %s: root-cause error missing: %s\n", what, errs.c_str());
+        ++failures;
+        return;
+    }
+    for (const auto& b : banned) {
+        if (errs.find(b) != std::string::npos) {
+            std::printf("  FAIL %s: cascaded with %s: %s\n", what, b.c_str(), errs.c_str());
+            ++failures;
+            return;
+        }
+    }
+    std::printf("  ok   %s\n", what);
+}
+
 const char* kFloatDeclIntLiteral = R"(
 function __main__():
 block0:
@@ -1349,7 +1372,34 @@ function __main__():
 block0:
     store _p : ptr[list[int[64], 4]]
     return
-)", "ptr pointees are int, float or bool only");
+)", "ptr pointees are int, float, bool or struct");
+
+    // 4.4, second half. A struct is a legal pointee: its bytes ARE its
+    // storage, so addressof names the blob. The IR carries `ptr[struct[N]]`
+    // and no struct NAME -- kind plus byte size -- which is what lets the
+    // frontend resolve `ptr[Point]` before rendering and the C++ side read it
+    // back with no change to its own type parser.
+    expect_accepts("pointer to a struct", R"(
+function __main__():
+block0:
+    store pt : struct[8]
+    %0 = const_i64 7
+    fieldstore pt, 0, %0 : int[32]
+    %1 = addressof pt
+    store _pp, %1 : ptr[struct[8]]
+    return
+)");
+
+    // A container is still refused: an address to a container would have to
+    // carry the container's shape, which a pointer cannot.
+    expect_rejects("pointer to a list is still refused", R"(
+function __main__():
+block0:
+    store xs : list[int[64], 4]
+    %0 = addressof xs
+    store _p, %0 : ptr[list[int[64], 4]]
+    return
+)", "ptr pointees are int, float, bool or struct");
 
     std::printf("typecheck: 0.6.10 uninitialized declarations\n");
 
@@ -1711,6 +1761,219 @@ block0:
     store z, %3 : int[64]
     %4 = load z
     call print, %4
+    return
+)");
+
+    // Hardening #7: a missing annotation is one error, not four. The body of a
+    // header-invalid function is not walked, so its reads of the unannotated
+    // parameter never become "'x' is not definitely assigned"; and a call into
+    // it is not type-argued against the empty parameter type, so it never
+    // becomes a "cannot convert to " with a nameless target.
+    expect_no_cascade("unannotated parameter does not cascade", R"(
+function f(x):
+block0:
+    %0 = load x
+    %1 = const_f64 1.5
+    %2 = add %0, %1
+    store r, %2 : float[64]
+    %3 = load r
+    return %3
+
+function __main__():
+block0:
+    %0 = const_f64 2.5
+    %1 = call f, %0
+    call print, %1
+    return
+)", "has no type annotation", {"not definitely assigned", "cannot convert"});
+
+    expect_no_cascade("missing return type does not cascade", R"(
+function f(x: int[64]):
+block0:
+    %0 = load x
+    return %0
+
+function __main__():
+block0:
+    %0 = const_i64 3
+    %1 = call f, %0
+    store r, %1 : int[64]
+    %2 = load r
+    call print, %2
+    return
+)", "has no return type annotation", {"not definitely assigned", "cannot convert"});
+
+    // Phase III: the raw syscall primitive. The result is the kernel's raw
+    // int64 return, so it types as int[64] no matter what the arguments were --
+    // including when the syscall obviously failed.
+    expect_accepts("syscall with a number only", R"(
+function __main__():
+block0:
+    %0 = const_i64 102
+    %1 = syscall %0
+    call print, %1
+    return
+)");
+
+    expect_accepts("syscall with the number and all six arguments", R"(
+function __main__():
+block0:
+    %0 = const_i64 39
+    %1 = const_i64 1
+    %2 = const_i64 2
+    %3 = const_i64 3
+    %4 = const_i64 4
+    %5 = const_i64 5
+    %6 = const_i64 6
+    %7 = syscall %0, %1, %2, %3, %4, %5, %6
+    store r, %7 : int[64]
+    %8 = load r
+    call print, %8
+    return
+)");
+
+    // A narrow int is still an int: the kernel reads a machine word, and this
+    // slice does not require the caller to widen by hand.
+    expect_accepts("syscall accepts a narrow int argument", R"(
+function __main__():
+block0:
+    %0 = const_i64 3
+    store n, %0 : int[8]
+    %1 = load n
+    %2 = const_i64 39
+    %3 = syscall %2, %1
+    call print, %3
+    return
+)");
+
+    // The number itself is a value like any other, not a required literal.
+    expect_accepts("syscall number may be computed", R"(
+function __main__():
+block0:
+    %0 = const_i64 100
+    %1 = const_i64 2
+    %2 = add %0, %1
+    %3 = syscall %2
+    call print, %3
+    return
+)");
+
+    // A pointer argument is refused, and the refusal is the point: the
+    // interpreter's pointers are synthetic addresses, so a pointer-taking
+    // syscall (write/read) could not behave the same in both tiers. Accepting
+    // it would ship a construct that works natively and faults in the oracle.
+    expect_rejects("syscall refuses a pointer argument", R"(
+function __main__():
+block0:
+    %0 = const_i64 65
+    store x, %0 : int[64]
+    %1 = addressof x
+    %2 = const_i64 1
+    %3 = syscall %2, %1
+    call print, %3
+    return
+)", "a raw syscall argument must be an integer in this slice");
+
+    expect_rejects("syscall refuses a float argument", R"(
+function __main__():
+block0:
+    %0 = const_i64 39
+    %1 = const_f64 2.0
+    %2 = syscall %0, %1
+    call print, %2
+    return
+)", "a raw syscall argument must be an integer in this slice");
+
+    // A syscall needs a number; with no operands at all there is nothing to
+    // call, so this is a static refusal rather than a runtime surprise.
+    expect_rejects("syscall with no operands", R"(
+function __main__():
+block0:
+    %0 = syscall
+    call print, %0
+    return
+)", "syscall() needs a syscall number");
+
+    // Six is the architectural limit (the number plus six arguments), so a
+    // seventh argument is refused rather than silently dropped.
+    expect_rejects("syscall with a seventh argument", R"(
+function __main__():
+block0:
+    %0 = const_i64 39
+    %1 = const_i64 1
+    %2 = const_i64 2
+    %3 = const_i64 3
+    %4 = const_i64 4
+    %5 = const_i64 5
+    %6 = const_i64 6
+    %7 = const_i64 7
+    %8 = syscall %0, %1, %2, %3, %4, %5, %6, %7
+    call print, %8
+    return
+)", "at most six arguments");
+
+    // A bool LITERAL carries int_imm == 1, so the literal range check used to
+    // wave it through and `v: int[64] = True` typed clean -- the declaration
+    // became a contract about nothing and both tiers printed True out of a name
+    // declared int. A float literal was already rejected here; a bool one is
+    // now rejected the same way instead of returning before the conversion
+    // check that would have caught it.
+    expect_rejects("bool literal into an int declaration", R"(
+function __main__():
+block0:
+    %0 = const_bool 1
+    store v, %0 : int[64]
+    %1 = load v
+    call print, %1
+    return
+)", "is a bool, but int[64] must hold an int");
+
+    expect_rejects("False literal into a narrow int declaration", R"(
+function __main__():
+block0:
+    %0 = const_bool 0
+    store v, %0 : int[8]
+    %1 = load v
+    call print, %1
+    return
+)", "is a bool, but int[8] must hold an int");
+
+    // A bool into a bool-typed name is of course fine -- the new check keys on
+    // the CONSTANT's opcode against an int target, so it must not fire here.
+    expect_accepts("bool literal into a bool declaration", R"(
+function __main__():
+block0:
+    %0 = const_bool 1
+    store b, %0 : bool
+    %1 = load b
+    call print, %1
+    return
+)");
+
+    // The non-literal form of the same mistake goes through the ordinary
+    // conversion check rather than the constant branch, and was already
+    // refused; this pins that the two paths agree.
+    expect_rejects("bool value into an int declaration", R"(
+function __main__():
+block0:
+    %0 = const_bool 1
+    store b, %0 : bool
+    %1 = load b
+    store v, %1 : int[64]
+    %2 = load v
+    call print, %2
+    return
+)", "cannot convert bool to int[64]");
+
+    // An int literal into an int target must still be accepted -- the check is
+    // on the constant's opcode, not on its value.
+    expect_accepts("int literal into an int declaration", R"(
+function __main__():
+block0:
+    %0 = const_i64 1
+    store v, %0 : int[64]
+    %1 = load v
+    call print, %1
     return
 )");
 

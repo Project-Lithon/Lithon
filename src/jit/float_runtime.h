@@ -27,11 +27,13 @@ namespace lithon::jit {
 // whatever instruction happens to follow the call.
 //
 // This is the JIT's counterpart to the interpreter's
-// `throw std::runtime_error("interpreter: division by zero")`, which
-// hello.cpp catches and reports as "error: ..." before returning 1.
-// Both paths therefore produce the same stderr text and the same exit
-// status, which is what lets run_tier_diff.py treat the interpreter as
-// an oracle for float code.
+// `throw std::runtime_error("division by zero")`, which hello.cpp
+// catches and reports as "error: ..." before returning 1. Both paths
+// therefore produce the same stderr text and the same exit status, which
+// is what lets run_tier_diff.py treat the interpreter as an oracle for
+// float code. The message is tier-neutral on purpose: the identical
+// sentence is printed whichever engine traps, so it never claims to come
+// from the interpreter.
 [[noreturn]] inline void host_report_error(const char* message) {
     std::fputs(message, stderr);
     std::fflush(stderr);

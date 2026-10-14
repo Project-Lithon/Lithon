@@ -21,6 +21,7 @@ operands), not, print(), if/elif/else, conditional expressions
 function calls, return.
 """
 import ast
+import copy
 import sys
 
 
@@ -73,14 +74,187 @@ def render_type_suffix(kind, width, elem_kind=None, elem_width=None,
     return f" : {kind}[{width}]"
 
 
-def parse_type_annotation(node):
+# 4.8. A type function is a compile-time type constructor, a "structural
+# typedef": `def Name(p, ...) -> NewType: return { T }`. Applying it substitutes
+# the call's arguments for the parameters and re-parses the body through
+# `parse_type_annotation`, so the result is an ordinary type -- a 6-tuple
+# indistinguishable from the expansion spelled out. Two equal expansions are
+# the same type, the result is interchangeable with the spelled-out form, and
+# nothing about the type function survives into the IR.
+#
+# `NewType` is a reserved marker: a `def` returning it is a type function, not a
+# runtime function, and emits no code. The body is exactly one type expression
+# in a one-element set literal -- `{ T }`. `{}` parses as ast.Dict (empty) and a
+# `{k: v}` display as a non-empty ast.Dict, so both are refused by kind, and a
+# `{x for ...}` comprehension is an ast.SetComp; only an ast.Set of one element
+# is a type body.
+TYPE_FUNCTION_MARKER = "NewType"
+
+
+class TypeFunction:
+    """One `def Name(p, ...) -> NewType: return { T }` declaration."""
+
+    __slots__ = ("name", "params", "body_node")
+
+    def __init__(self, name, params, body_node):
+        self.name = name
+        self.params = params          # list of parameter names, in order
+        self.body_node = body_node    # the single type expression inside { }
+
+
+# Populated once per run by `build_type_functions`, before any annotation is
+# parsed, because `parse_type_annotation` is the one choke point that resolves a
+# type-function call. The two side tables are per-run working state: the cache
+# memoizes a call's expansion by its structural shape (`ast.dump`, which ignores
+# source positions), and the active stack names the type functions currently
+# being expanded, which is what catches direct and mutual recursion.
+TYPE_FUNCTIONS = {}
+_TYPE_FUNC_CACHE = {}
+_TYPE_FUNC_ACTIVE = []
+
+
+class _TypeSubst(ast.NodeTransformer):
+    """Replaces each parameter `Name` in a type-function body with a deep copy of
+    the argument node the call supplied. A deep copy matters because one
+    parameter may be used more than once (`list[t, n]` then `n` again), and the
+    same node must not end up shared in the substituted tree."""
+
+    def __init__(self, mapping):
+        self.mapping = mapping
+
+    def visit_Name(self, node):
+        if node.id in self.mapping:
+            return copy.deepcopy(self.mapping[node.id])
+        return node
+
+
+def _collect_method_locals(body):
+    """Every name a method body binds: assignment, annotation, for-target and
+    match-capture names. These are the names an inlining must rename so a
+    method local can never capture or clobber a caller local.
+
+    A Store-context `Name` covers assignment, annotation, augmented assignment,
+    for-targets and comprehension targets. `match` captures are not `Name`
+    nodes, so `MatchAs`/`MatchStar` are collected explicitly.
+    """
+    names = set()
+    for node in ast.walk(ast.Module(body=body, type_ignores=[])):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            names.add(node.id)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            names.add(node.name)
+    return names
+
+
+class _MethodSubst(ast.NodeTransformer):
+    """Rewrites a method body for inlining: every occurrence of `self` becomes
+    the receiver place, and every parameter/local name is renamed to a call-site
+    unique name. Type annotations are left untouched -- they name types, never
+    locals -- so a struct name that happens to match a local is not rewritten."""
+
+    def __init__(self, rename, self_repl):
+        self.rename = rename
+        self.self_repl = self_repl
+
+    def visit_Name(self, node):
+        if node.id == "self" and self.self_repl is not None:
+            return copy.deepcopy(self.self_repl)
+        if node.id in self.rename:
+            node.id = self.rename[node.id]
+        return node
+
+    def visit_AnnAssign(self, node):
+        # Rename the target and the value, but not the annotation.
+        node.target = self.visit(node.target)
+        if node.value is not None:
+            node.value = self.visit(node.value)
+        return node
+
+    def visit_MatchAs(self, node):
+        if node.name in self.rename:
+            node.name = self.rename[node.name]
+        if node.pattern is not None:
+            node.pattern = self.visit(node.pattern)
+        return node
+
+    def visit_MatchStar(self, node):
+        if node.name in self.rename:
+            node.name = self.rename[node.name]
+        return node
+
+def _expand_type_function(call):
+    """Expands `Name(args...)` to the parsed type its body denotes.
+
+    Refuses an unknown callee, a keyword argument, an arity mismatch, and a
+    recursive type function, each by name, and refuses to build a type whose
+    substituted body is not itself a valid type (that surfaces from
+    `parse_type_annotation` on the substituted body).
+    """
+    func = call.func
+    if not isinstance(func, ast.Name):
+        raise NotImplementedError(
+            "LITHON-E0133: a type function call must be a plain name, e.g. "
+            "`Fixed(int[64], 4)` (4.8)")
+    name = func.id
+    tf = TYPE_FUNCTIONS.get(name)
+    if tf is None:
+        raise NotImplementedError(
+            f"LITHON-E0133: '{name}(...)' is not a declared type function; declare it "
+            f"with `def {name}(...) -> NewType: return {{ ... }}` (4.8)")
+    if call.keywords:
+        raise NotImplementedError(
+            f"LITHON-E0133: type function '{name}' takes positional type arguments only (4.8)")
+    if any(isinstance(a, ast.Starred) for a in call.args):
+        raise NotImplementedError(
+            f"LITHON-E0133: type function '{name}' cannot be applied with a starred "
+            f"argument (4.8)")
+    if len(call.args) != len(tf.params):
+        raise NotImplementedError(
+            f"LITHON-E0133: type function '{name}' takes {len(tf.params)} type "
+            f"argument(s), got {len(call.args)} (4.8)")
+
+    key = ast.dump(call)
+    cached = _TYPE_FUNC_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if name in _TYPE_FUNC_ACTIVE:
+        chain = " -> ".join(_TYPE_FUNC_ACTIVE + [name])
+        raise NotImplementedError(
+            f"LITHON-E0133: type function '{name}' is recursive ({chain}); a type function "
+            f"must bottom out in a concrete type (4.8)")
+
+    mapping = {p: a for p, a in zip(tf.params, call.args)}
+    substituted = _TypeSubst(mapping).visit(copy.deepcopy(tf.body_node))
+    _TYPE_FUNC_ACTIVE.append(name)
+    try:
+        result = parse_type_annotation(substituted)
+    finally:
+        _TYPE_FUNC_ACTIVE.pop()
+    _TYPE_FUNC_CACHE[key] = result
+    return result
+
+
+def parse_type_annotation(node, structs=None):
     """Returns (kind, width, elem_kind, elem_width, key_kind, key_width) from an
     annotation AST node, or raises NotImplementedError for forms this frontend
     slice doesn't handle.
     elem_kind/elem_width are None for every scalar and set for every container.
-    key_kind/key_width are set only for a dict.
+     key_kind/key_width are set only for a dict.
+    `structs` maps a struct type name to its layout. It is needed only to write
+    `ptr[Point]`: a struct is named at the source but the IR carries no struct
+    NAMES at all (a struct is `struct[N]`, kind plus byte size), so the name
+    has to be resolved to its size here, before it can be rendered.
     Mirrors the C++ parse_type_string, kept independent since this is a separate
     scaffolding tool (frontend vs IR parser)."""
+    if isinstance(node, ast.Call):
+        # 4.8. A call in annotation position is a type function application. It
+        # is resolved here, the single choke point every annotation flows
+        # through, so a type function works anywhere an annotation is allowed:
+        # a declaration, a parameter, a return, a container element, a struct
+        # field, a dict key/value, or a pointer pointee.
+        return _expand_type_function(node)
+
     if isinstance(node, ast.Name):
         if node.id == "bool":
             return "bool", -1, None, None, None, None
@@ -98,7 +272,7 @@ def parse_type_annotation(node):
         if base == "dict":
             return _parse_dict_annotation(node.slice)
         if base == "ptr":
-            return _parse_ptr_annotation(node.slice)
+            return _parse_ptr_annotation(node.slice, structs)
         if base in CONTAINER_KINDS:
             return _parse_container_annotation(base, node.slice)
         if base not in ("int", "float", "str"):
@@ -162,7 +336,7 @@ def _parse_dict_annotation(slice_node):
     return "dict", cap_node.value, val_kind, val_width, key_kind, key_width
 
 
-def _parse_ptr_annotation(slice_node):
+def _parse_ptr_annotation(slice_node, structs=None):
     """Parses the `T` of `ptr[T]`, e.g. `ptr[int[64]]`.
 
     4.4. The pointee is a plain scalar, and it must carry its size. An address
@@ -172,7 +346,15 @@ def _parse_ptr_annotation(slice_node):
     a stack slot address on the run side). So the pointee grants the pointer
     exactly one of int, float or bool at a stated width -- the width is what
     valueof needs to know how many bytes to read.
+
+    4.4, second half. A struct is also a legal pointee: its bytes ARE its
+    storage, so `addressof(pt)` names the blob and pointer arithmetic advances
+    by the whole struct. The name is resolved to the layout's byte size here,
+    because the IR carries `ptr[struct[N]]` and never a struct NAME -- which is
+    also why the C++ side needs no change: `struct[N]` already parses.
     """
+    if structs and isinstance(slice_node, ast.Name) and slice_node.id in structs:
+        return "ptr", -1, "struct", structs[slice_node.id].size, None, None
     if not isinstance(slice_node, (ast.Name, ast.Subscript)):
         raise NotImplementedError("LITHON-E0113: ptr[T] needs a scalar pointee, e.g. ptr[int[64]] (4.4)")
     elem_kind, elem_width, elem_elem_kind, elem_elem_width, _, _ = \
@@ -269,6 +451,14 @@ CONTAINER_KINDS = ("list", "tuple", "dict")
 # distinguishes a struct definition from a class this frontend does not support.
 STRUCT_BASE = "Struct"
 
+# 4.7. An enum is declared by subclassing the builtin `Enum` marker, the same
+# way a struct derives from `Struct`. Each member is a variant: a bare name
+# (unit), an annotation (a payload), or an inline `class V(Struct)` (a struct
+# payload). The tag/payload byte layout is computed here and frozen into the
+# same fieldload/fieldstore instructions a struct uses, so the tiers never learn
+# what a variant is.
+ENUM_BASE = "Enum"
+
 
 class StructLayout:
     """The packed byte layout of one struct type.
@@ -281,36 +471,44 @@ class StructLayout:
     what a field is called.
     """
 
-    __slots__ = ("name", "fields", "size")
+    __slots__ = ("name", "fields", "size", "methods")
 
     def __init__(self, name):
         self.name = name
         self.fields = {}   # field name -> {kind, width, offset, byte_size, struct_name}
         self.size = 0
+        # 4.9. Methods declared in the class body, name -> the FunctionDef. A
+        # method is not a value and emits no code of its own: a call inlines it
+        # at the call site, where the receiver is a concrete place.
+        self.methods = {}
 
 
-def _struct_field_type(struct_name, field_name, ann, registry):
-    """Resolves a field annotation to (kind, width, struct_name, byte_size).
+def _struct_field_type(struct_name, field_name, ann, structs, enums):
+    """Resolves a field annotation to (kind, width, ref_name, byte_size).
 
-    A field is int[w], float[64], bool, or a struct that was declared EARLIER.
-    Requiring earlier declaration is what makes the size of a nested struct
-    known here and, at the same time, makes a cycle impossible: a struct that
-    cannot name itself or a later struct has no way to be infinitely large.
+    A field is int[w], float[64], bool, a struct, or an enum, each declared
+    EARLIER. Requiring earlier declaration is what makes the size of a nested
+    aggregate known here and, at the same time, makes a cycle impossible: a
+    struct that cannot name itself or a later aggregate has no way to be
+    infinitely large. The returned ref_name names the struct or enum a field of
+    that kind embeds, and is None for a scalar.
     """
     if isinstance(ann, ast.Name):
-        if ann.id in registry:
-            return "struct", -1, ann.id, registry[ann.id].size
+        if ann.id in structs:
+            return "struct", -1, ann.id, structs[ann.id].size
+        if ann.id in enums:
+            return "enum", -1, ann.id, enums[ann.id].size
         if ann.id not in ("int", "float", "bool"):
             raise NotImplementedError(
                 f"LITHON-E0127: field '{field_name}' of struct '{struct_name}' has unknown type "
-                f"'{ann.id}' -- a field is int[w], float[64], bool, or a struct declared "
+                f"'{ann.id}' -- a field is int[w], float[64], bool, a struct or an enum declared "
                 f"earlier (4.6)")
     kind, width, elem_kind, elem_width, _key_kind, _key_width = parse_type_annotation(ann)
     if kind in CONTAINER_KINDS or kind == "ptr" or elem_kind is not None:
         raise NotImplementedError(
             f"LITHON-E0127: field '{field_name}' of struct '{struct_name}' is a {kind}; 4.6 "
-            f"fields are int[w], float[64], bool, or a plain struct -- a container or pointer "
-            f"cannot be stored in a struct")
+            f"fields are int[w], float[64], bool, a plain struct or an enum -- a container or "
+            f"pointer cannot be stored in a struct")
     if kind not in ("int", "float", "bool"):
         raise NotImplementedError(
             f"LITHON-E0127: field '{field_name}' of struct '{struct_name}' has unsupported "
@@ -324,59 +522,418 @@ def _struct_field_type(struct_name, field_name, ann, registry):
     return kind, width, None, width // 8
 
 
-def build_struct_registry(tree):
-    """Collects every `class Foo(Struct)` definition into a {name: StructLayout}.
+def _method_scalar_type(ann, owner_name, method_name, what, structs, enums):
+    """Validates that a method parameter or return annotation is a scalar.
 
-    Runs before any function is built, so a struct declared at module level is
-    visible as a field type to any later struct and as a variable type to any
-    function. Struct definitions may reference only EARLIER ones (see
-    _struct_field_type); the registry is built in source order to make that the
-    natural case rather than a checked one.
+    A method is inlined at the call site, so its parameters are evaluated once
+    into locals and its result is a local: both must be scalar value types. A
+    struct or enum is storage and cannot be one; a container or pointer is
+    passed by value elsewhere and is out of scope for a method signature.
+    """
+    if isinstance(ann, ast.Name) and ann.id == "bool":
+        return
+    if isinstance(ann, ast.Name) and (ann.id in structs or ann.id in enums
+                                      or ann.id == owner_name):
+        if ann.id == owner_name:
+            described = f"the enclosing type '{ann.id}'"
+        else:
+            described = f"the {'struct' if ann.id in structs else 'enum'} '{ann.id}'"
+        raise NotImplementedError(
+            f"LITHON-E0134: {what} of method '{owner_name}.{method_name}' is {described}; a "
+            f"method takes and returns scalar int[w], float[64] or bool (4.9)")
+    kind, width, elem_kind, elem_width, key_kind, key_width = parse_type_annotation(ann)
+    if kind == "ptr" or elem_kind is not None or key_kind is not None:
+        raise NotImplementedError(
+            f"LITHON-E0134: {what} of method '{owner_name}.{method_name}' is a {kind}; a method "
+            f"takes and returns scalar int[w], float[64] or bool (4.9)")
+    if kind not in ("int", "float", "bool"):
+        raise NotImplementedError(
+            f"LITHON-E0134: {what} of method '{owner_name}.{method_name}' is unsupported "
+            f"({kind}); a method takes and returns scalar int[w], float[64] or bool (4.9)")
+
+
+def _validate_method(stmt, owner_name, layout, structs, enums):
+    """Validates one `def` in a struct or enum class body and stores it.
+
+    The receiver is implicit: the first parameter must be the unannotated name
+    `self`, and the rest are annotated scalars. Methods are not overloaded and
+    there is no inheritance, so a name must be unique within the class and may
+    not shadow a field or a variant. The body is validated when the method is
+    inlined (it needs a receiver to resolve `self.field`); only the signature is
+    frozen here.
+    """
+    method_name = stmt.name
+    if stmt.decorator_list:
+        raise NotImplementedError(
+            f"LITHON-E0134: method '{owner_name}.{method_name}' cannot carry a decorator (4.9)")
+    a = stmt.args
+    if (a.posonlyargs or a.vararg or a.kwonlyargs or a.kwarg
+            or a.defaults or a.kw_defaults):
+        raise NotImplementedError(
+            f"LITHON-E0134: method '{owner_name}.{method_name}' takes only plain positional "
+            f"parameters -- no `/`, `*`, `**` or defaults (4.9)")
+    if not a.args:
+        raise NotImplementedError(
+            f"LITHON-E0134: method '{owner_name}.{method_name}' must take `self` as its first "
+            f"parameter (4.9)")
+    self_arg = a.args[0]
+    if self_arg.arg != "self":
+        raise NotImplementedError(
+            f"LITHON-E0134: the first parameter of method '{owner_name}.{method_name}' must be "
+            f"named `self`, the implicit receiver (4.9)")
+    if self_arg.annotation is not None:
+        raise NotImplementedError(
+            f"LITHON-E0134: `self` of method '{owner_name}.{method_name}' must be unannotated "
+            f"-- it names the receiver, not a value (4.9)")
+    for p in a.args[1:]:
+        if p.annotation is None:
+            raise NotImplementedError(
+                f"LITHON-E0134: parameter '{p.arg}' of method '{owner_name}.{method_name}' must "
+                f"be annotated, e.g. `{p.arg}: int[64]` (4.9)")
+        _method_scalar_type(p.annotation, owner_name, method_name,
+                            f"parameter '{p.arg}'", structs, enums)
+    if stmt.returns is not None:
+        _method_scalar_type(stmt.returns, owner_name, method_name, "return type", structs, enums)
+    if method_name in getattr(layout, "fields", {}) \
+            or method_name in getattr(layout, "variant_by_name", {}):
+        raise NotImplementedError(
+            f"LITHON-E0134: method '{owner_name}.{method_name}' collides with a field or "
+            f"variant of the same name (4.9)")
+    if method_name in layout.methods:
+        raise NotImplementedError(
+            f"LITHON-E0134: method '{owner_name}.{method_name}' is declared more than once (4.9)")
+    layout.methods[method_name] = stmt
+
+
+def _build_struct_layout(stmt, structs, enums):
+    """Validates one `class Name(Struct)` body and inserts its StructLayout.
+
+    Shared by the module-level struct pass and by an enum's inline struct
+    variant, so the two spellings produce byte-identical layouts.
+    """
+    if stmt.name in structs or stmt.name in enums:
+        raise NotImplementedError(
+            f"LITHON-E0126: type '{stmt.name}' is declared more than once (4.6/4.7)")
+    layout = StructLayout(stmt.name)
+    offset = 0
+    for member in stmt.body:
+        if isinstance(member, ast.FunctionDef):
+            # 4.9. A method: no field, no offset, no code of its own.
+            _validate_method(member, stmt.name, layout, structs, enums)
+            continue
+        if not isinstance(member, ast.AnnAssign):
+            raise NotImplementedError(
+                f"LITHON-E0126: struct '{stmt.name}' may contain only field annotations "
+                f"(`name: type`) and methods (`def`); found a {type(member).__name__} (4.6)")
+        if not isinstance(member.target, ast.Name):
+            raise NotImplementedError(
+                f"LITHON-E0126: a field of struct '{stmt.name}' must be a plain name, not "
+                f"a subscript or attribute (4.6)")
+        field_name = member.target.id
+        if field_name in layout.fields:
+            raise NotImplementedError(
+                f"LITHON-E0127: struct '{stmt.name}' declares field '{field_name}' more "
+                f"than once (4.6)")
+        kind, width, ref_name, byte_size = _struct_field_type(
+            stmt.name, field_name, member.annotation, structs, enums)
+        layout.fields[field_name] = {
+            "kind": kind, "width": width, "offset": offset, "byte_size": byte_size,
+            "struct_name": ref_name if kind == "struct" else None,
+            "enum_name": ref_name if kind == "enum" else None,
+        }
+        offset += byte_size
+    if not layout.fields:
+        raise NotImplementedError(
+            f"LITHON-E0126: struct '{stmt.name}' has no fields -- a struct needs at least "
+            f"one int[w], float[64], bool, a nested struct or an enum field (4.6)")
+    layout.size = offset
+    structs[stmt.name] = layout
+    return layout
+
+
+class EnumLayout:
+    """The packed byte layout of one enum type: `[tag][payload]`, no padding.
+
+    Like a StructLayout this is the canonical layout -- the tag offset (always 0)
+    and each payload offset are frozen into fieldload/fieldstore instructions, so
+    the C++ side sees only bytes. The tag starts at 0 and is an int[8] while the
+    enum has at most 128 variants (0..127, the positive range of a signed byte)
+    and an int[16] beyond that. Its value is the variant's declaration index.
+    The payload begins at the tag width; inactive payload bytes are undefined and
+    are never read.
+    """
+
+    __slots__ = ("name", "variants", "variant_by_name", "tag_width",
+                 "payload_offset", "size", "methods")
+
+    def __init__(self, name):
+        self.name = name
+        self.variants = []        # [{name, tag, payload, payload_offset}]
+        self.variant_by_name = {}
+        self.tag_width = 8
+        self.payload_offset = 1
+        self.size = 0
+        # 4.9. Methods declared in the class body, name -> the FunctionDef.
+        self.methods = {}
+
+
+def _enum_payload_type(enum_name, variant_name, ann, structs, enums):
+    """Resolves a variant payload annotation to a descriptor, or None for unit.
+
+    A payload is a scalar, or a struct declared earlier. A container payload
+    would need a nested run that the flat byte blob cannot index, and an
+    enum-valued payload would need nested construction; both are refused here
+    rather than silently mis-laid-out.
+    """
+    if isinstance(ann, ast.Name) and ann.id in enums:
+        raise NotImplementedError(
+            f"LITHON-E0130: variant '{variant_name}' of enum '{enum_name}' has an enum-typed "
+            f"payload; 4.7 payloads are a scalar or a struct (4.7)")
+    if isinstance(ann, ast.Name) and ann.id in structs:
+        return {"kind": "struct", "width": -1, "struct_name": ann.id,
+                "byte_size": structs[ann.id].size}
+    kind, width, elem_kind, elem_width, _key_kind, _key_width = parse_type_annotation(ann)
+    if kind in CONTAINER_KINDS or kind == "ptr" or elem_kind is not None:
+        raise NotImplementedError(
+            f"LITHON-E0130: variant '{variant_name}' of enum '{enum_name}' has a {kind} payload; "
+            f"4.7 payloads are a scalar, a struct or (later) a list -- a container is laid out "
+            f"elsewhere and cannot live inside the enum blob (4.7)")
+    if kind not in ("int", "float", "bool"):
+        raise NotImplementedError(
+            f"LITHON-E0130: variant '{variant_name}' of enum '{enum_name}' has unsupported "
+            f"payload type {kind} (4.7)")
+    if kind == "bool":
+        return {"kind": "bool", "width": -1, "struct_name": None, "byte_size": 1}
+    if width is None or width <= 0:
+        raise NotImplementedError(
+            f"LITHON-E0130: variant '{variant_name}' of enum '{enum_name}' payload needs a "
+            f"width, e.g. {kind}[64] (4.7)")
+    return {"kind": kind, "width": width, "struct_name": None, "byte_size": width // 8}
+
+
+def _build_enum_layout(stmt, structs, enums):
+    """Validates one `class Name(Enum)` body and inserts its EnumLayout.
+
+    A member is one of three variant spellings: a bare name (unit), an
+    annotation `V: T` (a payload), or an inline `class V(Struct)` (a struct
+    payload, equivalent to declaring that struct beforehand). Anything else --
+    `V = 1`, `def`, a nested non-Struct class -- is refused with a name for the
+    reason.
+    """
+    if stmt.name in structs or stmt.name in enums:
+        raise NotImplementedError(
+            f"LITHON-E0129: type '{stmt.name}' is declared more than once (4.6/4.7)")
+    if not stmt.body:
+        raise NotImplementedError(
+            f"LITHON-E0129: enum '{stmt.name}' has no variants -- an enum needs at least one "
+            f"variant (4.7)")
+    layout = EnumLayout(stmt.name)
+    max_payload = 0
+    for member in stmt.body:
+        payload = None
+        if isinstance(member, ast.Expr) and isinstance(member.value, ast.Name):
+            variant_name = member.value.id
+        elif isinstance(member, ast.AnnAssign):
+            if not isinstance(member.target, ast.Name):
+                raise NotImplementedError(
+                    f"LITHON-E0129: a variant of enum '{stmt.name}' must be a plain name (4.7)")
+            if member.value is not None:
+                raise NotImplementedError(
+                    f"LITHON-E0129: variant '{member.target.id}' of enum '{stmt.name}' cannot "
+                    f"take a value -- write `{member.target.id}: <type>` for a payload variant "
+                    f"or `{member.target.id}` for a unit variant (4.7)")
+            variant_name = member.target.id
+            payload = _enum_payload_type(
+                stmt.name, variant_name, member.annotation, structs, enums)
+        elif isinstance(member, ast.ClassDef):
+            if len(member.bases) != 1 or not isinstance(member.bases[0], ast.Name) \
+                    or member.bases[0].id != STRUCT_BASE:
+                raise NotImplementedError(
+                    f"LITHON-E0129: inline variant class '{member.name}' of enum '{stmt.name}' "
+                    f"must derive from Struct, e.g. `class {member.name}(Struct):` (4.7)")
+            _build_struct_layout(member, structs, enums)
+            variant_name = member.name
+            payload = {"kind": "struct", "width": -1, "struct_name": variant_name,
+                       "byte_size": structs[variant_name].size}
+        elif isinstance(member, ast.FunctionDef):
+            _validate_method(member, stmt.name, layout, structs, enums)
+            continue
+        else:
+            raise NotImplementedError(
+                f"LITHON-E0129: enum '{stmt.name}' members are bare unit names, payload "
+                f"annotations (`V: type`) or inline `class V(Struct)` variants; found a "
+                f"{type(member).__name__} (4.7)")
+        if variant_name in layout.variant_by_name:
+            raise NotImplementedError(
+                f"LITHON-E0129: enum '{stmt.name}' declares variant '{variant_name}' more "
+                f"than once (4.7)")
+        if payload is not None and payload["kind"] == "struct":
+            # Construction of a struct payload sets its fields by name and a
+            # match binds them one leaf at a time, so every field must be a
+            # scalar. A nested aggregate field would need nested construction
+            # that this slice does not spell.
+            for fname, f in structs[payload["struct_name"]].fields.items():
+                if f["kind"] not in ("int", "float", "bool"):
+                    raise NotImplementedError(
+                        f"LITHON-E0130: struct payload '{payload['struct_name']}' of variant "
+                        f"'{variant_name}' has a non-scalar field '{fname}'; 4.7 struct-payload "
+                        f"fields must be scalars (4.7)")
+        variant = {"name": variant_name, "tag": len(layout.variants),
+                   "payload": payload, "payload_offset": None}
+        layout.variants.append(variant)
+        layout.variant_by_name[variant_name] = variant
+        if payload is not None:
+            max_payload = max(max_payload, payload["byte_size"])
+    # The tag is signed, and a narrow int load sign-extends, so an int[8] tag
+    # only round-trips variants 0..127. Crossing that needs int[16].
+    if not layout.variant_by_name:
+        raise NotImplementedError(
+            f"LITHON-E0129: enum '{stmt.name}' has no variants -- an enum needs at least one "
+            f"variant in addition to any methods (4.9)")
+    layout.tag_width = 8 if len(layout.variants) <= 128 else 16
+    layout.payload_offset = layout.tag_width // 8
+    for variant in layout.variants:
+        if variant["payload"] is not None:
+            variant["payload_offset"] = layout.payload_offset
+    layout.size = layout.payload_offset + max_payload
+    enums[stmt.name] = layout
+    return layout
+
+
+def _is_type_function_def(stmt):
+    """True for `def ... -> NewType:` -- the marker that makes a def a type
+    function rather than a runtime function. Such a def emits no code and is
+    resolved only when its name is applied in an annotation."""
+    return (isinstance(stmt, ast.FunctionDef)
+            and isinstance(stmt.returns, ast.Name)
+            and stmt.returns.id == TYPE_FUNCTION_MARKER)
+
+
+def _reject_storage_in_type_function_bodies(structs, enums):
+    """Refuses a type-function body that names a struct or an enum.
+
+    A type function composes the *value* types a normal annotation can spell --
+    int, float, bool, containers, ptr and dict -- and it is resolved by
+    `parse_type_annotation`, which does not know struct or enum names (those are
+    storage and are recognised by the declaration sites instead). Naming one
+    finds no value type and would surface as a bare "requires an explicit size",
+    so it is refused here with the reason. A parameter that happens to share a
+    struct's name shadows it and is not refused.
+    """
+    for tf in TYPE_FUNCTIONS.values():
+        for node in ast.walk(tf.body_node):
+            if not isinstance(node, ast.Name) or node.id in tf.params:
+                continue
+            if node.id in structs:
+                kind = "struct"
+            elif node.id in enums:
+                kind = "enum"
+            else:
+                continue
+            raise NotImplementedError(
+                f"LITHON-E0132: type function '{tf.name}' body names the {kind} "
+                f"'{node.id}'; a type function composes scalar, container, pointer and "
+                f"dict types, not a struct or an enum (4.8)")
+
+
+def _validate_type_function(stmt, registry):
+    """Validates one type-function definition and inserts it into `registry`.
+
+    The signature is plain positional parameter names (a type function's
+    parameters are types or sizes, so they are unannotated and have no
+    defaults), and the body is exactly one `return { <type> }` whose braces hold
+    one type expression. A unit must bottom out: recursion is refused when the
+    function is applied, not here, because a definition alone cannot be applied.
+    """
+    name = stmt.name
+    if stmt.decorator_list:
+        raise NotImplementedError(
+            f"LITHON-E0132: type function '{name}' cannot carry a decorator (4.8)")
+    a = stmt.args
+    if (a.posonlyargs or a.vararg or a.kwonlyargs or a.kwarg
+            or a.defaults or a.kw_defaults):
+        raise NotImplementedError(
+            f"LITHON-E0132: type function '{name}' takes only plain positional parameter "
+            f"names -- no `/`, `*`, `**` or defaults (4.8)")
+    for arg in a.args:
+        if arg.annotation is not None:
+            raise NotImplementedError(
+                f"LITHON-E0132: parameter '{arg.arg}' of type function '{name}' must be "
+                f"unannotated -- its parameters are types or sizes, not values (4.8)")
+    if name in registry:
+        raise NotImplementedError(
+            f"LITHON-E0132: type function '{name}' is declared more than once (4.8)")
+    if len(stmt.body) != 1 or not isinstance(stmt.body[0], ast.Return):
+        raise NotImplementedError(
+            f"LITHON-E0132: type function '{name}' body must be a single `return {{ <type> }}` "
+            f"(4.8)")
+    ret = stmt.body[0]
+    if ret.value is None:
+        raise NotImplementedError(
+            f"LITHON-E0132: type function '{name}' must return a type expression, e.g. "
+            f"`return {{ list[a, 4] }}` (4.8)")
+    val = ret.value
+    if isinstance(val, ast.Dict):
+        raise NotImplementedError(
+            f"LITHON-E0132: type function '{name}' body must be `{{ <type> }}` holding one "
+            f"type; `{{}}` is a dict and a dict display is not a type here (4.8)")
+    if isinstance(val, ast.SetComp):
+        raise NotImplementedError(
+            f"LITHON-E0132: type function '{name}' body cannot be a comprehension; write "
+            f"`return {{ <type> }}` (4.8)")
+    if not isinstance(val, ast.Set):
+        raise NotImplementedError(
+            f"LITHON-E0132: type function '{name}' body must put a single type in braces, "
+            f"e.g. `return {{ list[a, 4] }}` (4.8)")
+    if len(val.elts) != 1:
+        raise NotImplementedError(
+            f"LITHON-E0132: type function '{name}' body must hold exactly one type "
+            f"expression, found {len(val.elts)} (4.8)")
+    registry[name] = TypeFunction(name, [arg.arg for arg in a.args], val.elts[0])
+
+
+def build_type_functions(tree):
+    """Collects every `def Name(...) -> NewType: ...` into a registry.
+
+    Run before `build_type_registry` so a struct field, enum payload, parameter
+    or return can name a type function. The names share one namespace with
+    structs and enums; the collision of the two registries is checked in
+    `build_program` once both exist.
     """
     registry = {}
+    for stmt in tree.body:
+        if _is_type_function_def(stmt):
+            _validate_type_function(stmt, registry)
+    return registry
+
+
+def build_type_registry(tree):
+    """Collects every `class Foo(Struct)` and `class Foo(Enum)` into two
+    registries, in a single source-order pass.
+
+    One pass is what lets either kind name the other: a struct field may be an
+    enum declared earlier, an enum payload may be a struct declared earlier, and
+    an inline `class V(Struct)` variant is registered (and usable as a type) as
+    it is seen. Later declarations are not visible to earlier ones, exactly as
+    for a nested struct field.
+    """
+    structs = {}
+    enums = {}
     for stmt in tree.body:
         if not isinstance(stmt, ast.ClassDef):
             continue
         bases = stmt.bases
-        if len(bases) != 1 or not isinstance(bases[0], ast.Name) \
-                or bases[0].id != STRUCT_BASE:
+        base = bases[0].id if (len(bases) == 1 and isinstance(bases[0], ast.Name)) else None
+        if base == STRUCT_BASE:
+            _build_struct_layout(stmt, structs, enums)
+        elif base == ENUM_BASE:
+            _build_enum_layout(stmt, structs, enums)
+        else:
             raise NotImplementedError(
-                f"LITHON-E0126: class '{stmt.name}' must derive from Struct, e.g. "
-                f"`class {stmt.name}(Struct):` -- other bases and inheritance are not "
-                f"supported (4.6)")
-        if stmt.name in registry:
-            raise NotImplementedError(
-                f"LITHON-E0126: struct '{stmt.name}' is declared more than once (4.6)")
-        layout = StructLayout(stmt.name)
-        offset = 0
-        for member in stmt.body:
-            if not isinstance(member, ast.AnnAssign):
-                raise NotImplementedError(
-                    f"LITHON-E0126: struct '{stmt.name}' may contain only field annotations "
-                    f"(`name: type`); found a {type(member).__name__} (4.6)")
-            if not isinstance(member.target, ast.Name):
-                raise NotImplementedError(
-                    f"LITHON-E0126: a field of struct '{stmt.name}' must be a plain name, not "
-                    f"a subscript or attribute (4.6)")
-            field_name = member.target.id
-            if field_name in layout.fields:
-                raise NotImplementedError(
-                    f"LITHON-E0127: struct '{stmt.name}' declares field '{field_name}' more "
-                    f"than once (4.6)")
-            kind, width, struct_ref, byte_size = _struct_field_type(
-                stmt.name, field_name, member.annotation, registry)
-            layout.fields[field_name] = {
-                "kind": kind, "width": width, "offset": offset,
-                "byte_size": byte_size, "struct_name": struct_ref,
-            }
-            offset += byte_size
-        if not layout.fields:
-            raise NotImplementedError(
-                f"LITHON-E0126: struct '{stmt.name}' has no fields -- a struct needs at least "
-                f"one int[w], float[64], bool or nested struct field (4.6)")
-        layout.size = offset
-        registry[stmt.name] = layout
-    return registry
+                f"LITHON-E0126: class '{stmt.name}' must derive from Struct or Enum, e.g. "
+                f"`class {stmt.name}(Struct):` or `class {stmt.name}(Enum):` -- other bases "
+                f"and inheritance are not supported (4.6/4.7)")
+    return structs, enums
 
 
 def scalar_cell_bytes(kind, width):
@@ -385,6 +942,16 @@ def scalar_cell_bytes(kind, width):
     the length a valueof of it reads."""
     if kind == "bool":
         return 1
+    # 4.4, second half. A struct's byte size IS its pointee size: the pointer
+    # names the blob, so `_p + 1` advances by the whole struct rather than by
+    # any field. The size comes from the struct's own layout, which the IR
+    # carries as ptr[struct[N]].
+    if kind == "struct":
+        if width is None or width <= 0:
+            raise NotImplementedError(
+                f"LITHON-E0113: a pointer to a struct needs its byte size, which comes "
+                f"from the struct's declaration (4.4)")
+        return width
     if kind in ("int", "float"):
         if width is None or width <= 0:
             raise NotImplementedError(
@@ -417,9 +984,10 @@ BITWISE_OPS = {
 
 
 class IRBuilder:
-    def __init__(self, fn_rename=None, structs=None):
+    def __init__(self, fn_rename=None, structs=None, enums=None):
         self.fn_rename = fn_rename or {}
         self.structs = structs or {}
+        self.enums = enums or {}
         self.reg_counter = 0
         self.block_counter = 0
         self.ifexpr_counter = 0
@@ -438,6 +1006,34 @@ class IRBuilder:
         # this is what tells `.field` apart from an attribute this frontend does
         # not support.
         self.struct_vars = {}
+        # 4.7. Local variables that hold an enum, mapped to their enum TYPE name
+        # (a key into self.enums). An enum is storage too: it is constructed into
+        # and read back through `match`, never loaded as a value.
+        self.enum_vars = {}
+        # 4.9. Method-inlining state. `method_return_stack` holds one
+        # (result_temp_or_None, return_label) per method being inlined, so a
+        # `return` in a method jumps to the end of that inline rather than to the
+        # enclosing function. `inline_active` names the (type, method) pairs on
+        # the inline stack, which is what catches recursion. `inline_counter`
+        # gives each call site a unique prefix so its generated locals cannot
+        # collide with the caller's.
+        self.method_return_stack = []
+        self.inline_active = []
+        self.inline_counter = 0
+        # 6.1. Names of loop counters this function has generated. A `zip` for
+        # header needs a counter the programmer did not write (unlike
+        # `enumerate`, whose first target IS the index), and that name has to
+        # be guaranteed not to collide with anything the programmer did write --
+        # see _fresh_loop_counter.
+        self.loop_counters = set()
+        # 4.9. Reachability. Every block is entered either by being the entry
+        # block or by a `jump`/`branch` to its label. Method inlining needs this:
+        # when every arm of a method's body returns, the merge block that
+        # follows is dead, and jumping from it to the inline's end would add a
+        # predecessor that never assigned the result. `entry_label` is the first
+        # block started and `reachable_labels` collects every branch target.
+        self.entry_label = None
+        self.reachable_labels = set()
 
     def new_reg(self):
         r = self.reg_counter
@@ -454,7 +1050,22 @@ class IRBuilder:
         self.blocks.append(b)
         self.current = b
         self.terminated = False
+        if self.entry_label is None:
+            self.entry_label = label
         return b
+
+    def block_is_reachable(self, label):
+        return label == self.entry_label or label in self.reachable_labels
+
+    def note_terminator_targets(self, stripped):
+        """Records the label(s) a `jump`/`branch` line targets. Every terminator
+        goes through here (or `emit`, which calls it) so reachability stays
+        complete even when a line is dropped straight into a block."""
+        if stripped.startswith("jump "):
+            self.reachable_labels.add(stripped[len("jump "):])
+        elif stripped.startswith("branch "):
+            for label in stripped[len("branch "):].split(",")[1:]:
+                self.reachable_labels.add(label.strip())
 
     def emit(self, line):
         # A block ends at its first terminator. Source after `break`,
@@ -466,6 +1077,7 @@ class IRBuilder:
             return
         self.current.lines.append(f"    {line}")
         stripped = line.strip()
+        self.note_terminator_targets(stripped)
         if stripped.startswith("jump ") or stripped.startswith("branch ") \
                 or stripped == "return" or stripped.startswith("return "):
             self.terminated = True
@@ -500,6 +1112,103 @@ class IRBuilder:
             "LITHON-E0115: input() takes an optional string literal prompt, e.g. "
             'input("Enter x: ")')
 
+    def _build_membership(self, positive, value_node, container_node):
+        """`x in xs` (or `not in`) over a fixed-capacity list.
+
+        6.1. The OR of `x == xs[k]` for k in 0..N-1. Capacity is a compile-time
+        constant, so this is straight-line code and there is no scan at run time;
+        the cost is the same OR-chain a hand-written loop would emit.
+        """
+        if not isinstance(container_node, ast.Name):
+            raise NotImplementedError(
+                "LITHON-E0114: `in` needs a plain list or tuple variable on the right, "
+                "e.g. `x in xs` -- a container has no value to scan yet")
+        cap = self._container_capacity(container_node.id)
+        if cap is None:
+            raise NotImplementedError(
+                f"LITHON-E0114: `in` needs a list or tuple declared with its capacity, "
+                f"e.g. `{container_node.id}: list[int[64], 8]`")
+        # The element comparison is `eq`, and `eq` does not accept bools
+        # anywhere in the language today -- `a == b` on two bools is refused by
+        # the runtime too. Rather than let `in` fail later with "comparison on a
+        # non-numeric value" from inside the interpreter, say so here, where the
+        # source names the list.
+        elem_kind = self.declared[container_node.id][2]
+        if elem_kind not in ("int", "float"):
+            raise NotImplementedError(
+                f"LITHON-E0114: `in` over a list of {elem_kind} is not supported -- it "
+                f"lowers to `==` over the elements, and equality does not take bools "
+                f"yet (the same refusal as `a == b` on two bools)")
+        value = self.build_expr(value_node)
+        name = container_node.id
+        false_r = self.new_reg()
+        self.emit(f"{false_r} = const_bool 0")
+        acc = false_r
+        for k in range(cap):
+            idx = self.new_reg()
+            self.emit(f"{idx} = const_i64 {k}")
+            el = self.new_reg()
+            self.emit(f"{el} = Index {name}, {idx}")
+            cmp_r = self.new_reg()
+            self.emit(f"{cmp_r} = eq {value}, {el}")
+            nxt = self.new_reg()
+            self.emit(f"{nxt} = or {acc}, {cmp_r}")
+            acc = nxt
+        if positive:
+            return acc
+        r = self.new_reg()
+        self.emit(f"{r} = not {acc}")
+        return r
+
+    def _emit_select(self, cond_reg, then_reg, else_reg, kind, width):
+        """`then_reg if cond else else_reg`, as registers rather than AST.
+
+        6.1's min/max need a select per element. The IR text format has no phi
+        opcode, so this is the same diamond the if-expression lowering builds
+        (see build_expr's ast.IfExp arm): both arms store one temporary and the
+        merge block loads it -- which the dominance-frontier analysis sees as a
+        single Phi at the join.
+        """
+        temp = f"{IF_EXPR_TEMP}{self.ifexpr_counter}"
+        self.ifexpr_counter += 1
+        then_label = self.reserve_label()
+        else_label = self.reserve_label()
+        merge_label = self.reserve_label()
+
+        self.emit(f"branch {cond_reg}, {then_label}, {else_label}")
+
+        self.start_block(then_label)
+        self.emit(f"store {temp}, {then_reg}")
+        self.emit(f"jump {merge_label}")
+
+        self.start_block(else_label)
+        self.emit(f"store {temp}, {else_reg}")
+        self.emit(f"jump {merge_label}")
+
+        self.start_block(merge_label)
+        r = self.new_reg()
+        self.emit(f"{r} = load {temp}{render_type_suffix(kind, width)}")
+        return r
+
+    def _reduce_list_arg(self, fname, node):
+        """The single container argument of sum/min/max/any/all, as (name, decl).
+
+        Every one of them is a rewrite over the compile-time capacity N, so they
+        all take a plain list/tuple variable -- the same shape `len()` and
+        `enumerate` take, because there is no list value to pass around yet.
+        """
+        if len(node.args) != 1 or not isinstance(node.args[0], ast.Name):
+            raise NotImplementedError(
+                f"LITHON-E0115: {fname}() takes exactly one list or tuple variable, "
+                f"e.g. {fname}(xs)")
+        name = node.args[0].id
+        cap = self._container_capacity(name)
+        if cap is None:
+            raise NotImplementedError(
+                f"LITHON-E0115: {fname}({name}) needs a list or tuple declared with its "
+                f"capacity, e.g. `{name}: list[int[64], 8]`")
+        return name, self.declared[name]
+
     def build_expr(self, node):
         if isinstance(node, ast.Constant) and isinstance(node.value, bool):
             r = self.new_reg()
@@ -526,6 +1235,13 @@ class IRBuilder:
                 raise NotImplementedError(
                     f"LITHON-E0128: '{node.id}' is a struct and has no value -- read or write "
                     f"one of its fields, e.g. {node.id}.<field> (4.6)")
+            # 4.7. An enum is storage too, and the only read is a `match`. Naming
+            # it in a value position would otherwise emit a load of its first
+            # byte (the tag) as though the enum were that int.
+            if node.id in self.enum_vars:
+                raise NotImplementedError(
+                    f"LITHON-E0131: '{node.id}' is an enum and has no value -- read it with a "
+                    f"`match` statement (4.7)")
             r = self.new_reg()
             self.emit(f"{r} = load {node.id}")
             # 4.4. A load of a pointer variable brings the pointer's pointee
@@ -589,10 +1305,19 @@ class IRBuilder:
         if isinstance(node, ast.Compare):
             if len(node.ops) != 1 or len(node.comparators) != 1:
                 raise NotImplementedError("LITHON-E0114: chained comparisons (a < b < c) not supported yet")
+            op_type = type(node.ops[0])
+            # 6.1. `x in xs` / `x not in xs` on a list. Like every other helper
+            # here it is a rewrite over the compile-time capacity: the OR of
+            # `x == xs[k]` for k in 0..N-1, and `not in` is that OR negated.
+            # There is no membership opcode and no scan at run time.
+            if op_type in (ast.In, ast.NotIn):
+                return self._build_membership(
+                    op_type is ast.In,
+                    node.left,
+                    node.comparators[0])
             left = self.build_expr(node.left)
             right = self.build_expr(node.comparators[0])
             op_map = {ast.Lt: "lt", ast.Gt: "gt", ast.Eq: "eq"}
-            op_type = type(node.ops[0])
             if op_type not in op_map:
                 raise NotImplementedError(f"LITHON-E0114: comparison {op_type.__name__} not supported yet")
             r = self.new_reg()
@@ -641,10 +1366,50 @@ class IRBuilder:
             return r
 
         if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):
+                # 4.9. `recv.method(args)` -- a method call, inlined right here.
+                # A receiver that is not a struct/enum place, or a method the
+                # type does not have, is refused inside with E0135.
+                r = self._inline_method_call(node)
+                if r is None:
+                    raise NotImplementedError(
+                        f"LITHON-E0135: method '{node.func.attr}()' returns no value, so it "
+                        f"cannot be used as a value (4.9)")
+                return r
             if not isinstance(node.func, ast.Name):
                 raise NotImplementedError("LITHON-E0115: only direct name calls are supported")
             if node.func.id == "print":
                 raise NotImplementedError("LITHON-E0115: print() is a statement in this slice, not an expression")
+            if node.func.id in ("sum", "min", "max", "any", "all"):
+                return self._build_reduction(node.func.id, node)
+            if node.func.id == "abs":
+                # 6.1. Scalar, unlike the others: abs() is a question about one
+                # value, not a walk over N. It lowers to the same diamond as an
+                # if-expression, so `abs(v)` is `-v if v < 0 else v`.
+                if len(node.args) != 1:
+                    raise NotImplementedError(
+                        "LITHON-E0115: abs() takes exactly one value, e.g. abs(x)")
+                v = self.build_expr(node.args[0])
+                zero = self.new_reg()
+                self.emit(f"{zero} = const_i64 0")
+                neg = self.new_reg()
+                is_neg = self.new_reg()
+                self.emit(f"{is_neg} = lt {v}, {zero}")
+                # The negation is emitted unconditionally: wrapping negation of
+                # the most negative int64 is itself, and it is discarded by the
+                # select when the value was not negative. The branch is what
+                # keeps the live value correct either way.
+                self.emit(f"{neg} = wrapsub {zero}, {v}")
+                return self._emit_select(is_neg, neg, v, "int", 64)
+            if node.func.id in ("enumerate", "zip"):
+                # 6.1. Header-only by construction, so say so here rather than
+                # letting it fall through to a generic `call` that the type
+                # checker rejects with "unknown function" -- which is true but
+                # useless to someone who simply wrote the loop the Python way.
+                raise NotImplementedError(
+                    f"LITHON-E0115: {node.func.id}(...) is only usable in a for header, "
+                    f"e.g. for a, b in {node.func.id}(xs, ys) -- it is a rewrite of a "
+                    f"counted loop, not a value, so there is nothing to bind here (6.1)")
             if node.func.id == "len":
                 # Op::Len names a container variable and returns the capacity.
                 # It is not a call: there is no `len` function to emit a `call`
@@ -693,6 +1458,19 @@ class IRBuilder:
                         "LITHON-E0116: addressof() takes exactly one plain variable, e.g. "
                         "addressof(x) (4.4)")
                 name = node.args[0].id
+                if name in self.struct_vars:
+                    # 4.4, second half. A struct is storage, and its bytes ARE
+                    # its addressable run -- there is no separate box to point
+                    # into. So addressof(p) is the blob's base, typed
+                    # ptr[struct], and pointer arithmetic on it advances by the
+                    # whole struct. This is also what makes ptr[int[8]] into
+                    # struct memory real (5.2's send/recv buffers) with no
+                    # special syscall operand.
+                    layout = self.structs[self.struct_vars[name]]
+                    r = self.new_reg()
+                    self.emit(f"{r} = addressof {name}")
+                    self.ptr_types[r] = ("struct", layout.size)
+                    return r
                 if name not in self.var_types:
                     raise NotImplementedError(
                         f"LITHON-E0116: addressof('{name}') needs the size of '{name}', so "
@@ -761,6 +1539,27 @@ class IRBuilder:
                 r = self.new_reg()
                 self.emit(f"{r} = toint {arg_reg}"
                           f"{render_type_suffix('int', width)}")
+                return r
+            if node.func.id == "syscall":
+                # Phase III. The raw syscall primitive. Like addressof/
+                # valueof/len, this is a compiler-recognized name, not a call
+                # to a function: it lowers to one `syscall` op whose first
+                # operand is the syscall number and whose remaining operands
+                # (up to six) are the arguments. The signature is
+                # deliberately unchecked -- `syscall(n, a1..a6) -> int[64]`,
+                # a negative result is -errno on Linux -- so there is no
+                # fallible wrapper to unwrap here. Arguments are integers in
+                # this slice (the typechecker rejects pointers, since the
+                # interpreter's synthetic addresses are not real memory). A
+                # user function named `syscall` would collide and is rejected
+                # by the checker.
+                if not (1 <= len(node.args) <= 7):
+                    raise NotImplementedError(
+                        "LITHON-E0115: syscall() takes a syscall number and up to six "
+                        "integer arguments, e.g. syscall(102) (Phase III)")
+                arg_regs = [self.build_expr(a) for a in node.args]
+                r = self.new_reg()
+                self.emit(f"{r} = syscall {', '.join(arg_regs)}")
                 return r
             arg_regs = [self.build_expr(a) for a in node.args]
             callee = self.fn_rename.get(node.func.id, node.func.id)
@@ -866,6 +1665,10 @@ class IRBuilder:
         for i, field_name in enumerate(parts):
             field = layout.fields.get(field_name)
             if field is None:
+                if field_name in layout.methods:
+                    raise NotImplementedError(
+                        f"LITHON-E0135: '{field_name}' is a method of struct '{layout.name}', not "
+                        f"a field -- call it instead, e.g. `{var}.{field_name}(...)` (4.9)")
                 raise NotImplementedError(
                     f"LITHON-E0128: struct '{layout.name}' has no field '{field_name}' (4.6)")
             offset += field["offset"]
@@ -877,12 +1680,532 @@ class IRBuilder:
                         f"one of ITS fields, e.g. .{field_name}.<field> (4.6)")
                 layout = self.structs[field["struct_name"]]
                 continue
+            if field["kind"] == "enum":
+                raise NotImplementedError(
+                    f"LITHON-E0131: '{field_name}' is an enum field and has no value -- "
+                    f"construct it into `{var}.{field_name}` or read it with a `match` (4.7)")
             if not last:
                 raise NotImplementedError(
                     f"LITHON-E0128: '{field_name}' is a {field['kind']}, not a struct, so it "
                     f"has no fields (4.6)")
             kind, width = field["kind"], field["width"]
         return var, offset, kind, width
+
+    # ---- 4.9 methods -------------------------------------------------------
+    #
+    # A method is not a value and not a separate IR function: a call to
+    # `recv.name(args)` INLINES the method body at the call site. That is forced
+    # by the storage model -- `self.field` has to resolve to the caller's
+    # variable (fieldload/fieldstore name a variable, not a register), and a
+    # struct cannot be passed to a function anyway (E0124). Inlining is what lets
+    # a method read AND write the receiver's fields, run loops and branches, and
+    # call other methods. It cannot recurse, because the body would never stop
+    # expanding; recursion is refused instead.
+
+    def _resolve_receiver_type(self, node):
+        """The (kind, type_name) of the receiver place `node`, or None when it
+        is not a struct or enum variable/field.
+
+        A receiver is a struct/enum variable or an attribute chain that ends at
+        a struct- or enum-typed field (`a.inner`, `s.e`). The type name indexes
+        self.structs or self.enums, whose `methods` map holds the methods.
+        """
+        parts = []
+        cur = node
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if not isinstance(cur, ast.Name):
+            return None
+        var = cur.id
+        if not parts:
+            if var in self.struct_vars:
+                return "struct", self.struct_vars[var]
+            if var in self.enum_vars:
+                return "enum", self.enum_vars[var]
+            return None
+        if var not in self.struct_vars:
+            return None
+        parts.reverse()
+        layout = self.structs[self.struct_vars[var]]
+        for i, field_name in enumerate(parts):
+            field = layout.fields.get(field_name)
+            if field is None:
+                return None
+            last = (i == len(parts) - 1)
+            if field["kind"] == "struct":
+                if last:
+                    return "struct", field["struct_name"]
+                layout = self.structs[field["struct_name"]]
+            elif field["kind"] == "enum":
+                if last:
+                    return "enum", field["enum_name"]
+                return None
+            else:
+                return None
+        return None
+
+    def _known_names(self):
+        """Every name bound anywhere in the current function.
+
+        Same set _fresh_method_prefix scans, plus the loop counters: a
+        `for i in range(...)` target is stored before it is read but is never
+        declared, so it is in none of the other collections, and a generated
+        name must not collide with it either.
+        """
+        return (set(self.var_types) | self.ptr_names | set(self.declared)
+                | set(self.struct_vars) | set(self.enum_vars) | self.dict_names
+                | self.loop_counters)
+
+    def _fresh_loop_counter(self):
+        """A scalar name for a compiler-generated loop counter.
+
+        6.1 `zip` needs a counter of its own: the programmer names only the
+        ELEMENTS (`for a, b in zip(xs, ys)`), so nothing in the source can
+        serve as the index.
+
+        The name cannot begin with `_`: 4.4 reserves that prefix for pointers
+        and both the frontend (E0122) and the type checker reject an `_`-named
+        non-pointer, so `__zip_i` would be refused -- the same reason
+        _fresh_method_prefix cannot use an underscore either. Hence `zip_i`,
+        with a counter suffix, skipping any name already in use.
+        """
+        known = self._known_names()
+        while True:
+            name = f"zip_i{self.inline_counter}"
+            self.inline_counter += 1
+            if name not in known:
+                self.loop_counters.add(name)
+                return name
+
+    def _fresh_method_prefix(self):
+        """A per-inline name prefix that no caller name starts with.
+
+        Method locals are renamed `prefix + name` and the result temp is
+        `prefix + "ret"`. A scalar name may not begin with `_` (E0122), so the
+        prefix cannot either; the counter keeps successive call sites apart, and
+        the scan guarantees a generated name can never collide with a caller
+        name that happens to begin the same way.
+        """
+        while True:
+            prefix = f"m{self.inline_counter}_"
+            self.inline_counter += 1
+            known = set(self.var_types) | self.ptr_names | set(self.declared) \
+                | set(self.struct_vars) | set(self.enum_vars) | self.dict_names
+            if not any(n.startswith(prefix) for n in known):
+                return prefix
+
+    def _inline_method_call(self, call):
+        """Inlines `recv.method(args)` (or `E.V(...)`-free attribute call) and
+        returns the result register, or None for a method that returns nothing.
+
+        The receiver is a place and becomes `self` inside the body. Parameters
+        are evaluated once, left to right, into freshly named locals declared
+        with the method's own annotations; the method's own locals are renamed
+        with the same per-call prefix, so the two scopes cannot collide. A `return`
+        stores into a result local and jumps to the inline's end label.
+        """
+        recv_node = node = call.func.value
+        resolved = self._resolve_receiver_type(node)
+        if resolved is None:
+            raise NotImplementedError(
+                f"LITHON-E0135: cannot call '{call.func.attr}()' here -- a method is called on a "
+                f"struct or enum variable, e.g. `p.{call.func.attr}(...)` (4.9)")
+        kind, type_name = resolved
+        layout = (self.structs if kind == "struct" else self.enums)[type_name]
+        method_name = call.func.attr
+        if method_name in (layout.fields if kind == "struct" else layout.variant_by_name):
+            raise NotImplementedError(
+                f"LITHON-E0135: '{method_name}' in {kind} '{type_name}' is a field, not a "
+                f"method, so it cannot be called (4.9)")
+        method = layout.methods.get(method_name)
+        if method is None:
+            raise NotImplementedError(
+                f"LITHON-E0135: {kind} '{type_name}' has no method '{method_name}' (4.9)")
+        params = method.args.args[1:]
+        if call.keywords or any(isinstance(a, ast.Starred) for a in call.args):
+            raise NotImplementedError(
+                f"LITHON-E0135: method '{type_name}.{method_name}' takes positional arguments "
+                f"only (4.9)")
+        if len(call.args) != len(params):
+            raise NotImplementedError(
+                f"LITHON-E0135: method '{type_name}.{method_name}' takes {len(params)} "
+                f"argument(s), got {len(call.args)} (4.9)")
+        has_result = method.returns is not None
+
+        token = (type_name, method_name)
+        if token in self.inline_active:
+            chain = " -> ".join(f"{t}.{m}" for t, m in self.inline_active + [token])
+            raise NotImplementedError(
+                f"LITHON-E0135: method call is recursive ({chain}); a method is inlined at the "
+                f"call site and cannot call itself, directly or indirectly (4.9)")
+
+        prefix = self._fresh_method_prefix()
+        rename = {nm: prefix + nm for nm in _collect_method_locals(method.body)}
+        for p in params:
+            rename[p.arg] = prefix + p.arg
+        body = _MethodSubst(rename, recv_node).visit(
+            copy.deepcopy(ast.Module(body=method.body, type_ignores=[]))).body
+
+        ret_label = self.reserve_label()
+        result_temp = (prefix + "ret") if has_result else None
+        saved_loop = self.loop_stack
+        self.loop_stack = []
+        self.method_return_stack.append((result_temp, ret_label))
+        self.inline_active.append(token)
+        try:
+            if has_result:
+                self.build_stmt(ast.AnnAssign(
+                    target=ast.Name(id=result_temp, ctx=ast.Store()),
+                    annotation=copy.deepcopy(method.returns), value=None, simple=1))
+            for p, arg in zip(params, call.args):
+                self.build_stmt(ast.AnnAssign(
+                    target=ast.Name(id=rename[p.arg], ctx=ast.Store()),
+                    annotation=copy.deepcopy(p.annotation), value=arg, simple=1))
+            for stmt in body:
+                self.build_stmt(stmt)
+            # The body ends in whatever block the last statement left current.
+            # Normally that block falls through to the result load, so it jumps
+            # to the end label. But when every path returned, that block is a
+            # dead merge (no branch reaches it) and jumping from it would give
+            # the result load a predecessor that never assigned -- the result
+            # would look unassigned. Withhold the jump; the dead block then has
+            # no successors and contributes nothing to the load.
+            if not self.terminated and self.block_is_reachable(self.current.label):
+                self.emit(f"jump {ret_label}")
+            self.start_block(ret_label)
+        finally:
+            self.method_return_stack.pop()
+            self.inline_active.pop()
+            self.loop_stack = saved_loop
+        if not has_result:
+            return None
+        r = self.new_reg()
+        self.emit(f"{r} = load {result_temp}")
+        return r
+
+    # ---- 4.7 enums ---------------------------------------------------------
+    #
+    # An enum is storage, exactly like a struct: `store e : struct[N]` reserves
+    # the blob, a construction writes the tag and the active payload, and a
+    # `match` reads the tag and (inside the chosen arm) the payload. Every one of
+    # those lowers to the same fieldload/fieldstore at a byte offset the layout
+    # decides, so neither execution tier learns what a variant is.
+
+    def _resolve_enum_place(self, node):
+        """Resolves an assignable/matching enum place to (base_var, byte_offset,
+        enum_type), or None when `node` does not name one.
+
+        A place is a plain enum variable or an attribute chain that ends at an
+        enum-typed struct field (`s.e`, `s.inner.e`). The walk reuses the struct
+        layout, so the byte offset is the same summed offset a leaf field read
+        would use.
+        """
+        parts = []
+        cur = node
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if not isinstance(cur, ast.Name):
+            return None
+        var = cur.id
+        if not parts:
+            if var in self.enum_vars:
+                return var, 0, self.enum_vars[var]
+            return None
+        if var not in self.struct_vars:
+            return None
+        parts.reverse()
+        layout = self.structs[self.struct_vars[var]]
+        offset = 0
+        for i, field_name in enumerate(parts):
+            field = layout.fields.get(field_name)
+            if field is None:
+                return None
+            offset += field["offset"]
+            last = (i == len(parts) - 1)
+            if field["kind"] == "struct":
+                if last:
+                    return None
+                layout = self.structs[field["struct_name"]]
+                continue
+            if field["kind"] == "enum":
+                if not last:
+                    return None
+                return var, offset, field["enum_name"]
+            return None
+        return None
+
+    def _parse_enum_constructor(self, value_node, place_enum):
+        """Matches `E.V` / `E.V(...)` against the enum named `place_enum` and
+        returns (variant, call_node_or_None)."""
+        if isinstance(value_node, ast.Attribute):
+            qual, variant_name, call = value_node.value, value_node.attr, None
+        elif isinstance(value_node, ast.Call) and isinstance(value_node.func, ast.Attribute):
+            qual = value_node.func.value
+            variant_name = value_node.func.attr
+            call = value_node
+        else:
+            raise NotImplementedError(
+                f"LITHON-E0130: a value of enum '{place_enum}' is built by naming one of its "
+                f"variants, e.g. {place_enum}.V or {place_enum}.V(value) (4.7)")
+        if not isinstance(qual, ast.Name) or qual.id != place_enum:
+            raise NotImplementedError(
+                f"LITHON-E0130: a value of enum '{place_enum}' is built from one of its own "
+                f"variants, e.g. {place_enum}.V(...) (4.7)")
+        layout = self.enums[place_enum]
+        variant = layout.variant_by_name.get(variant_name)
+        if variant is None:
+            raise NotImplementedError(
+                f"LITHON-E0130: enum '{place_enum}' has no variant '{variant_name}' (4.7)")
+        return variant, call
+
+    def _build_enum_construction(self, var, base_off, enum_name, value_node):
+        """Writes a construction into the enum blob `var` at `base_off`: the tag
+        first, then the active payload's fields, at fixed offsets."""
+        layout = self.enums[enum_name]
+        variant, call = self._parse_enum_constructor(value_node, enum_name)
+        tag_reg = self.new_reg()
+        self.emit(f"{tag_reg} = const_i64 {variant['tag']}")
+        self.emit(f"fieldstore {var}, {base_off}, {tag_reg}"
+                  f"{render_type_suffix('int', layout.tag_width)}")
+        payload = variant["payload"]
+        if payload is None:
+            if call is not None and (call.args or call.keywords):
+                raise NotImplementedError(
+                    f"LITHON-E0130: variant '{enum_name}.{variant['name']}' is a unit variant "
+                    f"and takes no payload (4.7)")
+            return
+        if payload["kind"] in ("int", "float", "bool"):
+            if call is None:
+                raise NotImplementedError(
+                    f"LITHON-E0130: variant '{enum_name}.{variant['name']}' carries a payload; "
+                    f"write {enum_name}.{variant['name']}(value) (4.7)")
+            if call.keywords or len(call.args) != 1:
+                raise NotImplementedError(
+                    f"LITHON-E0130: variant '{enum_name}.{variant['name']}' takes exactly one "
+                    f"payload value (4.7)")
+            val_reg = self.build_expr(call.args[0])
+            off = base_off + layout.payload_offset
+            self.emit(f"fieldstore {var}, {off}, {val_reg}"
+                      f"{render_type_suffix(payload['kind'], payload['width'])}")
+            return
+        # struct payload: set every field, by name or in declaration order.
+        if call is None:
+            raise NotImplementedError(
+                f"LITHON-E0130: variant '{enum_name}.{variant['name']}' carries a struct "
+                f"payload; write {enum_name}.{variant['name']}(field=value, ...) (4.7)")
+        fields = self.structs[payload["struct_name"]].fields
+        if call.args and call.keywords:
+            raise NotImplementedError(
+                f"LITHON-E0130: variant '{enum_name}.{variant['name']}' takes its fields either "
+                f"all by name or all in order, not both (4.7)")
+        supplied = {}
+        if call.args:
+            if len(call.args) != len(fields):
+                raise NotImplementedError(
+                    f"LITHON-E0130: variant '{enum_name}.{variant['name']}' needs "
+                    f"{len(fields)} payload field(s), got {len(call.args)} (4.7)")
+            for field_name, arg in zip(fields.keys(), call.args):
+                supplied[field_name] = arg
+        else:
+            for kw in call.keywords:
+                if kw.arg is None or kw.arg not in fields:
+                    raise NotImplementedError(
+                        f"LITHON-E0130: struct payload '{payload['struct_name']}' has no field "
+                        f"'{kw.arg}' (4.7)")
+                if kw.arg in supplied:
+                    raise NotImplementedError(
+                        f"LITHON-E0130: field '{kw.arg}' is set twice in this construction (4.7)")
+                supplied[kw.arg] = kw.value
+            missing = [fn for fn in fields if fn not in supplied]
+            if missing:
+                raise NotImplementedError(
+                    f"LITHON-E0130: construction of variant '{enum_name}.{variant['name']}' is "
+                    f"missing field(s) {', '.join(missing)} (4.7)")
+        for field_name, field in fields.items():
+            val_reg = self.build_expr(supplied[field_name])
+            off = base_off + layout.payload_offset + field["offset"]
+            self.emit(f"fieldstore {var}, {off}, {val_reg}"
+                      f"{render_type_suffix(field['kind'], field['width'])}")
+
+    def _parse_enum_pattern(self, pattern, enum_name):
+        """Parses one `case` pattern against enum `enum_name`, returning
+        (variant_name, binding). binding is None for a unit variant, a name for a
+        scalar payload, or a {field: name} map for a struct payload."""
+        layout = self.enums[enum_name]
+        if isinstance(pattern, ast.MatchValue):
+            value = pattern.value
+            if not (isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name)) \
+                    or value.value.id != enum_name:
+                raise NotImplementedError(
+                    f"LITHON-E0131: a unit variant arm is written `{enum_name}.V` (4.7)")
+            variant = layout.variant_by_name.get(value.attr)
+            if variant is None:
+                raise NotImplementedError(
+                    f"LITHON-E0131: enum '{enum_name}' has no variant '{value.attr}' (4.7)")
+            if variant["payload"] is not None:
+                raise NotImplementedError(
+                    f"LITHON-E0131: variant '{enum_name}.{value.attr}' carries a payload -- bind "
+                    f"it with {enum_name}.{value.attr}(...) (4.7)")
+            return value.attr, None
+        if isinstance(pattern, ast.MatchClass):
+            cls = pattern.cls
+            if not (isinstance(cls, ast.Attribute) and isinstance(cls.value, ast.Name)) \
+                    or cls.value.id != enum_name:
+                raise NotImplementedError(
+                    f"LITHON-E0131: a variant arm is written `{enum_name}.V(...)` (4.7)")
+            variant = layout.variant_by_name.get(cls.attr)
+            if variant is None:
+                raise NotImplementedError(
+                    f"LITHON-E0131: enum '{enum_name}' has no variant '{cls.attr}' (4.7)")
+            payload = variant["payload"]
+            if payload is None:
+                if pattern.patterns or pattern.kwd_attrs:
+                    raise NotImplementedError(
+                        f"LITHON-E0131: unit variant '{enum_name}.{cls.attr}' takes no payload "
+                        f"binding (4.7)")
+                return cls.attr, None
+            if payload["kind"] in ("int", "float", "bool"):
+                if pattern.kwd_attrs or len(pattern.patterns) != 1:
+                    raise NotImplementedError(
+                        f"LITHON-E0131: variant '{enum_name}.{cls.attr}' binds its payload with "
+                        f"exactly one name, e.g. {enum_name}.{cls.attr}(x) (4.7)")
+                sub = pattern.patterns[0]
+                if not (isinstance(sub, ast.MatchAs) and sub.name and sub.pattern is None):
+                    raise NotImplementedError(
+                        f"LITHON-E0131: variant '{enum_name}.{cls.attr}' payload must be bound to "
+                        f"a plain name (4.7)")
+                return cls.attr, sub.name
+            # struct payload
+            if pattern.patterns:
+                raise NotImplementedError(
+                    f"LITHON-E0131: struct payload '{payload['struct_name']}' is bound by field "
+                    f"name, e.g. {enum_name}.{cls.attr}(field=name, ...) (4.7)")
+            fields = self.structs[payload["struct_name"]].fields
+            binding = {}
+            for attr, sub in zip(pattern.kwd_attrs, pattern.kwd_patterns):
+                if attr not in fields:
+                    raise NotImplementedError(
+                        f"LITHON-E0131: struct payload '{payload['struct_name']}' has no field "
+                        f"'{attr}' (4.7)")
+                if attr in binding:
+                    raise NotImplementedError(
+                        f"LITHON-E0131: field '{attr}' is bound twice in this arm (4.7)")
+                if not (isinstance(sub, ast.MatchAs) and sub.name and sub.pattern is None):
+                    raise NotImplementedError(
+                        f"LITHON-E0131: field '{attr}' must be bound to a plain name (4.7)")
+                binding[attr] = sub.name
+            missing = [fn for fn in fields if fn not in binding]
+            if missing:
+                raise NotImplementedError(
+                    f"LITHON-E0131: arm '{enum_name}.{cls.attr}' must bind every payload field; "
+                    f"missing {', '.join(missing)} (4.7)")
+            return cls.attr, binding
+        raise NotImplementedError(
+            f"LITHON-E0131: unsupported match pattern {type(pattern).__name__} -- 4.7 arms are "
+            f"{enum_name}.V, {enum_name}.V(bindings) or `case _:` (4.7)")
+
+    def _bind_name(self, name, reg, kind, width):
+        """Declares a match binding `name` of the given scalar type and stores the
+        loaded payload value into it."""
+        if name.startswith("_"):
+            raise NotImplementedError(
+                f"LITHON-E0131: a match binding cannot start with '_'; that prefix is reserved "
+                f"for pointers (4.4)")
+        self.emit(f"store {name}, {reg}{render_type_suffix(kind, width)}")
+        self.declared[name] = (kind, width, None, None, None, None)
+        if kind in ("int", "float", "bool"):
+            self.var_types[name] = (kind, width)
+
+    def _bind_enum_payload(self, var, base_off, layout, variant, binding):
+        """Emits the fieldload(s) that bind a variant's payload inside its arm."""
+        payload = variant["payload"]
+        if payload is None:
+            return
+        pay_off = base_off + layout.payload_offset
+        if payload["kind"] in ("int", "float", "bool"):
+            reg = self.new_reg()
+            self.emit(f"{reg} = fieldload {var}, {pay_off}"
+                      f"{render_type_suffix(payload['kind'], payload['width'])}")
+            self._bind_name(binding, reg, payload["kind"], payload["width"])
+            return
+        fields = self.structs[payload["struct_name"]].fields
+        for field_name, bind_name in binding.items():
+            field = fields[field_name]
+            off = pay_off + field["offset"]
+            reg = self.new_reg()
+            self.emit(f"{reg} = fieldload {var}, {off}"
+                      f"{render_type_suffix(field['kind'], field['width'])}")
+            self._bind_name(bind_name, reg, field["kind"], field["width"])
+
+    def build_match(self, node):
+        place = self._resolve_enum_place(node.subject)
+        if place is None:
+            raise NotImplementedError(
+                "LITHON-E0131: `match` reads an enum; its subject must be an enum variable or "
+                "an enum struct field (4.7)")
+        var, base_off, enum_name = place
+        layout = self.enums[enum_name]
+
+        arms = []
+        wildcard_index = None
+        for i, case in enumerate(node.cases):
+            if case.guard is not None:
+                raise NotImplementedError(
+                    "LITHON-E0131: `case ... if <guard>` is not supported yet (4.7)")
+            pattern = case.pattern
+            if isinstance(pattern, ast.MatchAs) and pattern.name is None \
+                    and pattern.pattern is None:
+                arms.append(("wildcard", None, case.body))
+                wildcard_index = i
+            else:
+                variant, binding = self._parse_enum_pattern(pattern, enum_name)
+                arms.append((variant, binding, case.body))
+
+        if wildcard_index is None:
+            covered = {a[0] for a in arms}
+            missing = [v["name"] for v in layout.variants if v["name"] not in covered]
+            if missing:
+                raise NotImplementedError(
+                    f"LITHON-E0131: `match` on enum '{enum_name}' is not exhaustive -- no arm "
+                    f"covers {', '.join(missing)}; add it or a `case _:` (4.7)")
+        elif wildcard_index != len(arms) - 1:
+            raise NotImplementedError(
+                "LITHON-E0131: `case _:` must be the last arm -- arms after it are "
+                "unreachable (4.7)")
+
+        tag_reg = self.new_reg()
+        self.emit(f"{tag_reg} = fieldload {var}, {base_off}"
+                  f"{render_type_suffix('int', layout.tag_width)}")
+
+        merge_label = self.reserve_label()
+        for i, (variant, binding, body) in enumerate(arms):
+            last = (i == len(arms) - 1)
+            if variant == "wildcard":
+                self._bind_and_build(var, base_off, layout, None, None, body)
+                self.emit(f"jump {merge_label}")
+                break
+            v = layout.variant_by_name[variant]
+            const_reg = self.new_reg()
+            self.emit(f"{const_reg} = const_i64 {v['tag']}")
+            cond_reg = self.new_reg()
+            self.emit(f"{cond_reg} = eq {tag_reg}, {const_reg}")
+            then_label = self.reserve_label()
+            next_label = merge_label if last else self.reserve_label()
+            self.emit(f"branch {cond_reg}, {then_label}, {next_label}")
+            self.start_block(then_label)
+            self._bind_and_build(var, base_off, layout, v, binding, body)
+            self.emit(f"jump {merge_label}")
+            if not last:
+                self.start_block(next_label)
+        self.start_block(merge_label)
+
+    def _bind_and_build(self, var, base_off, layout, variant, binding, body):
+        if variant is not None:
+            self._bind_enum_payload(var, base_off, layout, variant, binding)
+        for stmt in body:
+            self.build_stmt(stmt)
 
     def build_if(self, node):
         cond_reg = self.build_expr(node.test)
@@ -894,6 +2217,7 @@ class IRBuilder:
 
         target_else = else_label if else_label else merge_label
         branch_block.lines.append(f"    branch {cond_reg}, {then_label}, {target_else}")
+        self.note_terminator_targets(f"branch {cond_reg}, {then_label}, {target_else}")
         self.terminated = True
 
         self.start_block(then_label)
@@ -931,20 +2255,230 @@ class IRBuilder:
 
         self.start_block(exit_label)
 
+    def _container_capacity(self, name):
+        """The declared capacity N of a list/tuple variable, or None.
+
+        Phase 6.1: enumerate/zip need a compile-time bound, and this is where it
+        comes from. `xs: list[int[64], 10]` records width=10 against the name,
+        so the bound is a constant here rather than a runtime length -- which is
+        exactly what makes these helpers cheap: the loop is a counted loop with
+        a literal limit, and the elements are indexed with a bounds check the
+        typechecker already understands.
+        """
+        decl = self.declared.get(name)
+        if decl is None:
+            return None
+        kind, width = decl[0], decl[1]
+        if kind not in ("list", "tuple"):
+            return None
+        return width
+
+    def _plan_iteration_helper(self, fname, node):
+        """Resolves `for a, b in enumerate(xs)` / `for a, b in zip(xs, ys)`.
+
+        Returns (counter_name, args, binds) where `args` is the one-element
+        argument list for the ordinary counted-loop path below and `binds` is a
+        list of (target_name, container_name) bound at the top of each
+        iteration.
+
+        Both helpers are a frontend REWRITE over constructs that already exist,
+        not new IR: the pair (index, element) never has to exist as a value.
+        That is the whole reason this is cheap. `enumerate(xs)` becomes
+        `for i in range(N): x = xs[i]`, and `zip(xs, ys)` becomes the same loop
+        bounded at min(N1, N2) -- a compile-time constant, because len() folds
+        to the declared capacity. So z = zip(a, b) is refused outright: there is
+        no value to hand back, and a homogeneous tuple cannot represent
+        enumerate's (int, T) pair anyway.
+        """
+        call = node.iter
+        args = call.args
+
+        def source_name(arg, what):
+            if not isinstance(arg, ast.Name):
+                raise NotImplementedError(
+                    f"LITHON-E0119: {fname}(...) takes plain {what} variables in a for "
+                    f"header, e.g. {fname}(xs) -- a container has no value to iterate "
+                    f"yet, so it cannot be written as an expression")
+            cap = self._container_capacity(arg.id)
+            if cap is None:
+                raise NotImplementedError(
+                    f"LITHON-E0119: {fname}({arg.id}) needs a list or tuple declared with "
+                    f"its capacity, e.g. `{arg.id}: list[int[64], 8] = ...`")
+            return arg.id, cap
+
+        def targets_of(n):
+            t = node.target
+            if not isinstance(t, ast.Tuple) or len(t.elts) != n:
+                shown = ", ".join(["a"] * n) if fname == "zip" else "i, x"
+                raise NotImplementedError(
+                    f"LITHON-E0119: {fname}(...) in a for header binds exactly {n} "
+                    f"target name{'s' if n != 1 else ''}, e.g. for {shown} in "
+                    f"{fname}(...)")
+            names = []
+            for elt in t.elts:
+                if not isinstance(elt, ast.Name):
+                    raise NotImplementedError(
+                        f"LITHON-E0119: a for target must be a plain name in {fname}(...)")
+                names.append(elt.id)
+            return names
+
+        if fname == "enumerate":
+            if len(args) != 1:
+                raise NotImplementedError(
+                    "LITHON-E0119: enumerate() takes exactly one container in a for header")
+            src, cap = source_name(args[0], "container")
+            names = targets_of(2)
+            return names[0], [ast.Constant(value=cap)], [(names[1], src)]
+
+        # zip
+        if len(args) < 2:
+            raise NotImplementedError(
+                "LITHON-E0119: zip() takes at least two containers in a for header")
+        sources = [source_name(a, "container") for a in args]
+        names = targets_of(len(sources))
+        # The bound is min(N1, N2, ...): zip stops at the shortest input, which
+        # is Python's semantics and here is a constant rather than a comparison
+        # performed at run time.
+        bound = min(cap for _, cap in sources)
+        # zip's targets are all ELEMENTS -- unlike enumerate there is no index
+        # target to name -- so the counter is an internal name, generated so it
+        # cannot collide with anything the programmer wrote.
+        counter = self._fresh_loop_counter()
+        binds = [(name, src) for name, (src, _) in zip(names, sources)]
+        return counter, [ast.Constant(value=bound)], binds
+
+    def _bind_target(self, name, kind, width, what):
+        """Records a for/enumerate/zip target as a binding of a known type.
+
+        6.1. A loop target is a binding like any other, so it has to obey the
+        same "a name has one type" rule (V1_SPEC 0.6.10 / E0122) that an
+        annotated declaration obeys. It used not to: `enumerate`'s and `zip`'s
+        targets were stored but never recorded, so binding `v` to an int in one
+        header and to a bool in another silently changed its type. Nothing
+        errored -- the value simply became unresolved, and the print guard then
+        refused the native tier with a message about the wrong thing entirely.
+
+        Registering it closes that: the second binding is now an E0122 refusal
+        naming both types, at the source line that caused it.
+        """
+        decl_key = (kind, width, None, None, None, None)
+        prev_decl = self.declared.get(name)
+        if prev_decl is not None and prev_decl != decl_key:
+            def spell(d):
+                return render_type_suffix(*d).lstrip(" :") or "?"
+            raise NotImplementedError(
+                f"LITHON-E0122: `{name}` is bound with a different type: first "
+                f"bound {spell(prev_decl)}, now {spell(decl_key)} as {'an' if what[0] in 'aeiou' else 'a'} "
+                f"{what} target -- a name has one type (V1_SPEC 0.6.10)")
+        self.declared[name] = decl_key
+        if kind in ("int", "float", "bool"):
+            self.var_types[name] = (kind, width)
+
+    def _build_reduction(self, fname, node):
+        """sum / min / max / any / all, unrolled over the compile-time N.
+
+        6.1. None of these needs a loop at run time: a list's capacity is
+        known when the program is compiled (it is what `len()` folds to), so
+        the walk is emitted as N straight-line steps. That is the whole reason
+        the spec calls them cheap -- there is no runtime helper, no iterator
+        value, and no unbounded memory anywhere in the construct.
+
+        Consequence worth stating: a list always holds exactly N elements
+        today (there is no length field until Phase 6.7), so `sum` over an
+        untouched slot adds a zero and `min`/`max` see a zero too. That is
+        consistent with every other operation on a fixed-capacity list, and it
+        is why these read as "the N slots" rather than "the elements".
+        """
+        name, decl = self._reduce_list_arg(fname, node)
+        kind, cap, elem_kind, elem_width = decl[0], decl[1], decl[2], decl[3]
+
+        if fname == "sum":
+            if elem_kind not in ("int", "float"):
+                raise NotImplementedError(
+                    f"LITHON-E0115: sum() is int/float only, {name} is "
+                    f"{render_type_suffix(kind, cap, elem_kind, elem_width).lstrip(' :')}")
+            acc = self.new_reg()
+            self.emit(f"{acc} = const_i64 0" if elem_kind == "int"
+                      else f"{acc} = const_f64 0.0")
+            for k in range(cap):
+                idx = self.new_reg()
+                self.emit(f"{idx} = const_i64 {k}")
+                el = self.new_reg()
+                self.emit(f"{el} = Index {name}, {idx}")
+                nxt = self.new_reg()
+                self.emit(f"{nxt} = add {acc}, {el}")
+                acc = nxt
+            return acc
+
+        if fname in ("min", "max"):
+            if elem_kind != "int":
+                raise NotImplementedError(
+                    f"LITHON-E0115: {fname}() is int only in this slice, {name} is "
+                    f"{render_type_suffix(kind, cap, elem_kind, elem_width).lstrip(' :')}")
+            if cap == 0:
+                raise NotImplementedError(
+                    f"LITHON-E0115: {fname}({name}) needs a non-empty list")
+            idx0 = self.new_reg()
+            self.emit(f"{idx0} = const_i64 0")
+            acc = self.new_reg()
+            self.emit(f"{acc} = Index {name}, {idx0}")
+            for k in range(1, cap):
+                idx = self.new_reg()
+                self.emit(f"{idx} = const_i64 {k}")
+                el = self.new_reg()
+                self.emit(f"{el} = Index {name}, {idx}")
+                cond = self.new_reg()
+                self.emit(f"{cond} = {'lt' if fname == 'min' else 'gt'} {el}, {acc}")
+                acc = self._emit_select(cond, el, acc, elem_kind, elem_width)
+            return acc
+
+        # any / all
+        if elem_kind != "bool":
+            raise NotImplementedError(
+                f"LITHON-E0115: {fname}() is bool only in this slice, {name} is "
+                f"{render_type_suffix(kind, cap, elem_kind, elem_width).lstrip(' :')}")
+        true_r = self.new_reg()
+        false_r = self.new_reg()
+        self.emit(f"{true_r} = const_bool 1")
+        self.emit(f"{false_r} = const_bool 0")
+        acc = true_r if fname == "any" else false_r
+        for k in range(cap):
+            idx = self.new_reg()
+            self.emit(f"{idx} = const_i64 {k}")
+            el = self.new_reg()
+            self.emit(f"{el} = Index {name}, {idx}")
+            # any: stay true once seen -> or. all: stay true while still true.
+            nxt = self.new_reg()
+            self.emit(f"{nxt} = or {acc}, {el}" if fname == "any"
+                      else f"{nxt} = and {acc}, {el}")
+            acc = nxt
+        return acc
+
     def build_for(self, node):
         if node.orelse:
             raise NotImplementedError("LITHON-E0118: for/else is not supported (the else clause would be silently dropped)")
-        if not isinstance(node.target, ast.Name):
-            raise NotImplementedError("LITHON-E0119: only a single name for-target is supported")
-        if not (isinstance(node.iter, ast.Call)
-                and isinstance(node.iter.func, ast.Name)
-                and node.iter.func.id == "range"):
-            raise NotImplementedError("LITHON-E0119: only for x in range(...) is supported")
-        args = node.iter.args
-        if len(args) not in (1, 2, 3):
-            raise NotImplementedError("LITHON-E0119: range takes 1, 2, or 3 arguments")
 
-        loop_var = node.target.id
+        # Phase 6.1: enumerate/zip are for-header rewrites. They resolve to the
+        # ordinary counted loop with a literal limit, plus the element bindings
+        # replayed at the top of each iteration.
+        binds = []
+        iter_call = node.iter
+        iter_name = (iter_call.func.id
+                     if isinstance(iter_call, ast.Call) and isinstance(iter_call.func, ast.Name)
+                     else None)
+        if iter_name in ("enumerate", "zip"):
+            loop_var, args, binds = self._plan_iteration_helper(iter_name, node)
+        else:
+            if not isinstance(node.target, ast.Name):
+                raise NotImplementedError("LITHON-E0119: only a single name for-target is supported")
+            if not (isinstance(node.iter, ast.Call)
+                    and isinstance(node.iter.func, ast.Name)
+                    and node.iter.func.id == "range"):
+                raise NotImplementedError("LITHON-E0119: only for x in range(...) is supported")
+            args = node.iter.args
+            loop_var = node.target.id
+            if len(args) not in (1, 2, 3):
+                raise NotImplementedError("LITHON-E0119: range takes 1, 2, or 3 arguments")
         # For now, all int[64] as per decision (user said i:int[64])
         start_reg = None
         limit_reg = None
@@ -976,6 +2510,10 @@ class IRBuilder:
                 raise NotImplementedError("LITHON-E0107: range(a,b,0): step is zero")
             # normalize to int[64] if small
 
+        # A for-target is stored before it is read but never declared, so it is
+        # in none of the name collections -- record it so a later generated
+        # counter (6.1 zip) cannot collide with it.
+        self.loop_counters.add(loop_var)
         self.emit("store " + loop_var + ", " + start_reg + " : int[64]")
 
         body_label = self.reserve_label()
@@ -994,6 +2532,22 @@ class IRBuilder:
             self.emit(f"branch {cond_reg}, {body_label}, {exit_label}")
 
             self.start_block(body_label)
+            # Phase 6.1: bind the element(s) before the body runs, which is what
+            # makes `for i, x in enumerate(xs)` and `for a, b in zip(xs, ys)`
+            # work without the pair ever being a value. The index is the loop
+            # counter itself, so it is already bound by the loop's own store.
+            if binds:
+                cur = self.new_reg()
+                self.emit(f"{cur} = load {loop_var}")
+                for elem_name, container in binds:
+                    kind, width, elem_kind, elem_width = \
+                        self.declared[container][:4]
+                    self._bind_target(elem_name, elem_kind, elem_width,
+                                     "enumerate" if len(binds) == 1 else "zip")
+                    er = self.new_reg()
+                    self.emit(f"{er} = Index {container}, {cur}")
+                    self.emit(f"store {elem_name}, {er}"
+                              f"{render_type_suffix(elem_kind, elem_width)}")
             self.loop_stack.append((latch_label, exit_label))
             for stmt in node.body:
                 self.build_stmt(stmt)
@@ -1249,8 +2803,26 @@ class IRBuilder:
                 self.struct_vars[name] = node.annotation.id
                 self.emit(f"store {name} : struct[{layout.size}]")
                 return
+            # 4.7. An enum declaration looks like a struct one, but it may carry
+            # a construction as its initializer: `e: E = E.A2(5)`. The blob is
+            # reserved first (the same valueless store a struct uses), then the
+            # constructor writes the tag and payload into it.
+            if isinstance(node.annotation, ast.Name) and node.annotation.id in self.enums:
+                layout = self.enums[node.annotation.id]
+                decl_key = ("enum", layout.size, node.annotation.id, None, None, None)
+                prev_decl = self.declared.get(name)
+                if prev_decl is not None and prev_decl != decl_key:
+                    raise NotImplementedError(
+                        f"LITHON-E0122: `{name}` is re-declared with a different type -- a name "
+                        f"has one type (V1_SPEC 0.6.10)")
+                self.declared[name] = decl_key
+                self.enum_vars[name] = node.annotation.id
+                self.emit(f"store {name} : struct[{layout.size}]")
+                if node.value is not None:
+                    self._build_enum_construction(name, 0, node.annotation.id, node.value)
+                return
             kind, width, elem_kind, elem_width, key_kind, key_width = \
-                parse_type_annotation(node.annotation)
+                parse_type_annotation(node.annotation, self.structs)
             suffix = render_type_suffix(kind, width, elem_kind, elem_width,
                                         key_kind, key_width)
             # 0.6.10. A name declares its type once per function. Writing a
@@ -1355,6 +2927,16 @@ class IRBuilder:
                 val = self.build_expr(node.value)
                 self.emit(f"IndexStore {target.value.id}, {idx}, {val}")
                 return
+            # 4.7. `e = E.V(...)` (an enum variable) or `s.e = E.V(...)` (an
+            # enum-typed struct field) is a construction written into the blob:
+            # the tag and the active payload's fields at fixed offsets. Nothing
+            # else can be assigned to an enum place, so a non-constructor value
+            # is refused here with a name for the reason.
+            enum_place = self._resolve_enum_place(target)
+            if enum_place is not None:
+                self._build_enum_construction(enum_place[0], enum_place[1],
+                                              enum_place[2], node.value)
+                return
             # 4.6. `s.field = v`, and nested `s.inner.field = v`, resolve to one
             # fieldstore at the summed byte offset. The value is a scalar (a
             # struct-typed leaf is refused by the resolver), so no whole-struct
@@ -1443,6 +3025,11 @@ class IRBuilder:
                 arg_reg = self.build_expr(call.args[0])
                 self.emit(f"call print, {arg_reg}")
                 return
+            if isinstance(call.func, ast.Attribute):
+                # 4.9. `recv.method(args)` as a statement. A method that returns
+                # a value is allowed here -- the result is simply discarded.
+                self._inline_method_call(call)
+                return
             self.build_expr(call)
             return
 
@@ -1458,7 +3045,30 @@ class IRBuilder:
             self.build_for(node)
             return
 
+        if isinstance(node, ast.Match):
+            self.build_match(node)
+            return
+
         if isinstance(node, ast.Return):
+            # 4.9. Inside an inlined method a `return` is not the enclosing
+            # function's return: it stores the method's result (if it has one)
+            # into the inline's temp and jumps to the inline's end label.
+            if self.method_return_stack:
+                result_temp, ret_label = self.method_return_stack[-1]
+                if node.value is not None:
+                    if result_temp is None:
+                        raise NotImplementedError(
+                            f"LITHON-E0135: this method returns no value, so `return <expr>` is "
+                            f"not allowed here (4.9)")
+                    val_reg = self.build_expr(node.value)
+                    self.emit(f"store {result_temp}, {val_reg}"
+                              f"{self.declared_suffix(result_temp)}")
+                elif result_temp is not None:
+                    raise NotImplementedError(
+                        f"LITHON-E0135: this method returns a value, so a bare `return` is not "
+                        f"allowed here (4.9)")
+                self.emit(f"jump {ret_label}")
+                return
             if node.value is not None:
                 val_reg = self.build_expr(node.value)
                 self.emit(f"return {val_reg}")
@@ -1491,15 +3101,38 @@ class IRBuilder:
 
 
 def build_program(tree):
+    global TYPE_FUNCTIONS, _TYPE_FUNC_CACHE, _TYPE_FUNC_ACTIVE
     module_parts = []
 
-    # 4.6. Struct definitions are collected before anything is built, so a struct
-    # is visible to every function and to later struct definitions. A ClassDef
-    # that is not a `class Foo(Struct)` is refused here (E0126), which is what
-    # lets the statement loop below skip every ClassDef without a second check.
-    structs = build_struct_registry(tree)
+    # 4.8. Type functions are resolved before any annotation is parsed, because
+    # `parse_type_annotation` is where a call is expanded. The cache and the
+    # active stack are reset here so the run starts from a clean slate.
+    TYPE_FUNCTIONS = build_type_functions(tree)
+    _TYPE_FUNC_CACHE = {}
+    _TYPE_FUNC_ACTIVE = []
 
-    user_fn_names = {s.name for s in tree.body if isinstance(s, ast.FunctionDef)}
+    # 4.6/4.7. Struct and enum definitions are collected in one source-order pass
+    # before anything is built, so either kind is visible to every function and
+    # to later definitions. A ClassDef that derives from neither `Struct` nor
+    # `Enum` is refused here (E0126), which is what lets the statement loop below
+    # skip every ClassDef without a second check.
+    structs, enums = build_type_registry(tree)
+
+    # 4.8. Type functions, structs and enums share one type namespace.
+    for name in TYPE_FUNCTIONS:
+        if name in structs or name in enums:
+            raise NotImplementedError(
+                f"LITHON-E0132: type function '{name}' collides with a struct or enum of "
+                f"the same name (4.8)")
+
+    user_fn_names = {s.name for s in tree.body
+                     if isinstance(s, ast.FunctionDef) and not _is_type_function_def(s)}
+    for name in TYPE_FUNCTIONS:
+        if name in user_fn_names:
+            raise NotImplementedError(
+                f"LITHON-E0132: '{name}' is declared both as a type function and as a "
+                f"runtime function (4.8)")
+    _reject_storage_in_type_function_bodies(structs, enums)
     fn_rename = {}
     if ENTRY_POINT in user_fn_names:
         mangled = MANGLED_PREFIX + ENTRY_POINT
@@ -1507,30 +3140,39 @@ def build_program(tree):
             mangled = MANGLED_PREFIX + mangled
         fn_rename[ENTRY_POINT] = mangled
 
-    main_builder = IRBuilder(fn_rename, structs)
+    main_builder = IRBuilder(fn_rename, structs, enums)
     main_builder.start_block(main_builder.reserve_label())
 
     for stmt in tree.body:
         if isinstance(stmt, ast.ClassDef):
-            # Already validated and registered; a struct definition emits no code.
+            # Already validated and registered; a type definition emits no code.
             continue
         if isinstance(stmt, ast.FunctionDef):
-            fb = IRBuilder(fn_rename, structs)
+            if _is_type_function_def(stmt):
+                # 4.8. A type function emits no code: it was registered above and
+                # is resolved only where its name is applied in an annotation.
+                continue
+            fb = IRBuilder(fn_rename, structs, enums)
             fb.start_block(fb.reserve_label())
 
             param_strs = []
             for arg in stmt.args.args:
                 if arg.annotation is not None:
-                    # 4.6. A struct is storage, not a value, so it cannot be
-                    # passed or returned: the function header names a kind and a
-                    # width, and a struct has neither. Refused at source with a
-                    # name for the reason rather than by the generic unknown-type
-                    # path, which would read as a typo.
+                    # 4.6/4.7. A struct or an enum is storage, not a value, so it
+                    # cannot be passed or returned: the function header names a
+                    # kind and a width, and neither has a kind the header can
+                    # carry. Refused at source with a name for the reason rather
+                    # than by the generic unknown-type path, which would read as a
+                    # typo.
                     if isinstance(arg.annotation, ast.Name) and arg.annotation.id in structs:
                         raise NotImplementedError(
                             f"LITHON-E0124: parameter '{arg.arg}' cannot be a struct -- a struct "
                             f"has no value to pass; a function takes int, float, bool, str or a "
                             f"container (4.6)")
+                    if isinstance(arg.annotation, ast.Name) and arg.annotation.id in enums:
+                        raise NotImplementedError(
+                            f"LITHON-E0124: parameter '{arg.arg}' cannot be an enum -- an enum "
+                            f"has no value to pass; pass the fields a function can use (4.7)")
                     kind, width, elem_kind, elem_width, key_kind, key_width = \
                         parse_type_annotation(arg.annotation)
                     if kind == "ptr":
@@ -1555,6 +3197,10 @@ def build_program(tree):
                     raise NotImplementedError(
                         f"LITHON-E0124: function '{stmt.name}' cannot return a struct -- a "
                         f"struct has no value to return (4.6)")
+                if isinstance(stmt.returns, ast.Name) and stmt.returns.id in enums:
+                    raise NotImplementedError(
+                        f"LITHON-E0124: function '{stmt.name}' cannot return an enum -- an "
+                        f"enum has no value to return (4.7)")
                 kind, width, elem_kind, elem_width, key_kind, key_width = \
                     parse_type_annotation(stmt.returns)
                 if kind == "ptr":

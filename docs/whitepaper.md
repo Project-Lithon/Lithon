@@ -38,6 +38,13 @@ kind of failure is this" readable from the code alone.
 | `E0126` | 1 (static refusal) | Struct definition (must derive from `Struct`; fields are annotations only) |
 | `E0127` | 1 (static refusal) | Struct field type (int[w]/float[64]/bool or an earlier struct; no containers/pointers) |
 | `E0128` | 1 (static refusal) | Struct field access (unknown field, or a whole struct used where a value is needed) |
+| `E0129` | 1 (static refusal) | Enum definition (must derive from `Enum`; variants are bare unit names, payload annotations, or inline `class V(Struct)`) |
+| `E0130` | 1 (static refusal) | Enum variant construction (unknown variant, wrong payload shape, unknown/missing/duplicate struct-payload field) |
+| `E0131` | 1 (static refusal) | `match` on an enum (bad subject/pattern, non-exhaustive, a guard, a wildcard that is not last, or an enum used where a value is needed) |
+| `E0132` | 1 (static refusal) | Type-function definition (`-> NewType`): bad signature, no body or more than one statement, a body that is not a one-element `{ T }`, a duplicate name, or a name colliding with a runtime function/struct/enum |
+| `E0133` | 1 (static refusal) | Type-function application: an unknown or non-call name, keyword/starred arguments, an arity mismatch, or a recursive (direct or mutual) expansion |
+| `E0134` | 1 (static refusal) | Method definition (a `def` in a struct/enum body): a decorator, `/`/`*`/`**`/defaults, a missing or annotated `self`, an unannotated or non-scalar parameter/return, a duplicate name, or a name colliding with a field or variant |
+| `E0135` | 1 (static refusal) | Method application: an unknown method, a field where a method is called, a non-struct/enum receiver, keyword/starred arguments, an arity mismatch, a recursive inline, or a method with no result used as a value |
 | `E0201` | 2 (environmental) | Fallible value read before `.ok` check |
 | `E0301` | 3 (dynamic runtime trap) | Division by zero |
 | `E0302` | 3 (dynamic runtime trap) | Modulo by zero |

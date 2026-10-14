@@ -460,6 +460,53 @@ block2:
       ],
     },
     {
+      id: "enumerate-and-zip",
+      title: "enumerate and zip",
+      blocks: [
+        {
+          kind: "p",
+          text: "`enumerate(xs)` and `zip(xs, ys)` work in a `for` header. Neither is a value: both are a **rewrite of a counted loop** over constructs that already exist, so there is no new opcode and no runtime helper. `for i, x in enumerate(xs)` becomes `for i in range(N): x = xs[i]`, and `for a, b in zip(xs, ys)` becomes the same loop bounded at `min(N1, N2)` — a compile-time constant, because the declared capacity is what `len()` folds to.",
+        },
+        {
+          kind: "p",
+          text: "`zip` stops at the shortest input, exactly as Python does. Elements bind with their declared type, and `break`/`continue` work inside either header because the rewrite is a real loop.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/typed_regression/iter_helpers.py (excerpt)",
+            sourceRef: "tests/typed_regression/iter_helpers.py",
+            expectedRef: "tests/typed_regression/expected/iter_helpers.out",
+            source: `xs: list[int[64], 3]
+xs[0] = 10
+xs[1] = 20
+xs[2] = 30
+
+for i, x in enumerate(xs):
+    print(i)
+    print(x)
+
+ys: list[int[64], 3]
+ys[0] = 1
+ys[1] = 2
+ys[2] = 3
+
+total: int[64] = 0
+for a, b in zip(xs, ys):
+    total = a + b
+print(total)`,
+            output: "0\n10\n1\n20\n2\n30\n33",
+          },
+        },
+        {
+          kind: "note",
+          tone: "warn",
+          title: "They are for-header only",
+          text: "`z = zip(a, b)` is refused (`LITHON-E0115`). The pair never needs to exist as a value, and a homogeneous tuple could not represent `enumerate`'s `(int, T)` anyway — so the rewrite is the whole design rather than an optimisation of a real iterator.",
+        },
+      ],
+    },
+    {
       id: "if-expression",
       title: "if as an expression",
       blocks: [
@@ -1354,6 +1401,671 @@ print(f)`,
   ],
 }
 
+const enums: DocPage = {
+  slug: "enums",
+  title: "Enums",
+  description:
+    "A tagged union: one variant active at a time, packed as a tag plus the largest payload, read back with match.",
+  group: "language",
+  tags: [
+    "enums",
+    "enum",
+    "tagged union",
+    "variants",
+    "match",
+    "pattern matching",
+    "tag",
+    "payload",
+  ],
+  sections: [
+    {
+      id: "what-an-enum-is",
+      title: "An enum is storage, not a value",
+      blocks: [
+        {
+          kind: "p",
+          text: "An `enum` is a tagged union: a byte blob holding an `int` tag and room for the payload of whichever variant is active. Like a struct it **has no value** — the only operations are constructing a variant, reading the tag with `match`, and reading a payload through the arm's binding. The whole enum is never an expression you can print, assign, pass, or return.",
+        },
+        {
+          kind: "p",
+          text: "The spelling is Lithon's own: an enum is a class deriving from `Enum`. Each body line declares one variant, in one of three forms — a bare unit name, a `name: type` payload annotation, or an inline `class V(Struct)` struct payload.",
+        },
+      ],
+    },
+    {
+      id: "declaring-and-variants",
+      title: "Declaring an enum and its variants",
+      blocks: [
+        {
+          kind: "p",
+          text: "The declaration `s: Shape` reserves and zeroes the blob, exactly the way a struct declaration does. The tag is written by a construction and read by a `match`; the variant names are never values in scope.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/programs/enum_basic.py (excerpt)",
+            sourceRef: "tests/programs/enum_basic.py",
+            expectedRef: "tests/programs/expected/enum_basic.out",
+            typecheck: false,
+            source: `class Shape(Enum):
+    Empty
+    Dot
+    Line: int[32]
+    Rect: int[64]
+
+
+s: Shape
+s = Shape.Dot
+match s:
+    case Shape.Empty:
+        print(0)
+    case Shape.Dot:
+        print(1)
+    case Shape.Line(n):
+        print(n)
+    case Shape.Rect(w):
+        print(w)`,
+            output: "1",
+          },
+        },
+        {
+          kind: "p",
+          text: "The three variant forms are: a bare name (`Empty`, `Dot`) is a unit variant with no payload; `Line: int[32]` is a payload variant whose variant carries one scalar; and an inline `class Tcp(Struct): ...` is a struct payload whose fields are packed at the payload offset. Two variants may not share a name.",
+        },
+      ],
+    },
+    {
+      id: "layout",
+      title: "Layout: a tag, then the largest payload",
+      blocks: [
+        {
+          kind: "p",
+          text: "The layout is `[tag][payload]` with **no padding**. The tag sits at offset 0. It is an `int[8]` while the enum has at most 128 variants (a signed byte holds 0..127) and widens to `int[16]` past that. The payload starts at the tag width, and the enum's size is the tag width plus the largest payload of any variant.",
+        },
+        {
+          kind: "table",
+          caption: "Shape · 9 bytes, no padding",
+          rows: [
+            ["0", "tag : int[8] (Empty=0, Dot=1, Line=2, Rect=3)"],
+            ["1", "payload : largest is Rect's int[64], 8 bytes"],
+          ],
+        },
+        {
+          kind: "p",
+          text: "Only the active variant's payload bytes are ever read. Overwriting a payload variant with a smaller one leaves the old bytes in place but inactive, so a later `match` can never observe them. The size the frontend bakes into the `struct[N]` declaration is exactly what a C `offsetof`/`sizeof` over a `#pragma pack(1)` tag-plus-union would produce; `tools/check_enum_layout.py` compiles that C layout, runs the frontend, and asserts the two agree at both tag-width boundaries.",
+        },
+      ],
+    },
+    {
+      id: "constructing",
+      title: "Constructing a variant",
+      blocks: [
+        {
+          kind: "p",
+          text: "A construction writes the tag and the active payload; it does not create a value. `e = E.V` writes a unit variant, `e = E.V(x)` a one-scalar payload, and `e = E.V(field=x, ...)` or `e = E.V(x, ...)` a struct payload by field name or position. A construction can appear as a bare assignment, in the declaration `e: E = E.V(...)`, or into a struct field `s.efield = E.V(...)`.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/programs/enum_struct.py (excerpt)",
+            sourceRef: "tests/programs/enum_struct.py",
+            typecheck: false,
+            source: `class Endpoint(Enum):
+    Empty
+    class Tcp(Struct):
+        port: int[16]
+        addr: int[32]
+    Udp: int[32]
+
+
+class Conn(Struct):
+    proto: Endpoint
+    id: int[64]
+
+
+c: Conn
+c.proto = Endpoint.Tcp(port=8080, addr=16777343)
+c.id = 7`,
+          },
+        },
+        {
+          kind: "note",
+          tone: "note",
+          title: "stale payloads are never read",
+          text: "After `s = Shape.Line(7)` then `s = Shape.Empty`, the `7` is still in the blob's payload bytes but the tag says `Empty`. A `match` reads the tag first and enters only the arm it selects, so the overwritten bytes are unreachable.",
+        },
+      ],
+    },
+    {
+      id: "matching",
+      title: "Reading a variant with match",
+      blocks: [
+        {
+          kind: "p",
+          text: "A `match` on an enum reads the tag once and dispatches to the arm whose variant matches. An arm for a payload variant binds that payload (`case Shape.Line(n):`); an arm for a unit variant binds nothing (`case Shape.Empty:`). A `case _:` arm is the wildcard and must be last. The match must be exhaustive: every variant is covered by some arm, or there is a `case _:`.",
+        },
+        {
+          kind: "table",
+          caption: "match arms",
+          rows: [
+            ["Unit arm", "`case E.V:` binds nothing"],
+            ["Scalar arm", "`case E.V(n):` binds the one payload scalar"],
+            ["Struct arm", "`case E.V(f1=a, f2=b):` binds each named field"],
+            ["Wildcard", "`case _:` must be the final arm"],
+            ["Exhaustiveness", "all variants covered, or a `case _:` present"],
+          ],
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/programs/enum_struct.py (excerpt)",
+            sourceRef: "tests/programs/enum_struct.py",
+            typecheck: false,
+            source: `class Endpoint(Enum):
+    Empty
+    class Tcp(Struct):
+        port: int[16]
+        addr: int[32]
+    Udp: int[32]
+
+
+class Conn(Struct):
+    proto: Endpoint
+    id: int[64]
+
+
+c: Conn
+c.proto = Endpoint.Tcp(port=8080, addr=16777343)
+c.id = 7
+match c.proto:
+    case Endpoint.Tcp(port=p, addr=a):
+        print(p)
+        print(a)
+    case Endpoint.Udp(n):
+        print(n)
+    case Endpoint.Empty:
+        print(-1)
+print(c.id)`,
+          },
+        },
+        {
+          kind: "p",
+          text: "`match` lowers to the same tag-compare if/elif chain a hand-written dispatch would be: each arm is a `fieldload` of the tag, an equality test, and a branch whose body reads the payload fields it bound. There is no new instruction kind and no enum value flowing through the IR.",
+        },
+      ],
+    },
+    {
+      id: "restrictions",
+      title: "What enums cannot do",
+      blocks: [
+        {
+          kind: "table",
+          caption: "Restrictions",
+          rows: [
+            ["Whole value", "an enum is never an expression; `print(e)` and `e2 = e` are refused"],
+            ["Parameters/returns", "enums are not passed to or returned from functions"],
+            ["List elements", "an enum may not be a list element or a list payload"],
+            ["Enum payloads", "a variant payload is a scalar or an inline `Struct`; not another enum"],
+            ["Guards", "`case E.V if <guard>:` is not supported"],
+          ],
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected · an enum definition error",
+            expect: "error",
+            tool: "frontend",
+            typecheck: false,
+            errorMatch: "LITHON-E0129",
+            source: `class E(Enum):
+    A
+    A
+print(0)`,
+          },
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected · an unknown variant",
+            expect: "error",
+            tool: "frontend",
+            typecheck: false,
+            errorMatch: "LITHON-E0130",
+            source: `class E(Enum):
+    A
+e: E
+e = E.B
+`,
+          },
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected · an enum used as a value",
+            expect: "error",
+            tool: "frontend",
+            typecheck: false,
+            errorMatch: "LITHON-E0131",
+            source: `class E(Enum):
+    A
+    B: int[32]
+e: E
+match e:
+    case E.A:
+        print(0)`,
+          },
+        },
+      ],
+    },
+  ],
+}
+
+const typeFunctions: DocPage = {
+  slug: "type-functions",
+  title: "Type Functions",
+  description:
+    "A compile-time type constructor: `def Name(params) -> NewType: return { T }`, applied as `Name(args)` anywhere a type is allowed.",
+  group: "language",
+  tags: [
+    "type functions",
+    "type function",
+    "NewType",
+    "type alias",
+    "typedef",
+    "generics",
+    "structural",
+    "type constructor",
+  ],
+  sections: [
+    {
+      id: "what-a-type-function-is",
+      title: "A type function is a compile-time type constructor",
+      blocks: [
+        {
+          kind: "p",
+          text: "A type function names a type shape. You declare it with `def Name(params) -> NewType: return { T }`, and then wherever a type is allowed you write `Name(args)`; at compile time the arguments are substituted into `T` and the result is an ordinary type. It runs entirely in the frontend: a definition carries no code, and no runtime value is ever involved.",
+        },
+        {
+          kind: "p",
+          text: "`NewType` is a reserved marker in the return position. The body must be exactly one `return { <type> }`. The parameters hold **types and sizes** — they are plain unannotated names standing in for whatever is spliced at the call site, not values.",
+        },
+      ],
+    },
+    {
+      id: "declaring-and-applying",
+      title: "Declaring and applying a type function",
+      blocks: [
+        {
+          kind: "code",
+          example: {
+            title: "tests/programs/typefunc_basic.py (excerpt)",
+            sourceRef: "tests/programs/typefunc_basic.py",
+            expectedRef: "tests/programs/expected/typefunc_basic.out",
+            typecheck: false,
+            source: `def Fixed(t, n) -> NewType:
+    return {list[t, n]}
+
+
+def Word() -> NewType:
+    return {int[32]}
+
+
+xs: Fixed(int[64], 4)
+xs[0] = 100
+xs[1] = 23
+xs[2] = -3
+print(xs[0] + xs[1] + xs[2])`,
+            output: "120",
+          },
+        },
+        {
+          kind: "p",
+          text: "`Fixed(int[64], 4)` is `list[int[64], 4]` and `Word()` is `int[32]`. A zero-parameter type function must still be applied with parentheses — write `Word()`, not a bare `Word`, which would read as a sized integer and be refused.",
+        },
+      ],
+    },
+    {
+      id: "structural",
+      title: "The result is structural",
+      blocks: [
+        {
+          kind: "p",
+          text: "Applying a type function yields a type **identical** to the expansion spelled out — there is no distinct typedef identity. `Alias(int[64])` is the very same type as `int[64]`, so a variable declared one way and re-declared the other is not a re-declaration with a different type.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/programs/typefunc_basic.py (excerpt)",
+            sourceRef: "tests/programs/typefunc_basic.py",
+            typecheck: false,
+            source: `def Alias(t) -> NewType:
+    return {t}
+
+
+a: int[64] = 5
+a: Alias(int[64]) = 6
+print(a)`,
+          },
+        },
+        {
+          kind: "p",
+          text: "Because the type erases completely, nothing about a type function survives into the IR. `tools/check_typefunc.py` proves this: it compiles a type-function program and the same program with every type spelled out, and asserts the two IR texts are byte-identical.",
+        },
+      ],
+    },
+    {
+      id: "where-they-work",
+      title: "Where a type function can be applied",
+      blocks: [
+        {
+          kind: "p",
+          text: "A call is resolved inside the single annotation parser every type flows through, so a type function works anywhere a type is written: nested in another type function's argument, in a function parameter and return type, as a struct field, and as a container element type.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/programs/typefunc_uses.py (excerpt)",
+            sourceRef: "tests/programs/typefunc_uses.py",
+            expectedRef: "tests/programs/expected/typefunc_uses.out",
+            typecheck: false,
+            source: `def Word() -> NewType:
+    return {int[32]}
+
+
+def Pair(t) -> NewType:
+    return {list[t, 2]}
+
+
+ps: Pair(Word())
+ps[0] = 11
+ps[1] = -22
+print(ps[0] + ps[1])`,
+            output: "-11",
+          },
+        },
+        {
+          kind: "note",
+          tone: "note",
+          title: "applications nest",
+          text: "`Pair(Word())` applies `Word()` first, giving `list[int[32], 2]`. Applications are memoized by call shape, so writing the same `Pair(int[64])` twice expands the body once and returns the same type.",
+        },
+      ],
+    },
+    {
+      id: "restrictions",
+      title: "What a type function cannot do",
+      blocks: [
+        {
+          kind: "table",
+          caption: "Restrictions",
+          rows: [
+            ["Body", "exactly one `return { <type> }`; `{}` is a dict and refused, multi-element bodies and comprehensions too"],
+            ["Composes", "scalar, container, pointer and dict types — not a struct or an enum (those are storage)"],
+            ["Parameters", "plain unannotated positional names; no `/`, `*`, `**` or defaults"],
+            ["Names", "no redeclaration, and no collision with a struct, an enum or a function"],
+            ["Recursion", "must bottom out in a concrete type; direct and mutual recursion are refused"],
+          ],
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected · a body holding two types",
+            expect: "error",
+            tool: "frontend",
+            typecheck: false,
+            errorMatch: "LITHON-E0132",
+            source: `def T(a) -> NewType:
+    return {a, a}
+print(0)`,
+          },
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected · a recursive type function",
+            expect: "error",
+            tool: "frontend",
+            typecheck: false,
+            errorMatch: "LITHON-E0133",
+            source: `def P(a) -> NewType:
+    return {P(a)}
+x: P(int[64]) = 1
+print(0)`,
+          },
+        },
+      ],
+    },
+  ],
+}
+
+const methods: DocPage = {
+  slug: "methods",
+  title: "Methods",
+  description:
+    "A function declared in a struct or enum body, with an implicit self, inlined at each call site.",
+  group: "language",
+  tags: [
+    "methods",
+    "method",
+    "self",
+    "receiver",
+    "struct methods",
+    "enum methods",
+    "inline",
+  ],
+  sections: [
+    {
+      id: "what-a-method-is",
+      title: "A method is a function in a class body",
+      blocks: [
+        {
+          kind: "p",
+          text: "A `def` inside a `Struct` or `Enum` body is a **method**. Its first parameter is the implicit receiver `self`, the rest are annotated scalars, and the return type is optional. A method is called on a struct or enum place: `p.f(1)`, where `p` may be a variable or a struct/enum field.",
+        },
+        {
+          kind: "p",
+          text: "A method is **inlined at the call site**. That is forced by the storage model — a field access names a variable, not a value, and a struct or enum cannot be passed to a function (E0124). Inlining is what lets a method read and write the receiver's fields, run loops and branches, and call other methods.",
+        },
+      ],
+    },
+    {
+      id: "declaring-and-calling",
+      title: "Declaring and calling a method",
+      blocks: [
+        {
+          kind: "code",
+          example: {
+            title: "tests/programs/method_basic.py (excerpt)",
+            sourceRef: "tests/programs/method_basic.py",
+            expectedRef: "tests/programs/expected/method_basic.out",
+            typecheck: false,
+            source: `class Counter(Struct):
+    value: int[64]
+
+    def add(self, n: int[64]) -> int[64]:
+        self.value = self.value + n
+        return self.value
+
+
+c: Counter
+print(c.add(5))
+print(c.add(7))`,
+            output: "5",
+          },
+        },
+        {
+          kind: "p",
+          text: "A method's locals are private to the call: a name in the body cannot capture or clobber a caller's variable of the same spelling, because the inline renames every method local with a per-call prefix. A method that returns nothing is a statement (`p.log()`); one that returns a scalar is an expression you can print or combine.",
+        },
+      ],
+    },
+    {
+      id: "receivers",
+      title: "The receiver, and enum methods",
+      blocks: [
+        {
+          kind: "p",
+          text: "The receiver is a place, so it can be a struct field: `o.inner` resolves to the field's bytes and a method on `Inner` reads and writes the caller's `inner`. A method on an enum reads `self` with `match self` — the only way to read an enum — and returns a scalar computed from the active variant.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/programs/method_enum.py (excerpt)",
+            sourceRef: "tests/programs/method_enum.py",
+            expectedRef: "tests/programs/expected/method_enum.out",
+            typecheck: false,
+            source: `class Shape(Enum):
+    Empty
+    Line: int[32]
+
+    def code(self) -> int[64]:
+        match self:
+            case Shape.Empty:
+                return 0
+            case Shape.Line(n):
+                return n
+            case _:
+                return -1
+
+
+s: Shape
+s = Shape.Empty
+print(s.code())`,
+            output: "0",
+          },
+        },
+      ],
+    },
+    {
+      id: "what-methods-cannot-do",
+      title: "What a method cannot do",
+      blocks: [
+        {
+          kind: "table",
+          caption: "Restrictions",
+          rows: [
+            ["Receiver", "the first parameter must be the unannotated name `self`"],
+            ["Signature", "scalars only (`int[w]`/`float[64]`/`bool`); not a struct, enum, container or pointer, as parameter or return"],
+            ["Arguments", "plain positional names; no `/`, `*`, `**` or defaults"],
+            ["Names", "no redeclaration or overloading; may not shadow a field or variant"],
+            ["Recursion", "inlined at each call site, so direct and mutual recursion are refused"],
+          ],
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected · a method whose first parameter is not `self`",
+            expect: "error",
+            tool: "frontend",
+            typecheck: false,
+            errorMatch: "LITHON-E0134",
+            source: `class P(Struct):
+    x: int[64]
+    def f(a: int[64]) -> int[64]:
+        return a
+p: P
+print(p.f(1))`,
+          },
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected · a recursive method",
+            expect: "error",
+            tool: "frontend",
+            typecheck: false,
+            errorMatch: "LITHON-E0135",
+            source: `class P(Struct):
+    x: int[64]
+    def f(self) -> int[64]:
+        return self.f()
+p: P
+print(p.f())`,
+          },
+        },
+      ],
+    },
+  ],
+}
+
+const syscalls: DocPage = {
+  slug: "syscalls",
+  title: "Syscalls",
+  description:
+    "The raw syscall primitive: `syscall(number, a1..a6) -> int[64]`, one IR instruction, one host trampoline, identical in both tiers.",
+  group: "language",
+  tags: ["syscall", "syscalls", "kernel", "raw", "int[64]", "errno", "Phase III"],
+  sections: [
+    {
+      id: "the-primitive",
+      title: "One instruction, unchecked",
+      blocks: [
+        {
+          kind: "p",
+          text: "`syscall(number, a1, a2, a3, a4, a5, a6)` is a compiler-recognized name, not a function you import. It takes a syscall number and up to six arguments and returns the kernel's **raw** result as `int[64]`. The whole call lowers to a single `Syscall` IR instruction.",
+        },
+        {
+          kind: "p",
+          text: "Nothing is wrapped and nothing is checked. On Linux a failure is simply a negative number: the negated errno, exactly as the kernel reports it. There is no `fallible[...]` to unwrap and no use-before-check rule in this slice — a program that wants to handle failure compares the result itself.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "a syscall number that does not exist",
+            source: `r: int[64] = syscall(-1)
+print(r)`,
+            output: "-38",
+            note: "-1 is not a syscall number, so the kernel returns -ENOSYS (-38). The number is stable across both tiers and across the platform fork, which is what makes it a checkable example.",
+          },
+        },
+      ],
+    },
+    {
+      id: "integer-arguments",
+      title: "Arguments are integers",
+      blocks: [
+        {
+          kind: "p",
+          text: "A raw syscall argument must be an `int` in this slice. A pointer is **rejected at compile time**, and the reason is worth stating plainly: the interpreter does not have real memory addresses. It proves pointer semantics on a synthetic address space of its own (see [Pointers](/docs/pointers)), so a pointer handed to a kernel syscall would name nothing in the interpreter while naming a real frame slot natively. The two tiers would silently disagree.",
+        },
+        {
+          kind: "p",
+          text: "Refusing the pointer is the honest answer: it keeps the primitive tier-neutral. Pointer-taking syscalls such as `write` and `read` are deferred until the interpreter grows a real address-space story, rather than shipping as a construct that works in one tier and faults in the other.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected · a pointer argument",
+            expect: "error",
+            errorMatch: "a raw syscall argument must be an integer in this slice",
+            typecheck: false,
+            source: `x: int[64] = 65
+_ptrX: ptr[int[64]] = addressof(x)
+r: int[64] = syscall(1, _ptrX)
+print(r)`,
+            output:
+              "RCR error: syscall() argument 1 has type ptr[int[64]] -- a raw syscall argument must be an integer in this slice; pointer-taking syscalls (write/read) are not yet supported (Phase III)",
+          },
+        },
+      ],
+    },
+    {
+      id: "both-tiers-agree",
+      title: "Both tiers execute the same trampoline",
+      blocks: [
+        {
+          kind: "p",
+          text: "The platform fork lives in exactly one place, `src/jit/syscall_runtime.h`. It consults an embedder-installed hook first, on every platform. With no hook it runs the real `syscall` instruction on Linux/x86-64; on a platform whose raw ABI is not stable (Windows) it returns `-ENOSYS` rather than guessing.",
+        },
+        {
+          kind: "p",
+          text: "Both the interpreter and the JIT call that one helper, so the two engines cannot drift about the calling convention — the argument registers, the clobbered registers, and the raw return are defined once. The JIT treats the op as a register-clobbering boundary, exactly like a call, so a value live across a syscall is spilled or placed in a callee-saved register.",
+        },
+      ],
+    },
+  ],
+}
+
 export const LANGUAGE_PAGES: DocPage[] = [
   types,
   declarations,
@@ -1363,4 +2075,8 @@ export const LANGUAGE_PAGES: DocPage[] = [
   containers,
   pointers,
   structs,
+  enums,
+  methods,
+  typeFunctions,
+  syscalls,
 ]

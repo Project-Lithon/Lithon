@@ -225,6 +225,11 @@ inline bool is_pure_op(lithon::ir::Op op) {
         case Op::InputInt: return false;
         case Op::ToInt: return false;
         case Op::GuardNonZero: return false;
+        // Phase III. A raw syscall has arbitrary side effects (it can write,
+        // read, or exit) and its result is unproven, so it is neither movable
+        // nor removable -- stated explicitly rather than left to the default
+        // so a future reader sees the reason.
+        case Op::Syscall: return false;
         default: return false;
             return false;   // Call/Return/Branch/Jump have effects; Add/Sub/Mul/Div/Shl/Shr trap; Float/Phi stay untouched
     }

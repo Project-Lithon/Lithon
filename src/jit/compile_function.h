@@ -21,6 +21,7 @@
 #include "print_guard.h"
 #include "register_alloc.h"
 #include "stack_guard.h"
+#include "syscall_runtime.h"
 #include "x86_encoder.h"
 
 // The bridge from typed ir::Functions to runnable x86-64 machine code.
@@ -928,7 +929,7 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
             const ValueLocation& loc = alloc.temp_location(id);
             return loc.in_register ? loc.reg : kL;
         };
-        auto commit_result = [&](ValueId id, Reg computed_in) {
+auto commit_result = [&](ValueId id, Reg computed_in) {
             const ValueLocation& loc = alloc.temp_location(id);
             if (!loc.in_register) emit_store_rbp_offset(code, computed_in, loc.stack_slot);
         };
@@ -951,11 +952,14 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
         // call and execute garbage.
         // Report a fatal error through the host and return. The message must
         // be spelled exactly as the interpreter spells it, prefix included:
-        // the interpreter throws runtime_error("interpreter: division by
-        // zero") and hello.cpp/tier_runner print "error: " + what(), so the
-        // interpreter's stderr line is "error: interpreter: division by
-        // zero". run_tier_diff.py compares stderr, so anything less than an
-        // exact match here is a diff.
+        // the interpreter throws runtime_error("division by zero") and
+        // hello.cpp/tier_runner print "error: " + what(), so the interpreter's
+        // stderr line is "error: division by zero". The text is deliberately
+        // tier-neutral -- no message names the engine that raised it, because
+        // run_tier_diff.py runs the same program through both engines and the
+        // sentence has to read correctly whichever one traps first.
+        // run_tier_diff.py compares stderr, so anything less than an exact
+        // match here is a diff.
         auto emit_host_error_trap = [&](const char* message) {
             emit_mov_reg_imm(code, abi::kArgRegs[0], reinterpret_cast<int64_t>(message));
             emit_mov_reg_imm(code, kR, reinterpret_cast<int64_t>(&host_report_error));
@@ -966,14 +970,14 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
         };
 
         auto emit_float_zero_division_trap = [&]() {
-            emit_host_error_trap("error: interpreter: division by zero\n");
+            emit_host_error_trap("error: division by zero\n");
         };
 
         // The integer counterpart. Distinct text on purpose: the interpreter
         // says "modulo by zero", and run_tier_diff.py matches stderr exactly,
         // so reusing the division string here would show up as a diff.
         auto emit_int_zero_modulo_trap = [&]() {
-            emit_host_error_trap("error: interpreter: modulo by zero\n");
+            emit_host_error_trap("error: modulo by zero\n");
         };
 
         // E0303. Emitted immediately after an int64 add/sub/imul, whose signed
@@ -1019,7 +1023,7 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
         // Python-style wraparound would be a language change and would need to
         // land in the interpreter, typechecker and this guard together.
         auto emit_index_out_of_range_trap = [&]() {
-            emit_host_error_trap("error: interpreter: list index out of range\n");
+            emit_host_error_trap("error: list index out of range\n");
         };
 
 auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& name) {
@@ -2171,6 +2175,50 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 break;
             }
 
+            // Phase III. The raw syscall primitive. The generated code calls
+            // the host helper host_syscall(number, six_slots), which is where
+            // the platform fork lives (syscall_runtime.h): the real 0F 05
+            // instruction on Linux, an embedder hook or -ENOSYS on Windows.
+            // Routing both engines through one helper is what makes the
+            // interpreter and the JIT agree on the calling convention instead
+            // of each spelling the kernel's register rules out separately.
+            //
+            // The six argument slots are staged on the stack, a6 first so a1
+            // lands at [rsp], then the pointer is passed in the second
+            // argument register. Any argument the call omitted is staged as
+            // zero. The pushes are balanced immediately after the call; the
+            // frame's own RSP-relative areas are never live across this
+            // sequence, and six pushes keep RSP 16-byte aligned, so the call
+            // site stays ABI-correct on both hosts.
+            case Op::Syscall: {
+                const size_t nargs = instr.args.size();
+                if (nargs == 0 || nargs > 7) {
+                    throw std::runtime_error(
+                        "compile_module: syscall takes a number and at most six arguments");
+                }
+                for (int pos = 6; pos >= 1; --pos) {
+                    if (static_cast<size_t>(pos) < nargs)
+                        materialize_into(kL, instr.args[static_cast<size_t>(pos)]);
+                    else
+                        emit_xor_zero(code, kL);
+                    emit_push_reg(code, kL);
+                }
+                materialize_into(abi::kArgRegs[0], instr.args[0]);
+                emit_mov_reg_reg(code, abi::kArgRegs[1], Reg::RSP);
+                emit_mov_reg_imm(code, kR,
+                                 reinterpret_cast<int64_t>(&lithon::jit::host_syscall));
+                if (abi::kShadowSpace) emit_sub_rsp_imm32(code, abi::kShadowSpace);
+                emit_call_reg(code, kR);
+                if (abi::kShadowSpace) emit_add_rsp_imm32(code, abi::kShadowSpace);
+                emit_add_rsp_imm32(code, 6 * 8);
+                if (instr.result != kInvalidValue) {
+                    Reg dst = compute_dest(instr.result);
+                    if (dst != Reg::RAX) emit_mov_reg_reg(code, dst, Reg::RAX);
+                    commit_result(instr.result, dst);
+                }
+                break;
+            }
+
             case Op::Store: {
                 // 4.1. A valueless container store is a declaration, not an
                 // assignment: the slot run was reserved during layout, and
@@ -2370,6 +2418,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             // bytes and a load SIGN-extends an int field (a Lithon int is
             // signed) or zero-extends a bool, exactly like a list element of
             // the same width.
+
             case Op::FieldLoad: {
                 if (alloc.struct_size(instr.name) == 0) {
                     throw std::runtime_error("compile_module: field load from '" +
@@ -2508,7 +2557,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                         // A read of an absent key traps. The message is fixed and
                         // names no key, because the trap takes a literal string and
                         // the two tiers are compared byte for byte on stderr.
-                        emit_host_error_trap("error: interpreter: dict key not found\n");
+                        emit_host_error_trap("error: dict key not found\n");
                     });
                 break;
             }
@@ -2776,10 +2825,10 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                         JumpPatch count_in_range = emit_jcc_rel32(code, Cond::JumpBelowEq);
                         if (is_shl)
                             emit_host_error_trap(
-                                "error: interpreter: shift count out of range 0..63 for `<<`\n");
+                                "error: shift count out of range 0..63 for `<<`\n");
                         else
                             emit_host_error_trap(
-                                "error: interpreter: shift count out of range 0..63 for `>>`\n");
+                                "error: shift count out of range 0..63 for `>>`\n");
                         resolve_jump_patch(code, count_in_range, code.size());
 
                         // `shl rcx, cl` would read the value and the count out

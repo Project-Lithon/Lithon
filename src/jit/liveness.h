@@ -374,7 +374,13 @@ private:
                     last_use_here[arg] = static_cast<int>(pos);
 
             for (size_t pos = 0; pos < fn.blocks[b].instrs.size(); ++pos) {
-                if (Op::Call != fn.blocks[b].instrs[pos].op) continue;
+                // Both a user call and the raw syscall are register-clobbering
+                // boundaries: the call per the host ABI, the syscall because
+                // the instruction itself destroys RCX and R11 and the host
+                // helper is reached as an ordinary call. A value live across
+                // either must be in a callee-saved register or spilled.
+                const lithon::ir::Op op = fn.blocks[b].instrs[pos].op;
+                if (op != Op::Call && op != Op::Syscall) continue;
                 const int call_pos = static_cast<int>(pos);
                 for (auto& kv : ranges_) {
                     LiveRange& r = kv.second;

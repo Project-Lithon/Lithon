@@ -4,8 +4,10 @@
 #include "jit/input_runtime.h"
 #include "jit/print_guard.h"
 #include "jit/stack_guard.h"
+#include "jit/syscall_runtime.h"
 #include "dict_hash.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -102,40 +104,108 @@ public:
         return it->second;
     }
 
-    // 4.4. Synthetic addresses. The JIT computes a real rbp-relative pointer
-    // on the native stack, which an interpreter has no way to reproduce, so
-    // the interpreter proves pointer semantics on a synthetic address space
-    // of its own: each addressed variable is handed a small, strictly
-    // positive, distinct address on first mention, and valueof resolves the
-    // address back to the variable's live value through the reverse map.
+    // 4.4. Real addresses. A ptr[T] is a genuine host address in BOTH tiers,
+    // not a synthetic handle: a kernel syscall handed one (5.2's send/recv
+    // buffers) must be able to read and write the bytes behind it. The
+    // interpreter used to hand out 0x1000, 0x1008, ... and resolve valueof
+    // through a reverse map, which made every pointer unusable by anything
+    // outside the interpreter.
     //
-    // Determinism and uniqueness are the whole contract:
-    //   * the addresses depend only on program order, not on machine state,
-    //     so `_p == _q` (same target twice) is False, `_p == _q` of two
-    //     different variables is False, and `_p == 0` is always False after a
-    //     successful addressof -- 0 is never handed out, on purpose, so it
-    //     stays the "no pointer" sentinel that the `_p == 0` test means;
-    //   * a valueof of an address that resolves to no live variable is a
-    //     deterministic trap, which is the interpreter's answer for the
-    //     dangling-pointer case. That case is out of scope for 4.4 and never
-    //     exercised by the corpus.
-    std::unordered_map<std::string, int64_t> addr_of_var;
+    // Each address-taken variable gets its OWN 8-byte block rather than a
+    // slice of one growing arena: std::vector reallocates when it grows, which
+    // would move every address already handed out and leave a live pointer
+    // dangling. unordered_map is node-based, so a mapped vector's buffer stays
+    // put across later insertions -- which is the whole reason for this shape.
+    //
+    // The slot is 8 bytes because that is what the JIT gives every variable too,
+    // so the two layouts agree. Narrow values occupy the low bytes; see
+    // sync_arena below.
+    std::unordered_map<std::string, std::vector<uint8_t>> arena_slots;
     std::unordered_map<int64_t, std::string> var_of_addr;
-    int64_t synthetic_next = 0x1000;
+
+    // Writes `v` into the variable's block in the same little-endian order the
+    // JIT's frame stores it, so the bytes a pointer names are the bytes the
+    // native tier would have written. A float goes out as its IEEE-754 bits,
+    // which is what store_float_var's movsd does natively.
+    void sync_arena(const std::string& name, const LithonValue& v) {
+        auto it = arena_slots.find(name);
+        if (it == arena_slots.end()) return;   // not address-taken: fast value form
+        std::vector<uint8_t>& slot = it->second;
+        uint64_t bits = 0;
+        if (v.is_float()) {
+            const double d = v.as_float();
+            std::memcpy(&bits, &d, sizeof bits);
+        } else {
+            bits = static_cast<uint64_t>(v.as_int());
+        }
+        for (size_t i = 0; i < slot.size() && i < 8; ++i)
+            slot[i] = static_cast<uint8_t>((bits >> (8 * i)) & 0xFF);
+    }
 
     int64_t address_of(const std::string& name) {
-        auto it = addr_of_var.find(name);
-        if (it != addr_of_var.end()) return it->second;
+        // 4.4. A struct is already a byte run, so its base IS its address and
+        // no slot is allocated: the pointer names the same bytes fieldload and
+        // fieldstore read and write. This is what makes a pointer into struct
+        // memory real for a kernel syscall (5.2).
+        auto s = structs.find(name);
+        if (s != structs.end()) {
+            const int64_t addr =
+                static_cast<int64_t>(reinterpret_cast<uintptr_t>(s->second.data()));
+            var_of_addr[addr] = name;
+            return addr;
+        }
+        auto it = arena_slots.find(name);
+        if (it != arena_slots.end())
+            return static_cast<int64_t>(reinterpret_cast<uintptr_t>(it->second.data()));
         if (vars.find(name) == vars.end()) {
             throw std::runtime_error("interpreter: reference to undefined variable '" + name + "'");
         }
-        const int64_t addr = synthetic_next;
-        synthetic_next += 8;
-        addr_of_var[name] = addr;
+        auto ins = arena_slots.emplace(name, std::vector<uint8_t>(8, 0));
+        std::vector<uint8_t>& slot = ins.first->second;
+        const int64_t addr =
+            static_cast<int64_t>(reinterpret_cast<uintptr_t>(slot.data()));
         var_of_addr[addr] = name;
+        // The variable may already hold a value -- `a = 5` before
+        // `_p = addressof(a)` -- so the block is seeded from it rather than
+        // left zero, which would make a pointer taken later read a stale zero.
+        auto v = vars.find(name);
+        if (v != vars.end()) sync_arena(name, v->second);
         return addr;
     }
+
+    // Which struct blob a field op targets.
+    //
+    // 4.4, second half. A field op with no base argument names its struct, as
+    // it always has. With one, the base is a POINTER's address: the address
+    // resolves back through the same map address_of populated, so a pointer
+    // into a struct reaches the very bytes fieldload/fieldstore read and
+    // write -- there is no copy and no second copy of the blob to keep in
+    // step. A store carries the value at args[0] and the base at args[1], so
+    // the two never collide.
+    std::string field_target(const Instr& in, size_t base_arg) const {
+        if (in.args.size() > base_arg) {
+            LithonValue p = get_reg(in.args[base_arg]);
+            if (!p.is_int()) {
+                throw std::runtime_error(
+                    "interpreter: field access through a non-address base");
+            }
+            return name_behind(p.as_int());
+        }
+        return in.name;
+    }
+
+    // The name behind a pointer, or an error naming the failure.
+    std::string name_behind(int64_t addr) const {
+        auto back = var_of_addr.find(addr);
+        if (back == var_of_addr.end()) {
+            throw std::runtime_error(
+                "interpreter: dereference of a pointer that names no live object -- "
+                "dangling and out-of-bounds pointers are out of scope (4.4)");
+        }
+        return back->second;
+    }
 };
+
 
 // The value a container element holds before anything is written to it. Zero
 // of the element's own kind, so a freshly declared list[float[64],4] reads
@@ -263,7 +333,7 @@ LithonValue apply_binop(Op op, LithonValue lhs, LithonValue rhs) {
         // same condition, so the two engines agree here by construction --
         // which is what lets run_tier_diff.py treat the interpreter as an
         // oracle for float code at all.
-        if (b == 0.0) throw std::runtime_error("interpreter: division by zero");
+        if (b == 0.0) throw std::runtime_error("division by zero");
         return LithonValue::make_float(a / b);
     }
 
@@ -278,7 +348,7 @@ LithonValue apply_binop(Op op, LithonValue lhs, LithonValue rhs) {
                 // Same zero-divisor rule as Div above, for the same reason: the
                 // JIT checks it, so the two engines agree by construction. NaN
                 // divisors propagate rather than trap, again matching Div.
-                if (b == 0.0) throw std::runtime_error("interpreter: modulo by zero");
+                if (b == 0.0) throw std::runtime_error("modulo by zero");
                 // fmod is exactly the truncated (sign-follows-dividend)
                 // remainder, so the float path needs no sign correction.
                 double r = std::fmod(a, b);
@@ -337,7 +407,7 @@ LithonValue apply_binop(Op op, LithonValue lhs, LithonValue rhs) {
         case Op::WrapMul: return LithonValue::make_int(
             static_cast<int64_t>(static_cast<uint64_t>(a) * static_cast<uint64_t>(b)));
         case Op::Mod: {
-            if (b == 0) throw std::runtime_error("interpreter: modulo by zero");
+            if (b == 0) throw std::runtime_error("modulo by zero");
             // int64_t has no representable result for INT64_MIN % -1: it is 2^63,
             // one past the maximum. C++ leaves that undefined and x86 `idiv`
             // raises #DE, which would take the whole process down instead of
@@ -417,7 +487,7 @@ LithonValue apply_bitop(Op op, LithonValue lhs, LithonValue rhs) {
                 // byte-for-byte and the JIT's trap passes a literal string, so
                 // a formatted count here would show up as a tier diff. The
                 // compile-time message for a literal count does include it.
-                throw std::runtime_error("interpreter: shift count out of range 0..63 for `<<`");
+                throw std::runtime_error("shift count out of range 0..63 for `<<`");
             }
             // Unsigned shift, then reinterpret: shifting a negative int64 left
             // into the sign bit is well-defined via the unsigned domain, while
@@ -428,7 +498,7 @@ LithonValue apply_bitop(Op op, LithonValue lhs, LithonValue rhs) {
                 static_cast<int64_t>(static_cast<uint64_t>(a) << static_cast<uint64_t>(b)));
         case Op::Shr:
             if (b < 0 || b > 63) {
-                throw std::runtime_error("interpreter: shift count out of range 0..63 for `>>`");
+                throw std::runtime_error("shift count out of range 0..63 for `>>`");
             }
             // Arithmetic (sign-propagating): C++20 mandates this for signed
             // operands, and it is what Python's >> does, so -1 >> 1 is -1.
@@ -644,6 +714,12 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     // throws on hand-written IR.
                     if (instr.args.empty()) break;
                     frame.vars[instr.name] = frame.get_reg(instr.args.at(0));
+                    // 4.4. If this variable's address was taken, keep the bytes
+                    // behind the pointer in step with the value. Without this
+                    // the pointer and the name would be two sources of truth,
+                    // and the second writer -- a syscall reading the block --
+                    // would see whichever the mirror missed.
+                    frame.sync_arena(instr.name, frame.vars[instr.name]);
                     break;
                 case Op::DictStore:
                 case Op::DictIndex:
@@ -678,7 +754,7 @@ LithonValue execute_function(const Module& module, const Function& fn,
                             // reason the index trap has no numbers: the JIT's
                             // trap passes a literal string and the two tiers are
                             // compared byte-for-byte on stderr.
-                            throw std::runtime_error("interpreter: dict key not found");
+                            throw std::runtime_error("dict key not found");
                         }
                         frame.regs[instr.result] = t.values[static_cast<size_t>(b)];
                     }
@@ -701,17 +777,17 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     frame.regs[instr.result] =
                         LithonValue::make_int(frame.address_of(instr.name));
                     break;
+                // 4.4. A pointer is a real address, so valueof resolves it to
+                // the object it names. The value comes from the variable's own
+                // slot, which is kept byte-identical to the block a pointer
+                // addresses (see sync_arena), so a narrow int is still the
+                // signed value it was stored as.
                 case Op::ValueOf: {
                     LithonValue ptr = frame.get_reg(instr.args.at(0));
                     if (!ptr.is_int()) {
                         throw std::runtime_error("interpreter: valueof of a non-address value");
                     }
-                    auto back = frame.var_of_addr.find(ptr.as_int());
-                    if (back == frame.var_of_addr.end()) {
-                        throw std::runtime_error(
-                            "interpreter: dereference of a pointer with no live variable behind it");
-                    }
-                    frame.regs[instr.result] = frame.get_var(back->second);
+                    frame.regs[instr.result] = frame.get_var(frame.name_behind(ptr.as_int()));
                     break;
                 }
                 // 4.6. Struct field access. The offset (int_imm) and the field's
@@ -722,7 +798,7 @@ LithonValue execute_function(const Module& module, const Function& fn,
                 // agrees across the tiers.
                 case Op::FieldLoad: {
                     const std::vector<uint8_t>& bytes =
-                        frame.get_struct(instr.name, "read from");
+                        frame.get_struct(frame.field_target(instr, 0), "read from");
                     const int off = static_cast<int>(instr.int_imm);
                     if (instr.type_kind == "float") {
                         if (off < 0 || static_cast<size_t>(off) + 8 > bytes.size()) {
@@ -745,7 +821,8 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     break;
                 }
                 case Op::FieldStore: {
-                    std::vector<uint8_t>& bytes = frame.get_struct(instr.name, "write to");
+                    std::vector<uint8_t>& bytes =
+                        frame.get_struct(frame.field_target(instr, 1), "write to");
                     const int off = static_cast<int>(instr.int_imm);
                     LithonValue v = frame.get_reg(instr.args.at(0));
                     if (instr.type_kind == "float") {
@@ -795,6 +872,29 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     }
                     break;
                 }
+                // Phase III. The raw syscall. Both engines reach the same
+                // helper, so the platform fork -- the real `syscall`
+                // instruction on Linux, a host hook elsewhere -- is identical
+                // for the interpreter and the JIT by construction. The result
+                // is the kernel's raw return, stored as a plain int[64].
+                // Arguments are integers in this slice; the typechecker
+                // rejects pointers, whose interpreter representation is a
+                // synthetic address rather than real memory.
+                case Op::Syscall: {
+                    if (instr.args.empty()) {
+                        throw std::runtime_error(
+                            "interpreter: syscall without a syscall number");
+                    }
+                    const int64_t number = frame.get_reg(instr.args.at(0)).as_int();
+                    int64_t slots[6] = {0, 0, 0, 0, 0, 0};
+                    const size_t extra = std::min<size_t>(instr.args.size() - 1, 6);
+                    for (size_t i = 0; i < extra; ++i) {
+                        slots[i] = frame.get_reg(instr.args.at(i + 1)).as_int();
+                    }
+                    frame.regs[instr.result] =
+                        LithonValue::make_int(lithon::jit::host_syscall(number, slots));
+                    break;
+                }
                 case Op::Index:
                 case Op::IndexStore: {
                     std::vector<LithonValue>& elems = frame.get_list(
@@ -810,7 +910,7 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     // byte-for-byte between the tiers.
                     const int64_t i = idx.as_int();
                     if (i < 0 || i >= static_cast<int64_t>(elems.size())) {
-                        throw std::runtime_error("interpreter: list index out of range");
+                        throw std::runtime_error("list index out of range");
                     }
                     if (instr.op == Op::Index) {
                         frame.regs[instr.result] = elems[static_cast<size_t>(i)];

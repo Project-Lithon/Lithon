@@ -373,6 +373,34 @@ FRONTEND_REFUSALS = [
     ("for over a list, only range() exists (E0119)",
      "xs: list[int[64], 4]\nfor i in xs:\n    print(i)\n",
      "LITHON-E0119"),
+    # 6.1. enumerate/zip are a rewrite of a counted loop, so they exist only in
+    # a for header: there is no value to bind, and a homogeneous tuple cannot
+    # represent enumerate's (int, T) pair anyway. Used as a value they must be
+    # refused HERE, with that reason, rather than falling through to a generic
+    # `call` that the checker rejects as an unknown function.
+    ("zip() as a value (E0115)",
+     "xs: list[int[64], 4]\nz: int[64] = zip(xs, xs)\nprint(z)\n",
+     "LITHON-E0115"),
+    ("enumerate() as a value (E0115)",
+     "xs: list[int[64], 4]\nz: int[64] = enumerate(xs)\nprint(z)\n",
+     "LITHON-E0115"),
+    ("enumerate with the wrong number of targets (E0119)",
+     "xs: list[int[64], 4]\nfor i in enumerate(xs):\n    print(i)\n",
+     "LITHON-E0119"),
+    ("enumerate over a non-container (E0119)",
+     "x: int[64] = 1\nfor i, v in enumerate(x):\n    print(i)\n",
+     "LITHON-E0119"),
+    ("zip of a single container (E0119)",
+     "xs: list[int[64], 4]\nfor a in zip(xs):\n    print(a)\n",
+     "LITHON-E0119"),
+    # 6.1. A loop target is a binding, so it obeys the same one-type-per-name
+    # rule as an annotated declaration. Registering it is what turns a silent
+    # type change into a refusal that names both types.
+    ("an enumerate target rebound to a different type (E0122)",
+     "xs: list[int[64], 4]\nys: list[bool, 4]\n"
+     "for i, v in enumerate(xs):\n    print(v)\n"
+     "for j, v in enumerate(ys):\n    print(v)\n",
+     "LITHON-E0122"),
     ("while/else dropped eagerly (E0118)",
      "x: int[64] = 0\nwhile x < 3:\n    x = x + 1\nelse:\n    print(x)\n",
      "LITHON-E0118"),
@@ -400,6 +428,81 @@ FRONTEND_REFUSALS = [
      "class Foo(Struct):\n    x: int[64]\nf: Foo\nprint(f)\n", "LITHON-E0128"),
     ("unknown field access on a struct (E0128)",
      "class Foo(Struct):\n    x: int[64]\nf: Foo\nf.y = 1\n", "LITHON-E0128"),
+    ("enum without the Enum base (E0126)",
+     "class E(Bar):\n    A\nprint(0)\n", "LITHON-E0126"),
+    ("enum member with a value (E0129)",
+     "class E(Enum):\n    A = 1\nprint(0)\n", "LITHON-E0129"),
+    ("duplicate enum variant (E0129)",
+     "class E(Enum):\n    A\n    A\nprint(0)\n", "LITHON-E0129"),
+    ("unknown enum variant (E0130)",
+     "class E(Enum):\n    A\ne: E\ne = E.B\n", "LITHON-E0130"),
+    ("unit variant constructed with a payload (E0130)",
+     "class E(Enum):\n    A\n    B: int[32]\ne: E\ne = E.A(1)\n", "LITHON-E0130"),
+    ("enum used where a value is needed (E0131)",
+     "class E(Enum):\n    A\ne: E\nprint(e)\n", "LITHON-E0131"),
+    ("non-exhaustive enum match (E0131)",
+     "class E(Enum):\n    A\n    B: int[32]\ne: E\nmatch e:\n    case E.A:\n        print(0)\n",
+     "LITHON-E0131"),
+    ("enum match guard (E0131)",
+     "class E(Enum):\n    A\ne: E\nmatch e:\n    case E.A if True:\n        print(0)\n",
+     "LITHON-E0131"),
+    ("type function body with two types (E0132)",
+     "def T(a) -> NewType:\n    return {a, a}\nprint(0)\n", "LITHON-E0132"),
+    ("type function body is an empty dict (E0132)",
+     "def T() -> NewType:\n    return {}\nprint(0)\n", "LITHON-E0132"),
+    ("type function with an annotated parameter (E0132)",
+     "def T(a: int[64]) -> NewType:\n    return {a}\nprint(0)\n", "LITHON-E0132"),
+    ("type function name collides with a struct (E0132)",
+     "def T(a) -> NewType:\n    return {a}\nclass T(Struct):\n    x: int[64]\nprint(0)\n",
+     "LITHON-E0132"),
+    ("application of an undeclared type function (E0133)",
+     "x: T(int[64]) = 1\nprint(0)\n", "LITHON-E0133"),
+    ("type function arity mismatch (E0133)",
+     "def P(a, b) -> NewType:\n    return {list[a, b]}\nx: P(int[64]) = 1\nprint(0)\n",
+     "LITHON-E0133"),
+    ("recursive type function (E0133)",
+     "def P(a) -> NewType:\n    return {P(a)}\nx: P(int[64]) = 1\nprint(0)\n",
+     "LITHON-E0133"),
+    ("type function body names a struct (E0132)",
+     "class S(Struct):\n    v: int[64]\ndef P() -> NewType:\n    return {S}\ns: P()\n",
+     "LITHON-E0132"),
+    ("method with a decorator (E0134)",
+     "class P(Struct):\n    x: int[64]\n    @staticmethod\n    def f(self) -> int[64]:\n"
+     "        return 1\np: P\nprint(p.f())\n", "LITHON-E0134"),
+    ("method whose first parameter is not `self` (E0134)",
+     "class P(Struct):\n    x: int[64]\n    def f(a: int[64]) -> int[64]:\n"
+     "        return a\np: P\nprint(p.f(1))\n", "LITHON-E0134"),
+    ("method with an annotated `self` (E0134)",
+     "class P(Struct):\n    x: int[64]\n    def f(self: int[64]) -> int[64]:\n"
+     "        return 1\np: P\nprint(p.f())\n", "LITHON-E0134"),
+    ("method with an unannotated parameter (E0134)",
+     "class P(Struct):\n    x: int[64]\n    def f(self, a) -> int[64]:\n"
+     "        return a\np: P\nprint(p.f(1))\n", "LITHON-E0134"),
+    ("method with a container parameter (E0134)",
+     "class P(Struct):\n    x: int[64]\n    def f(self, a: list[int[64], 4]) -> int[64]:\n"
+     "        return 1\np: P\nprint(p.f(1))\n", "LITHON-E0134"),
+    ("method with a default argument (E0134)",
+     "class P(Struct):\n    x: int[64]\n    def f(self, a: int[64] = 3) -> int[64]:\n"
+     "        return a\np: P\nprint(p.f())\n", "LITHON-E0134"),
+    ("method name colliding with a field (E0134)",
+     "class P(Struct):\n    x: int[64]\n    def x(self) -> int[64]:\n"
+     "        return 1\np: P\nprint(p.x())\n", "LITHON-E0134"),
+    ("call to an unknown method (E0135)",
+     "class P(Struct):\n    x: int[64]\np: P\nprint(p.h())\n", "LITHON-E0135"),
+    ("a field called as a method (E0135)",
+     "class P(Struct):\n    x: int[64]\np: P\nprint(p.x())\n", "LITHON-E0135"),
+    ("method call with a keyword argument (E0135)",
+     "class P(Struct):\n    x: int[64]\n    def f(self, a: int[64]) -> int[64]:\n"
+     "        return a\np: P\nprint(p.f(a=1))\n", "LITHON-E0135"),
+    ("method call arity mismatch (E0135)",
+     "class P(Struct):\n    x: int[64]\n    def f(self, a: int[64]) -> int[64]:\n"
+     "        return a\np: P\nprint(p.f(1, 2))\n", "LITHON-E0135"),
+    ("recursive method (E0135)",
+     "class P(Struct):\n    x: int[64]\n    def f(self) -> int[64]:\n"
+     "        return self.f()\np: P\nprint(p.f())\n", "LITHON-E0135"),
+    ("method with no result used as a value (E0135)",
+     "class P(Struct):\n    x: int[64]\n    def f(self):\n        return\n"
+     "p: P\nprint(p.f())\n", "LITHON-E0135"),
 ]
 
 

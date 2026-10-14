@@ -837,9 +837,9 @@ def evaluate(py_path: Path, tmp_ir: Path):
     interp = run([str(HELLO), str(tmp_ir)])
 
     # A divide/modulo-by-zero trap is a *result*, not a rejection: the
-    # interpreter prints "error: interpreter: division by zero" (or "modulo by
-    # zero") and exits 1, and the JIT prints the same line and exits 1. Both
-    # engines are supposed to do that, so the program is worth comparing -- it
+    # interpreter prints "error: division by zero" (or "modulo by zero") and
+    # exits 1, and the JIT prints the same line and exits 1. Both engines are
+    # supposed to do that, so the program is worth comparing -- it
     # exercises the emitted zero test (comisd sets ZF for an unordered compare
     # as well as for an equal one, so the check has to be ZF AND !PF or it
     # traps on a NaN divisor instead). Skipping these would throw away precisely

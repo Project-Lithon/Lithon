@@ -67,6 +67,15 @@ python3 tools/check_encoder_vs_as.py
 step "struct layout: frontend offsets == C packed sizeof/offsetof"
 python3 tools/check_struct_layout.py
 
+step "type functions: expansion is byte-identical to the spelled-out type"
+python3 tools/check_typefunc.py
+
+step "enum layout: tag width + payload offset + sizeof == model == C packed"
+python3 tools/check_enum_layout.py
+
+step "methods: inlined call == hand-inlined code in both tiers (+ refusals)"
+python3 tools/check_methods.py
+
 step "CPU target features: CPUID detection must match the kernel's own view"
 python3 tools/check_cpu_features.py
 

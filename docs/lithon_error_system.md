@@ -172,11 +172,16 @@ through one shared trap mechanism
 (`host_report_error` / the `emit_host_error_trap` lambda already in
 `compile_function.h`) that prints a message and terminates — no recovery
 path is offered, by design, because a program fault means the program's
-remaining state cannot be trusted.
+remaining state cannot be trusted. The message text is **tier-neutral**: the
+same sentence is printed whether the interpreter or the native tier traps
+first, so it never names the engine. An `interpreter:`/`native:` prefix would
+be a lie half the time, and the run banner already says which engine ran;
+`tools/run_tier_diff.py` asserts the absence of such a prefix, not just that
+the two engines agree byte for byte.
 
 **New obligation this document adds — structured error codes.** Today's
 trap messages are individually well-written prose
-(`"RCR error: division by zero"`) but not machine-matchable. Every Tier-3
+(`"error: division by zero"`) but not machine-matchable. Every Tier-3
 trap and every Tier-1 RCR rejection should carry a stable, numbered code
 alongside its prose, the same spirit as the existing `V1_SPEC 0.6.5`-style
 citations, formalized:
@@ -295,8 +300,8 @@ op below with an unlisted or undefined fourth case.
 | `Shl`, `Shr` | Literal shift amount, `0 <= amount < width` | Dynamic amount → **Tier 3** | Runtime bounds check + trap (`E0304`) — **shipped** |
 | `IndexStore` (list/dict, capacity check) | Constant-provable index/length vs. declared capacity | Dynamic index/length → **Tier 3** | Runtime bounds check + trap (`E0305`) — **shipped for list**, dict TBD |
 | Stack depth (every function prologue) | N/A — always dynamic, no static proof form exists | Always **Tier 3** | Runtime depth check + trap (`E0401`) — **shipped**: both tiers increment a shared call-depth counter and trap at 4096 with byte-identical output |
-| `addressof`, `valueof`, syscall raw op | N/A — Tier 0 by definition, proof never attempted | **Tier 0** | No check. `_`-prefix required on the declaring identifier — **shipped (addressof/valueof design); syscalls designed, not built** |
-| A syscall's return value | N/A — environmental by deliberate classification | **Tier 2** | `fallible[T]` return, use-before-check enforced — **designed, not built** |
+| `addressof`, `valueof`, syscall raw op | N/A — Tier 0 by definition, proof never attempted | **Tier 0** | No check. `_`-prefix required on the declaring identifier — **shipped**: the raw `syscall(number, a1..a6) -> int[64]` op is built and tier-neutral (both engines reach the same host trampoline). Arguments are integers in this slice; a pointer argument is refused because the interpreter's addresses are synthetic, not real memory, so pointer-taking syscalls (`write`/`read`) are deferred |
+| A syscall's return value | N/A — environmental by deliberate classification | **Tier 2** | `fallible[T]` return, use-before-check enforced — **designed, not built**. The shipped form is the raw Tier-0 `int[64]` return (finite, enumerable; a negative value is `-errno` on Linux); the `fallible[T]` ergonomics here are future work |
 | `Not`, comparisons (`Lt`/`Gt`/`Eq`), `And`/`Or` | N/A — these ops cannot fail; not part of the tier system at all (see the "fifth case" in section 4) | — | No check of any kind, ever |
 
 ## 4b. Exact syntax per tier
@@ -341,7 +346,7 @@ readable from the code alone.
 
 | Code | Tier | Trigger |
 |---|---|---|
-| `E01xx` | 1 (static refusal) | `E0101` overflow-on-reassignment, `E0102` literal zero divisor, `E0103` literal shift out of range, `E0104` literal-provable capacity overflow, `E0105` unsupported type width, `E0106` `float(64, x)` of int[64] refused (lossy: 53 bits cannot hold every int[64]), `E0107` `range(a,b,0)` with literal zero step, `E0108` unsupported type-annotation form, `E0109` unknown or badly-sized annotation type name, `E0110` annotation missing a required field, `E0111` bad container capacity / literal count, `E0112` container element must be a plain scalar, `E0113` pointer (`ptr[T]`) declaration rules (4.4), `E0114` unsupported or restricted program construct, `E0115` unsupported builtin call form, `E0116` builtin argument rules (`valueof`/`addressof`/`wrap_*`), `E0117` indexing / container-subscript restrictions, `E0118` `else` clause on a `while`/`for` loop, `E0119` `for`-loop form restrictions, `E0120` `break`/`continue` outside a loop, `E0121` assignment / target restrictions, `E0122` declaration and re-declaration rules, `E0123` tuple/dict literal shape, `E0124` function-header restrictions, `E0125` pointer arithmetic form, `E0126` struct definition (must derive from `Struct`, annotation fields only), `E0127` struct field type (int[w]/float[64]/bool or an earlier struct), `E0128` struct field access (unknown field or whole-struct-as-value) |
+| `E01xx` | 1 (static refusal) | `E0101` overflow-on-reassignment, `E0102` literal zero divisor, `E0103` literal shift out of range, `E0104` literal-provable capacity overflow, `E0105` unsupported type width, `E0106` `float(64, x)` of int[64] refused (lossy: 53 bits cannot hold every int[64]), `E0107` `range(a,b,0)` with literal zero step, `E0108` unsupported type-annotation form, `E0109` unknown or badly-sized annotation type name, `E0110` annotation missing a required field, `E0111` bad container capacity / literal count, `E0112` container element must be a plain scalar, `E0113` pointer (`ptr[T]`) declaration rules (4.4), `E0114` unsupported or restricted program construct, `E0115` unsupported builtin call form, `E0116` builtin argument rules (`valueof`/`addressof`/`wrap_*`), `E0117` indexing / container-subscript restrictions, `E0118` `else` clause on a `while`/`for` loop, `E0119` `for`-loop form restrictions, `E0120` `break`/`continue` outside a loop, `E0121` assignment / target restrictions, `E0122` declaration and re-declaration rules, `E0123` tuple/dict literal shape, `E0124` function-header restrictions, `E0125` pointer arithmetic form, `E0126` struct definition (must derive from `Struct`, annotation fields only), `E0127` struct field type (int[w]/float[64]/bool or an earlier struct), `E0128` struct field access (unknown field or whole-struct-as-value), `E0129` enum definition (must derive from `Enum`; unit names, payload annotations, or inline `Struct` variants only), `E0130` enum variant construction (unknown variant, wrong payload shape, unknown/missing/duplicate struct-payload field), `E0131` `match` on an enum (bad subject/pattern, non-exhaustive, a guard, a trailing wildcard that is not last, or an enum used where a value is needed), `E0132` type-function definition (`-> NewType`: bad signature, body not a one-element `{ T }`, duplicate/colliding name), `E0133` type-function application (unknown callee, keyword/starred args, arity mismatch, recursive expansion), `E0134` method definition (decorator, `/`/`*`/`**`/defaults, missing or annotated `self`, unannotated or non-scalar parameter/return, duplicate or colliding name), `E0135` method application (unknown method, field called as a method, non-struct/enum receiver, keyword/starred args, arity mismatch, recursive inline, void result used as a value) |
 | `E02xx` | 2 (environmental) | `E0201` fallible value read before `.ok` check |
 | `E03xx` | 3 (dynamic runtime trap, arithmetic/logic) | `E0301` division by zero, `E0302` modulo by zero, `E0303` dynamic integer overflow, `E0304` shift amount out of range, `E0305` dynamic index/capacity out of range, `E0306` invalid integer literal in input, `E0307` input value outside the target width, `E0308` end of input, `E0309` float-to-int conversion out of range or not finite, `E0310` `range(a,b,step)` with `step == 0` (dynamic) |
 | `E04xx` | 3 (dynamic runtime trap, resource) | `E0401` stack overflow |
@@ -412,9 +417,14 @@ ad hoc handling per feature. Concretely:
 - **Phase 4.3 (`dict`)**: a full-table dynamic insert is Tier 3 — already
   decided, same slot.
 - **Phase 4.4 (pointers)**: Tier 0, as designed.
-- **Phase 5.1 (syscalls)**: Tier 2, via `fallible[T]` — this document is
-  what makes that design concrete and buildable rather than a stated
-  preference with no representation.
+- **Phase 5.1 (syscalls)**: shipped as **Tier 0 raw** — `syscall(number,
+  a1..a6) -> int[64]`, the kernel's unchecked return, one IR op reached by both
+  engines through one host trampoline. The **Tier 2 `fallible[T]` ergonomics
+  below remain designed, not built**: the raw form deliberately lands in Tier 0
+  because the set of producers stays small and enumerable, and because a
+  pointer argument (which is what `fallible[T]` would mainly wrap) cannot yet
+  behave the same in both tiers. `fallible[T]` becomes buildable once
+  `struct` and a real interpreter address space exist.
 - **Retroactive fixes, landed independently of any future phase:**
   - dynamic integer overflow on `Add`/`Sub`/`Mul` (`E0303`) — a Tier-3
     runtime check with `wrap_*` opt-out; the one item with a known live bug
@@ -447,7 +457,26 @@ ad hoc handling per feature. Concretely:
 - The shared trap mechanism itself (`host_report_error` /
   `emit_host_error_trap`) that every Tier-3 check already routes through,
   now including the `LITHON-Exxxx` coded renderings
+- Message hygiene (#7): every shared Tier-3 trap prints tier-neutral prose
+  (no `interpreter:`/`native:` prefix), which both engines produce byte for
+  byte and `run_tier_diff.py` now *asserts*, not merely compares; and a
+  missing parameter/return annotation is reported once, not as a cascade of
+  four consequences (each unannotated read as "not definitely assigned", each
+  call as a nameless "cannot convert to ")
 - Tier 0's `_`-prefix convention and the `addressof`/`valueof` boundary
+- The raw syscall primitive (Phase III): `syscall(number, a1..a6) -> int[64]`
+  lowers to one `syscall` IR op, executed by a single host trampoline
+  (`jit/syscall_runtime.h`) that both the interpreter and the JIT call, so the
+  two tiers cannot disagree about the calling convention. The trampoline
+  consults an embedder-installed hook first, on every platform; with no hook it
+  runs the actual `syscall` instruction on Linux/x86-64, and returns `-ENOSYS`
+  where there is no stable raw ABI. `syscall_hook_test` runs the same program
+  through both engines with a hook installed and requires the hook to observe
+  identical arguments — which is what pins the JIT's six-slot stack staging.
+  The result is the kernel's raw return, unchecked (negative is `-errno` on
+  Linux). Arguments are integers in this slice; pointer arguments are refused
+  because the interpreter's pointer values are synthetic addresses rather than
+  real memory, so pointer-taking syscalls (`write`/`read`) are deferred
 - `tools/check_error_codes.py` (the code-discipline gate wired into
   `verify_all.sh`) and `tools/typecheck.py`'s mirror of the static checks
 

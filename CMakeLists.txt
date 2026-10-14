@@ -38,6 +38,22 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|X86_64)$")
 
     enable_testing()
 
+    # syscall_hook_test: Phase III's raw syscall primitive, checked through the
+    # one seam both engines share. Installs g_syscall_hook and runs the SAME
+    # program through the interpreter and the JIT, requiring the hook to observe
+    # identical arguments both times -- which is what pins the JIT's six-slot
+    # stack staging and keeps the two tiers from drifting about the calling
+    # convention. Needs the interpreter and the code generator, so it links the
+    # same sources as tier_runner.
+    add_executable(syscall_hook_test
+        src/jit/syscall_hook_test.cpp
+        src/ir/text_parser.cpp
+        src/interpreter/interpreter.cpp
+        src/typecheck/typecheck.cpp
+    )
+    target_include_directories(syscall_hook_test PUBLIC src src/jit)
+    add_test(NAME syscall_hook_test COMMAND syscall_hook_test)
+
     # typecheck_test: pins the static rules on their own, with no JIT and no
     # interpreter in the way. Portable -- it is pure IR plus check_module().
     add_executable(typecheck_test

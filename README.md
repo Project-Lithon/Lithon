@@ -62,6 +62,24 @@ fuzzing.
 It is **not yet a stable production library** and should not be treated as a
 drop-in Python replacement.
 
+### Recently added
+
+- **Raw syscalls** — `syscall(number, a1..a6) -> int[64]`, one IR instruction
+  and one host trampoline that *both* tiers call, so the calling convention
+  cannot drift between them. Integer arguments only; see the limitations list.
+- **Iteration helpers** — `enumerate`, `zip`, `sum`, `min`, `max`, `abs`, `any`,
+  `all`, and `in`/`not in` over a list. All are rewrites over the compile-time
+  capacity `N`, so there is no new opcode and no runtime helper. Cross-checked
+  against CPython byte for byte.
+- **Real pointers** — a `ptr[T]` is a genuine host address in the interpreter as
+  well as the JIT, backed by per-variable byte storage that a syscall could
+  read. `ptr[struct[N]]` forms, typechecks, compares, and scales by
+  `sizeof(Point)`.
+- **Three type-system holes closed** — a bool literal stored into an `int`
+  (`v: int[64] = True`) used to type-check clean and print `True`; a capacity-1
+  list could not compile natively at all; and a loop target could silently
+  change type between `for` headers.
+
 ---
 
 ## ✨ Why Lithon?
@@ -158,6 +176,8 @@ The compiler also checks:
 * container element types
 * pointer types
 * struct field types
+* enum variant and match rules
+* type-function arity and expansion rules
 * shift bounds
 * container capacities
 
@@ -477,19 +497,23 @@ The verification suite checks several independent layers.
 
 | Area                                 |         Current result        |
 | :----------------------------------- | :---------------------------: |
-| CTest                                |       **32 / 32 passed**      |
-| x86-64 encoder comparisons           |        **9,239 cases**        |
+| CTest                                |       **33 / 33 passed**      |
+| x86-64 encoder comparisons           |        **9,931 cases**        |
 | Incorrect encoder cases              |             **0**             |
 | Typed differential fuzzing           |      **300 / 300 passed**     |
 | Bitwise / shift fuzzing              |      **200 / 200 passed**     |
 | Conditional-expression / SSA fuzzing |    **200 / 200 per suite**    |
 | Direct float Phi sweep               | **38 matched / 0 mismatched** |
-| ABI modules audited                  |             **23**            |
+| ABI modules audited                  |             **34**            |
 | ABI stack/callee-saved failures      |             **0**             |
-| Typed regression suite               |       **15 / 15 passed**      |
-| General regression suite             |       **23 / 23 passed**      |
+| Typed regression suite               |       **24 / 24 passed**      |
+| General regression suite             |       **34 / 34 passed**      |
+| Type-checker unit checks             |          **145 ok**          |
+| Error-code discipline checks         |          **86 ok**           |
+| Tier differential (interp vs JIT)    |      **159 / 159 passed**     |
+| Syscall hook parity (both tiers)     |        **4 / 4 passed**      |
 | SIMD vectorizer loop cases           |        **6 / 6 passed**      |
-| SIMD vectorizer gate + fallback      |        **verified**          |
+| SIMD vectorizer gate + fallback      |          **verified**          |
 
 The full verification gate concludes:
 
@@ -711,6 +735,165 @@ compiler and asserts the frontend's offsets and sizes equal the C
 
 ---
 
+## 🏷️ Enums
+
+An enum is a tagged union: a byte blob holding an `int` tag plus room for the
+payload of whichever variant is active. Like a struct it **has no value** —
+the only operations are constructing a variant, reading the tag with `match`,
+and reading a payload through the arm's binding. It is spelled as a class
+deriving from `Enum`:
+
+```python
+class Shape(Enum):
+    Empty
+    Dot
+    Line: int[32]
+    Rect: int[64]
+
+s: Shape
+s = Shape.Dot
+match s:
+    case Shape.Empty:
+        print(0)
+    case Shape.Dot:
+        print(1)
+    case Shape.Line(n):
+        print(n)
+    case Shape.Rect(w):
+        print(w)
+```
+
+A variant is a bare unit name (`Empty`), a `name: type` scalar payload
+(`Line: int[32]`), or an inline `class V(Struct)` struct payload. The layout is
+`[tag][payload]` with **no padding**: the tag is an `int[8]` while the enum has
+at most 128 variants and widens to `int[16]` past that, the payload starts at
+the tag width, and the size is the tag width plus the largest payload. Only the
+active variant's bytes are ever read, so overwriting a payload variant with a
+smaller one leaves stale bytes that no `match` can observe.
+
+A `match` must be exhaustive — every variant covered, or a final `case _:`. It
+lowers to a tag `fieldload`, an equality test, and a branch per arm, reusing the
+struct machinery; there is no new IR. A struct field may be an enum
+(`c.proto = Endpoint.Tcp(port=8080, addr=16777343)`), but list elements, enum
+parameters/returns, enum-typed payloads, and `case` guards are refused.
+
+`tools/check_enum_layout.py` compiles an equivalent C `#pragma pack(1)`
+tag-plus-union and asserts the frontend's tag width, payload offset, and size
+equal the C `offsetof`/`sizeof` values at both tag-width boundaries.
+
+---
+
+## 🔧 Methods
+
+A `def` inside a struct or enum body is a **method**. The first parameter is the
+implicit receiver `self`; the rest are annotated scalars, and the return type is
+optional. A method is called as `recv.name(args)`.
+
+```python
+class Counter(Struct):
+    value: int[64]
+
+    def add(self, n: int[64]) -> int[64]:
+        self.value = self.value + n
+        return self.value
+
+    def total(self, n: int[64]) -> int[64]:
+        t: int[64] = 0
+        i: int[64] = 1
+        while i < n + 1:
+            t = t + i
+            i = i + 1
+        return t
+
+
+c: Counter
+print(c.add(5))
+print(c.total(4))
+```
+
+A method call is **inlined at the call site**: `self` becomes the receiver place,
+the method's parameters and locals are renamed so they cannot collide with the
+caller's, and its `return` stores the result and jumps to the end of the inline.
+Inlining is forced by the storage model — a field access names a variable, not a
+value, and a struct or enum cannot be passed to a function (E0124) — and it is
+what lets a method read *and write* the receiver's fields, keep its own locals,
+run loops and branches, and call other methods. The receiver can be a struct or
+enum variable or a struct/enum field (`o.inner.bump(1)`), and an enum method
+reads `self` with `match self`.
+
+Because the body is expanded at each call site, a method cannot recurse,
+directly or indirectly (E0135). A method signature is scalars only
+(`int[w]`/`float[64]`/`bool`): a method may not take or return a struct, an
+enum, a container or a pointer, and `self` is unannotated. There is no
+inheritance or overloading, a method name may not shadow a field or a variant,
+and the signature accepts no `/`, `*`, `**` or defaults (E0134).
+
+```python
+class Shape(Enum):
+    Empty
+    Line: int[32]
+
+    def code(self) -> int[64]:
+        match self:
+            case Shape.Empty:
+                return 0
+            case Shape.Line(n):
+                return n
+            case _:
+                return -1
+```
+
+`tools/check_methods.py` proves the transparency claim: it compiles a
+method-using program and the same program with the bodies inlined by hand and
+requires both tiers to produce identical output, checks the IR is deterministic,
+and checks the E0134/E0135 refusals.
+
+---
+
+## 🧩 Type Functions
+
+A type function is a **compile-time type constructor**: `def Name(params) ->
+NewType` returns `{ T }`, and writing `Name(args)` anywhere a type is allowed
+substitutes the arguments into `T` and yields an ordinary type.
+
+```python
+def Fixed(t, n) -> NewType:
+    return {list[t, n]}
+
+def Word() -> NewType:
+    return {int[32]}
+
+def Ref(t) -> NewType:
+    return {ptr[t]}
+
+xs: Fixed(int[64], 4)      # == list[int[64], 4]
+w: Word()                  # == int[32]
+_p: Ref(int[64])           # == ptr[int[64]]
+```
+
+The result is **structural** — `Alias(int[64])` and `int[64]` are the same
+type, so nothing about a type function survives into the IR: compiling the
+program above and the same program with the three types spelled out produces
+byte-identical IR. The parameters hold **types and sizes** (they are
+unannotated names), not runtime values; a definition carries no code and is
+invisible to the runtime.
+
+Applications nest (`Pair(Word())`) and work anywhere an annotation does:
+function parameters and returns, struct fields, and container element types.
+The body must be exactly one `return { <type> }` — `{}` is a dict and is
+refused, as are multi-element bodies, comprehensions, decorators, annotated or
+defaulted parameters, redeclarations, and names that collide with a struct, an
+enum or a function. A body composes the value types an annotation can spell —
+scalars, containers, pointers and dicts — and may not name a struct or an enum,
+which are storage rather than values. A type function must bottom out in a
+concrete type, so direct and mutual recursion are refused.
+
+`tools/check_typefunc.py` proves the structural claim: it compiles a
+type-function program and its spelled-out equivalent and requires the IR to be
+byte-identical, then checks memoization and the E0132/E0133 refusals.
+
+---
+
 ## 🧠 SSA and Optimization
 
 Lithon's compiler is progressively moving from a memory-based IR toward SSA.
@@ -866,6 +1049,36 @@ the CPU's register-level behavior.
 
 ---
 
+## 🔌 Raw Syscalls
+
+Lithon can invoke the platform's raw syscall primitive directly:
+
+```python
+uid: int[64] = syscall(102)   # getuid() on Linux/x86-64
+```
+
+`syscall(number, a1, a2, a3, a4, a5, a6)` takes a syscall number and up to six
+arguments and returns the kernel's **raw** result as `int[64]`. On Linux a
+failure is a negative `-errno`; nothing is wrapped and nothing is checked — a
+program that wants to handle failure compares the result itself. There is no
+`syscall` function to import: it is a compiler-recognized name that lowers to a
+single `Syscall` IR instruction.
+
+Both tiers execute it through one shared host trampoline
+(`src/jit/syscall_runtime.h`), so the calling convention cannot drift between
+the interpreter and the JIT. That trampoline consults an embedder-installed
+hook first, on every platform; with no hook it runs the actual x86-64 `syscall`
+instruction on Linux, and on a platform whose raw ABI is not stable (Windows)
+returns `-ENOSYS` rather than guessing.
+
+**Current restriction:** arguments are integers in this slice. A pointer
+argument is refused at typecheck, because the interpreter represents pointers as
+synthetic addresses rather than real memory, so a syscall that takes a pointer
+(`write`, `read`) could not behave the same in both tiers. Pointer-taking
+syscalls are deferred until the interpreter grows a real address-space story.
+
+---
+
 ## 🛡️ Safety Philosophy
 
 Lithon is not trying to eliminate low-level programming.
@@ -955,6 +1168,57 @@ than CPython, PyPy, Cython, Rust, or C++.
 
 ---
 
+## 🔢 Iteration Helpers
+
+`enumerate` and `zip` work in a `for` header:
+
+```python
+for i, x in enumerate(xs):
+    print(i)
+    print(x)
+
+for a, b in zip(xs, ys):
+    print(a)
+    print(b)
+```
+
+Neither is a value. Both are a **rewrite of a counted loop** over constructs that
+already exist: `for i, x in enumerate(xs)` becomes `for i in range(N): x = xs[i]`,
+and `for a, b in zip(xs, ys)` becomes the same loop bounded at `min(N1, N2)` — a
+compile-time constant, because the declared capacity is what `len()` folds to.
+So there is no new opcode and no runtime helper; `zip` costs nothing beyond the
+indexed loads it already emits.
+
+Two consequences worth stating plainly:
+
+- **`zip` stops at the shortest input**, exactly as Python does. `zip(xs, ys)`
+  over a `list[..., 6]` and a `list[..., 3]` runs three times.
+- **`enumerate` and `zip` are for-header only.** `z = zip(a, b)` is refused: the
+  pair never needs to exist as a value, and a homogeneous tuple could not
+  represent `enumerate`'s `(int, T)` anyway.
+
+Elements bind with their declared type, so a `float[64]` list yields floats and
+a `list[int[16], N]` stays signed. `break` and `continue` work inside either
+header, because the rewrite is a real loop.
+
+### 🧾 Divergences from Python
+
+Deliberate narrowings, collected next to `%` and `v == n`:
+
+| Construct | Python | Lithon | Why |
+|---|---|---|---|
+| `%` | remainder, sign follows the divisor | truncation toward zero; zero divisor traps (`E0301`/`E0302`) | signed machine remainder is not total |
+| `v == n` | value equality | not supported | equality on machine values has no total answer |
+| `zip` / `enumerate` | first-class iterators, usable as values | for-header only | a rewrite of a counted loop; the pair is never a value |
+| `x in xs` on a list | membership, over any element type | membership over int/float lists only | it lowers to `==`, which does not take bools yet |
+| `v in xs` on a `bool` list | membership | refused | same `==` restriction |
+| `print(a, b)` | space-separated, one trailing newline | exactly one argument | a separator + `end` needs a no-newline print variant |
+| `print(_p)` | a stable address | prints an address, but it differs per tier | real addresses cannot be byte-comparable across tiers |
+| a dangling `_p` | undefined | undefined, and now a `SIGSEGV` | out of scope by design, not tracked by the compiler |
+| string literals | `str` | not supported yet | `str[N]` is Phase 6.2: N must be a declared capacity |
+
+---
+
 ## 🧭 Roadmap
 
 ```text
@@ -1012,10 +1276,26 @@ than CPython, PyPy, Cython, Rust, or C++.
 
 ### Phase III — Systems / hardware integration
 
-* [ ] Direct syscall emission
+* [x] Direct syscall emission (raw `syscall(number, a1..a6) -> int[64]`,
+  integer arguments; pointer-taking syscalls deferred)
 * [ ] Expanded raw-memory operations
 * [ ] Expanded native FFI
 * [ ] ARM64 backend
+
+### Phase IV — Python-familiar surface
+
+* [x] Iteration helpers: `enumerate`, `zip` (for-header only; a rewrite of a
+  counted loop, no new IR)
+* [x] `sum` / `min` / `max` / `abs` / `any` / `all`, and `in` over a list — also
+  rewrites over the compile-time capacity `N`; `min`/`max` select through the
+  if-expression diamond, `abs` is `-v if v < 0 else v`
+* [ ] Multi-argument `print` with a separator and `end`
+* [ ] `str[N]` bounded strings and string literals
+* [ ] f-strings (in `print` first, then as a value)
+* [ ] `str.find` / `str.count`
+* [ ] `str.split` and `list.append` (both need the list length field)
+* [ ] `x in xs` over a `bool` list — refused because it lowers to `==`, which
+  does not take bools yet (the same refusal as `a == b` on two bools)
 
 ---
 
@@ -1035,6 +1315,31 @@ Current limitations include:
 * Pointer values have strict restrictions around function boundaries and
   container access.
 * Some SSA/native paths remain opt-in or have known unsupported cases.
+* **Field access through a pointer (`valueof(_p).x`) works in the interpreter
+  only.** The IR, parser, type checker and interpreter are done and proven — a
+  write through a pointer is read back through the name — but the JIT has no
+  `[reg+disp]` encoder primitive yet, so the native tier refuses these
+  instructions and falls back to the interpreter rather than miscompile them.
+  This is the one blocker for 5.2, whose `send`/`recv` buffers are
+  `ptr[int[8]]` into struct memory.
+* `ptr[Point]` forms, typechecks, compares, and scales by `sizeof(Point)`, but
+  cannot yet be read or written through natively (see above). Struct and enum
+  pointees, `self` as `ptr[Point]`, and the optimizer alias barriers for
+  address-taken variables are all still to come.
+* **Dangling pointers are out of scope by design.** The compiler does not track
+  a pointer's lifetime against what it points at, so dereferencing freed or
+  out-of-bounds memory is undefined — and now that pointers are real addresses,
+  a wild dereference is a `SIGSEGV` in the interpreter too, not a deterministic
+  trap. This is a stated choice, not a silent gap: the programmer proves the
+  math, the types and the constraints, never the memory location.
+* **A printed pointer value is not comparable across tiers.** The interpreter's
+  arena addresses and the JIT's frame addresses differ, and ASLR moves them
+  between runs. Pointer arithmetic, comparison of two pointers into the same
+  object, and `valueof` *are* tier-consistent; the raw number is not. Programs
+  that print a pointer are excluded from the tier-diff oracles.
+* `syscall(...)` accepts integer arguments only; pointer-taking syscalls
+  (`write`/`read`) are not yet supported because the interpreter's pointers were
+  synthetic addresses rather than real memory.
 * AVX2 vectorized code is emitted and byte-verified everywhere, but it is only
   *executed* on hosts that report AVX2; on other hosts the CPUID gate always
   takes the scalar fallback, so vector execution itself is not exercised there.
@@ -1080,6 +1385,34 @@ python3 tools/run_typed_regression.py
 ```bash
 python3 tools/run_tier_diff.py
 ```
+
+Every program runs twice — once through the interpreter (the oracle) and once
+through the native tier — and the two stdout streams must be byte-identical.
+Currently **159 / 159** cases pass, 93 of them on the native tier.
+
+Two classes of case are deliberately outside this comparison:
+
+- **Adversarial cases** declare which tier they *expect*, so a guard that is
+  too weak (native where it must refuse) and too strict (interpreter where
+  native is provably safe) both fail the run.
+- **Printed pointer values** cannot be byte-comparable, because the two tiers
+  address memory differently. Pointer arithmetic, comparison of two pointers
+  into the same object, and `valueof` *are* compared.
+
+Sockets are likewise outside it: they are stateful and external, so 5.2 is
+verified against a raw C program doing the identical syscalls instead.
+
+### Syscall hook parity
+
+```bash
+./build/syscall_hook_test
+```
+
+`g_syscall_hook` is consulted first on every platform, which turns the raw
+syscall into a pure function of its inputs. The test installs a hook and runs
+the *same* program through both tiers, requiring the hook to observe identical
+arguments — which is what pins the JIT's six-slot stack staging and keeps the
+two engines from drifting about the calling convention.
 
 ### Differential fuzzing
 

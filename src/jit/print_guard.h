@@ -385,6 +385,15 @@ struct Analysis {
                         break;
                     }
 
+                    // Phase III. The raw syscall's result is the kernel's
+                    // int64 return -- a value or a negative errno -- so it is
+                    // provably an int for print-format purposes. Its arguments
+                    // are never consumed as int-vs-float arithmetic, so
+                    // nothing needs checking on that side.
+                    case Op::Syscall:
+                        raise(st.vals[in.result], Kind::Int);
+                        break;
+
                     case Op::Call: {
                         if (in.name == "print") {
                             if (final_pass) check_print(st, block, in, verdict);

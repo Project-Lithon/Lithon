@@ -439,13 +439,28 @@ Module parse_ir_text(const std::string& text) {
         // and `fieldstore s, 4, %v`.
         } else if (oa.op_name == "fieldload") {
             instr.op = Op::FieldLoad;
-            instr.name = oa.raw_args.at(0);
             instr.int_imm = std::stoll(oa.raw_args.at(1));
+            // 4.4, second half. The subject is either a struct VARIABLE name
+            // (the long-standing form) or, when it starts with '%', a pointer
+            // BASE register -- so a field can be read through `_p` and reach
+            // the same bytes the named form does. A base leaves `name` empty,
+            // which is what tells the checker and both engines to dereference.
+            if (!oa.raw_args.at(0).empty() && oa.raw_args.at(0)[0] == '%') {
+                instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+            } else {
+                instr.name = oa.raw_args.at(0);
+            }
         } else if (oa.op_name == "fieldstore") {
             instr.op = Op::FieldStore;
-            instr.name = oa.raw_args.at(0);
             instr.int_imm = std::stoll(oa.raw_args.at(1));
+            // A store's operands are VALUE first, then the optional base, so
+            // the value and the pointer can never collide.
             instr.args.push_back(parse_value_ref(oa.raw_args.at(2)));
+            if (!oa.raw_args.at(0).empty() && oa.raw_args.at(0)[0] == '%') {
+                instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+            } else {
+                instr.name = oa.raw_args.at(0);
+            }
         } else if (oa.op_name == "tofloat") {
             instr.op = Op::ToFloat;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
@@ -459,6 +474,14 @@ Module parse_ir_text(const std::string& text) {
         } else if (oa.op_name == "guardnonzero") {
             instr.op = Op::GuardNonZero;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+        // Phase III. The raw syscall: every operand (the number first, then
+        // up to six arguments) is a real ValueId, parsed generically. Missing
+        // trailing arguments are simply absent from the vector.
+        } else if (oa.op_name == "syscall") {
+            instr.op = Op::Syscall;
+            for (const auto& raw : oa.raw_args) {
+                instr.args.push_back(parse_value_ref(raw));
+            }
         } else if (oa.op_name == "add") {
             instr.op = Op::Add;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));

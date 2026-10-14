@@ -205,6 +205,20 @@ class TypeChecker:
                     f"a value (V1_SPEC 0.6.10)")
             return scope[node.id]
 
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            # Negation preserves the operand's type and width -- it is a
+            # machine-word operation, not a promotion. Added alongside the raw
+            # syscall so `syscall(-1)` (the deterministic -ENOSYS probe) is
+            # statically typed the same way the engine types it. `+` and `~`
+            # are still refused below by the general "cannot statically
+            # determine" message.
+            inner = self.infer_expr_type(node.operand, scope, context)
+            if inner.kind != "int":
+                raise RCRError(
+                    f"{context}: cannot negate a value of type {inner} -- unary `-` is "
+                    f"integer-only (V1_SPEC 0.6.11)")
+            return LType("int", inner.width)
+
         if isinstance(node, ast.BinOp):
             left_t = self.infer_expr_type(node.left, scope, context)
             right_t = self.infer_expr_type(node.right, scope, context)
@@ -276,6 +290,28 @@ class TypeChecker:
                             f"LITHON-E0303: {fname}() needs two int[64] operands -- "
                             f"narrow ints never overflow and a float cannot wrap "
                             f"(E0303, v1 int[64] only)")
+                return LType("int", 64)
+
+            if fname == "syscall":
+                # Phase III. The raw syscall primitive, mirroring the C++
+                # checker's Op::Syscall case: a number and up to six integer
+                # arguments. A pointer is rejected on purpose -- it would name
+                # an address in the interpreter's synthetic address space, so a
+                # pointer-taking syscall (write/read) could not behave the same
+                # in both tiers. The result is the kernel's raw return, typed
+                # int[64]; there is no fallible wrapper to unwrap.
+                if not (1 <= len(node.args) <= 7):
+                    raise RCRError(
+                        f"{context}: syscall() takes a syscall number and up to six "
+                        f"arguments, e.g. syscall(102) (Phase III)")
+                for i, arg_node in enumerate(node.args):
+                    t = self.infer_expr_type(arg_node, scope, f"{context}, syscall argument {i}")
+                    if t.kind != "int":
+                        raise RCRError(
+                            f"{context}: syscall() argument {i} has type {t} -- a raw "
+                            f"syscall argument must be an integer in this slice; "
+                            f"pointer-taking syscalls (write/read) are not yet "
+                            f"supported (Phase III)")
                 return LType("int", 64)
 
             if fname not in self.functions:

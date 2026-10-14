@@ -178,7 +178,33 @@ enum class Op : uint8_t {
     ToInt,
     InputInt,
     // Range guard: dynamic step == 0 traps with E0310.
-    GuardNonZero
+    GuardNonZero,
+
+    // Phase III. The raw syscall primitive. A compiler-recognized builtin
+    // `syscall(number, a1..a6)` lowers to exactly this op:
+    //
+    //   Syscall   args = {number, a1, a2, a3, a4, a5, a6}   result = int[64]
+    //
+    // (the trailing arguments are absent, not zero, when the call supplies
+    // fewer of them). The result is the kernel's raw return, UNCHECKED --
+    // on Linux a failure is -errno, exactly as the kernel reports it. There
+    // is no `syscall` function to call and no fallible wrapper in this slice;
+    // a program that wants to inspect the failure compares the result itself.
+    //
+    // Arguments are integers in this slice. A pointer argument would name an
+    // address in the interpreter's synthetic address space, not real memory,
+    // so a kernel syscall taking a pointer (write/read) could not behave the
+    // same in both tiers -- pointer-taking syscalls are therefore rejected by
+    // the typechecker until the interpreter grows a real address-space story,
+    // rather than accepted and silently diverging.
+    //
+    // The instruction is deliberately platform-neutral: it names the raw
+    // operation, and the platform fork (the x86-64 `syscall` instruction on
+    // Linux, a host-serviceable hook on Windows, whose raw ABI is not stable)
+    // lives in one place, jit/syscall_runtime.h. Both engines reach it through
+    // that same helper, so the interpreter and the JIT cannot disagree about
+    // the calling convention.
+    Syscall
 };
 
 using ValueId = uint32_t;
