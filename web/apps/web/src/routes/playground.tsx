@@ -291,7 +291,7 @@ function Playground() {
         </div>
 
         <div className="grid gap-4 lg:grid-cols-2">
-          <div className="flex min-h-[30rem] flex-col">
+          <div className="flex min-h-[30rem] min-w-0 flex-col">
             <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
               <CardHeader className="flex flex-row items-center justify-between border-b py-2">
                 <CardTitle className="font-mono text-xs font-normal text-muted-foreground">
@@ -327,7 +327,7 @@ function Playground() {
             </Card>
           </div>
 
-          <div className="flex min-h-[30rem] flex-col gap-4">
+          <div className="flex min-h-[30rem] min-w-0 flex-col gap-4">
             <Card>
               <CardHeader className="flex flex-row items-center justify-between border-b py-2">
                 <CardTitle className="font-mono text-xs font-normal text-muted-foreground">
