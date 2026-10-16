@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-router"
 import {
   ArrowsLeftRightIcon,
+  CompassIcon,
   DiscordLogo,
   GithubLogo,
   ListIcon,
@@ -16,6 +17,8 @@ import {
   SpeakerXIcon,
   SunIcon,
 } from "@phosphor-icons/react"
+
+import { Badge } from "@workspace/ui/components/badge"
 
 import { Button } from "@workspace/ui/components/button"
 import { DirectionProvider } from "@workspace/ui/components/direction"
@@ -68,14 +71,7 @@ export const Route = createRootRoute({
       { rel: "stylesheet", href: appCss },
     ],
   }),
-  notFoundComponent: () => (
-    <main className="mx-auto w-full max-w-6xl p-4 px-4 pt-16">
-      <h1 className="text-2xl font-bold">404</h1>
-      <p className="text-muted-foreground">
-        The requested page could not be found.
-      </p>
-    </main>
-  ),
+  notFoundComponent: NotFoundPage,
   shellComponent: RootDocument,
 })
 
@@ -90,6 +86,69 @@ const NAV_LINKS = [
   { to: "/playground", label: "Playground" },
 ] as const
 
+const QUICK_LINKS = [
+  { to: "/docs", label: "Browse docs" },
+  { to: "/playground", label: "Playground" },
+  { to: "/use-cases", label: "Use cases" },
+  { to: "/benchmarks", label: "Benchmarks" },
+] as const
+
+function NotFoundPage() {
+  return (
+    <div className="mx-auto flex min-h-[70vh] w-full max-w-6xl flex-col items-start justify-center px-4 py-16">
+      <Badge variant="outline" className="mb-4">
+        Error 404
+      </Badge>
+      <div className="flex items-start gap-4">
+        <CompassIcon
+          className="mt-1 hidden size-12 shrink-0 text-muted-foreground/50 sm:block"
+          aria-hidden="true"
+        />
+        <div>
+          <h1 className="font-heading text-4xl font-extrabold tracking-tight md:text-5xl">
+            Lost in the IR.
+          </h1>
+          <p className="mt-4 max-w-xl text-muted-foreground">
+            The page you're looking for doesn't exist, moved, or never
+            compiled. Check the URL, or jump back to solid ground below.
+          </p>
+        </div>
+      </div>
+      <div className="mt-8 flex flex-wrap gap-3">
+        <Button size="lg" render={<Link to="/" />}>
+          Back to home
+        </Button>
+        <NotFoundSearchButton />
+      </div>
+      <Separator className="my-10 w-full max-w-xl" />
+      <p className="mb-3 text-xs font-semibold text-muted-foreground">
+        Or try one of these
+      </p>
+      <div className="flex flex-wrap gap-2">
+        {QUICK_LINKS.map((link) => (
+          <Button
+            key={link.to}
+            variant="outline"
+            size="sm"
+            render={<Link to={link.to} />}
+          >
+            {link.label}
+          </Button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function NotFoundSearchButton() {
+  const { open } = useSearch()
+  return (
+    <Button variant="outline" size="lg" onClick={open}>
+      <MagnifyingGlassIcon />
+      Search docs
+    </Button>
+  )
+}
 function BoaMark() {
   return (
     <svg viewBox="0 0 36 36" aria-hidden="true" className="size-7">

@@ -60,12 +60,35 @@ const errors: DocPage = {
             ],
             ["`E0105`, 1 (static refusal)", "Unsupported type width"],
             [
+              "`E0106`, 1 (static refusal)",
+              "`float(64, x)` of `int[64]` refused: lossy, 53 bits cannot hold every int[64]",
+            ],
+            [
+              "`E0107`, 1 (static refusal)",
+              "`range(a, b, 0)` with a literal zero step",
+            ],
+            [
+              "`E0108`-`E0125`, 1 (static refusal)",
+              "annotation, container, pointer, assignment, loop, declaration, tuple/dict, and function-header restrictions: one code per construct (see docs/lithon_error_system.md)",
+            ],
+            [
+              "`E0126`-`E0131`, 1 (static refusal)",
+              "struct/enum definition, field, access, variant construction, and `match` restrictions",
+            ],
+            [
+              "`E0132`-`E0135`, 1 (static refusal)",
+              "type-function and method definition/application restrictions",
+            ],
+            [
               "`E0201`, 2 (environmental)",
               "Fallible value read before `.ok` check",
             ],
             ["`E0301`, 3 (dynamic trap)", "Division by zero: shipped"],
             ["`E0302`, 3 (dynamic trap)", "Modulo by zero: shipped"],
-            ["`E0303`, 3 (dynamic trap)", "Dynamic integer overflow"],
+            [
+              "`E0303`, 3 (dynamic trap)",
+              "Dynamic integer overflow: shipped, wrap_* opt-out",
+            ],
             ["`E0304`, 3 (dynamic trap)", "Shift amount out of range: shipped"],
             [
               "`E0305`, 3 (dynamic trap)",
@@ -77,7 +100,18 @@ const errors: DocPage = {
               "Input value outside the target width",
             ],
             ["`E0308`, 3 (dynamic trap)", "End of input"],
-            ["`E0401`, 3 (resource trap)", "Stack overflow"],
+            [
+              "`E0309`, 3 (dynamic trap)",
+              "Float-to-int conversion out of range or not finite",
+            ],
+            [
+              "`E0310`, 3 (dynamic trap)",
+              "`range(a, b, step)` with `step == 0`, dynamic",
+            ],
+            [
+              "`E0401`, 3 (resource trap)",
+              "Stack overflow: shipped, 4096-depth shared counter, byte-identical in both tiers",
+            ],
           ],
         },
       ],
@@ -104,9 +138,9 @@ c: int[64] = b + 50          # Tier-3 trap (E0303) iff it overflows`,
         },
         {
           kind: "note",
-          tone: "warn",
-          title: "E0303 and E0401 are being built",
-          text: "Per docs/lithon_error_system.md, dynamic-overflow trapping for Add/Sub/Mul (E0303) closes the `find_e.py` gap and the stack-depth guard (E0401) is designed; unbounded recursion is currently a raw crash in both tiers. E0301/E0302/E0304 and list E0305 are shipped.",
+          tone: "good",
+          title: "E0303 and E0401 are shipped",
+          text: "Dynamic-overflow trapping for Add/Sub/Mul (E0303) is shipped, with wrap_add/wrap_sub/wrap_mul as the explicit opt-out, and the stack-depth guard (E0401) is shipped: both tiers bump a shared call-depth counter and trap at depth 4096 byte-identically. E0301/E0302/E0304 and list E0305 are shipped too.",
         },
       ],
     },
@@ -228,6 +262,42 @@ const builtins: DocPage = {
               "`bool`: key `k` present in dict `d` (constant and runtime keys)",
             ],
             [
+              "`sum(xs)`",
+              "sum of a `list[int[64]|float[64], N]`: unrolled over the compile-time capacity N",
+            ],
+            [
+              "`min(xs)` / `max(xs)`",
+              "min/max of a `list`: unrolled over N, same comparison as CPython",
+            ],
+            [
+              "`any(xs)` / `all(xs)`",
+              "`bool` OR/AND over a `list[bool, N]`",
+            ],
+            [
+              "`abs(v)`",
+              "scalar absolute value: `-v if v < 0 else v`, not a list walk",
+            ],
+            [
+              "`x in xs` / `x not in xs`",
+              "`bool`: OR of `x == xs[k]` over the compile-time N",
+            ],
+            [
+              "`int(w, v)`",
+              "explicit conversion to `int[w]`: `float[64] -> int[w]` (E0309 trap if out of range or not finite)",
+            ],
+            [
+              "`float(64, v)`",
+              "explicit conversion to `float[64]` from `int[8|16|32]`/`float[64]` (E0106 refusal for a lossy `int[64]` source)",
+            ],
+            [
+              "`int(w, input(prompt))`",
+              "read `int[w]` from stdin, optional prompt string (E0306-E0308 traps: bad literal, out of width, end of input)",
+            ],
+            [
+              "`syscall(n, a1..a6)`",
+              "raw unchecked syscall, integer args only, returns `int[64]` (`-errno` on Linux)",
+            ],
+            [
               "`wrap_add(a, b)`",
               "wrapping integer add: same wrapped value in both tiers",
             ],
@@ -274,16 +344,15 @@ print(z)`,
               "`len()` on a scalar",
               "type error: `len` is a container operation",
             ],
-            [
-              "`int()` / `float()` constructors",
-              "do not exist: conversion is a typing rule, not a call",
-            ],
             ["`cast()`", "does not exist anywhere in the language"],
             [
               "user-defined `print`",
               "rejected: `print` is reserved as the fixed built-in",
             ],
-            ["`abs()` / `min()` / `max()`", "not yet: write the comparison"],
+            [
+              "bare `int`/`float` constructor call, e.g. `int(x)`",
+              "wrong arity: the real form takes an explicit width, `int(w, x)` / `float(64, x)`",
+            ],
           ],
         },
       ],
@@ -562,7 +631,7 @@ const limits: DocPage = {
             ["AOT binary emit", "none · everything runs in-process"],
             ["architectures", "x86-64 only · ARM64 is Phase III"],
             ["AVX-512", "not emitted · feature gating only"],
-            ["`E0303`/`E0401` runtime traps", "designed, being built"],
+            ["`dict` capacity trapping", "`list` bounds trap shipped, `dict`'s equivalent doesn't yet"],
             ["`//` floor division", "not yet implemented"],
             ["`**` power", "limited: see the regression corpus"],
             ["unsigned ints", "no `uint`: signed at every width"],
