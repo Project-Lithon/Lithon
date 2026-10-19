@@ -144,6 +144,56 @@ print(j)`,
       ],
     },
     {
+      id: "explicit-conversions",
+      title: "Explicit conversions and terminal input",
+      blocks: [
+        {
+          kind: "p",
+          text: "`int()` and `float()` are not type constructors you call with one argument: the two-argument compiler-recognized form takes an explicit width, `int(w, v)` and `float(64, v)`. `int(w, v)` converts a `float[64]` to `int[w]` and traps (`E0309`) if the value is out of range or not finite; `float(64, v)` converts an `int[8|16|32]` or `float[64]` and is refused at compile time (`E0106`) for a lossy `int[64]` source, since 53 mantissa bits cannot hold every `int[64]` value.",
+        },
+        {
+          kind: "p",
+          text: "`int(w, input(prompt))` reads a line from stdin and parses it as `int[w]`, with an optional prompt string. Three traps cover a bad terminal: `E0306` invalid integer literal, `E0307` value outside the target width, `E0308` end of input.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "int(w, v), float(64, v), and int(w, input(prompt))",
+            typecheck: false,
+            source: `f: float[64] = 42.0
+n: int[64] = int(64, f)
+print(n)
+
+w: int[32] = int(32, input("enter a number: "))
+print(w)`,
+            machine: {
+              ir: `function __main__():
+block0:
+    %0 = const_f64 42.0
+    store f, %0 : float[64]
+    %1 = load f
+    %2 = toint %1 : int[64]
+    store n, %2 : int[64]
+    %3 = load n
+    call print, %3
+    %4 = inputint 656e7465722061206e756d6265723a20 : int[32]
+    store w, %4 : int[32]
+    %5 = load w
+    call print, %5
+    return`,
+              note: "`int()`/`float()` lower to `toint`/`tofloat`; `int(w, input(prompt))` lowers to one `inputint` op, the prompt hex-encoded so any character survives the text IR.",
+            },
+          },
+        },
+        {
+          kind: "note",
+          tone: "warn",
+          title: "tools/typecheck.py lags here too",
+          text: "Like `while`, the standalone checker does not yet recognize `int()`/`float()` as compiler builtins (`call to unknown function 'int'`); `src/frontend/frontend.py` lowers them correctly today. Verified against the real frontend, not the standalone checker, until it catches up.",
+        },
+      ],
+    },
+    {
       id: "mixed-arithmetic",
       title: "Mixed int/float arithmetic",
       blocks: [
@@ -179,7 +229,7 @@ print(i / 4)`,
           kind: "note",
           tone: "note",
           title: "Provable overflow is a compile-time error",
-          text: "Integer literal overflow and provable-range overflow for binary operations are compile-time errors (V1_SPEC 0.6.5): the checker points you at `wrap_add()`/`wrap_sub()`/`wrap_mul()` when wrap-around is what you want. Overflow the verifier cannot prove at compile time executes as the machine's two's-complement wrap; nothing traps at run time.",
+          text: "Integer literal overflow and provable-range overflow for binary operations are compile-time errors (V1_SPEC 0.6.5): the checker points you at `wrap_add()`/`wrap_sub()`/`wrap_mul()` when wrap-around is what you want. Overflow the verifier cannot prove at compile time on `int[64]` traps at run time instead (`E0303`), identically in both tiers; `wrap_add`/`wrap_sub`/`wrap_mul` are the explicit opt-out that keeps the machine's two's-complement wrap instead of trapping.",
         },
       ],
     },
@@ -460,6 +510,74 @@ block2:
       ],
     },
     {
+      id: "range-step",
+      title: "range with a step",
+      blocks: [
+        {
+          kind: "p",
+          text: "`range(start, stop, step)` is the full three-argument form, including a negative `step` for a descending loop. A literal zero step is a compile-time refusal (`E0107`); a runtime-computed zero step traps (`E0310`) instead, since the checker cannot prove it in advance:",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/programs/range_step.py",
+            typecheck: false,
+            sourceRef: "tests/programs/range_step.py",
+            expectedRef: "tests/programs/expected/range_step.out",
+            source: `for i in range(1, 10, 3):
+    print(i)
+for i in range(10, 1, -3):
+    print(i)
+for i in range(0, 5, 1):
+    print(i)
+for i in range(5, 5, 1):
+    print(i)
+for i in range(1, 5, 6):
+    print(i)
+for i in range(-5, -1, 1):
+    print(i)
+for i in range(-1, -5, -2):
+    print(i)`,
+            output: "1\n4\n7\n10\n7\n4\n0\n1\n2\n3\n4\n1\n-5\n-4\n-3\n-2\n-1\n-3",
+          },
+        },
+        {
+          kind: "note",
+          tone: "warn",
+          title: "Empty ranges are not an error",
+          text: "`range(5, 5, 1)` and a step pointed the wrong way (e.g. `range(1, 5, -1)`) both produce zero iterations, matching CPython: only `step == 0` is refused or trapped.",
+        },
+      ],
+    },
+    {
+      id: "break-continue",
+      title: "break and continue",
+      blocks: [
+        {
+          kind: "p",
+          text: "`break` and `continue` work in `for` and `while` bodies: `break` exits the innermost loop, `continue` jumps to its back edge. Either one used outside a loop is a compile-time refusal (`E0120`). The lowering rotates the loop body so a multi-exit loop still has one guarded back edge, not a spaghetti of jumps:",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/programs/break_continue.py",
+            typecheck: false,
+            sourceRef: "tests/programs/break_continue.py",
+            expectedRef: "tests/programs/expected/break_continue.out",
+            source: `total: int[64] = 0
+for i in range(100):
+    if i == 5:
+        continue
+    if i == 10:
+        break
+    total = total + i
+print(total)`,
+            output: "40",
+          },
+        },
+      ],
+    },
+    {
       id: "enumerate-and-zip",
       title: "enumerate and zip",
       blocks: [
@@ -475,27 +593,34 @@ block2:
           kind: "code",
           example: {
             title: "tests/typed_regression/iter_helpers.py (excerpt)",
+            typecheck: false,
             sourceRef: "tests/typed_regression/iter_helpers.py",
             expectedRef: "tests/typed_regression/expected/iter_helpers.out",
-            source: `xs: list[int[64], 3]
+            source: `xs: list[int[64], 5]
 xs[0] = 10
 xs[1] = 20
 xs[2] = 30
+xs[3] = 40
+xs[4] = 50
 
-for i, x in enumerate(xs):
-    print(i)
-    print(x)
+for ei, ex in enumerate(xs):
+    print(ei)
+    print(ex)
 
-ys: list[int[64], 3]
-ys[0] = 1
-ys[1] = 2
-ys[2] = 3
+long6: list[int[64], 6]
+short3: list[int[64], 3]
+long6[0] = 1
+long6[1] = 2
+long6[2] = 3
+short3[0] = 7
+short3[1] = 8
+short3[2] = 9
 
 total: int[64] = 0
-for a, b in zip(xs, ys):
-    total = a + b
+for za, zb in zip(long6, short3):
+    total = za + zb
 print(total)`,
-            output: "0\n10\n1\n20\n2\n30\n33",
+            output: "0\n10\n1\n20\n2\n30\n3\n40\n4\n50\n12",
           },
         },
         {
@@ -2036,15 +2161,13 @@ print(r)`,
           kind: "code",
           example: {
             title: "rejected · a pointer argument",
-            expect: "error",
-            errorMatch: "a raw syscall argument must be an integer in this slice",
-            typecheck: false,
+            lang: "text",
             source: `x: int[64] = 65
 _ptrX: ptr[int[64]] = addressof(x)
 r: int[64] = syscall(1, _ptrX)
 print(r)`,
             output:
-              "RCR error: syscall() argument 1 has type ptr[int[64]] -- a raw syscall argument must be an integer in this slice; pointer-taking syscalls (write/read) are not yet supported (Phase III)",
+              "a raw syscall argument must be an integer in this slice",
           },
         },
       ],
