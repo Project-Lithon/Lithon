@@ -1,0 +1,72 @@
+# 6.7. A run-time list length: `list.append` and what `len`/print/reduction
+# mean once a list is not full.
+#
+# A list is still a fixed-capacity run of leaves, but it now also carries a
+# companion `int[64]` holding HOW MANY of those slots are live. A bare
+# declaration is the all-zero list with every slot live; a literal counts as
+# many slots as it names, so the trailing slots stay zeroed and unused. append
+# writes the next slot (the ordinary `xs[i] = v` bounds check traps if the run
+# is full) and advances the count. len reads the count, print renders only the
+# live prefix, and sum/min/max/any/all and `in` scan only the live prefix.
+# Every line is byte-identical to CPython.
+
+xs: list[int[64], 6] = [1, 2, 3]
+print(len(xs))          # 3
+print(xs)               # [1, 2, 3]
+print(sum(xs))          # 6
+print(10 in xs)         # False
+
+xs.append(10)
+xs.append(20)
+print(len(xs))          # 5
+print(xs)               # [1, 2, 3, 10, 20]
+print(sum(xs))          # 36
+print(20 in xs)         # True
+print(min(xs))          # 1
+print(max(xs))          # 20
+
+# A bare declaration is all-zero and fully live: len is the capacity.
+zs: list[int[64], 4]
+print(len(zs))          # 4
+print(zs)               # [0, 0, 0, 0]
+print(sum(zs))          # 0
+
+# A bool list with a shorter literal, and membership/any/all over the prefix.
+bs: list[bool, 4] = [True, False]
+print(len(bs))          # 2
+print(bs)               # [True, False]
+print(any(bs))          # True
+print(all(bs))          # False
+
+bs.append(True)
+print(len(bs))          # 3
+print(bs)               # [True, False, True]
+print(all(bs))          # False
+
+cs: list[bool, 3] = [True, True]
+cs.append(True)
+print(all(cs))          # True
+print(any(cs))          # True
+
+# A float list: the live prefix drives the reduction as well.
+fs: list[float[64], 5] = [1.5, 2.5]
+print(len(fs))          # 2
+print(fs)               # [1.5, 2.5]
+print(sum(fs))          # 4.0
+
+# The length is usable as a value and in arithmetic.
+n: int[64] = len(xs)
+print(n + 1)            # 6
+print(len(xs) == 5)     # True
+
+# The companion must survive even when its ONLY use is the print itself -- with
+# no len() load to keep it live -- so a print-only short list still renders just
+# its elements.
+only: list[int[64], 6] = [7, 8]
+print(only)             # [7, 8]
+
+# And two lists of the same shape, both print-only, in sequence.
+m1: list[int[64], 4] = [1]
+m2: list[int[64], 4] = [2, 3]
+print(m1)               # [1]
+print(m2)               # [2, 3]

@@ -113,8 +113,8 @@ def main() -> int:
         return 1
 
     break_programs = [
-        ROOT / "tests" / "programs" / "break_continue.py",
-        ROOT / "tests" / "programs" / "range_step.py",
+        ROOT / "tests" / "programs" / "break_continue.lio",
+        ROOT / "tests" / "programs" / "range_step.lio",
     ]
 
     for prog in break_programs:

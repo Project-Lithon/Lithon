@@ -4,4 +4,9 @@ _ptrI:ptr[int[16]] = addressof(i)
 print(_ptrI)
 print(valueof(_ptrI))
 print(valueof(_ptrI-100))
-
+print(_ptrI-100)
+_ptrK:ptr[int[16]] = _ptrI
+t:int[16] = i
+i = 64
+print(t)
+print(valueof(_ptrK))

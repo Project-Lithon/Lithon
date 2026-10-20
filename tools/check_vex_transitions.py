@@ -172,7 +172,7 @@ def main():
 
         irs = list(args.irs)
         for d in args.dirs:
-            for py in sorted(d.glob("*.py")):
+            for py in sorted(d.glob("*.lio")):
                 fe = subprocess.run([sys.executable, str(FRONTEND), str(py)],
                                     capture_output=True, text=True)
                 if fe.returncode != 0:

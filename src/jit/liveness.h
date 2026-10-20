@@ -380,7 +380,16 @@ private:
                 // helper is reached as an ordinary call. A value live across
                 // either must be in a callee-saved register or spilled.
                 const lithon::ir::Op op = fn.blocks[b].instrs[pos].op;
-                if (op != Op::Call && op != Op::Syscall) continue;
+                // 6.1. PrintContainer calls a host helper by address, so it
+                // clobbers caller-saved registers exactly as a Call does; a
+                // value live across it must be callee-saved or spilled.
+                // 6.2. StrLen and StrEq also reach a host helper by address, so
+                // they clobber caller-saved registers for the same reason.
+                // 6.4's StrFind/StrCount reach a helper the same way.
+                if (op != Op::Call && op != Op::Syscall && op != Op::PrintContainer &&
+                    op != Op::StrLen && op != Op::StrEq &&
+                    op != Op::StrFind && op != Op::StrCount)
+                    continue;
                 const int call_pos = static_cast<int>(pos);
                 for (auto& kv : ranges_) {
                     LiveRange& r = kv.second;

@@ -26,17 +26,17 @@
 
 ## 🚀 What is Lithon?
 
-Lithon is a **Python library and native execution engine** that runs `.py`
+Lithon is a **Python library and native execution engine** that runs `.lio`
 source code using an extended **PEP-526-style static typing syntax**.
 
 Lithon is designed to keep Python's familiar source-code model while giving
 the compiler explicit type information that can be used for static verification,
 native machine-code generation, and predictable execution.
 
-Lithon is **not a separate programming language**. Python remains the source
-language and `.py` remains the source format. Lithon extends the typing
-information available to the compiler so that supported Python code can be
-lowered to native x86-64 machine code.
+Lithon sources use the **`.lio`** extension. The syntax is deliberately
+Python-shaped, but `.lio` is what marks a file as a Lithon program; the frontend
+refuses any other extension, so a plain Python script is never silently compiled
+as Lithon.
 
 For example:
 
@@ -66,15 +66,28 @@ drop-in Python replacement.
 
 - **Raw syscalls** — `syscall(number, a1..a6) -> int[64]`, one IR instruction
   and one host trampoline that *both* tiers call, so the calling convention
-  cannot drift between them. Integer arguments only; see the limitations list.
+  cannot drift between them. Takes int[64] and pointers.
+- **Networking (5.2)** — `socket`/`bind`/`connect`/`listen`/`accept`/`send`/
+  `recv`/`close` as raw syscalls, with `&sockaddr_in` and send/recv buffers
+  passed as pointers into real frame bytes. A single-process loopback round trip
+  across a mid-flight `getsockname` is compared line-for-line against a
+  libc-free C oracle, and the byte-swap failure mode is asserted explicitly.
+- **Multi-argument `print`** — `print(a, b, c)` prints space-separated with one
+  trailing newline, matching Python, and `print()` prints a bare newline. It is
+  lowered to runtime pieces (`print_bare` / `print_sep` / `print_nl`), never a
+  built string, so each tier formats each value exactly as before. `sep=` and
+  `end=` are deferred.
 - **Iteration helpers** — `enumerate`, `zip`, `sum`, `min`, `max`, `abs`, `any`,
   `all`, and `in`/`not in` over a list. All are rewrites over the compile-time
   capacity `N`, so there is no new opcode and no runtime helper. Cross-checked
   against CPython byte for byte.
 - **Real pointers** — a `ptr[T]` is a genuine host address in the interpreter as
   well as the JIT, backed by per-variable byte storage that a syscall could
-  read. `ptr[struct[N]]` forms, typechecks, compares, and scales by
-  `sizeof(Point)`.
+  read. `ptr[struct[N]]` forms, typechecks, compares, scales by `sizeof(Point)`,
+  and **is read and written through** (`valueof(_p).x`) in both tiers — the JIT
+  gained a general `[reg+disp]` encoder primitive, verified against GNU `as`
+  over 18,379 cases, so pointer-base field ops run natively instead of falling
+  back. `ptr_field.lio` and `ptr_alias.lio` are the regression guards.
 - **Three type-system holes closed** — a bool literal stored into an `int`
   (`v: int[64] = True`) used to type-check clean and print `True`; a capacity-1
   list could not compile natively at all; and a loop target could silently
@@ -87,7 +100,7 @@ drop-in Python replacement.
 Lithon is built around several principles:
 
 * **Python source with extended PEP-526 typing** — Lithon works directly with
-  `.py` source while providing additional type information to the native
+  `.lio` source while providing additional type information to the native
   execution pipeline.
 * **Mandatory static typing** — types are verified before execution.
 * **Fixed-width values** — integer widths are explicit.
@@ -334,7 +347,7 @@ Lithon currently spans four implementation layers:
 
 ```mermaid
 graph TD
-    A[Python .py Source] --> B[Frontend]
+    A[Lithon .lio Source] --> B[Frontend]
     B --> C[Typed IR]
     C --> D[Static Flow Verification]
 
@@ -388,7 +401,7 @@ have to block the entire execution pipeline.
 Use:
 
 ```bash
-lithon program.py --strict
+lithon program.lio --strict
 ```
 
 `--strict` means:
@@ -417,16 +430,16 @@ pip install -e .
 Then:
 
 ```bash
-lithon program.py
+lithon program.lio
 ```
 
 Useful commands:
 
 ```bash
-lithon program.py
-lithon program.py --strict
-lithon program.py --ir
-lithon program.py -v
+lithon program.lio
+lithon program.lio --strict
+lithon program.lio --ir
+lithon program.lio -v
 ```
 
 The current development package layout is still being consolidated before the
@@ -460,25 +473,25 @@ cmake --build build -j$(nproc)
 ```bash
 pip install -e .
 
-lithon tests/programs/float.py
+lithon tests/programs/float.lio
 ```
 
 Native-only:
 
 ```bash
-lithon tests/programs/float.py --strict
+lithon tests/programs/float.lio --strict
 ```
 
 Print IR:
 
 ```bash
-lithon tests/programs/float.py --ir
+lithon tests/programs/float.lio --ir
 ```
 
 Verbose execution information:
 
 ```bash
-lithon tests/programs/float.py -v
+lithon tests/programs/float.lio -v
 ```
 
 ---
@@ -498,7 +511,7 @@ The verification suite checks several independent layers.
 | Area                                 |         Current result        |
 | :----------------------------------- | :---------------------------: |
 | CTest                                |       **33 / 33 passed**      |
-| x86-64 encoder comparisons           |        **9,931 cases**        |
+| x86-64 encoder comparisons           |       **18,379 cases**        |
 | Incorrect encoder cases              |             **0**             |
 | Typed differential fuzzing           |      **300 / 300 passed**     |
 | Bitwise / shift fuzzing              |      **200 / 200 passed**     |
@@ -506,12 +519,13 @@ The verification suite checks several independent layers.
 | Direct float Phi sweep               | **38 matched / 0 mismatched** |
 | ABI modules audited                  |             **34**            |
 | ABI stack/callee-saved failures      |             **0**             |
-| Typed regression suite               |       **24 / 24 passed**      |
+| Typed regression suite               |       **28 / 28 passed**      |
 | General regression suite             |       **34 / 34 passed**      |
 | Type-checker unit checks             |          **145 ok**          |
 | Error-code discipline checks         |          **86 ok**           |
-| Tier differential (interp vs JIT)    |      **159 / 159 passed**     |
+| Tier differential (interp vs JIT)    |      **168 / 168 passed**     |
 | Syscall hook parity (both tiers)     |        **4 / 4 passed**      |
+| Networking loopback vs a C oracle    |          **verified**        |
 | SIMD vectorizer loop cases           |        **6 / 6 passed**      |
 | SIMD vectorizer gate + fallback      |          **verified**          |
 
@@ -636,11 +650,38 @@ xs[0] = 10
 xs[1] = 20
 
 print(xs[0])
+print(xs)        # [10, 20, 0, 0]
 print(len(xs))
 ```
 
 Bounds are statically checked when possible and dynamically trapped when the
 index is only known at runtime.
+
+#### The live length (6.7)
+
+A list still has a fixed capacity, but it also carries a **run-time length**: a
+companion `int[64]` holding how many leading slots are live. A literal counts the
+slots it names, so its trailing slots stay zeroed and are not part of the list:
+
+```python
+xs: list[int[64], 6] = [1, 2, 3]
+print(len(xs))    # 3   (not 6)
+print(xs)         # [1, 2, 3]
+print(sum(xs))    # 6   (only the live prefix)
+
+xs.append(4)      # writes slot 3, advances the count to 4
+xs.append(5)      # ... and slot 4
+print(xs)         # [1, 2, 3, 4, 5]
+```
+
+A bare declaration is the all-zero list with every slot live, so `len` is the
+capacity. `len(xs)` reads the companion, `print(xs)` renders only the live
+prefix, and the reductions `sum`/`min`/`max`/`any`/`all` and `x in xs` scan the
+live prefix. Because those are unrolled over a compile-time length, appending
+inside a loop — which makes the length run-time-only — refuses them
+(`E0114`/`E0115`/`E0119`). `append` onto a full list traps
+(`list index out of range`) in both tiers, and a statically-known "already full"
+append is refused (`E0111`).
 
 ### Tuples
 
@@ -680,6 +721,217 @@ Supported operations include:
 * deterministic miss traps
 
 Mutation after construction is intentionally not currently supported.
+
+A key is an `int` (any width up to 64), a `bool`, or a bounded string (6.8):
+
+```python
+k: str[16] = "name"
+
+d: dict[str[16], int[64], 4] = {"name": 1, "age": 2}
+print(d[k])          # 1   (a str variable names the key's run)
+print(d["age"])      # 2   (a literal is materialised into its own run)
+print(contains(d, "zz"))
+```
+
+A str key is not a scalar, so it has no register form: the operand is the *name*
+of the key's byte run, and the probe is a byte hash and a byte comparison rather
+than a multiply and a word compare. Both tiers run the **same** walk, so a str
+key does not merely hash the same way in each tier — the two cannot disagree,
+because there is one function (`dict_str_probe`) behind both. Because a key is
+copied into a fixed `str[N]`-wide slot, a key's *capacity* must not exceed the
+table's key capacity; a literal of `L` bytes also needs `L < N`, exactly as it
+would as a `str[N]` assignment. Table order and bucket (memory) order coincide,
+so a whole-dict `print` of a str-keyed table is deterministic but not insertion
+order.
+
+A value is a scalar (`int`, `float`, `bool`, `str[N]`) or a container — a `list`
+or a `tuple` (6.9):
+
+```python
+d: dict[int[64], list[int[64], 4], 4] = {1: [10, 20, 30, 40]}
+
+print(d[1][0])    # 10   (the value is read out into a run, then indexed)
+print(d)          # {1: [10, 20, 30, 40]}
+```
+
+A container value has no scalar form, so it is not stored in a register: the
+table's value region is a flat run of leaf cells (`buckets × leaves`), and the
+value is copied in and out of one bucket's slice as a whole — from a run at
+construction, into a run on a read. The copy moves whole leaves at the leaf's
+own width (8, 4, 2 or 1 bytes, whichever divides the remaining run), not whole
+8-byte slots, because the leaves are packed: `list[tuple[int[32],4],2]` is eight
+4-byte leaves, and a slot-at-a-time copy would read past the run and skip every
+other leaf. A value of 1000 reads back as 1000, not as `1000 mod 256`. Both tiers
+copy exactly the same leaves, so a nested value prints identically. A `dict`
+value is still refused (it has three regions, so it has no single leaf run a
+value slot could hold).
+
+### Strings (6.2)
+
+Bounded strings are supported:
+
+```python
+s: str[8] = "hi"
+
+print(s)        # hi
+print(len(s))   # 2
+print(s[0])     # 104  ('h' as an int[8] byte)
+
+s[1] = 73       # write a byte -> "hI"
+print(s)        # hI
+
+t: str[8] = "hI"
+print(s == t)   # True
+```
+
+A `str[N]` is exactly `N` bytes of NUL-terminated storage — the same packed
+byte run a `list[int[8], N]` would be — so the content is the bytes before the
+first `0x00`, `len(s)` is the run-time byte count (capped at `N`), and `print(s)`
+writes those bytes as text. A literal of `L` bytes needs `L < N`, since the last
+byte is the terminator; a bare `s: str[8]` is the empty string. `s[i]` reads or
+writes one `int[8]` byte, `len(s)` raises to a full `int[64]`, and `s == t` is a
+byte-for-byte comparison that may span **different capacities**. Both the
+interpreter and the JIT run the same byte scan, so a string prints and compares
+identically in either tier.
+
+Two substring scans complete the string surface (6.4):
+
+```python
+s: str[16] = "hello world"
+
+print(s.find("world"))   # 6     (lowest index, or -1 when absent)
+print(s.find("z"))       # -1
+print(s.count("l"))      # 3     (non-overlapping matches)
+print(s.count(""))       # 12    (len(s) + 1, as in Python)
+```
+
+`s.find(sub)` returns the lowest index of `sub` or `-1`; `s.count(sub)` counts
+non-overlapping occurrences. The needle is a string literal or another `str`
+variable, and its capacity need not match the haystack's. The empty needle is
+the Python edge: `find` returns `0`, `count` returns `len(s) + 1`. Both scans
+read the same NUL-terminated byte runs `s == t` does, so they agree byte for
+byte across the two tiers.
+
+The one way to take a string apart is `str.split` (6.7). A list is a declared
+run, not a value, so the pieces have to be named somewhere: the destination is
+declared on the left, and the split writes into it.
+
+```python
+s: str[32] = "a,bb,ccc"
+
+parts: list[str[8], 4] = s.split(",")
+print(len(parts))    # 3
+print(parts)         # ['a', 'bb', 'ccc']
+
+t: str[4] = "::"
+q: list[str[8], 4] = "x::y::z".split(t)   # a str variable separator too
+print(q)             # ['x', 'y', 'z']
+```
+
+`s.split(sep)` fills the destination and sets its length companion, so `len` and
+`print` see exactly the pieces produced — including empty ones, so `",a,b,"`
+splits into `['', 'a', 'b', '']`. A piece longer than `K-1` bytes is truncated
+to fit its `str[K]`, and a split that produces more than `M` pieces traps
+(`too many pieces for the list (str.split)`) rather than dropping any silently.
+The whitespace-splitting form `s.split()` and an empty separator are refused, so
+the separator is always explicit.
+
+#### A string is a leaf type
+
+Because a `str[N]` is just a byte run, it can be *anywhere* a scalar element can
+be: a list or tuple element, a struct field, or a pointer's pointee.
+
+```python
+words: list[str[8], 3] = ["one", "two", ""]
+print(words[1][2])        # 111  ('o' of "two")
+words[1][2] = 88          # -> "twX"
+
+class Named(Struct):
+    name: str[8]
+    n: int[8]
+
+c: Named
+c.name = "hi"
+print(len(c.name))        # 2
+c.name[0] = 120           # -> "xi"
+
+s: str[8] = "hi"
+_p: ptr[str[8]] = addressof(s)
+print(valueof(_p))        # hi   -- the pointer names s's run
+print(len(valueof(_p)))   # 2
+```
+
+A struct's `str` field lives in a *companion byte run* named by the dotted
+attribute path (`c.name`), declared right after the struct's own blob; a nested
+field is named by the whole path, so `o.inner.tag` is one run too. A `str[N]`
+pointer names the string it was minted from, so `valueof(_p)` denotes that
+string's place rather than a scalar — every string operation works through it.
+A field reached through a pointer *into the struct* (`valueof(_pp).name`) is
+refused: the companion run is keyed by the variable name, so there is no run to
+name there.
+
+#### Printing a nested string
+
+A string printed **directly** — a bare variable, or a struct field — prints its
+bare contents. A string that appears **inside an aggregate** (a list or tuple)
+prints the way Python's `repr` does: quoted, with the same backslash escapes
+CPython uses.
+
+```python
+s: str[8] = "hi"
+print(s)                       # hi        (bare, top level)
+
+pair: tuple[str[8], 2] = ("hi", "a b")
+print(pair)                    # ('hi', 'a b')   (repr, nested)
+```
+
+Both tiers produce byte-identical output for both forms.
+
+#### Printing string literals and f-strings (6.3 Stage A)
+
+A string literal may be printed directly, and an f-string may be used inside
+`print`. Neither builds a string value: a constant chunk is written into a
+shared bounded run and printed through the same top-level path `print(s)` uses,
+while `{expr}` is printed by the ordinary value printer, so a `%` or a brace in
+a literal is just a byte and floats use the one shared shortest-round-trip
+formatter.
+
+```python
+x: int[32] = 3
+s: str[16] = "world"
+
+print("hello")                 # hello
+print("x is:", x)              # x is: 3        (arguments are space-separated)
+print(f"x is {x}")             # x is 3         (f-string pieces are adjacent)
+print(f"{{x}}={x}")            # {x}=3          ({{ }} escape a brace)
+print("100%")                  # 100%
+```
+
+`{{` / `}}` escape a literal brace **inside an f-string only**; in a plain
+string literal they are two ordinary braces, exactly as in Python. A format
+specifier (`{x:.2f}`), a conversion (`{x!r}`) and `{x=}` are refused rather than
+printed wrong. An f-string used as a *value* (`s: str[64] = f"x={x}"`) is Stage
+B and is not implemented yet.
+
+
+### Printing and nesting
+
+`print(xs)` renders a whole container the way Python's `repr` does — `[10, 20,
+30]` for a list, `(1, 2, 3)` for a tuple (with the one-element trailing comma
+`(1,)`) — in both tiers, and a `dict` prints in bucket (memory) order.
+
+Containers **nest**: an element may itself be a list or tuple, so
+`list[list[int[64], 4], 2]` and `list[tuple[int[64], 3], 4]` are legal and a
+nested `dict` is refused (a dict has no flat scalar leaf). The layout is a flat
+run of scalar leaves, so `xs[i][j]` is a single indexed access at the summed
+byte offset — there is no intermediate container object. Reads, writes and
+`print` all descend to the deepest leaf; a partial index chain like `xs[i]` on a
+nested container is refused.
+
+A container is *storage, not a value*. It is built by its declaration plus
+`IndexStore`s, and there is nothing to copy, so `z = ys` (two lists) and
+`xs[0] = a` (a container element) are refused at compile time rather than
+miscompiled.
 
 ---
 
@@ -924,7 +1176,7 @@ Current components include:
 Phi handling is now implemented as an opt-in native path:
 
 ```bash
-lithon program.py --strict
+lithon program.lio --strict
 ```
 
 with the compiler's direct-Phi development path available through the relevant
@@ -1126,7 +1378,7 @@ rather than hiding the fact that a variable contains a raw address.
 
 | Feature               | CPython              | Cython / mypyc              | PyPy           | **Lithon**                |
 | :-------------------- | :------------------- | :-------------------------- | :------------- | :------------------------ |
-| Syntax                | Python               | Python                      | Python         | **Python `.py` + Extended PEP-526**           |
+| Syntax                | Python               | Python                      | Python         | **Python-shaped `.lio` + Extended PEP-526**           |
 | Primary execution     | Bytecode interpreter | C extensions                | Tracing JIT    | **Native x86-64**         |
 | Static typing         | No                   | Optional                    | No             | **Mandatory**             |
 | Fixed-width integers  | No                   | Possible                    | No             | **Built-in**              |
@@ -1210,12 +1462,25 @@ Deliberate narrowings, collected next to `%` and `v == n`:
 | `%` | remainder, sign follows the divisor | truncation toward zero; zero divisor traps (`E0301`/`E0302`) | signed machine remainder is not total |
 | `v == n` | value equality | not supported | equality on machine values has no total answer |
 | `zip` / `enumerate` | first-class iterators, usable as values | for-header only | a rewrite of a counted loop; the pair is never a value |
-| `x in xs` on a list | membership, over any element type | membership over int/float lists only | it lowers to `==`, which does not take bools yet |
-| `v in xs` on a `bool` list | membership | refused | same `==` restriction |
-| `print(a, b)` | space-separated, one trailing newline | exactly one argument | a separator + `end` needs a no-newline print variant |
+| `x in xs` on a list | membership, over any element type | membership over int/float/bool lists | it lowers to `==`; an aggregate or `str` element has no scalar `==` |
+| `a == b` on two bools | `True == 1` | same: a bool compares as `0/1` in both tiers | a bool is a 1-byte scalar, not a distinct incomparable type |
+| `v in xs` on a `bool` list | membership | supported | same `==` over the `0/1` value |
+| `print(a, b)` | space-separated, one trailing newline | supported; `sep=` / `end=` not yet | the default separator and newline are runtime calls; a configurable one needs string values |
+| f-strings | any expression, format specs, `!r` | in `print` only (Stage A); `{expr}` for int/float/bool/str, `{{`/`}}` escapes | a format spec / conversion needs a runtime formatter; an f-string *value* needs a bounded buffer |
+| `print("literal")` | prints the text | supported | the bytes are materialised into a bounded run and printed through the `str` path; no string value is built |
 | `print(_p)` | a stable address | prints an address, but it differs per tier | real addresses cannot be byte-comparable across tiers |
 | a dangling `_p` | undefined | undefined, and now a `SIGSEGV` | out of scope by design, not tracked by the compiler |
-| string literals | `str` | not supported yet | `str[N]` is Phase 6.2: N must be a declared capacity |
+| string literals | unbounded `str`, any operation | `str[N]` bounded strings: literal construction, `print`, `len`, `s[i]` read/write of one `int[8]` byte, `s == t`; usable as a list/tuple element, a struct field or a `ptr` pointee | the capacity must be declared, so a string is a fixed byte run with no heap |
+| a list literal shorter than its capacity | the list has exactly the elements written | the trailing slots stay zeroed and are **not** live: `len`/`print`/a reduction see only the named elements | the run is fixed-size and zeroed, and the live count is a separate companion |
+| `xs[i] = v` on a list | grows the list if `i` is past the end | unchanged length; `i` must be in `0..cap-1` or it traps | the length is advanced by `append`, not by an indexed store |
+| `list.append(v)` | amortised O(1), unbounded | writes the next live slot; a full list traps (`list index out of range`) | the capacity is fixed, so growth has no storage to run to |
+| `list.append(v)` inside a loop | — | makes the length run-time-only, which refuses `sum`/`min`/`max`/`any`/`all`, `in`, `enumerate` and `zip` over that list (`E0114`/`E0115`/`E0119`) | those are unrolled over a compile-time length; a run-time bound has none |
+| `s.split(sep)` | returns a new `list[str]` | `parts: list[str[K], M] = s.split(sep)` writes into a declared list; a piece longer than `K-1` bytes is truncated, and more than `M` pieces traps | a list is a declared run, not a value, so the destination is named; the pieces are bounded strings |
+| `s.split()` (whitespace) | splits on runs of whitespace | refused (`E0114`) | the default form needs a whitespace-class scan; an explicit separator is the one this slice implements |
+| a `dict` | mutable, `d[k] = v` after construction, any hashable key | immutable: built by its literal, then read and `contains` only; keys are `int`/`bool`/`str[N]` | one probe both tiers derive from one hash, with no growth and no rehash |
+| a `str` dict key | any string | `str[N]`: a literal key or a `str` variable whose **capacity** does not exceed the table's key capacity | a key is copied into a fixed `N`-byte slot; a wider run could not survive the copy |
+| a `dict` value | any value, including another `dict` | a scalar, or a `list`/`tuple` run; a `dict` value is refused (`E0112`) | a value slot is one flat leaf run; a `dict` has three regions, so it has no single run a slot could hold |
+| source file extension | `.py` | `.lio`; the frontend refuses any other extension (`E0114`) | the extension is what marks a file as a Lithon program, so a plain Python script is never silently compiled as Lithon |
 
 ---
 
@@ -1276,8 +1541,11 @@ Deliberate narrowings, collected next to `%` and `v == n`:
 
 ### Phase III — Systems / hardware integration
 
-* [x] Direct syscall emission (raw `syscall(number, a1..a6) -> int[64]`,
-  integer arguments; pointer-taking syscalls deferred)
+* [x] Direct syscall emission (raw `syscall(number, a1..a6) -> int[64]`)
+* [x] Networking syscalls (5.2): `socket`/`bind`/`connect`/`listen`/`accept`/
+  `send`/`recv`/`close`, with `&sockaddr_in` and buffers passed as pointers — a
+  single-process loopback round trip is verified against a raw C oracle
+  (`tools/check_net_loopback.py`), including the byte-swap failure mode
 * [ ] Expanded raw-memory operations
 * [ ] Expanded native FFI
 * [ ] ARM64 backend
@@ -1289,13 +1557,39 @@ Deliberate narrowings, collected next to `%` and `v == n`:
 * [x] `sum` / `min` / `max` / `abs` / `any` / `all`, and `in` over a list — also
   rewrites over the compile-time capacity `N`; `min`/`max` select through the
   if-expression diamond, `abs` is `-v if v < 0 else v`
-* [ ] Multi-argument `print` with a separator and `end`
-* [ ] `str[N]` bounded strings and string literals
-* [ ] f-strings (in `print` first, then as a value)
-* [ ] `str.find` / `str.count`
-* [ ] `str.split` and `list.append` (both need the list length field)
-* [ ] `x in xs` over a `bool` list — refused because it lowers to `==`, which
-  does not take bools yet (the same refusal as `a == b` on two bools)
+* [x] Multi-argument `print`, lowered to runtime pieces (a value printer, a
+  separator, a newline) rather than a built string; `sep=` / `end=` deferred
+* [x] `str[N]` bounded strings and string literals: literal construction, `print`,
+  `len`, `s[i]` read/write of one `int[8]` byte, `s == t`, usable as a list/tuple
+  element, a struct field and a `ptr` pointee
+* [x] f-strings and string-literal printing, in `print` only (6.3 Stage A):
+  `print("x is:", x)` and `print(f"x is {x}")` lower to literal chunks plus value
+  prints — no string is built; `{expr}` for int/float/bool/str, `{{`/`}}` escapes,
+  a `%` in a literal is an ordinary byte. Format specs (`{x:.2f}`), `!r` and
+  `{x=}` are refused; an f-string as a *value* (Stage B) is still to come
+* [x] `str.find` / `str.count` (6.4): `s.find(sub)` returns the lowest index or
+  `-1`, `s.count(sub)` counts non-overlapping matches; the needle is a string
+  literal or another `str`, and the empty needle matches Python (`find` → 0,
+  `count` → `len(s) + 1`)
+* [x] `list.append` and the run-time list length (6.7): a list is still a
+  fixed-capacity run, but it now carries a companion `int[64]` holding how many
+  slots are live. A literal counts the slots it names (the trailing ones stay
+  zeroed), `append(v)` writes the next slot and advances the count, `len(xs)` is
+  the count, `print(xs)` renders only the live prefix, and `sum`/`min`/`max`/
+  `any`/`all` and `in` scan it. Appending onto a full list traps
+  ("list index out of range") in both tiers; appending inside a loop makes the
+  length run-time-only, which refuses a reduction/membership scan (`E0114`/
+  `E0115`/`E0119`) and turns a compile-time "already full" append into `E0111`.
+* [x] `str.split` (6.7): `parts: list[str[K], M] = s.split(sep)` splits a bounded
+  string into a declared, fixed-capacity list of bounded strings. `sep` is a
+  string literal or another `str`; the piece count lands in the destination's
+  length companion (`len`/`print` see exactly the pieces). A piece longer than
+  `K-1` bytes is truncated, and more than `M` pieces traps in both tiers. The
+  whitespace-splitting form `s.split()` and an empty separator are refused
+  (`E0114`).
+* [x] `x in xs` over a `bool` list — it lowers to `==`, and a bool now compares
+  as its `0/1` value in both tiers, so membership works over every scalar element
+  type (int, float, bool)
 
 ---
 
@@ -1315,17 +1609,36 @@ Current limitations include:
 * Pointer values have strict restrictions around function boundaries and
   container access.
 * Some SSA/native paths remain opt-in or have known unsupported cases.
-* **Field access through a pointer (`valueof(_p).x`) works in the interpreter
-  only.** The IR, parser, type checker and interpreter are done and proven — a
-  write through a pointer is read back through the name — but the JIT has no
-  `[reg+disp]` encoder primitive yet, so the native tier refuses these
-  instructions and falls back to the interpreter rather than miscompile them.
-  This is the one blocker for 5.2, whose `send`/`recv` buffers are
-  `ptr[int[8]]` into struct memory.
-* `ptr[Point]` forms, typechecks, compares, and scales by `sizeof(Point)`, but
-  cannot yet be read or written through natively (see above). Struct and enum
-  pointees, `self` as `ptr[Point]`, and the optimizer alias barriers for
-  address-taken variables are all still to come.
+* **Field access through a pointer (`valueof(_p).x`) works in both tiers.** The
+  IR, parser, type checker, interpreter and JIT all agree: a field read or write
+  whose subject is a pointer register lowers to the same byte offset the named
+  form uses. The JIT gained a general `[reg+disp]` encoder primitive (verified
+  against GNU `as` over 18,379 cases, zero disagreements) so these instructions
+  run natively instead of falling back. `tests/typed_regression/ptr_field.lio`
+  proves the read and write paths, and `ptr_alias.lio` proves the named and
+  pointer forms stay aliased across a loop and an inlined method at every
+  optimization level.
+* `ptr[Point]` forms, typechecks, compares, scales by `sizeof(Point)`, and can be
+  read and written through in both tiers. A method receiver is still bound by
+  inlining as a concrete place rather than as a `ptr[Point]`, which is
+  observationally the same and needs no separate pointer path.
+* **A bounded string is a leaf type.** A `str[N]` may be a list/tuple element, a
+  struct field, or a `ptr[str[N]]` pointee. A struct's `str` field lives in a
+  companion byte run named by the dotted attribute path (`s.a`, `s.inner.a`), so
+  `len`, byte reads/writes, `print` and `==` all reuse the top-level string path
+  with no separate codegen; a nested field is named by the whole path. A
+  `ptr[str[N]]` (only meaningfully obtained from `addressof(s)`) names `s`'s run,
+  so `valueof(_p)` denotes that string's place. A `str` field reached through a
+  pointer *into* the struct (`valueof(_pp).a`) is refused (`E0128`), because the
+  companion run is keyed by the variable name. `tests/typed_regression/` covers
+  a list of strings (`strings_nested.lio`), a struct field (`struct_str.lio`), a
+  nested struct field (`struct_str_nested.lio`) and a string pointer
+  (`ptr_str.lio`).
+* **Address-taken memory is an optimizer barrier.** A variable whose address is
+  taken is never promoted to SSA (both `ssa.h` and `register_alloc.h` gate on
+  `AddressOf`), and a pointer cannot cross a function boundary (the header
+  records no pointee, `E0124`), so no pass can forward a stored value across a
+  pointer store or elide one. `ptr_alias.lio` is the regression guard.
 * **Dangling pointers are out of scope by design.** The compiler does not track
   a pointer's lifetime against what it points at, so dereferencing freed or
   out-of-bounds memory is undefined — and now that pointers are real addresses,
@@ -1337,9 +1650,13 @@ Current limitations include:
   between runs. Pointer arithmetic, comparison of two pointers into the same
   object, and `valueof` *are* tier-consistent; the raw number is not. Programs
   that print a pointer are excluded from the tier-diff oracles.
-* `syscall(...)` accepts integer arguments only; pointer-taking syscalls
-  (`write`/`read`) are not yet supported because the interpreter's pointers were
-  synthetic addresses rather than real memory.
+* `syscall(...)` takes int[64] and pointer arguments. Networking (5.2) is
+  reachable: `bind`/`connect` pass `&sockaddr_in` and `send`/`recv` pass a
+  buffer, both as real pointers into frame memory. Network byte order is *not*
+  applied for you — the port and address must be byte-swapped explicitly, and a
+  wrong swap silently names the wrong address (`tools/check_net_loopback.py`
+  pins both the round trip and the failure mode). Floats and aggregates are not
+  passed by value.
 * AVX2 vectorized code is emitted and byte-verified everywhere, but it is only
   *executed* on hosts that report AVX2; on other hosts the CPUID gate always
   takes the scalar fallback, so vector execution itself is not exercised there.

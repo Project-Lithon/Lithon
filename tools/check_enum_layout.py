@@ -184,7 +184,7 @@ def run_c(tmp: pathlib.Path):
 
 
 def run_frontend(tmp: pathlib.Path):
-    src = tmp / "enum.py"
+    src = tmp / "enum.lio"
     src.write_text(program())
     proc = subprocess.run([sys.executable, str(FRONTEND), str(src)],
                           capture_output=True, text=True)

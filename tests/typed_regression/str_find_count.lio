@@ -1,0 +1,51 @@
+# 6.4. str.find / str.count: the two substring scans on a bounded string.
+#
+# Like `s == t`, both name two string runs -- there is no receiver object and no
+# string value -- so the haystack and the needle are compared byte by byte, and
+# the two capacities need not match. find returns the lowest index or -1 (in
+# band, exactly as Python); count returns the number of NON-overlapping matches.
+# The empty needle is the edge both share: find -> 0, count -> len(haystack)+1.
+# Every line is byte-identical to CPython.
+
+s: str[16] = "hello world"
+t: str[4] = "lo"
+
+# find: present (not at 0), present at 0, at the last index, absent.
+print(s.find("lo"))            # 3
+print(s.find(t))               # 3   (a str variable needle)
+print(s.find("world"))         # 6
+print(s.find("hello"))         # 0
+print(s.find("d"))             # 10
+print(s.find("z"))             # -1
+print(s.find("dd"))            # -1
+print(s.find(""))              # 0
+print(s.find("hello world"))   # 0
+
+# count: single bytes, a multi-byte needle, absent, and the empty needle.
+print(s.count("l"))            # 3
+print(s.count("lo"))           # 1
+print(s.count("z"))            # 0
+print(s.count(""))             # 12
+
+# Non-overlapping: "aaaa" has two "aa", not three.
+u: str[8] = "aaaa"
+print(u.count("aa"))           # 2
+print(u.count("a"))            # 4
+print(u.find("aa"))            # 0
+
+# The result is a full int[64], usable in arithmetic and comparison.
+n: int[64] = s.find("world")
+print(n + 1)                   # 7
+print(s.find("z") < 0)         # True
+print(s.count("l") == 3)       # True
+
+
+class Box(Struct):
+    name: str[8]
+
+
+b: Box
+b.name = "lithon"
+print(b.name.find("thon"))     # 2
+print(b.name.count("o"))       # 1
+print(b.name.find("x"))        # -1

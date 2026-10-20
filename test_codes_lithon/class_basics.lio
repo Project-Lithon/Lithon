@@ -1,0 +1,7 @@
+class test_class:
+	name:str[64];
+	year:int[16];
+
+x = test_class
+x.name = "Lithon"
+x.age  = 2026

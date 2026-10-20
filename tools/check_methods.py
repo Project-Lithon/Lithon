@@ -194,7 +194,7 @@ REFUSALS = [
 ]
 
 
-def frontend_compile(source: str, tmp: pathlib.Path, name: str = "prog.py"):
+def frontend_compile(source: str, tmp: pathlib.Path, name: str = "prog.lio"):
     path = tmp / name
     path.write_text(source, encoding="utf-8")
     proc = subprocess.run([sys.executable, str(FRONTEND), str(path)],
@@ -220,8 +220,8 @@ def main() -> int:
         tmp = pathlib.Path(td)
 
         for label, method_src, manual_src in CASES:
-            mrc, mir, merr = frontend_compile(method_src, tmp, "method.py")
-            crc, cir, cerr = frontend_compile(manual_src, tmp, "manual.py")
+            mrc, mir, merr = frontend_compile(method_src, tmp, "method.lio")
+            crc, cir, cerr = frontend_compile(manual_src, tmp, "manual.lio")
             if mrc != 0:
                 failures.append(f"{label}: method source refused:\n{merr}")
                 continue
@@ -229,7 +229,7 @@ def main() -> int:
                 failures.append(f"{label}: manual source refused:\n{cerr}")
                 continue
             # Determinism: the same source must compile to the same text.
-            if frontend_compile(method_src, tmp, "method2.py")[1] != mir:
+            if frontend_compile(method_src, tmp, "method2.lio")[1] != mir:
                 failures.append(f"{label}: frontend IR is not deterministic")
             for tier in ("--interp", "--native"):
                 mrun = run_tier(mir, tmp, tier)
@@ -246,7 +246,7 @@ def main() -> int:
                 print(f"  ok   {label}: both tiers agree, and match hand-inlined code")
 
         for label, source, code in REFUSALS:
-            rc, _out, err = frontend_compile(source, tmp, "refuse.py")
+            rc, _out, err = frontend_compile(source, tmp, "refuse.lio")
             if rc == 0:
                 failures.append(f"{label}: accepted (wanted {code})")
             elif code not in err:

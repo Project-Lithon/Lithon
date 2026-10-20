@@ -112,9 +112,16 @@ inline PromotionMap select_promoted_variables(
             for (const auto& in : b.instrs) {
                 if (in.op == Op::Store && in.name == name &&
                     (in.type_kind == "list" || in.type_kind == "tuple" ||
-                     in.type_kind == "dict" || in.type_kind == "struct"))
+                     in.type_kind == "dict" || in.type_kind == "struct" ||
+                     in.type_kind == "str"))
                     return true;
                 if (in.op == Op::AddressOf && in.name == name) addressed = true;
+                // Phase 6.7. A list's live-length companion is read by its frame
+                // OFFSET from the print descriptor (the helper reads
+                // `base + len_offset`), so it must have a slot: a register-held
+                // companion would leave variable_offset at 0 and the helper
+                // would print `base[0]` many elements. Keep it in memory.
+                if (in.op == Op::PrintContainer && in.name2 == name) return true;
             }
         }
         return addressed;
@@ -257,6 +264,23 @@ public:
     }
     bool is_container(const std::string& name) const {
         return container_capacity_.count(name) != 0;
+    }
+
+    // 4.1 (phase 3). The recursive type of a nested container, and its flat-leaf
+    // layout. Null / invalid for a one-level container, whose single index the
+    // existing element_offset/container_stride path still handles.
+    std::shared_ptr<lithon::ir::Type> container_type(const std::string& name) const {
+        auto it = container_type_.find(name);
+        return it == container_type_.end() ? nullptr : it->second;
+    }
+    bool has_flat_layout(const std::string& name) const {
+        auto it = container_layout_.find(name);
+        return it != container_layout_.end() && it->second.valid &&
+               it->second.strides.size() > 1;
+    }
+    const lithon::ir::ContainerLayout* flat_layout(const std::string& name) const {
+        auto it = container_layout_.find(name);
+        return it == container_layout_.end() ? nullptr : &it->second;
     }
 
     // 4.3. A dict is a container for every purpose that matters here, in
@@ -415,6 +439,12 @@ private:
     // indexed by mistake.
     std::unordered_map<std::string, int> container_capacity_;
     std::unordered_map<std::string, int> container_stride_;
+    // 4.1 (phase 3). A nested container's recursive type and its flat-leaf
+    // layout (per-level byte strides). A one-level container stores neither --
+    // its single stride is already in container_stride_ -- so every existing
+    // reader is untouched and only the nested path consults these.
+    std::unordered_map<std::string, std::shared_ptr<lithon::ir::Type>> container_type_;
+    std::unordered_map<std::string, lithon::ir::ContainerLayout> container_layout_;
 
     std::unordered_map<std::string, DictLayout> dict_layouts_;
     // 4.6. A struct variable's total byte size. Its base is recorded in
@@ -531,8 +561,38 @@ private:
         d.key_width = decl->type_key_width;
         d.value_kind = decl->type_elem_kind;
         d.value_width = decl->type_elem_width;
-        d.key_stride = container_element_stride(d.key_kind, d.key_width);
-        d.value_stride = container_element_stride(d.value_kind, d.value_width);
+        // 6.8. A str key has no packed scalar form -- it IS the N bytes of its
+        // run -- so container_element_stride, which answers "how many bytes does
+        // this kind take in a frame", correctly has nothing to say about it. Its
+        // stride is its capacity, and the region is buckets * capacity: the same
+        // shape the interpreter's str_key_bytes uses and the one walk shared by
+        // both tiers traverses.
+        if (d.key_kind == "str") {
+            if (d.key_width <= 0)
+                throw std::logic_error("4.3: dict '" + name +
+                                       "' has a str key with no capacity");
+            d.key_stride = d.key_width;
+        } else {
+            d.key_stride = container_element_stride(d.key_kind, d.key_width);
+        }
+        // 6.9. A dict value may itself be a container (4.3). A list or tuple has
+        // no single "kind" that carries a stride, so its stride is the total byte
+        // size of one flat leaf run -- the same total container_layout computes,
+        // which is what the interpreter's leaf_count * leaf_bytes comes to. A
+        // scalar value keeps the packed sizeof.
+        if (d.value_kind == "list" || d.value_kind == "tuple") {
+            if (!decl || !decl->decl_type || !decl->decl_type->elem)
+                throw std::logic_error("4.3: dict '" + name +
+                                       "' has a container value with no type");
+            const lithon::ir::ContainerLayout vlay =
+                lithon::ir::container_layout(*decl->decl_type->elem);
+            if (!vlay.valid)
+                throw std::logic_error("4.3: dict '" + name +
+                                       "' has a container value with no flat layout");
+            d.value_stride = vlay.total_bytes;
+        } else {
+            d.value_stride = container_element_stride(d.value_kind, d.value_width);
+        }
         if (d.key_stride <= 0 || d.value_stride <= 0)
             throw std::logic_error(
                 "4.3: dict '" + name + "' has key type " +
@@ -597,14 +657,36 @@ private:
             int cap = 0;
             std::string elem_kind;
             int elem_width = -1;
+            std::shared_ptr<lithon::ir::Type> decl;
             for (const auto& b2 : fn_.blocks)
                 for (const auto& in2 : b2.instrs)
                     if (in2.op == lithon::ir::Op::Store && in2.name == name &&
-                        (in2.type_kind == "list" || in2.type_kind == "tuple")) {
+                        (in2.type_kind == "list" || in2.type_kind == "tuple" ||
+                         in2.type_kind == "str")) {
                         cap = in2.type_width > 0 ? in2.type_width : 1;
                         elem_kind = in2.type_elem_kind;
                         elem_width = in2.type_elem_width;
+                        decl = in2.decl_type;
                     }
+
+            // 4.1 (phase 3). A nested list/tuple is ONE flat leaf run: row-major,
+            // packed, no per-level padding. Its size is the leaf count times the
+            // leaf size -- not cap*stride, because the "element" is itself a
+            // container with no single stride. Record the recursive type and the
+            // per-level strides so Index/IndexStore and PrintContainer can
+            // address the run and both tiers lay it out identically.
+            lithon::ir::ContainerLayout flat;
+            if (decl) flat = lithon::ir::container_layout(*decl);
+            if (flat.valid && flat.strides.size() > 1) {
+                const int slots = (flat.total_bytes + 7) / 8;
+                for (int i = 0; i < slots; ++i) allocate_new_slot();
+                variable_offsets_[name] = next_slot_offset_;
+                container_capacity_[name] = cap;
+                container_stride_[name] = flat.strides[0];
+                container_type_[name] = decl;
+                container_layout_[name] = flat;
+                return;
+            }
 
             // 4.3. A dict is found and laid out before the list path, because
             // its storage is three regions and the list path's single stride is

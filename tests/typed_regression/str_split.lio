@@ -1,0 +1,70 @@
+# 6.7. str.split: the run-time split of a bounded string into a declared,
+# fixed-capacity list of bounded strings.
+#
+# There is no string value and no list value, so the pieces have nowhere to go
+# unless the destination is named: the left side declares `list[str[K], M]` and
+# the right side is `s.split(sep)`. sep is a string literal or another str. The
+# piece count is set into the destination's length companion, so len/print
+# agree with CPython.
+
+s: str[32] = "a,bb,ccc"
+parts: list[str[8], 4] = s.split(",")
+print(len(parts))          # 3
+print(parts)               # ['a', 'bb', 'ccc']
+
+# A str VARIABLE as the separator, and a multi-byte one.
+t: str[4] = "::"
+u: str[32] = "x::y::z"
+p2: list[str[8], 4] = u.split(t)
+print(len(p2))             # 3
+print(p2)                  # ['x', 'y', 'z']
+
+# Leading and trailing separators make EMPTY pieces, exactly as Python does.
+lead: str[16] = ",a,b,"
+p3: list[str[8], 4] = lead.split(",")
+print(len(p3))             # 4
+print(p3)                  # ['', 'a', 'b', '']
+
+# No separator at all: the whole string is one piece.
+one: str[16] = "hello"
+p4: list[str[8], 4] = one.split(",")
+print(len(p4))             # 1
+print(p4)                  # ['hello']
+
+# An empty string splits to a single empty piece, as in Python.
+emp: str[8] = ""
+p5: list[str[8], 4] = emp.split(",")
+print(len(p5))             # 1
+print(p5)                  # ['']
+
+# A piece is a bounded str run: its bytes are addressable like any other, so
+# `parts[k][j]` reads the j-th byte (a byte is an int[8]).
+print(parts[1][0])         # 98  ('b')
+
+# Adjacent separators: a zero-length piece between them.
+adj: str[16] = "a,,b"
+p6: list[str[8], 4] = adj.split(",")
+print(len(p6))             # 3
+print(p6)                  # ['a', '', 'b']
+
+# Only the FIRST M pieces fit; the pieces count is still exact when it fits.
+big: str[32] = "1-2-3"
+p7: list[str[8], 8] = big.split("-")
+print(len(p7))             # 3
+print(p7)                  # ['1', '2', '3']
+
+# A piece longer than K-1 content bytes is truncated (a str[K] holds K-1 bytes
+# plus its terminator). CPython: ['abcdefghij'].
+long: str[32] = "abcdefghij"
+p8: list[str[4], 2] = long.split(",")
+print(len(p8))             # 1
+print(p8)                  # ['abc']
+
+# A print-only split (no len() load to keep its companion live) and a SECOND one
+# after it: each must still render just its own pieces.
+first: str[16] = "a,b,c"
+q1: list[str[8], 4] = first.split(",")
+print(q1)                  # ['a', 'b', 'c']
+second: str[16] = "x-y"
+q2: list[str[8], 4] = second.split("-")
+print(q2)                  # ['x', 'y']

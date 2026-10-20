@@ -63,6 +63,21 @@ inline Kind kind_of_elem(const std::string& elem_kind) {
     return Kind::Int;
 }
 
+// 4.1 (phase 3). The kind of a nested container's LEAVES. A container is a run
+// of one scalar leaf kind, so the running kind an Index yields is the deepest
+// element's kind, not the immediate one (which would be "container" and fall
+// back to Int). The spine is a list/tuple chain; a dict is never an inner level
+// (4.3 values are scalars), so the first non-list/tuple node is the leaf.
+inline Kind leaf_kind_of(const lithon::ir::Type& t) {
+    const lithon::ir::Type* cur = &t;
+    // 6.2. A str[N] is a level too: its leaves are int[8] bytes, so an Index
+    // into one yields Int.
+    while (cur->elem && (cur->kind == "list" || cur->kind == "tuple" ||
+                         cur->kind == "str"))
+        cur = cur->elem.get();
+    return kind_of_elem(cur->kind);
+}
+
 inline const char* kind_name(Kind k) {
     switch (k) {
         case Kind::Int:     return "int";
@@ -230,11 +245,24 @@ struct Analysis {
                     }
                     case Op::Store:
                         if (in.args.empty() &&
-                            (in.type_kind == "list" || in.type_kind == "tuple")) {
+                            (in.type_kind == "list" || in.type_kind == "tuple" ||
+                             in.type_kind == "str" || in.type_kind == "dict")) {
                             // 4.1. Container declaration. Records the element
                             // kind only; there is no scalar Kind for the
-                            // container itself.
-                            st.containers[in.name] = kind_of_elem(in.type_elem_kind);
+                            // container itself. 6.2. A str is a byte run, so its
+                            // Index yields Int. 6.8. A dict's ELEMENT is its
+                            // value type, which is what its DictIndex yields --
+                            // recorded in the same table because the lookup is
+                            // by name and a dict never collides with a list of
+                            // the same name. A dict's values are scalar, so the
+                            // FLAT element kind is exact; leaf_kind_of would
+                            // walk no further than the dict node itself and
+                            // answer Int for a float-valued table.
+                            st.containers[in.name] =
+                                in.type_kind == "dict"
+                                    ? kind_of_elem(in.type_elem_kind)
+                                    : (in.decl_type ? leaf_kind_of(*in.decl_type)
+                                                    : kind_of_elem(in.type_elem_kind));
                             break;
                         }
                         if (!in.args.empty())
@@ -252,14 +280,66 @@ struct Analysis {
                               it == st.containers.end() ? Kind::Unseen : it->second);
                         break;
                     }
+                    // 6.8. A dict read yields the table's VALUE kind, recorded
+                    // at the declaration; a membership test is a bool. Without
+                    // these two the result stayed Unseen, so `print(d["k"])`
+                    // was refused natively as "not provably int" while the
+                    // interpreter ran it -- a tier split on a program that had
+                    // already been typechecked.
+                    case Op::DictIndex: {
+                        if (in.result == lithon::ir::kInvalidValue) break;
+                        auto it = st.containers.find(in.name);
+                        raise(st.vals[in.result],
+                              it == st.containers.end() ? Kind::Unseen : it->second);
+                        break;
+                    }
+                    case Op::DictContains:
+                        raise(st.vals[in.result], Kind::Bool);
+                        break;
                     case Op::IndexStore: {
+                        // 4.1 (phase 3). The VALUE is the LAST argument; every
+                        // argument before it is an index. For a nested store
+                        // `IndexStore xs, i, j, %v` args[1] is an index, so the
+                        // value must be read from the back.
                         auto it = st.containers.find(in.name);
                         if (it != st.containers.end() && in.args.size() >= 2)
-                            raise(it->second, val(st, in.args[1]));
+                            raise(it->second, val(st, in.args.back()));
                         break;
                     }
                     case Op::Len:
                         raise(st.vals[in.result], Kind::Int);
+                        break;
+
+                    // 6.2. len(s) is an int and s == t is a bool, both exact in
+                    // the kind lattice, so the print guard and codegen can trust
+                    // them independently of operand inference.
+                    case Op::StrLen:
+                        raise(st.vals[in.result], Kind::Int);
+                        break;
+                    case Op::StrEq:
+                        raise(st.vals[in.result], Kind::Bool);
+                        break;
+                    // 6.4. s.find / s.count produce an int[64], exact in the
+                    // lattice like StrLen.
+                    case Op::StrFind:
+                    case Op::StrCount:
+                        raise(st.vals[in.result], Kind::Int);
+                        break;
+
+                    // 6.7. strsplit produces the piece count as an int[64], the
+                    // same lattice slot StrFind uses. Its source/separator/
+                    // destination are named runs, not register operands, so there
+                    // is no running kind to update for them here.
+                    case Op::StrSplit:
+                        raise(st.vals[in.result], Kind::Int);
+                        break;
+
+                    // 6.1. A whole-container print carries its own shape and
+                    // renders every leaf with the kind the typechecker already
+                    // accepted, so it imposes no closed-set obligation here. The
+                    // op has no register operands and no result, so there is no
+                    // running kind to update; it is native-safe by construction.
+                    case Op::PrintContainer:
                         break;
 
                     // 4.4. addressof yields a pointer, which no value can ever
@@ -395,8 +475,14 @@ struct Analysis {
                         break;
 
                     case Op::Call: {
-                        if (in.name == "print") {
+                        if (in.name == "print" || in.name == "print_bare") {
                             if (final_pass) check_print(st, block, in, verdict);
+                            break;
+                        }
+                        // 6.1. The separator and final newline of a
+                        // multi-argument print carry no value and cannot be
+                        // formatted wrongly, so they are always native-safe.
+                        if (in.name == "print_sep" || in.name == "print_nl") {
                             break;
                         }
                         auto it = index.find(in.name);
@@ -502,11 +588,12 @@ struct Analysis {
         // provably-float value with host_format_double(), which reproduces
         // CPython's shortest-roundtrip repr, so the bytes match what the
         // interpreter prints. Ptr is native-safe too: both tiers print it as
-        // 0x<hex>. The FORMAT matches; the number does not -- the interpreter
-        // hands out synthetic addresses, the JIT prints real frame addresses --
-        // so a program that prints a pointer is not byte-comparable across
-        // tiers (see tools/run_tier_diff.py). A join of incomparable kinds is
-        // still refused.
+        // 0x<hex>. The FORMAT matches; the number does not -- each tier prints
+        // its own REAL frame addresses (4.4: the interpreter's pointers are
+        // genuine addresses too, so ASLR moves them every run) -- so a program
+        // that prints a pointer is not byte-comparable across tiers (see
+        // tools/run_tier_diff.py and tools/check_ptr_print.py). A join of
+        // incomparable kinds is still refused.
         if (k != Kind::Int && k != Kind::Bool && k != Kind::Float && k != Kind::Ptr) {
             verdict->native_safe = false;
             verdict->reasons.push_back(where + ": print argument %" +

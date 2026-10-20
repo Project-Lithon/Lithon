@@ -1,4 +1,4 @@
-"""`lithon` command line:  lithon script.py [--strict | --interp] [--ir] [--verbose]"""
+"""`lithon` command line:  lithon script.lio [--strict | --interp] [--ir] [--verbose]"""
 import argparse
 import sys
 

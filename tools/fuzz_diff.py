@@ -8,7 +8,7 @@ we do not reimplement V1_SPEC's rules here), runs it on both execution
 engines and diffs stdout + exit code. On the first mismatch, the failing
 program is minimized (repeated single-statement-removal passes, each
 re-checked against the SAME two gates: still typechecks, still mismatches)
-and the minimal repro is written to fuzz_failures/ as both .py and .ir.
+and the minimal repro is written to fuzz_failures/ as both .lio and .ir.
 
 CPython is used as a secondary oracle: if the interpreter itself disagrees
 with CPython, that's a real bug too, just a different one (frontend/
@@ -303,7 +303,7 @@ class Gen:
             self.emit(indent, "print(0)")
 
     # Two recursive shapes: a tail-recursive accumulator (like
-    # tests/jit_only/tail_deep.py, just far shallower here -- that file
+    # tests/jit_only/tail_deep.lio, just far shallower here -- that file
     # already covers the extreme-depth/TCO case) and a tree-recursive,
     # non-tail form (two arithmetic operations around the recursive call,
     # so it genuinely exercises call/return plumbing instead of being
@@ -971,7 +971,7 @@ def minimize(src: str, target_reason: str, tmp_dir: Path) -> str:
     tree = ast.parse(src)
 
     def reproduces():
-        py = tmp_dir / "_min.py"
+        py = tmp_dir / "_min.lio"
         py.write_text(ast.unparse(tree) + "\n")
         r = evaluate(py, tmp_dir / "_min.ir")
         return (not r.ok) and r.reason == target_reason
@@ -1062,7 +1062,7 @@ def main():
             src = gen.program_lsr()
         else:
             src = gen.program()
-        py = tmp_dir / "candidate.py"
+        py = tmp_dir / "candidate.lio"
         py.write_text(src)
         result = evaluate(py, tmp_dir / "candidate.ir")
 
@@ -1079,8 +1079,8 @@ def main():
 
         fail_dir.mkdir(exist_ok=True)
         stem = f"seed{seed}_{result.reason}"
-        (fail_dir / f"{stem}.py").write_text(minimal)
-        fe = run([sys.executable, str(FRONTEND), str(fail_dir / f"{stem}.py")])
+        (fail_dir / f"{stem}.lio").write_text(minimal)
+        fe = run([sys.executable, str(FRONTEND), str(fail_dir / f"{stem}.lio")])
         if fe.returncode == 0:
             (fail_dir / f"{stem}.ir").write_text(fe.stdout)
 
@@ -1088,7 +1088,7 @@ def main():
               f"and {fail_dir / (stem + '.ir')}")
         print("--- minimal source ---")
         print(minimal)
-        reval = evaluate(fail_dir / f"{stem}.py", tmp_dir / "reval.ir")
+        reval = evaluate(fail_dir / f"{stem}.lio", tmp_dir / "reval.ir")
         print(f"interpreter: rc={reval.interp_rc} stdout={reval.interp_out!r}")
         print(f"jit        : rc={reval.jit_rc} stdout={reval.jit_out!r}")
         print(f"cpython    : rc={reval.cpy_rc} stdout={reval.cpy_out!r}")

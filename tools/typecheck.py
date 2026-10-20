@@ -266,13 +266,17 @@ class TypeChecker:
             fname = node.func.id
 
             if fname == "print":
-                if len(node.args) != 1:
-                    raise RCRError(f"{context}: print() with exactly one argument is supported")
-                arg_t = self.infer_expr_type(node.args[0], scope, context)
-                if arg_t.kind not in ("int", "float", "str", "bool"):
-                    raise RCRError(
-                        f"{context}: print() does not accept {arg_t} -- V1_SPEC 0.6.9's closed "
-                        f"overload set is int[N], float[N], str[N], bool only")
+                # 6.1. print() takes any number of arguments; Python separates
+                # them with a space and writes one trailing newline. Each is
+                # formatted on its own, so each must be in the closed printable
+                # set (matching the IR-level checker in src/typecheck).
+                for i, arg_node in enumerate(node.args):
+                    arg_t = self.infer_expr_type(
+                        arg_node, scope, f"{context}, print argument {i+1}")
+                    if arg_t.kind not in ("int", "float", "str", "bool", "ptr"):
+                        raise RCRError(
+                            f"{context}: print() does not accept {arg_t} -- V1_SPEC 0.6.9's closed "
+                            f"overload set is int[N], float[N], str[N], bool and ptr[T] only")
                 return LType("bool")
 
             if fname in ("wrap_add", "wrap_sub", "wrap_mul"):
@@ -293,25 +297,26 @@ class TypeChecker:
                 return LType("int", 64)
 
             if fname == "syscall":
-                # Phase III. The raw syscall primitive, mirroring the C++
-                # checker's Op::Syscall case: a number and up to six integer
-                # arguments. A pointer is rejected on purpose -- it would name
-                # an address in the interpreter's synthetic address space, so a
-                # pointer-taking syscall (write/read) could not behave the same
-                # in both tiers. The result is the kernel's raw return, typed
-                # int[64]; there is no fallible wrapper to unwrap.
+                # Phase III / 5.2. The raw syscall primitive, mirroring the C++
+                # checker's Op::Syscall case: a number and up to six arguments,
+                # each an int[64] or a pointer. 5.2 needs pointers -- bind/
+                # connect take `&sockaddr_in`, send/recv take a buffer -- and a
+                # pointer is a real host address in both tiers (4.4), so the
+                # kernel can read and write the bytes behind it. The result is
+                # the kernel's raw return, typed int[64]; there is no fallible
+                # wrapper to unwrap.
                 if not (1 <= len(node.args) <= 7):
                     raise RCRError(
                         f"{context}: syscall() takes a syscall number and up to six "
                         f"arguments, e.g. syscall(102) (Phase III)")
                 for i, arg_node in enumerate(node.args):
                     t = self.infer_expr_type(arg_node, scope, f"{context}, syscall argument {i}")
-                    if t.kind != "int":
+                    if t.kind != "int" and t.kind != "ptr":
                         raise RCRError(
                             f"{context}: syscall() argument {i} has type {t} -- a raw "
-                            f"syscall argument must be an integer in this slice; "
-                            f"pointer-taking syscalls (write/read) are not yet "
-                            f"supported (Phase III)")
+                            f"syscall argument must be an integer or a pointer (a "
+                            f"buffer or a sockaddr); floats and aggregates are not "
+                            f"passed by value (Phase III)")
                 return LType("int", 64)
 
             if fname not in self.functions:

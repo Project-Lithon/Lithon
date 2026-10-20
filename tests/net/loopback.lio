@@ -1,0 +1,94 @@
+# 5.2. A single-process TCP loopback round trip, built entirely from raw
+# syscalls. One socket binds to 127.0.0.1 on an ephemeral port (the address is
+# byte-swapped by hand -- see swap_bytes.py), listens, and accepts; a second
+# socket connects back to it; the client sends an int64 and the accepted
+# connection receives it. Every op is a `syscall(...)` with the Linux number.
+#
+# This file is the subject of tools/check_net_loopback.py, which compiles and
+# runs tests/net/loopback_oracle.c -- a raw C program issuing the identical
+# syscalls -- and requires the two programs to print the same lines. Sockets are
+# stateful and external, so interpreter-vs-JIT parity is *not* the right oracle
+# (both tiers could be wrong the same way); the C program is.
+#
+# Nothing here prints a file descriptor: fd numbers depend on what else the
+# process has open, and the C oracle's would differ. Only the return codes, the
+# byte length, and the round-tripped value are printed, and all are identical.
+
+
+def swap32(v: int[64]) -> int[64]:
+    return ((v & 255) << 24) | ((v & 65280) << 8) | ((v >> 8) & 65280) | ((v >> 24) & 255)
+
+
+# sin_family | sin_port | sin_addr packed into one little-endian word. The
+# address is 127.0.0.1 = 0x7F000001; swap32 makes the stored bytes 7F 00 00 01,
+# which is what the kernel reads as network order. The port starts at 0 so the
+# kernel picks a free one, and getsockname fills it in below.
+class SockAddrIn(Struct):
+    lo: int[64]
+    hi: int[64]
+
+
+# An 8-byte buffer the kernel can read from and write into.
+class Buf(Struct):
+    v: int[64]
+
+
+sa: SockAddrIn
+sa.lo = 2 | (swap32(2130706433) << 32)
+sa.hi = 0
+_sa: ptr[SockAddrIn] = addressof(sa)
+
+socklen: int[64] = 16
+_psocklen: ptr[int[64]] = addressof(socklen)
+
+# socket(AF_INET=2, SOCK_STREAM=1, 0)
+srv: int[64] = syscall(41, 2, 1, 0)
+
+# bind(srv, &sa, sizeof(sockaddr_in))
+print(syscall(49, srv, _sa, 16))
+
+# getsockname(srv, &sa, &socklen): the kernel writes the real port back into the
+# very bytes we handed it, which only works because the address is real memory.
+print(syscall(51, srv, _sa, _psocklen))
+print(socklen)
+
+# listen(srv, backlog=1)
+print(syscall(50, srv, 1))
+
+# A second socket connects back to the address getsockname filled in.
+cli: int[64] = syscall(41, 2, 1, 0)
+print(syscall(42, cli, _sa, 16))
+
+# accept(srv, NULL, NULL); the connection is already established, so this
+# returns immediately.
+conn: int[64] = syscall(43, srv, 0, 0)
+print(conn > 0)
+
+out: Buf
+out.v = 123456789
+inb: Buf
+inb.v = 0
+_pout: ptr[Buf] = addressof(out)
+_pin: ptr[Buf] = addressof(inb)
+
+# sendto(cli, &out, 8, 0, NULL, 0) == 8 bytes
+print(syscall(44, cli, _pout, 8, 0, 0, 0))
+# recvfrom(conn, &in, 8, 0, NULL, NULL) -> 8, and the bytes land in inb.
+print(syscall(45, conn, _pin, 8, 0, 0, 0))
+print(inb.v)
+
+print(syscall(3, cli))
+print(syscall(3, conn))
+print(syscall(3, srv))
+
+# The failure mode, made explicit. The SAME address, WITHOUT the byte swap, is
+# still a perfectly good 32-bit number -- so nothing crashes. Its bytes just name
+# 1.0.0.127 instead of 127.0.0.1, and bind to a non-local address fails with
+# EADDRNOTAVAIL (-99). A happy-path connect alone would not show this.
+bad: SockAddrIn
+bad.lo = 2 | (2130706433 << 32)
+bad.hi = 0
+_bad: ptr[SockAddrIn] = addressof(bad)
+badfd: int[64] = syscall(41, 2, 1, 0)
+print(syscall(49, badfd, _bad, 16) < 0)
+print(syscall(3, badfd))

@@ -1,0 +1,52 @@
+# 6.9. Dict values that are themselves containers.
+#
+# A list or tuple value has no scalar form, so it is stored as a flat leaf run
+# in the dict's value region and copied in and out of one bucket's slice. The
+# two tiers copy the same leaves and print through the same recursive walk, so
+# this program is a tier-diff (like dict_str_keys.py) rather than a CPython
+# oracle: a whole-dict print is bucket order, not insertion order.
+
+d: dict[int[64], list[int[64], 4], 4] = {1: [10, 20, 30, 40]}
+
+# A read yields a run, so a following subscript is an ordinary list index.
+print(d[1][0])
+print(d[1][3])
+# And the value prints through the same walk a list literal would.
+print(d)
+print(d[1])
+
+# A tuple value, and two entries so probing is exercised.
+p: dict[int[64], tuple[int[32], 2], 4] = {7: (5, 6), 9: (8, 9)}
+print(p[7][0])
+print(p[7][1])
+print(p[9][1])
+print(p)
+
+# A container value under a str key: both name-vs-register splits at once.
+s: dict[str[16], list[int[64], 3], 4] = {"ab": [1, 2, 3]}
+print(s["ab"][1])
+print(s["ab"])
+print(s)
+
+# A value built from a short literal: the tail stays zeroed in both tiers.
+t: dict[int[64], list[int[64], 4], 2] = {1: [9]}
+print(t[1])
+print(t)
+
+# 6.9. Values above 255, so the copy has to move whole leaves and not just
+# their low bytes. A leaf stored one byte at a time reads back as value % 256,
+# which every case above (all of them below 256) would have hidden.
+big: dict[int[64], list[int[64], 4], 4] = {1: [1000, 20000, 300000, 4000000]}
+print(big[1])
+print(big[1][3])
+print(big)
+bigt: dict[int[64], tuple[int[64], 3], 2] = {5: (70000, 800000, 90000000)}
+print(bigt[5])
+print(bigt)
+
+# A scalar value that is NOT equal to its key, so a store that wrote the key
+# instead of the value cannot pass.
+sc: dict[int[64], int[64], 4] = {1: 111, 2: 222}
+print(sc[1])
+print(sc[2])
+print(sc)

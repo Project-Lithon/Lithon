@@ -1,0 +1,39 @@
+# 4.4. Address-taken memory is a barrier for the optimizer: a variable whose
+# address is taken is never promoted to SSA, so every `x` and every
+# `valueof(_p)` reads and writes the same frame bytes, and no pass may forward
+# a stored value across a pointer store or elide one. This program is only
+# correct if that holds: the named form and the pointer form interleave in a
+# loop and across an inlined method (4.9), and both tiers must agree at every
+# optimization level. expected/ptr_alias.out is written from 4.4/4.6/4.9
+# semantics (Struct is not a Python builtin, so there is no CPython oracle).
+
+
+class Pair(Struct):
+    a: int[64]
+    b: int[64]
+
+    def bump(self, n: int[64]) -> int[64]:
+        self.a = self.a + n
+        return self.a
+
+
+pair: Pair
+pair.a = 0
+pair.b = 100
+_pp: ptr[Pair] = addressof(pair)
+
+i: int[64] = 0
+while i < 5:
+    pair.a = pair.a + 1
+    valueof(_pp).b = pair.b - 10
+    i = i + 1
+
+print(pair.a)
+print(pair.b)
+print(valueof(_pp).a)
+print(valueof(_pp).b)
+
+print(pair.bump(7))
+print(pair.a)
+print(pair.bump(7))
+print(pair.a)

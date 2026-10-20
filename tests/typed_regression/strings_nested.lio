@@ -1,0 +1,19 @@
+# 6.2. str[N] as a container element. A list/tuple of strings is a flat run of
+# byte leaves; each element prints as Python's repr (quoted), and an element's
+# byte is read/written with a full index chain. Both tiers must agree.
+words: list[str[8], 3] = ["one", "two", ""]
+print(words)
+print(len(words))
+print(words[0][0])
+print(words[1][2])
+
+words[1][2] = 88
+print(words)
+
+pair: tuple[str[6], 2] = ("ab", "cdef")
+print(pair)
+print(pair[1][3])
+
+grid: list[list[str[4], 2], 2] = [["a", "bb"], ["ccc", "d"]]
+print(grid)
+print(grid[1][0][1])

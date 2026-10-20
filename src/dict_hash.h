@@ -74,4 +74,57 @@ inline int64_t canonical_key(int64_t key, bool is_bool, int width_bits) {
     return static_cast<int64_t>(static_cast<uint64_t>(key) & mask);
 }
 
+// 4.3. String keys.
+//
+// A str[N] key is a run of bytes rather than a word, so it needs a byte hash and
+// a byte compare where an int key needs a multiply and a single cmp. Both are
+// defined here, once, for the same reason the integer hash is: the interpreter
+// walks the table in C++ and the JIT asks a host helper to walk it in C++ too,
+// and both must agree byte for byte about what "the same key" means.
+//
+// FNV-1a. One xor and one multiply per byte, which is the cheapest hash that
+// still scatters short keys -- and short keys are the whole point of a bounded
+// string. A sum would make "ab" and "ba" collide, and a table of two-character
+// keys would degenerate into one probe chain.
+//
+// The bytes hashed are the string's CONTENT: up to the first NUL, capped at the
+// run's capacity. Content rather than the whole run because the capacities can
+// differ -- `d["ab"]` materialises a str[3] search key while the table stores a
+// str[16] slot -- and two strings are the same key exactly when their text
+// agrees. Hashing the padding instead would make the same text two different
+// keys depending on the capacity it was copied from.
+constexpr uint64_t kFnvOffsetBasis = 14695981039346656037ull;
+constexpr uint64_t kFnvPrime = 1099511628211ull;
+
+inline uint64_t hash_str_content(const uint8_t* p, int cap) {
+    uint64_t h = kFnvOffsetBasis;
+    for (int i = 0; i < cap; ++i) {
+        const uint8_t c = p[i];
+        if (c == 0) break;
+        h ^= c;
+        h *= kFnvPrime;
+    }
+    return h;
+}
+
+// The starting bucket for a string key. The byte hash is folded back through
+// bucket_of so a str key and an int key share the one window-and-mask step.
+inline int64_t bucket_of_str(const uint8_t* p, int cap, int buckets) {
+    return bucket_of(static_cast<int64_t>(hash_str_content(p, cap)), buckets);
+}
+
+// Content equality, bounded by each run's capacity. Missing bytes count as NUL,
+// so a shorter run and a longer run with the same text compare equal, which is
+// what makes a str[3] search key match a str[16] stored slot.
+inline bool str_content_eq(const uint8_t* a, int a_cap, const uint8_t* b, int b_cap) {
+    int i = 0;
+    while (true) {
+        const uint8_t ca = (i < a_cap) ? a[i] : 0;
+        const uint8_t cb = (i < b_cap) ? b[i] : 0;
+        if (ca != cb) return false;
+        if (ca == 0) return true;
+        ++i;
+    }
+}
+
 } // namespace lithon::dict

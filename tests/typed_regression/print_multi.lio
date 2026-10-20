@@ -1,0 +1,20 @@
+# 6.1. Multi-argument print. Python separates the arguments with a single space
+# and writes exactly one trailing newline; print() with no arguments writes a
+# bare newline. The frontend lowers this without ever building a string -- each
+# value is a print_bare call, the separator a print_sep call, the newline a
+# print_nl call -- so each tier formats each value exactly as it would have for
+# a one-argument print. Every value kind is exercised here (int, float, bool) so
+# the JIT has to pick a format for each inside a multi-argument call.
+
+a: int[64] = 7
+b: int[64] = -3
+f: float[64] = 2.5
+t: bool = True
+u: bool = False
+
+print(a, b)
+print(f, a, t)
+print()
+print(u, a, b, f)
+print(a)
+print(a,)

@@ -148,7 +148,7 @@ def main():
         tmp = pathlib.Path(tmp)
 
         def compile_ir(name, src):
-            py = tmp / f"{name}.py"; py.write_text(src)
+            py = tmp / f"{name}.lio"; py.write_text(src)
             r = subprocess.run([sys.executable, str(frontend), str(py)], capture_output=True, text=True)
             if r.returncode != 0:
                 raise RuntimeError(f"frontend failed: {r.stderr.strip()[:300]}")

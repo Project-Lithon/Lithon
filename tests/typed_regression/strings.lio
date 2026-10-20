@@ -1,0 +1,40 @@
+# 6.2. Bounded strings. A str[N] is N bytes whose content ends at the first
+# NUL. The literal, print, len, indexed read and write, and equality must agree
+# byte-for-byte across the interpreter and the JIT.
+s: str[8] = "hi"
+print(s)
+print(len(s))
+print(s[0])
+print(s[1])
+
+s[1] = 73
+print(s)
+print(len(s))
+
+t: str[8] = "hI"
+print(s == t)
+
+u: str[8] = "hello"
+print(u == s)
+
+empty: str[4]
+print(len(empty))
+print(empty)
+print(empty == empty)
+
+long: str[16] = "Lithon IR"
+print(long)
+print(len(long))
+print(long[7])
+
+# Different capacities compare by content, not by size.
+a: str[4] = "abc"
+b: str[8] = "abc"
+print(a == b)
+
+# A byte written then read back.
+byte: str[4] = "xyz"
+print(byte[0])
+byte[0] = 88
+print(byte)
+print(byte[0])

@@ -7,7 +7,7 @@ architecture choice, replaced by a native Lithon parser at M10.
 
 Two modes, both supported by the same builder:
   - Untyped input (bare "x = 10", no annotations): emits IR exactly
-    as before, with no type fields. Existing tests/programs/*.py
+    as before, with no type fields. Existing tests/programs/*.lio
     (the M1/M2 regression suite) use this path unchanged.
   - Typed input (AnnAssign "x: int[8] = 10", typed function
     signatures): emits IR carrying type_kind/type_width per V1_SPEC
@@ -31,47 +31,133 @@ class Block:
         self.lines = []
 
 
-def render_type_suffix(kind, width, elem_kind=None, elem_width=None,
-                       key_kind=None, key_width=None):
-    """Renders the trailing " : T" / " : T[N]" annotation the IR parser reads.
+class Type:
+    """A resolved Lithon type, recursive so an element/key/value can be one too.
 
-    A container is `list[int[64], 4]`: the capacity is the OUTER bracket and the
-    element type is nested inside it, which is the opposite arrangement from a
-    scalar's `int[64]` where the bracket holds the width. Keeping that shape is
-    what lets `parse_type_string` on the C++ side recurse once and land on the
-    same ParsedType either way.
+    kind is one of int/float/str/bool/struct/ptr/list/tuple/dict.
+    - a scalar carries its width (bool uses -1, struct its byte size);
+    - ptr carries its pointee type in `elem`;
+    - list/tuple carry a capacity and an element type in `elem`;
+    - dict carries a bucket count, a key type in `key` and a value type in `elem`.
 
-    4.3. A dict is the one container with three fields, so it gets its own branch:
-    `dict[int[64], bool, 8]` is key, then value, then bucket count. The value
-    still renders through the ordinary path, so it lands in the same element
-    fields the C++ side already reads.
+    Recursion is what lets `list[tuple[int[64], 4], 2]` exist as one value: the
+    old flat six-field form could only name one level of element, so a container
+    inside a container had nowhere to live and was silently flattened.
     """
-    if not kind:
-        return ""
+
+    __slots__ = ("kind", "width", "cap", "elem", "key", "ref")
+
+    def __init__(self, kind, width=-1, cap=None, elem=None, key=None, ref=None):
+        self.kind = kind
+        self.width = width
+        self.cap = cap
+        self.elem = elem
+        self.key = key
+        self.ref = ref   # a struct/enum NAME, for the source-level spelling only
+
+    def is_container(self):
+        return self.kind in CONTAINER_KINDS
+
+    def is_scalar(self):
+        return self.kind in ("int", "float", "str", "bool", "struct")
+
+    def _flat(self):
+        """The legacy (kind, width, elem_kind, elem_width, key_kind, key_width)
+        projection. Exact for a scalar and for a one-level container; a nested
+        element is collapsed to its outer kind, which is what the old flat form
+        always did. Only the sites that predate nesting use it."""
+        if self.kind == "dict":
+            return ("dict", self.cap, self.elem.kind, self.elem.width,
+                    self.key.kind, self.key.width)
+        if self.kind in ("list", "tuple"):
+            e = self.elem
+            return (self.kind, self.cap, e.kind, e.cap if e.is_container() else e.width,
+                    None, None)
+        if self.kind == "ptr":
+            return ("ptr", -1, self.elem.kind, self.elem.width, None, None)
+        return (self.kind, self.width, self.ref, None, None, None)
+
+    def __iter__(self):
+        return iter(self._flat())
+
+    def __getitem__(self, index):
+        return self._flat()[index]
+
+    def __eq__(self, other):
+        if isinstance(other, Type):
+            return ((self.kind, self.width, self.cap, self.ref) ==
+                    (other.kind, other.width, other.cap, other.ref)
+                    and self.elem == other.elem and self.key == other.key)
+        if isinstance(other, tuple):
+            return self._flat() == other
+        return NotImplemented
+
+    def __hash__(self):
+        return hash((self.kind, self.width, self.cap, self.ref,
+                     self.elem, self.key))
+
+    def render(self):
+        """The type's IR spelling, e.g. `list[tuple[int[64], 4], 2]`."""
+        k = self.kind
+        if k == "dict":
+            return f"dict[{self.key.render()}, {self.elem.render()}, {self.cap}]"
+        if k == "ptr":
+            return f"ptr[{self.elem.render()}]"
+        if k in ("list", "tuple"):
+            return f"{k}[{self.elem.render()}, {self.cap}]"
+        if k == "str":
+            return f"str[{self.cap}]"
+        if k == "bool":
+            return "bool"
+        return f"{k}[{self.width}]"
+
+    def cell_bytes(self):
+        """Bytes one cell of this type occupies in a frame. A container's cell is
+        its whole packed run of elements; a dict's is its buckets, each holding a
+        key cell and a value cell, plus the occupancy that is tracked apart."""
+        if self.kind == "bool":
+            return 1
+        # 6.2. A str[N] is N bytes: the capacity IS the byte size, unlike a
+        # scalar whose `width` is a bit width.
+        if self.kind == "str":
+            return self.cap
+        if self.kind in ("ptr", "struct"):
+            return self.width
+        if self.kind in ("list", "tuple"):
+            return self.cap * self.elem.cell_bytes()
+        if self.kind == "dict":
+            return self.cap * (self.key.cell_bytes() + self.elem.cell_bytes())
+        return self.width // 8
+
+    def __repr__(self):
+        return f"Type({self.render()})"
+
+
+def _flat_tuple_to_type(kind, width, elem_kind, elem_width, key_kind, key_width):
+    """Rebuilds a Type from the legacy flat six fields. Exact only when the
+    element and key are scalars, which is the case at every remaining flat call
+    site; a nested level has no flat spelling."""
     if kind == "dict":
-        if elem_kind is None or key_kind is None:
-            raise NotImplementedError(
-                f"LITHON-E0110: dict annotation is missing its key or value type")
-        k = render_type_suffix(key_kind, key_width).lstrip(" :")
-        v = render_type_suffix(elem_kind, elem_width).lstrip(" :")
-        return f" : dict[{k}, {v}, {width}]"
+        return Type("dict", cap=width, elem=Type(elem_kind, width=elem_width),
+                    key=Type(key_kind, width=key_width))
     if kind == "ptr":
-        # 4.4. `ptr[int[64]]`: the pointee is nested one level, exactly like a
-        # container's element, but no capacity follows it. The C++ side reads
-        # the pointee back through the same recursion, so it stays in the same
-        # element fields a container's element would use.
-        if elem_kind is None:
-            raise NotImplementedError("LITHON-E0110: ptr annotation is missing its pointee type")
-        inner = render_type_suffix(elem_kind, elem_width).lstrip(" :")
-        return f" : ptr[{inner}]"
+        return Type("ptr", elem=Type(elem_kind, width=elem_width))
     if kind in CONTAINER_KINDS:
-        if elem_kind is None:
-            raise NotImplementedError(f"LITHON-E0110: {kind} annotation is missing its element type")
-        inner = render_type_suffix(elem_kind, elem_width).lstrip(" :")
-        return f" : {kind}[{inner}, {width}]"
-    if width is None or width == -1:
-        return f" : {kind}"
-    return f" : {kind}[{width}]"
+        return Type(kind, cap=width, elem=Type(elem_kind, width=elem_width))
+    return Type(kind, width=width)
+
+
+def render_type_suffix(t, width=None, elem_kind=None, elem_width=None,
+                       key_kind=None, key_width=None):
+    """Renders the trailing " : T" annotation the IR parser reads. Accepts a
+    recursive Type, or the legacy flat six fields (scalar/one-level only). An
+    empty type (None) renders as the empty string."""
+    if isinstance(t, Type):
+        return f" : {t.render()}"
+    if t is None:
+        return ""
+    flat = _flat_tuple_to_type(t, width, elem_kind, elem_width, key_kind, key_width)
+    return f" : {flat.render()}"
 
 
 # 4.8. A type function is a compile-time type constructor, a "structural
@@ -92,13 +178,25 @@ TYPE_FUNCTION_MARKER = "NewType"
 
 
 class TypeFunction:
-    """One `def Name(p, ...) -> NewType: return { T }` declaration."""
+    """One `def Name(p, ...) -> NewType: return { T }` declaration.
 
-    __slots__ = ("name", "params", "body_node")
+    A parameter is either a *type parameter* (unannotated: the call supplies a
+    type expression, e.g. `Fixed(int[64], 4)` passes `int[64]` for `t`) or a
+    *value parameter* (annotated: the call supplies a literal of that type, e.g.
+    `Fixed(n: int[16])` applied as `Fixed(4)` passes the value 4). Both are
+    substituted structurally into the body -- the difference is that a value
+    argument is checked against its declared type before substitution, so a
+    width, capacity or arity can never be handed a type, or vice versa.
+    """
 
-    def __init__(self, name, params, body_node):
+    __slots__ = ("name", "params", "value_anns", "body_node")
+
+    def __init__(self, name, params, value_anns, body_node):
         self.name = name
         self.params = params          # list of parameter names, in order
+        # Parallel to `params`: the annotation AST for a value parameter, or
+        # None for a type parameter.
+        self.value_anns = value_anns
         self.body_node = body_node    # the single type expression inside { }
 
 
@@ -182,6 +280,51 @@ class _MethodSubst(ast.NodeTransformer):
             node.name = self.rename[node.name]
         return node
 
+def _check_value_argument(func_name, param, ann_node, arg):
+    """Checks one argument supplied for an annotated (value) parameter.
+
+    The parameter names a scalar value type -- only `int[8|16|32|64]` and
+    `bool` -- and the argument must be a literal of exactly that type. A
+    value parameter exists so a width, capacity or arity can be threaded
+    through a type function as a number rather than as a type, so an argument
+    that is not a fitting literal is refused here, before substitution, rather
+    than surfacing as a confusing failure to parse the substituted body.
+    """
+    ann_t = parse_type_annotation(ann_node)
+    kind, width = ann_t.kind, ann_t.width
+    if ann_t.is_container() or ann_t.kind == "ptr" or kind not in ("int", "bool"):
+        raise NotImplementedError(
+            f"LITHON-E0132: parameter '{param}' of type function '{func_name}' is "
+            f"annotated with '{ast.unparse(ann_node)}'; a value parameter must be a "
+            f"scalar -- int[8|16|32|64] or bool (4.8)")
+    if kind == "bool":
+        if not (isinstance(arg, ast.Constant) and isinstance(arg.value, bool)):
+            raise NotImplementedError(
+                f"LITHON-E0132: parameter '{param}' of type function '{func_name}' is "
+                f"bool; its argument must be a bool literal, e.g. True or False (4.8)")
+        return
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, int) \
+            and not isinstance(arg.value, bool):
+        value = arg.value
+    elif (isinstance(arg, ast.UnaryOp) and isinstance(arg.op, ast.USub)
+            and isinstance(arg.operand, ast.Constant)
+            and isinstance(arg.operand.value, int)
+            and not isinstance(arg.operand.value, bool)):
+        value = -arg.operand.value
+    else:
+        raise NotImplementedError(
+            f"LITHON-E0132: parameter '{param}' of type function '{func_name}' is "
+            f"int[{width}]; its argument must be an integer literal, got "
+            f"'{ast.unparse(arg)}' (4.8)")
+    _require_supported_width("int", width)
+    lo = -(1 << (width - 1))
+    hi = (1 << (width - 1)) - 1
+    if not (lo <= value <= hi):
+        raise NotImplementedError(
+            f"LITHON-E0132: argument {value} does not fit int[{width}] for parameter "
+            f"'{param}' of type function '{func_name}' (valid range {lo}..{hi}) (4.8)")
+
+
 def _expand_type_function(call):
     """Expands `Name(args...)` to the parsed type its body denotes.
 
@@ -212,6 +355,9 @@ def _expand_type_function(call):
         raise NotImplementedError(
             f"LITHON-E0133: type function '{name}' takes {len(tf.params)} type "
             f"argument(s), got {len(call.args)} (4.8)")
+    for param, ann, arg in zip(tf.params, tf.value_anns, call.args):
+        if ann is not None:
+            _check_value_argument(name, param, ann, arg)
 
     key = ast.dump(call)
     cached = _TYPE_FUNC_CACHE.get(key)
@@ -236,11 +382,8 @@ def _expand_type_function(call):
 
 
 def parse_type_annotation(node, structs=None):
-    """Returns (kind, width, elem_kind, elem_width, key_kind, key_width) from an
-    annotation AST node, or raises NotImplementedError for forms this frontend
-    slice doesn't handle.
-    elem_kind/elem_width are None for every scalar and set for every container.
-     key_kind/key_width are set only for a dict.
+    """Returns a recursive `Type` from an annotation AST node, or raises
+    NotImplementedError for forms this frontend slice doesn't handle.
     `structs` maps a struct type name to its layout. It is needed only to write
     `ptr[Point]`: a struct is named at the source but the IR carries no struct
     NAMES at all (a struct is `struct[N]`, kind plus byte size), so the name
@@ -257,7 +400,7 @@ def parse_type_annotation(node, structs=None):
 
     if isinstance(node, ast.Name):
         if node.id == "bool":
-            return "bool", -1, None, None, None, None
+            return Type("bool")
         if node.id in ("int", "float"):
             opts = "8, 16, 32 or 64" if node.id == "int" else "64"
             raise NotImplementedError(
@@ -275,13 +418,28 @@ def parse_type_annotation(node, structs=None):
             return _parse_ptr_annotation(node.slice, structs)
         if base in CONTAINER_KINDS:
             return _parse_container_annotation(base, node.slice)
-        if base not in ("int", "float", "str"):
+        # 6.2. `str[N]` is a bounded string: N bytes of NUL-terminated storage.
+        # N is a BYTE capacity, not a bit width, so it does not go through
+        # _require_supported_width. The element is the byte int[8], which is
+        # what makes indexing a string reuse the container byte machinery.
+        if base == "str":
+            size_node = node.slice
+            if not isinstance(size_node, ast.Constant) \
+                    or not isinstance(size_node.value, int) \
+                    or isinstance(size_node.value, bool):
+                raise NotImplementedError(
+                    "LITHON-E0111: str[N] requires a literal integer capacity, e.g. str[16]")
+            if size_node.value <= 0:
+                raise NotImplementedError(
+                    f"LITHON-E0111: str capacity must be positive, got {size_node.value}")
+            return Type("str", cap=size_node.value, elem=Type("int", width=8))
+        if base not in ("int", "float"):
             raise NotImplementedError(f"LITHON-E0109: unknown type '{base}'")
         size_node = node.slice
         if not isinstance(size_node, ast.Constant) or not isinstance(size_node.value, int):
             raise NotImplementedError(f"LITHON-E0109: {base}[N] requires a literal integer size")
         _require_supported_width(base, size_node.value)
-        return base, size_node.value, None, None, None, None
+        return Type(base, width=size_node.value)
 
     raise NotImplementedError("LITHON-E0108: unsupported type annotation form")
 
@@ -312,6 +470,10 @@ def _parse_dict_annotation(slice_node):
     turns a key into a bucket, and a computed count would put a division in the
     hot path of every lookup. It is also required to be a power of two, so the
     mask is an and rather than a division.
+
+    4.3. The value is a full recursive type. A container value is accepted only
+    once the tiers can lay one out and index it; until then it is refused here,
+    in the one place the type is built, rather than being silently flattened.
     """
     if not isinstance(slice_node, ast.Tuple) or len(slice_node.elts) != 3:
         raise NotImplementedError(
@@ -327,13 +489,21 @@ def _parse_dict_annotation(slice_node):
     if cap_node.value & (cap_node.value - 1):
         raise NotImplementedError(
             f"LITHON-E0111: dict bucket count must be a power of two, got {cap_node.value}")
-    key_kind, key_width, key_elem_kind, _, _, _ = parse_type_annotation(key_node)
-    if key_elem_kind is not None:
+    key_t = parse_type_annotation(key_node)
+    if key_t.is_container() or key_t.kind == "ptr":
         raise NotImplementedError("LITHON-E0112: a dict key cannot itself be a container")
-    val_kind, val_width, val_elem_kind, _, _, _ = parse_type_annotation(val_node)
-    if val_elem_kind is not None:
-        raise NotImplementedError("LITHON-E0112: a dict value cannot itself be a container")
-    return "dict", cap_node.value, val_kind, val_width, key_kind, key_width
+    val_t = parse_type_annotation(val_node)
+    if val_t.kind == "dict":
+        raise NotImplementedError(
+            f"LITHON-E0112: a dict cannot be a dict value (4.3)")
+    # 6.9. A value slot is one flat leaf run, so a list or tuple value is the
+    # one container shape a slot can hold. A pointer has no leaf run either --
+    # it is an address, and its storage is elsewhere -- so it is refused here
+    # for the same reason a dict is, rather than silently given a slot.
+    if val_t.kind == "ptr":
+        raise NotImplementedError(
+            f"LITHON-E0112: a pointer cannot be a dict value (4.3)")
+    return Type("dict", cap=cap_node.value, elem=val_t, key=key_t)
 
 
 def _parse_ptr_annotation(slice_node, structs=None):
@@ -354,19 +524,26 @@ def _parse_ptr_annotation(slice_node, structs=None):
     also why the C++ side needs no change: `struct[N]` already parses.
     """
     if structs and isinstance(slice_node, ast.Name) and slice_node.id in structs:
-        return "ptr", -1, "struct", structs[slice_node.id].size, None, None
+        return Type("ptr", elem=Type("struct", width=structs[slice_node.id].size,
+                                    ref=slice_node.id))
     if not isinstance(slice_node, (ast.Name, ast.Subscript)):
         raise NotImplementedError("LITHON-E0113: ptr[T] needs a scalar pointee, e.g. ptr[int[64]] (4.4)")
-    elem_kind, elem_width, elem_elem_kind, elem_elem_width, _, _ = \
-        parse_type_annotation(slice_node)
-    if elem_elem_kind is not None:
+    elem_t = parse_type_annotation(slice_node)
+    # 6.2. A bounded string is also a legal pointee: `s: str[N]` is a real
+    # N-byte run in the frame, so `ptr[str[N]]` names it and pointer arithmetic
+    # advances by the whole string. valueof() of such a pointer yields the
+    # string's run (length, bytes, print), never a scalar -- see the str branch
+    # in the addressof lowering, which tracks which str variable a pointer names.
+    if elem_t.kind == "str":
+        return Type("ptr", elem=elem_t)
+    if elem_t.is_container() or elem_t.kind == "ptr":
         raise NotImplementedError(
             f"LITHON-E0113: a ptr pointee is a scalar, not a container (4.4); "
-            f"ptr[{elem_kind}[...]] does not point at anything single")
-    if elem_kind not in ("int", "float", "bool"):
+            f"ptr[{elem_t.kind}[...]] does not point at anything single")
+    if elem_t.kind not in ("int", "float", "bool"):
         raise NotImplementedError(
-            f"LITHON-E0113: ptr pointees are int, float or bool only, got {elem_kind} (4.4)")
-    return "ptr", -1, elem_kind, elem_width, None, None
+            f"LITHON-E0113: ptr pointees are int, float or bool only, got {elem_t.kind} (4.4)")
+    return Type("ptr", elem=elem_t)
 
 
 def _parse_container_annotation(base, slice_node):
@@ -377,6 +554,11 @@ def _parse_container_annotation(base, slice_node):
     size at compile time. A computed capacity would mean the compiler cannot
     size the allocation, which is the entire reason this type exists, so it is
     rejected rather than deferred.
+
+    4.1. A nested container element is accepted as a TYPE -- the type has to
+    exist before the flat-stride work that can lay one out. Together with the
+    recursive Type, this is what lets `list[tuple[int[64], 4], 2]` be one value
+    instead of being flattened to its outer shell.
     """
     if not isinstance(slice_node, ast.Tuple) or len(slice_node.elts) != 2:
         raise NotImplementedError(
@@ -388,16 +570,16 @@ def _parse_container_annotation(base, slice_node):
         raise NotImplementedError(f"LITHON-E0111: {base}[T, N] requires a literal integer capacity")
     if cap_node.value <= 0:
         raise NotImplementedError(f"LITHON-E0111: {base} capacity must be positive, got {cap_node.value}")
-    elem_kind, elem_width, _unused_key_kind, _unused_key_width, \
-        elem_elem_kind, elem_elem_width = parse_type_annotation(elem_node)
-    if elem_elem_kind is not None:
-        # 4.1 accepts a nested container as a TYPE -- the type has to exist
-        # before the flat-stride work that can lay one out -- but rejects it in
-        # codegen, where the outer stride becomes sizeof(inner) and no SIB scale
-        # can express it. Accepting it here keeps the type and the rejection in
-        # their agreed places rather than duplicating the error in three layers.
-        return base, cap_node.value, elem_kind, elem_width, None, None
-    return base, cap_node.value, elem_kind, elem_width, None, None
+    elem_t = parse_type_annotation(elem_node)
+    if elem_t.is_container():
+        # 4.1. A nested list or tuple is a flat leaf run and is accepted. A dict
+        # is kept refused: its storage is three regions, so it has no single
+        # scalar leaf the flat layout can address.
+        if elem_t.kind == "dict":
+            raise NotImplementedError(
+                f"LITHON-E0112: a dict cannot be an element of {base}; a nested "
+                f"dict has no flat scalar leaf to lay out (4.1)")
+    return Type(base, cap=cap_node.value, elem=elem_t)
 
 
 # The synthesized module-level entry point is called `__main__`, which
@@ -419,6 +601,22 @@ MANGLED_PREFIX = "user_"
 # and infers the type from the arms (is_lowered_merge_temp in
 # src/typecheck/typecheck.cpp), which is why the two spellings must agree.
 IF_EXPR_TEMP = "__ifexpr"
+
+# 6.3 Stage A. The bounded run a constant chunk of a printed string literal (or
+# f-string) is materialised into before it is printed. The literal has no value
+# in this slice, so it is spelled the way any `str[N]` is: a zeroed run plus one
+# IndexStore per byte, then the ordinary top-level str print. One run is shared
+# by every chunk of the same capacity (the name carries the capacity), because a
+# chunk fully overwrites it before printing and a type can be re-declared.
+PRINT_LIT_TEMP = "__printlit"
+
+# 6.9. The run a dict's container VALUE is materialised into before the store
+# copies it into the table. A container is a run of frame bytes and has no
+# scalar form, so the value cannot arrive as a register -- exactly like a str
+# key, it arrives as the NAME of a run. One temp per entry: a top-level list
+# literal may be shorter than its capacity and leaves the rest zeroed, so a
+# shared temp would carry the previous entry's tail into the next one.
+DICT_VALUE_TEMP = "__dictval"
 
 # One table, used by both BinOp and AugAssign. It used to be duplicated as a
 # literal dict at each site, which is exactly the kind of drift that lets a
@@ -486,12 +684,13 @@ class StructLayout:
 def _struct_field_type(struct_name, field_name, ann, structs, enums):
     """Resolves a field annotation to (kind, width, ref_name, byte_size).
 
-    A field is int[w], float[64], bool, a struct, or an enum, each declared
-    EARLIER. Requiring earlier declaration is what makes the size of a nested
-    aggregate known here and, at the same time, makes a cycle impossible: a
-    struct that cannot name itself or a later aggregate has no way to be
+    A field is int[w], float[64], bool, a str[N], a struct, or an enum, each
+    declared EARLIER. Requiring earlier declaration is what makes the size of a
+    nested aggregate known here and, at the same time, makes a cycle impossible:
+    a struct that cannot name itself or a later aggregate has no way to be
     infinitely large. The returned ref_name names the struct or enum a field of
-    that kind embeds, and is None for a scalar.
+    that kind embeds, and is None for a scalar. For a str[N], `width` carries the
+    byte capacity N (there is no bit width) and byte_size is that same N.
     """
     if isinstance(ann, ast.Name):
         if ann.id in structs:
@@ -503,8 +702,22 @@ def _struct_field_type(struct_name, field_name, ann, structs, enums):
                 f"LITHON-E0127: field '{field_name}' of struct '{struct_name}' has unknown type "
                 f"'{ann.id}' -- a field is int[w], float[64], bool, a struct or an enum declared "
                 f"earlier (4.6)")
-    kind, width, elem_kind, elem_width, _key_kind, _key_width = parse_type_annotation(ann)
-    if kind in CONTAINER_KINDS or kind == "ptr" or elem_kind is not None:
+    ann_t = parse_type_annotation(ann)
+    kind, width = ann_t.kind, ann_t.width
+    # 6.2. A `str[N]` field is N bytes of bounded-string storage. Like a struct,
+    # it is not a value: it has no standalone read, only its bytes (`s.f[i]`),
+    # its run-time length, its rendering and its comparison. The capacity N is
+    # returned in the `width` slot (for a str's own `Type`, `width` is -1 and
+    # `cap` is N; the layout dict records the cap under both names so every
+    # reader has it).
+    if kind == "str":
+        cap = ann_t.cap
+        if cap is None or cap <= 0:
+            raise NotImplementedError(
+                f"LITHON-E0127: field '{field_name}' of struct '{struct_name}' needs a "
+                f"positive str capacity, e.g. str[16] (6.2)")
+        return "str", cap, None, cap
+    if ann_t.is_container() or kind == "ptr":
         raise NotImplementedError(
             f"LITHON-E0127: field '{field_name}' of struct '{struct_name}' is a {kind}; 4.6 "
             f"fields are int[w], float[64], bool, a plain struct or an enum -- a container or "
@@ -541,8 +754,9 @@ def _method_scalar_type(ann, owner_name, method_name, what, structs, enums):
         raise NotImplementedError(
             f"LITHON-E0134: {what} of method '{owner_name}.{method_name}' is {described}; a "
             f"method takes and returns scalar int[w], float[64] or bool (4.9)")
-    kind, width, elem_kind, elem_width, key_kind, key_width = parse_type_annotation(ann)
-    if kind == "ptr" or elem_kind is not None or key_kind is not None:
+    ann_t = parse_type_annotation(ann)
+    kind = ann_t.kind
+    if kind == "ptr" or ann_t.is_container():
         raise NotImplementedError(
             f"LITHON-E0134: {what} of method '{owner_name}.{method_name}' is a {kind}; a method "
             f"takes and returns scalar int[w], float[64] or bool (4.9)")
@@ -640,6 +854,10 @@ def _build_struct_layout(stmt, structs, enums):
             "kind": kind, "width": width, "offset": offset, "byte_size": byte_size,
             "struct_name": ref_name if kind == "struct" else None,
             "enum_name": ref_name if kind == "enum" else None,
+            # 6.2. A str field's byte capacity. For a str `width` already holds
+            # it (no scalar bit width applies); this key is the single place the
+            # companion-slot code reads it from, so the two can never drift.
+            "cap": width if kind == "str" else None,
         }
         offset += byte_size
     if not layout.fields:
@@ -692,8 +910,9 @@ def _enum_payload_type(enum_name, variant_name, ann, structs, enums):
     if isinstance(ann, ast.Name) and ann.id in structs:
         return {"kind": "struct", "width": -1, "struct_name": ann.id,
                 "byte_size": structs[ann.id].size}
-    kind, width, elem_kind, elem_width, _key_kind, _key_width = parse_type_annotation(ann)
-    if kind in CONTAINER_KINDS or kind == "ptr" or elem_kind is not None:
+    ann_t = parse_type_annotation(ann)
+    kind, width = ann_t.kind, ann_t.width
+    if ann_t.is_container() or kind == "ptr":
         raise NotImplementedError(
             f"LITHON-E0130: variant '{variant_name}' of enum '{enum_name}' has a {kind} payload; "
             f"4.7 payloads are a scalar, a struct or (later) a list -- a container is laid out "
@@ -839,11 +1058,15 @@ def _reject_storage_in_type_function_bodies(structs, enums):
 def _validate_type_function(stmt, registry):
     """Validates one type-function definition and inserts it into `registry`.
 
-    The signature is plain positional parameter names (a type function's
-    parameters are types or sizes, so they are unannotated and have no
-    defaults), and the body is exactly one `return { <type> }` whose braces hold
-    one type expression. A unit must bottom out: recursion is refused when the
-    function is applied, not here, because a definition alone cannot be applied.
+    The signature is plain positional parameter names -- no `/`, `*`, `**` or
+    defaults. A parameter is a *type parameter* when unannotated (the call
+    supplies a type expression) or a *value parameter* when annotated (the call
+    supplies a literal of that scalar type); the annotation is kept and checked
+    when the function is applied, because resolving it may name a type function
+    declared later. The body is exactly one `return { <type> }` whose braces
+    hold one type expression. A unit must bottom out: recursion is refused when
+    the function is applied, not here, because a definition alone cannot be
+    applied.
     """
     name = stmt.name
     if stmt.decorator_list:
@@ -855,11 +1078,7 @@ def _validate_type_function(stmt, registry):
         raise NotImplementedError(
             f"LITHON-E0132: type function '{name}' takes only plain positional parameter "
             f"names -- no `/`, `*`, `**` or defaults (4.8)")
-    for arg in a.args:
-        if arg.annotation is not None:
-            raise NotImplementedError(
-                f"LITHON-E0132: parameter '{arg.arg}' of type function '{name}' must be "
-                f"unannotated -- its parameters are types or sizes, not values (4.8)")
+    value_anns = [arg.annotation for arg in a.args]
     if name in registry:
         raise NotImplementedError(
             f"LITHON-E0132: type function '{name}' is declared more than once (4.8)")
@@ -889,7 +1108,8 @@ def _validate_type_function(stmt, registry):
         raise NotImplementedError(
             f"LITHON-E0132: type function '{name}' body must hold exactly one type "
             f"expression, found {len(val.elts)} (4.8)")
-    registry[name] = TypeFunction(name, [arg.arg for arg in a.args], val.elts[0])
+    registry[name] = TypeFunction(
+        name, [arg.arg for arg in a.args], value_anns, val.elts[0])
 
 
 def build_type_functions(tree):
@@ -957,6 +1177,13 @@ def scalar_cell_bytes(kind, width):
             raise NotImplementedError(
                 f"LITHON-E0113: {kind} needs a stated width to be pointed at, e.g. {kind}[64] (4.4)")
         return width // 8
+    # 6.2. A pointer to a str walks whole strings: the pointee is a `str[N]`,
+    # whose "width" slot carries the byte capacity N, so the stride IS N.
+    if kind == "str":
+        if width is None or width <= 0:
+            raise NotImplementedError(
+                f"LITHON-E0113: str needs a stated capacity to be pointed at, e.g. str[16] (6.2)")
+        return width
     raise NotImplementedError(
         f"LITHON-E0113: only a scalar cell can be pointed at, got {kind} (4.4)")
 
@@ -996,9 +1223,29 @@ class IRBuilder:
         self.terminated = False
         self.loop_stack = []  # list of (continue_target, break_target)
         self.dict_names = set()
+        # 6.9. Sequence for the temp run a dict's container value is built into.
+        # One per entry: the name is also the type's identity for the checker's
+        # "a name has one type" rule, so two dicts with different value types in
+        # the same function must not reuse a run.
+        self.dictval_counter = 0
         self.var_types = {}
         self.ptr_types = {}
         self.ptr_names = set()
+        # 4.4, second half. `ptr[Point]` needs the pointee STRUCT's name, which
+        # the IR's `ptr[struct[N]]` deliberately drops (it carries only the byte
+        # size). These two maps keep the name beside the size so `valueof(_p).x`
+        # can resolve the field layout: ptr_struct_names is keyed by the pointer
+        # VARIABLE, ptr_struct by the register a pointer value lives in.
+        self.ptr_struct_names = {}
+        self.ptr_struct = {}
+        # 6.2. A pointer into a bounded string (`_p = addressof(s)`, s: str[N])
+        # tracks WHICH string variable it names, so `valueof(_p)` can be
+        # lowered to that run's own ops (length, byte read/write, print, ==)
+        # instead of loading a scalar. ptr_str_names is keyed by the pointer
+        # VARIABLE, ptr_str by the register a pointer value lives in -- the
+        # mirror of the ptr_struct pair above.
+        self.ptr_str_names = {}
+        self.ptr_str = {}
         self.declared = {}
         # 4.6. Local variables that hold a struct, mapped to their struct TYPE
         # name (a key into self.structs). A struct variable is not a value, so
@@ -1026,6 +1273,23 @@ class IRBuilder:
         # be guaranteed not to collide with anything the programmer did write --
         # see _fresh_loop_counter.
         self.loop_counters = set()
+        # Phase 6.7. The run-time length field. A list is a fixed-capacity run
+        # of leaves, but it also carries a companion `int[64]` variable (named
+        # `<list>.__len`) holding HOW MANY of those slots are live. Declaring a
+        # list always emits it; `list.append` and `str.split` advance it, `len`
+        # reads it, and print/reduction consult it so trailing zeroed slots are
+        # not mistaken for elements. `list_len` records what the frontend can
+        # prove about that value: an int when it is a compile-time constant (the
+        # common case -- a fixed literal), or None once an operation could make
+        # it vary at run time (an append inside a loop, a split). A reduction
+        # over a list whose length is only known at run time is refused rather
+        # than silently reading the capacity.
+        self.list_len = {}
+        # Phase 6.7. How many enclosing loops the builder is currently inside.
+        # An `append` (or a store that could extend a list) seen while this is
+        # non-zero can run a varying number of times, so the list's length stops
+        # being a compile-time constant.
+        self.loop_depth = 0
         # 4.9. Reachability. Every block is entered either by being the entry
         # block or by a `jump`/`branch` to its label. Method inlining needs this:
         # when every arm of a method's body returns, the merge block that
@@ -1128,17 +1392,31 @@ class IRBuilder:
             raise NotImplementedError(
                 f"LITHON-E0114: `in` needs a list or tuple declared with its capacity, "
                 f"e.g. `{container_node.id}: list[int[64], 8]`")
-        # The element comparison is `eq`, and `eq` does not accept bools
-        # anywhere in the language today -- `a == b` on two bools is refused by
-        # the runtime too. Rather than let `in` fail later with "comparison on a
-        # non-numeric value" from inside the interpreter, say so here, where the
-        # source names the list.
-        elem_kind = self.declared[container_node.id][2]
-        if elem_kind not in ("int", "float"):
+        # Phase 6.7. A list's scan covers its LIVE length, not its capacity --
+        # otherwise a trailing zeroed slot would answer `0 in xs` for free. The
+        # length is a compile-time constant unless the list can be appended to
+        # in a loop or split, in which case the unrolled scan has no fixed bound
+        # and is refused rather than silently scanning the whole run.
+        cdecl = self.declared[container_node.id]
+        if cdecl[0] == "list":
+            live = self._list_live_length(container_node.id)
+            if live is None:
+                raise NotImplementedError(
+                    f"LITHON-E0114: `in` over `{container_node.id}` -- its length is only "
+                    f"known at run time (it is appended to or split), and `in` unrolls "
+                    f"over a compile-time length (6.7)")
+            cap = live
+        # The element comparison is `eq`. It takes int, float and bool operands
+        # in both tiers (a bool compares as its 0/1 value, matching Python), so
+        # a list of any scalar may be scanned. Anything else -- a str or an
+        # aggregate element -- has no scalar `eq`, so it is refused here, where
+        # the source names the list, rather than failing later inside a tier.
+        elem_kind = self.declared[container_node.id].elem.kind
+        if elem_kind not in ("int", "float", "bool"):
             raise NotImplementedError(
                 f"LITHON-E0114: `in` over a list of {elem_kind} is not supported -- it "
-                f"lowers to `==` over the elements, and equality does not take bools "
-                f"yet (the same refusal as `a == b` on two bools)")
+                f"lowers to `==` over the elements, and equality only takes int, float "
+                f"or bool scalars")
         value = self.build_expr(value_node)
         name = container_node.id
         false_r = self.new_reg()
@@ -1248,6 +1526,10 @@ class IRBuilder:
             # with it, so later `_p + 1` knows the cell size it must scale by.
             if node.id in self.ptr_names:
                 self.ptr_types[r] = self.var_types[node.id]
+                if node.id in self.ptr_struct_names:
+                    self.ptr_struct[r] = self.ptr_struct_names[node.id]
+                if node.id in self.ptr_str_names:
+                    self.ptr_str[r] = self.ptr_str_names[node.id]
             return r
 
         if isinstance(node, ast.BinOp):
@@ -1275,6 +1557,8 @@ class IRBuilder:
                         r = self.new_reg()
                         self.emit(f"{r} = {op_map[op_type]} {left}, {off}")
                         self.ptr_types[r] = (k, w)
+                        if left in self.ptr_struct:
+                            self.ptr_struct[r] = self.ptr_struct[left]
                         return r
                 left_lit = self.literal_int(node.left)
                 if left_lit is not None:
@@ -1315,6 +1599,19 @@ class IRBuilder:
                     op_type is ast.In,
                     node.left,
                     node.comparators[0])
+            # 6.2. `s == t` between two bounded strings is a run comparison, not
+            # a scalar `eq`: a string is N bytes and never a register value, so
+            # it lowers to StrEq naming both places rather than loading either.
+            # A str FIELD (`s.f == t.f`, or a field against a top-level string)
+            # is such a place too, naming its companion run. Both operands are
+            # resolved by a pure walk (no emission), so source order holds.
+            if op_type is ast.Eq:
+                ln = self._str_place_name(node.left)
+                rn = self._str_place_name(node.comparators[0])
+                if ln is not None and rn is not None:
+                    r = self.new_reg()
+                    self.emit(f"{r} = streq {ln}, {rn}")
+                    return r
             left = self.build_expr(node.left)
             right = self.build_expr(node.comparators[0])
             op_map = {ast.Lt: "lt", ast.Gt: "gt", ast.Eq: "eq"}
@@ -1367,6 +1664,21 @@ class IRBuilder:
 
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Attribute):
+                # 6.4. `s.find(sub)` / `s.count(sub)` on a bounded string. A str
+                # has no methods in the 4.9 sense, so these lower to a two-name
+                # substring scan before the method inliner is consulted. The
+                # helper returns None when the receiver is not a str place, so a
+                # struct method named find/count still reaches the inliner.
+                if node.func.attr in ("find", "count"):
+                    r = self._build_str_method(node)
+                    if r is not None:
+                        return r
+                # Phase 6.7. `xs.append(v)` as a value: Python's append returns
+                # None, so using it as a value is refused below.
+                if node.func.attr == "append" and self._build_list_append(node):
+                    raise NotImplementedError(
+                        "LITHON-E0135: list.append() returns no value, so it cannot be "
+                        "used as a value -- write it as its own statement (6.7)")
                 # 4.9. `recv.method(args)` -- a method call, inlined right here.
                 # A receiver that is not a struct/enum place, or a method the
                 # type does not have, is refused inside with E0135.
@@ -1414,8 +1726,30 @@ class IRBuilder:
                 # Op::Len names a container variable and returns the capacity.
                 # It is not a call: there is no `len` function to emit a `call`
                 # for, and a user function named `len` would otherwise collide.
-                if len(node.args) != 1 or not isinstance(node.args[0], ast.Name):
+                if len(node.args) != 1:
                     raise NotImplementedError("LITHON-E0115: len() takes exactly one variable")
+                # 6.2. A string has a RUN-TIME length (the bytes before the NUL),
+                # unlike a container whose len() is the compile-time capacity, so
+                # it takes a different opcode rather than a folded constant. A
+                # str field (`len(s.f)`) is such a place too, via its companion run.
+                sp = self._str_place_name(node.args[0])
+                if sp is not None:
+                    r = self.new_reg()
+                    self.emit(f"{r} = strlen {sp}")
+                    return r
+                if not isinstance(node.args[0], ast.Name):
+                    raise NotImplementedError("LITHON-E0115: len() takes exactly one variable")
+                # Phase 6.7. A list's len() is the LIVE length, not the
+                # capacity: a shorter literal (or a sequence of appends) leaves
+                # trailing slots unused. It is carried in the list's companion
+                # length variable, so this is a plain load -- no runtime helper
+                # and no constant folding that a later append could invalidate.
+                arg_name = node.args[0].id
+                decl = self.declared.get(arg_name)
+                if decl is not None and decl[0] == "list":
+                    r = self.new_reg()
+                    self.emit(f"{r} = load {self._list_len_name(arg_name)}")
+                    return r
                 r = self.new_reg()
                 self.emit(f"{r} = Len {node.args[0].id}")
                 return r
@@ -1426,9 +1760,10 @@ class IRBuilder:
                 if len(node.args) != 2 or not isinstance(node.args[0], ast.Name):
                     raise NotImplementedError(
                         "LITHON-E0115: contains() takes a dict variable and a key, e.g. contains(d, k)")
-                key_reg = self.build_expr(node.args[1])
+                dict_name = node.args[0].id
+                key_operand = self._dict_key_operand(dict_name, node.args[1])
                 r = self.new_reg()
-                self.emit(f"{r} = DictContains {node.args[0].id}, {key_reg}")
+                self.emit(f"{r} = DictContains {dict_name}, {key_operand}")
                 return r
             if node.func.id == "valueof":
                 # 4.4. A pointer read. The argument builds to a register that
@@ -1445,6 +1780,17 @@ class IRBuilder:
                     raise NotImplementedError(
                         "LITHON-E0116: valueof() needs a pointer, e.g. valueof(_p) (4.4)")
                 k, w = self.ptr_types[arg_reg]
+                # 6.2. valueof() of a ptr[str[N]] denotes the WHOLE bounded
+                # string, which -- like every string -- has no value. It is only
+                # meaningful where a string place is expected (printed, len'd,
+                # indexed, compared), and those spellings resolve the
+                # pointer's str-variable name directly rather than loading a
+                # scalar. Reaching here means it was used in a value position.
+                if k == "str":
+                    raise NotImplementedError(
+                        "LITHON-E0114: valueof() of a ptr[str[N]] is the whole string, which has "
+                        "no value -- use it as a place, e.g. print(valueof(_p)), "
+                        "len(valueof(_p)) or valueof(_p)[i] (6.2)")
                 r = self.new_reg()
                 self.emit(f"{r} = valueof {arg_reg}{render_type_suffix(k, w)}")
                 return r
@@ -1470,6 +1816,24 @@ class IRBuilder:
                     r = self.new_reg()
                     self.emit(f"{r} = addressof {name}")
                     self.ptr_types[r] = ("struct", layout.size)
+                    self.ptr_struct[r] = self.struct_vars[name]
+                    return r
+                if name in self.var_types:
+                    r = self.new_reg()
+                    self.emit(f"{r} = addressof {name}")
+                    self.ptr_types[r] = self.var_types[name]
+                    return r
+                # 6.2. A str[N] is a real N-byte run in the frame, so it can be
+                # pointed at. The pointer carries the capacity as its stride
+                # (`_p + 1` walks one whole string) and, separately, the name of
+                # the string it names, so `valueof(_p)` can be lowered to that
+                # run's own ops rather than a bogus scalar load.
+                decl = self.declared.get(name)
+                if decl is not None and decl.kind == "str":
+                    r = self.new_reg()
+                    self.emit(f"{r} = addressof {name}")
+                    self.ptr_types[r] = ("str", decl.cap)
+                    self.ptr_str[r] = name
                     return r
                 if name not in self.var_types:
                     raise NotImplementedError(
@@ -1548,15 +1912,15 @@ class IRBuilder:
                 # (up to six) are the arguments. The signature is
                 # deliberately unchecked -- `syscall(n, a1..a6) -> int[64]`,
                 # a negative result is -errno on Linux -- so there is no
-                # fallible wrapper to unwrap here. Arguments are integers in
-                # this slice (the typechecker rejects pointers, since the
-                # interpreter's synthetic addresses are not real memory). A
-                # user function named `syscall` would collide and is rejected
-                # by the checker.
+                # fallible wrapper to unwrap here. Arguments are int[64] or
+                # pointers (5.2 needs `&sockaddr_in` and send/recv buffers); a
+                # pointer is a real host address in both tiers (4.4). Floats and
+                # aggregates are refused by the checker. A user function named
+                # `syscall` would collide and is rejected by the checker.
                 if not (1 <= len(node.args) <= 7):
                     raise NotImplementedError(
                         "LITHON-E0115: syscall() takes a syscall number and up to six "
-                        "integer arguments, e.g. syscall(102) (Phase III)")
+                        "arguments, e.g. syscall(102) (Phase III)")
                 arg_regs = [self.build_expr(a) for a in node.args]
                 r = self.new_reg()
                 self.emit(f"{r} = syscall {', '.join(arg_regs)}")
@@ -1575,19 +1939,79 @@ class IRBuilder:
         # is also why there is no list value to subscript -- see the note on
         # assignment below.
         if isinstance(node, ast.Subscript):
-            if not isinstance(node.value, ast.Name):
+            # 4.1 (phase 3). `xs[i][j]...` are all subscripts of one variable,
+            # so the chain is collected into ONE multi-index Index. The AST nests
+            # left-deep (the innermost `xs` is reached last), so the slices are
+            # reversed into source order before being emitted.
+            slices = []
+            cur = node
+            while isinstance(cur, ast.Subscript):
+                slices.append(cur.slice)
+                cur = cur.value
+            if not isinstance(cur, ast.Name):
+                # 6.2. A string PLACE can be indexed as its bytes even though a
+                # str has no value: `s.f[i]` (a struct field's companion run) and
+                # `valueof(_p)[i]` (the str a pointer names). Both resolve to the
+                # variable the run lives in, so the ordinary one-level Index is
+                # emitted. Two levels are refused -- a str's bytes are already
+                # the leaf.
+                place = self._str_place_name(cur)
+                if place is not None and len(slices) == 1:
+                    slices.reverse()
+                    idx = self.build_expr(slices[0])
+                    r = self.new_reg()
+                    self.emit(f"{r} = Index {place}, {idx}")
+                    return r
                 raise NotImplementedError(
                     "LITHON-E0117: only a plain variable can be indexed, e.g. xs[i]; there is no "
                     "value that denotes a container yet")
-            idx = self.build_expr(node.slice)
+            slices.reverse()
             r = self.new_reg()
             # 4.3. A dict subscript is a hash and a probe, not an address
-            # computation, so it is a different opcode. The variable's kind is
-            # remembered at its declaration because this is the only place that
-            # knows which one of the two it is, and guessing would silently pick
-            # the wrong address arithmetic.
-            op = "DictIndex" if node.value.id in self.dict_names else "Index"
-            self.emit(f"{r} = {op} {node.value.id}, {idx}")
+            # computation, so it is a different opcode. Its key is resolved
+            # separately: an int/bool key is a register, a str key is the NAME of
+            # the string run.
+            #
+            # 6.9. A dict whose VALUE is a container adds one step: the probe
+            # copies the bucket's leaves into a fresh run named here, and the
+            # read is then an ordinary list/tuple subscript of that run. That is
+            # what lets `t[k]` and `t[k][i][j]` both read the same value -- the
+            # run is the value, so a deeper chain just keeps indexing it.
+            if cur.id in self.dict_names:
+                key_operand = self._dict_key_operand(cur.id, slices[0])
+                val_t = self.declared[cur.id].elem
+                if val_t.kind in ("list", "tuple"):
+                    self.dictval_counter += 1
+                    run = f"{DICT_VALUE_TEMP}{self.dictval_counter}"
+                    # The run is declared first so both tiers allocate it exactly
+                    # as they would a list literal's run; the read then overwrites
+                    # every leaf of it.
+                    self.emit(f"store {run}{render_type_suffix(val_t)}")
+                    self.emit(f"DictIndex {cur.id}, {key_operand}, {run}"
+                              f"{render_type_suffix(val_t)}")
+                    self.declared[run] = val_t
+                    # A list prints its LIVE length, so the run needs the same
+                    # companion a list literal gets. A tuple has none -- it prints
+                    # its whole declared run -- which is why this is only for a
+                    # list value. The whole run was stored, so every top-level slot
+                    # is live: the companion starts at the value type's capacity.
+                    if val_t.kind == "list":
+                        self._declare_list_length(run, val_t.cap, None)
+                    rest = slices[1:]
+                    if not rest:
+                        return run
+                    idxs = [self.build_expr(s) for s in rest]
+                    rr = self.new_reg()
+                    self.emit(f"{rr} = Index {run}, {', '.join(idxs)}")
+                    return rr
+                if len(slices) != 1:
+                    raise NotImplementedError(
+                        f"LITHON-E0117: '{cur.id}[...]' has more than one subscript but its "
+                        f"value type is {val_t.render()}, which is not a container")
+                self.emit(f"{r} = DictIndex {cur.id}, {key_operand}")
+                return r
+            idxs = [self.build_expr(s) for s in slices]
+            self.emit(f"{r} = Index {cur.id}, {', '.join(idxs)}")
             return r
 
         if isinstance(node, ast.IfExp):
@@ -1628,17 +2052,102 @@ class IRBuilder:
         # have no values to be intermediate). A struct-typed field therefore has
         # no standalone value, only its own fields do.
         if isinstance(node, ast.Attribute):
-            var, offset, kind, width = self._resolve_struct_field(node)
+            pf = self._resolve_ptr_field(node)
+            if pf is not None:
+                reg, offset, kind, width, _ = pf
+                r = self.new_reg()
+                self.emit(f"{r} = fieldload {reg}, {offset}{render_type_suffix(kind, width)}")
+                return r
+            var, offset, kind, width, synth = self._resolve_struct_field(node)
+            if kind == "str":
+                # 6.2. A whole str field has no value (like a nested container or
+                # a struct): only `s.f[i]`/`len(s.f)`/`print(s.f)`/`s.f == t.f`
+                # reach it. `x = s.f` would need a string value, which the
+                # language does not have.
+                raise NotImplementedError(
+                    f"LITHON-E0114: '{node.attr}' is a {render_type_suffix(Type('str', cap=width)).lstrip(' :')} "
+                    f"field with no value -- index a byte (`{node.attr}`[i]), take its len(), "
+                    f"print it, or compare it (6.2)")
             r = self.new_reg()
             self.emit(f"{r} = fieldload {var}, {offset}{render_type_suffix(kind, width)}")
             return r
 
         raise NotImplementedError(f"LITHON-E0114: expression node {type(node).__name__} not supported yet")
 
+    def _resolve_ptr_field(self, node):
+        """`valueof(_p).field` -- a field read THROUGH a pointer.
+
+        4.4, second half. The base is a `valueof` call over a pointer whose
+        pointee is a named struct, so the field's byte offset is resolved from
+        that struct's layout exactly as the named form does. The only difference
+        is the SUBJECT handed to fieldload: a register holding the pointer,
+        rather than a struct variable's name. Returns (register, offset, kind,
+        width, None), or None when the chain does not start from `valueof`. The
+        trailing None is the str companion-slot name every field resolver
+        carries; a str field is refused here, so this form never has one.
+        """
+        parts = []
+        cur = node
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if not (isinstance(cur, ast.Call) and isinstance(cur.func, ast.Name)
+                and cur.func.id == "valueof"):
+            return None
+        if len(cur.args) != 1:
+            raise NotImplementedError(
+                "LITHON-E0116: valueof() takes exactly one pointer, e.g. valueof(_p) (4.4)")
+        reg = self.build_expr(cur.args[0])
+        if reg not in self.ptr_types:
+            raise NotImplementedError(
+                "LITHON-E0116: valueof() needs a pointer, e.g. valueof(_p) (4.4)")
+        if reg not in self.ptr_struct:
+            raise NotImplementedError(
+                "LITHON-E0128: valueof(...).field needs a pointer whose pointee is a named "
+                "struct with a known layout (4.4)")
+        parts.reverse()
+        layout = self.structs[self.ptr_struct[reg]]
+        offset = 0
+        kind = width = None
+        for i, field_name in enumerate(parts):
+            field = layout.fields.get(field_name)
+            if field is None:
+                raise NotImplementedError(
+                    f"LITHON-E0128: struct '{layout.name}' has no field '{field_name}' (4.6)")
+            offset += field["offset"]
+            last = (i == len(parts) - 1)
+            if field["kind"] == "struct":
+                if last:
+                    raise NotImplementedError(
+                        f"LITHON-E0128: '{field_name}' is a struct field with no value -- read "
+                        f"one of ITS fields, e.g. .{field_name}.<field> (4.6)")
+                layout = self.structs[field["struct_name"]]
+                continue
+            if field["kind"] == "enum":
+                raise NotImplementedError(
+                    f"LITHON-E0131: '{field_name}' is an enum field and has no value -- read it "
+                    f"with a `match` (4.7)")
+            if field["kind"] == "str":
+                # 6.2. A str field's bytes live in a companion slot keyed by the
+                # struct VARIABLE, which an address alone cannot name, so a str
+                # field is not reachable through `valueof(_p).field`. Reading the
+                # struct's raw bytes here would see the reserved-but-unused run,
+                # not the string.
+                raise NotImplementedError(
+                    f"LITHON-E0128: '{field_name}' is a str field; a bounded string field is "
+                    f"reached through its struct variable (e.g. s.{field_name}), not through a "
+                    f"pointer into the struct (6.2)")
+            if not last:
+                raise NotImplementedError(
+                    f"LITHON-E0128: '{field_name}' is a {field['kind']}, not a struct, so it "
+                    f"has no fields (4.6)")
+            kind, width = field["kind"], field["width"]
+        return reg, offset, kind, width, None
+
     def _resolve_struct_field(self, node):
         """Resolves an attribute chain `a.b.c...` to (variable, byte_offset,
-        leaf_kind, leaf_width), or raises the E0128 refusal that explains why it
-        is not a field access.
+        leaf_kind, leaf_width, str_place), or raises the E0128 refusal that
+        explains why it is not a field access.
 
         The chain must bottom out at a plain struct VARIABLE, and every step but
         the last must be a struct-typed field (so the offset walk is meaningful).
@@ -1689,7 +2198,16 @@ class IRBuilder:
                     f"LITHON-E0128: '{field_name}' is a {field['kind']}, not a struct, so it "
                     f"has no fields (4.6)")
             kind, width = field["kind"], field["width"]
-        return var, offset, kind, width
+        # 6.2. A str field's bytes are held in a companion slot named by the
+        # full attribute path (`s.a`, `s.inner.a`), declared alongside the struct
+        # variable and keyed off it. The five ops on a bounded string -- byte
+        # read/write, print, len and == -- all name that slot, so no new IR
+        # opcode is needed and both tiers reuse the machinery a top-level
+        # `str[N]` already uses.
+        synth = None
+        if kind == "str":
+            synth = var + "." + ".".join(parts)
+        return var, offset, kind, width, synth
 
     # ---- 4.9 methods -------------------------------------------------------
     #
@@ -2114,7 +2632,7 @@ class IRBuilder:
                 f"LITHON-E0131: a match binding cannot start with '_'; that prefix is reserved "
                 f"for pointers (4.4)")
         self.emit(f"store {name}, {reg}{render_type_suffix(kind, width)}")
-        self.declared[name] = (kind, width, None, None, None, None)
+        self.declared[name] = Type(kind, width=width)
         if kind in ("int", "float", "bool"):
             self.var_types[name] = (kind, width)
 
@@ -2204,8 +2722,10 @@ class IRBuilder:
     def _bind_and_build(self, var, base_off, layout, variant, binding, body):
         if variant is not None:
             self._bind_enum_payload(var, base_off, layout, variant, binding)
+        self.loop_depth += 1
         for stmt in body:
             self.build_stmt(stmt)
+        self.loop_depth -= 1
 
     def build_if(self, node):
         cond_reg = self.build_expr(node.test)
@@ -2221,14 +2741,18 @@ class IRBuilder:
         self.terminated = True
 
         self.start_block(then_label)
+        self.loop_depth += 1
         for stmt in node.body:
             self.build_stmt(stmt)
+        self.loop_depth -= 1
         self.emit(f"jump {merge_label}")
 
         if node.orelse:
             self.start_block(else_label)
+            self.loop_depth += 1
             for stmt in node.orelse:
                 self.build_stmt(stmt)
+            self.loop_depth -= 1
             self.emit(f"jump {merge_label}")
 
         self.start_block(merge_label)
@@ -2248,8 +2772,10 @@ class IRBuilder:
 
         self.start_block(body_label)
         self.loop_stack.append((header_label, exit_label))
+        self.loop_depth += 1
         for stmt in node.body:
             self.build_stmt(stmt)
+        self.loop_depth -= 1
         self.loop_stack.pop()
         self.emit(f"jump {header_label}")
 
@@ -2272,6 +2798,322 @@ class IRBuilder:
         if kind not in ("list", "tuple"):
             return None
         return width
+
+    def _list_len_name(self, name):
+        """The companion `int[64]` variable holding a list's live length."""
+        return name + ".__len"
+
+    def _list_live_length(self, name):
+        """The compile-time live length of list `name`, or None if it is only
+        known at run time (Phase 6.7).
+
+        A list's capacity is fixed at declaration, but how many slots are live
+        is a run-time value once the list can be appended to or split. The
+        frontend tracks the constant case exactly (a fixed literal, or a
+        straight-line append) and gives up -- None -- the moment the count could
+        vary. Callers use this to fold `len`, a reduction or a membership scan,
+        and refuse (rather than read the capacity) when it is None.
+        """
+        return self.list_len.get(name)
+
+    def _container_print_arg(self, arg):
+        """(variable-name, declared Type) of a container or bounded string named
+        directly in a print argument, or None when the argument is not one.
+
+        6.1. Only a bare name can be printed as a whole aggregate: a container
+        has no value, so `print(xs)` is the one spelling that names one. An
+        indexed element is a scalar and takes the ordinary print path.
+
+        6.2. A `str[N]` field is the second place a whole bounded string can be
+        printed (`print(s.f)`): it is named by its companion run, whose capacity
+        is the field's own.
+        """
+        if isinstance(arg, ast.Name):
+            decl = self.declared.get(arg.id)
+            if decl is not None and decl.kind in ("list", "tuple", "dict", "str"):
+                return arg.id, decl
+            return None
+        if isinstance(arg, ast.Attribute):
+            try:
+                _var, _off, kind, width, synth = self._resolve_struct_field(arg)
+            except NotImplementedError:
+                return None
+            if kind == "str":
+                return synth, Type("str", cap=width)
+        # 6.2. `print(valueof(_p))` names the whole string the pointer points at,
+        # exactly as `print(s)` names s. It resolves to the string variable's
+        # own companion run, so it prints through the same top-level str path
+        # (bare text, no quotes -- it is not nested here).
+        if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name) \
+                and arg.func.id == "valueof" and len(arg.args) == 1 \
+                and isinstance(arg.args[0], ast.Name):
+            place = self.ptr_str_names.get(arg.args[0].id)
+            if place is not None:
+                return place, self.declared.get(place)
+        return None
+
+    # ---- 6.3 Stage A. Printing string literals and f-strings ---------------
+    #
+    # `print("literal")`, `print("x is:", x)` and `print(f"x is {x}")` all lower
+    # to the SAME runtime pieces an ordinary multi-argument print already uses:
+    # a value printer, a separator and a newline. The new work is the constant
+    # chunks. A chunk is materialised into a shared bounded run (`str[L+1]`) and
+    # printed through the existing top-level str path, so both tiers render it
+    # exactly as `print(s)` renders a `str[N]` -- bare text, no quotes, the same
+    # bytes a `str[N]` literal construction writes. No format string carrying
+    # user text is ever handed to printf, so a `%` in a literal is just a byte.
+
+    def _emit_print_arg(self, arg):
+        """One top-level print() argument, expanded in place.
+
+        A string literal or an f-string expands to its pieces with NO separator
+        between them (f"a{b}" is "ab", not "a b"); every other argument is a
+        single value or aggregate. The caller emits the separator between
+        top-level arguments, which is exactly Python's rule.
+        """
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            self._emit_print_literal(arg.value)
+            return
+        if isinstance(arg, ast.JoinedStr):
+            self._emit_print_fstring(arg)
+            return
+        self._emit_print_value(arg)
+
+    def _emit_print_value(self, arg):
+        """A single argument: an aggregate/bounded-string place, or a scalar.
+
+        Evaluation and printing are one step here, which is what an ordinary
+        `print(x)` wants. An f-string cannot use this: it has to evaluate every
+        `{expr}` BEFORE it prints any piece, so it splits the two halves and uses
+        them separately (see _emit_print_fstring).
+        """
+        self._print_place(self._eval_print_place(arg))
+
+    def _eval_print_place(self, arg):
+        """Evaluates one print operand and returns where its text lives.
+
+        6.9. The returned place is one of:
+          ("container", name, decl) -- a whole aggregate/bounded string, printed
+             from its own run by name;
+          ("reg", register)         -- a scalar, or a container value read out of
+             a dict into the run named by `register`.
+        Only the code that MATERIALISES the value is emitted, so a caller can
+        evaluate several operands in Python's argument order and print them
+        afterwards -- which is exactly what an f-string's `{...}` parts need.
+        """
+        cp = self._container_print_arg(arg)
+        if cp is not None:
+            return ("container", cp[0], cp[1])
+        arg_reg = self.build_expr(arg)
+        # 6.9. A dict value that is a container is read out into a run, so
+        # `print(d[k])` names a run rather than a register. It prints its whole
+        # run, exactly as `print(d)` renders the same value nested.
+        decl = self.declared.get(arg_reg)
+        if decl is not None and decl.kind in ("list", "tuple"):
+            return ("container", arg_reg, decl)
+        return ("reg", arg_reg)
+
+    def _print_place(self, place):
+        """Emits the runtime print for a place _eval_print_place produced."""
+        kind, value, *rest = place
+        if kind == "container":
+            decl = rest[0]
+            # Phase 6.7. A list prints its LIVE length, so the companion length
+            # variable rides along as the second name. Tuples, dicts and strings
+            # have no length field and print their whole run as before.
+            if decl[0] == "list":
+                self.emit(f"print_container {value}, "
+                          f"{self._list_len_name(value)}{render_type_suffix(decl)}")
+                return
+            self.emit(f"print_container {value}{render_type_suffix(decl)}")
+            return
+        self.emit(f"call print_bare, {value}")
+
+    def _emit_print_fstring(self, node):
+        """A `JoinedStr`: literal chunks verbatim, `{expr}` via the value path.
+
+        `{{` / `}}` are already decoded to single braces by CPython's parser. A
+        format spec (`{x:.2f}`), a conversion (`{x!r}`) and `{x=}` are refused
+        rather than silently printed wrong; floats already use the one shared
+        shortest-round-trip formatter, so the plain `{x}` is exact.
+
+        Python builds the whole f-string value before it prints anything: every
+        `{expr}` is evaluated, the pieces are concatenated, and only then is the
+        result written out. That ordering is observable whenever an expression
+        has a side effect, e.g. `f"{f()}"` where `f` itself prints -- CPython
+        runs `f` first and prints `a` and `b` around the value it returned, while
+        emitting the literal chunks as we reach them would write "a" before `f`
+        ran. So every `{expr}` is evaluated FIRST, in source order, into a place
+        (register or its own run), and the pieces are printed only after. A
+        literal chunk needs no stashing: it is materialised fresh at print time.
+        """
+        pieces = []   # ("literal", text) | ("place", place)
+        for part in node.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                pieces.append(("literal", part.value))
+                continue
+            if isinstance(part, ast.FormattedValue):
+                if part.format_spec is not None:
+                    raise NotImplementedError(
+                        "LITHON-E0114: an f-string format specifier (`{x:.2f}`) is not "
+                        "supported yet (6.3)")
+                if part.conversion != -1:
+                    raise NotImplementedError(
+                        "LITHON-E0114: an f-string conversion (`{x!r}`) is not supported "
+                        "yet (6.3)")
+                pieces.append(("place", self._eval_print_place(part.value)))
+                continue
+            raise NotImplementedError(
+                f"LITHON-E0114: unsupported f-string part {type(part).__name__} (6.3)")
+        for kind, payload in pieces:
+            if kind == "literal":
+                self._emit_print_literal(payload)
+            else:
+                self._print_place(payload)
+
+    def _materialize_str_literal(self, text):
+        """Emits a constant string chunk into a shared bounded run; returns
+        (run-name, capacity).
+
+        The run is `str[L+1]`, one per capacity (the name carries the capacity),
+        zeroed by the valueless store and filled by one IndexStore per UTF-8
+        byte, so the NUL terminator after the last byte is implicit. `L+1` is the
+        smallest capacity the literal fits, since a literal of `L` bytes needs
+        `L < N`. Sharing one run per capacity is safe: a chunk fully overwrites
+        it before it is read. Used by 6.3 (a printed literal chunk) and 6.4 (a
+        substring scan's literal needle).
+        """
+        data = text.encode("utf-8")
+        cap = len(data) + 1
+        temp = f"{PRINT_LIT_TEMP}{cap}"
+        self.emit(f"store {temp} : str[{cap}]")
+        for i, byte in enumerate(data):
+            idx = self.new_reg()
+            self.emit(f"{idx} = const_i64 {i}")
+            val = self.new_reg()
+            self.emit(f"{val} = const_i64 {byte}")
+            self.emit(f"IndexStore {temp}, {idx}, {val}")
+        return temp, cap
+
+    def _materialize_container_value(self, val_t, val_node, entry_index):
+        """Emits a dict's container VALUE into its own run; returns the run name.
+
+        6.9. A dict value may be a list or a tuple (4.3), and a container is a
+        run of frame bytes with no scalar form to put in a register -- the same
+        reason a str key is named rather than loaded. So the literal is built
+        into a fresh `store __dictvalK : T` (which also zeroes it, which is what
+        a top-level list literal shorter than its capacity relies on) and the
+        name is what the store carries.
+
+        The name is taken from a counter rather than shared the way a str chunk
+        is, because a run's TYPE is its identity for the checker's "a name has
+        one type" rule: two dicts with different value types in one function
+        would otherwise declare the same name twice with two shapes. Overwriting
+        rather than reusing is also what keeps an entry whose literal is shorter
+        than its capacity from inheriting the previous entry's tail.
+        """
+        self.dictval_counter += 1
+        temp = f"{DICT_VALUE_TEMP}{self.dictval_counter}"
+        self.emit(f"store {temp}{render_type_suffix(val_t)}")
+        self._build_container_literal(temp, val_t, val_node, [])
+        return temp
+
+    def _emit_print_literal(self, text):
+        """Prints a constant chunk without ever building a string value.
+
+        The bytes go into a shared `str[L+1]` run and out through the top-level
+        str print path. An empty chunk emits nothing -- the surrounding
+        print_sep / print_nl pieces already spell Python's output for it.
+        """
+        if not text:
+            return
+        temp, cap = self._materialize_str_literal(text)
+        self.emit(f"print_container {temp} : str[{cap}]")
+
+    def _build_str_method(self, call):
+        """`s.find(sub)` / `s.count(sub)` (6.4), or None when the receiver is
+        not a bounded-string place (so a struct method that happens to be named
+        find/count still falls through to the 4.9 inliner).
+
+        A str has no methods in the 4.9 sense -- there is no receiver object to
+        pass -- so both are two-name scans, like `s == t`: the haystack is the
+        receiver's run and the needle is either another str place or a string
+        literal materialised into its own run. find returns the lowest index or
+        -1; count returns the number of non-overlapping matches. The result is a
+        full int[64], matching Python and `len(s)`.
+        """
+        recv = call.func.value
+        hay = self._str_place_name(recv)
+        if hay is None:
+            return None
+        if len(call.args) != 1 or call.keywords:
+            raise NotImplementedError(
+                f"LITHON-E0114: str.{call.func.attr}() takes exactly one string "
+                f"argument, e.g. s.{call.func.attr}(sub) (6.4)")
+        sub = call.args[0]
+        needle = self._str_place_name(sub)
+        if needle is None:
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                needle, _cap = self._materialize_str_literal(sub.value)
+            else:
+                raise NotImplementedError(
+                    f"LITHON-E0114: str.{call.func.attr}() needs a string literal or a "
+                    f"str variable as its argument (6.4)")
+        r = self.new_reg()
+        op = "strfind" if call.func.attr == "find" else "strcount"
+        self.emit(f"{r} = {op} {hay}, {needle}")
+        return r
+
+    def _build_list_append(self, call):
+        """`xs.append(v)` on a fixed-capacity list (Phase 6.7).
+
+        Returns True when the receiver is a plain list variable, else False so
+        a struct method named `append` still reaches the 4.9 inliner.
+
+        A list is a fixed run of leaves plus a live-length companion. Appending
+        is: read the length, write the new value into that slot (the ordinary
+        `IndexStore`, whose runtime bounds check is what traps when the run is
+        full), then advance the length. No new opcode -- it is exactly the
+        `xs[i] = v` the source would write by hand, plus the count bump.
+        """
+        recv = call.func.value
+        if not isinstance(recv, ast.Name):
+            return False
+        name = recv.id
+        decl = self.declared.get(name)
+        if decl is None or decl[0] != "list":
+            return False
+        if len(call.args) != 1 or call.keywords:
+            raise NotImplementedError(
+                "LITHON-E0114: list.append() takes exactly one value, e.g. xs.append(v) (6.7)")
+        cap = decl[1]
+        live = self._list_live_length(name)
+        if live is not None and live >= cap:
+            raise NotImplementedError(
+                f"LITHON-E0111: `{name}` is already full (its capacity is {cap}), so "
+                f"append() would overflow it -- declare it with more room (6.7)")
+        len_name = self._list_len_name(name)
+        idx = self.new_reg()
+        self.emit(f"{idx} = load {len_name}")
+        val = self.build_expr(call.args[0])
+        # The bounds check on a runtime index traps "list index out of range"
+        # when idx == cap, which is exactly a full list -- the two tiers already
+        # agree on that text, so append inherits it rather than adding a new trap.
+        self.emit(f"IndexStore {name}, {idx}, {val}")
+        one = self.new_reg()
+        self.emit(f"{one} = const_i64 1")
+        nxt = self.new_reg()
+        self.emit(f"{nxt} = add {idx}, {one}")
+        self.emit(f"store {len_name}, {nxt}")
+        # The compile-time length is still exact for a straight-line append;
+        # inside a loop (or any control flow that can run it more than once)
+        # the count becomes a run-time value and any compile-time reasoning
+        # about the list's length is given up.
+        if self.loop_depth == 0 and live is not None:
+            self.list_len[name] = live + 1
+        else:
+            self.list_len[name] = None
+        return True
 
     def _plan_iteration_helper(self, fname, node):
         """Resolves `for a, b in enumerate(xs)` / `for a, b in zip(xs, ys)`.
@@ -2304,6 +3146,19 @@ class IRBuilder:
                 raise NotImplementedError(
                     f"LITHON-E0119: {fname}({arg.id}) needs a list or tuple declared with "
                     f"its capacity, e.g. `{arg.id}: list[int[64], 8] = ...`")
+            # Phase 6.7. The loop bound becomes a literal `range(...)` limit, so
+            # it must be a compile-time constant. A list whose live length is
+            # run-time (appended to in a loop, or split) has no such bound, so
+            # iterating it with enumerate/zip is refused here.
+            adecl = self.declared.get(arg.id)
+            if adecl is not None and adecl[0] == "list":
+                live = self._list_live_length(arg.id)
+                if live is None:
+                    raise NotImplementedError(
+                        f"LITHON-E0119: {fname}({arg.id}) -- {arg.id}'s length is only known "
+                        f"at run time (it is appended to or split), and {fname} needs a "
+                        f"compile-time bound (6.7)")
+                cap = live
             return arg.id, cap
 
         def targets_of(n):
@@ -2361,11 +3216,11 @@ class IRBuilder:
         Registering it closes that: the second binding is now an E0122 refusal
         naming both types, at the source line that caused it.
         """
-        decl_key = (kind, width, None, None, None, None)
+        decl_key = Type(kind, width=width)
         prev_decl = self.declared.get(name)
         if prev_decl is not None and prev_decl != decl_key:
             def spell(d):
-                return render_type_suffix(*d).lstrip(" :") or "?"
+                return render_type_suffix(d).lstrip(" :") or "?"
             raise NotImplementedError(
                 f"LITHON-E0122: `{name}` is bound with a different type: first "
                 f"bound {spell(prev_decl)}, now {spell(decl_key)} as {'an' if what[0] in 'aeiou' else 'a'} "
@@ -2391,6 +3246,20 @@ class IRBuilder:
         """
         name, decl = self._reduce_list_arg(fname, node)
         kind, cap, elem_kind, elem_width = decl[0], decl[1], decl[2], decl[3]
+
+        # Phase 6.7. The walk is over the list's LIVE length, not its capacity.
+        # For a fixed literal that is still a compile-time constant (so the
+        # unrolled walk is unchanged); once the list can be appended to in a
+        # loop or split, the bound is a run-time value and there is no fixed
+        # unroll to emit, so the reduction is refused here.
+        if kind == "list":
+            live = self._list_live_length(name)
+            if live is None:
+                raise NotImplementedError(
+                    f"LITHON-E0115: {fname}({name}) -- {name}'s length is only known at "
+                    f"run time (it is appended to or split), and {fname} unrolls over a "
+                    f"compile-time length (6.7)")
+            cap = live
 
         if fname == "sum":
             if elem_kind not in ("int", "float"):
@@ -2549,8 +3418,10 @@ class IRBuilder:
                     self.emit(f"store {elem_name}, {er}"
                               f"{render_type_suffix(elem_kind, elem_width)}")
             self.loop_stack.append((latch_label, exit_label))
+            self.loop_depth += 1
             for stmt in node.body:
                 self.build_stmt(stmt)
+            self.loop_depth -= 1
             self.loop_stack.pop()
             self.emit(f"jump {latch_label}")
 
@@ -2595,8 +3466,10 @@ class IRBuilder:
 
         self.start_block(body_label)
         self.loop_stack.append((latch_label, exit_label))
+        self.loop_depth += 1
         for stmt in node.body:
             self.build_stmt(stmt)
+        self.loop_depth -= 1
         self.loop_stack.pop()
         self.emit(f"jump {latch_label}")
 
@@ -2646,53 +3519,372 @@ class IRBuilder:
 
         self.start_block(exit_label)
 
-    def build_tuple_declaration(self, name, capacity, suffix, value_node):
+    def _build_container_literal(self, name, decl_t, value_node, prefix):
+        """Recursively fills a (possibly nested) list/tuple declaration.
+
+        4.1 (phase 3). `prefix` is the chain of index value-registers already
+        materialised for the enclosing levels, so a SCALAR leaf emits one
+        multi-index IndexStore whose arguments are prefix + [i]. A nested element
+        recurses with prefix + [i]. This is the same IndexStore an ordinary
+        `xs[i][j] = v` uses -- nesting gets no second constructor opcode, so the
+        tuple immutability rule still has exactly one place to live (the type
+        checker recognises the valueless declaration followed by its leaf stores).
+        """
+        kind = decl_t.kind
+        cap = decl_t.cap
+        lit = ast.Tuple if kind == "tuple" else ast.List
+        lit_spelling = "(a, b, ...)" if kind == "tuple" else "[a, b, ...]"
+        if not isinstance(value_node, lit):
+            raise NotImplementedError(
+                f"LITHON-E0123: a {kind} is built from a {kind} literal, so `{name}: ... = "
+                f"<expr>` needs {lit_spelling}, not a single expression (4.1)")
+        if len(value_node.elts) != cap:
+            # Phase 6.7. A TOP-LEVEL list literal may be shorter than the
+            # capacity: the extra slots stay zeroed and simply are not live, so
+            # `list.append` has somewhere to put the next element and `len`
+            # reports the number written. A tuple is immutable and has no
+            # length field, and a NESTED list's inner count is not tracked, so
+            # both still require their literal to fill the run exactly.
+            if kind == "list" and not prefix and len(value_node.elts) < cap:
+                pass
+            else:
+                raise NotImplementedError(
+                    f"LITHON-E0123: `{name}: {kind}[..., {cap}]` needs exactly {cap} element"
+                    f"{'' if cap == 1 else 's'}, got {len(value_node.elts)} (4.1)")
+        elem_t = decl_t.elem
+        for i, elt in enumerate(value_node.elts):
+            idx_reg = self.new_reg()
+            self.emit(f"{idx_reg} = const_i64 {i}")
+            chain = prefix + [idx_reg]
+            if elem_t.is_container():
+                self._build_container_literal(name, elem_t, elt, chain)
+                continue
+            # 6.2. A str element is a run of byte leaves, so it is filled exactly
+            # like the str declaration itself: one IndexStore per content byte,
+            # with the element index from `chain` and a byte index appended. The
+            # bytes after the literal are the zeroed terminator/padding, so no
+            # terminator store is emitted.
+            if elem_t.kind == "str":
+                if not (isinstance(elt, ast.Constant) and isinstance(elt.value, str)):
+                    raise NotImplementedError(
+                        f"LITHON-E0114: element {i} of `{name}` is a str, and a str is built "
+                        f"from a string literal (6.2)")
+                data = elt.value.encode("utf-8")
+                if len(data) >= elem_t.cap:
+                    raise NotImplementedError(
+                        f"LITHON-E0111: element {i} of `{name}` is `{elem_t.render()}` and holds "
+                        f"at most {elem_t.cap - 1} bytes plus a NUL terminator, but the literal "
+                        f"is {len(data)} bytes (6.2)")
+                # 4.2. A tuple's literal is checked for completeness by counting
+                # its leaf stores, so each str element must contribute exactly its
+                # capacity in stores. The content bytes are followed by explicit
+                # zero bytes (the terminator and padding), which is the same value
+                # the declaration already zeroed -- harmless, and it keeps the
+                # tuple's store count equal to its flat-leaf count. A list is not
+                # tracked that way, so it emits only the content bytes.
+                n_stores = elem_t.cap if kind == "tuple" else len(data)
+                for j in range(n_stores):
+                    byte = data[j] if j < len(data) else 0
+                    j_reg = self.new_reg()
+                    self.emit(f"{j_reg} = const_i64 {j}")
+                    b_reg = self.new_reg()
+                    self.emit(f"{b_reg} = const_i64 {byte}")
+                    self.emit(f"IndexStore {name}, {', '.join(chain + [j_reg])}, {b_reg}")
+                continue
+            if isinstance(elt, (ast.Tuple, ast.List, ast.Dict)):
+                raise NotImplementedError(
+                    f"LITHON-E0123: element {i} of `{name}` is a container literal, but its "
+                    f"declared element is {elem_t.render()}; a container is not a value (4.1)")
+            val_reg = self.build_expr(elt)
+            self.emit(f"IndexStore {name}, {', '.join(chain)}, {val_reg}")
+
+    def build_tuple_declaration(self, name, decl_t, suffix, value_node):
         """Emits a tuple declaration, with or without a tuple literal.
 
         4.2. The valueless store comes first and is not optional. It reserves
-        and zeroes the run, and both execution tiers size N slots from it.
+        and zeroes the run, and both execution tiers size the flat leaf run from
+        it.
 
-        The literal's elements then arrive as N IndexStore instructions, which
-        is the same opcode an illegal t[0] = v would use. There is
-        deliberately no second opcode for building a tuple. Adding one would
-        give the immutability rule two places to live, and one of them would be
-        a runtime check. Instead the type checker recognises exactly this
-        sequence, a valueless declaration followed by its own N element stores,
-        and refuses every other IndexStore into a tuple.
+        The literal's elements then arrive as one IndexStore per LEAF, which is
+        the same opcode an illegal t[0] = v would use. There is deliberately no
+        second opcode for building a tuple: adding one would give the
+        immutability rule two places to live, and one of them would be a runtime
+        check. Instead the type checker recognises exactly this sequence -- a
+        valueless declaration followed by its own N leaf stores -- and refuses
+        every other IndexStore into a tuple.
 
         So the literal is the only way to get a non zero value into a tuple, and
-        it is checked rather than trusted. Arity, element kinds and widths all
-        go through the normal element rules.
+        it is checked rather than trusted. Arity, element kinds and widths all go
+        through the normal element rules.
         """
         self.emit(f"store {name}{suffix}")
         if value_node is None:
             return
-        if not isinstance(value_node, ast.Tuple):
-            raise NotImplementedError(
-                f"LITHON-E0123: a tuple is built from a tuple literal, so `{name}: ... = <expr>` "
-                f"needs (a, b, ...), not a single expression (4.2)")
-        if len(value_node.elts) != capacity:
-            raise NotImplementedError(
-                f"LITHON-E0123: `{name}: tuple[..., {capacity}]` needs exactly {capacity} element"
-                f"{'' if capacity == 1 else 's'}, got {len(value_node.elts)}")
-        for i, elt in enumerate(value_node.elts):
-            # A nested container literal would need the outer stride to be the
-            # inner's byte size, which is the same non-power-of-two SIB limit
-            # that rejects nested containers as a type.
-            if isinstance(elt, (ast.Tuple, ast.List)):
-                raise NotImplementedError(
-                    f"LITHON-E0123: tuple element {i} is a container literal; 4.2 tuples hold "
-                    f"int, float or bool elements only")
-            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                raise NotImplementedError(
-                    f"LITHON-E0123: tuple element {i} is a string literal; 4.2 tuples hold "
-                    f"int, float or bool elements only")
-            idx_reg = self.new_reg()
-            self.emit(f"{idx_reg} = const_i64 {i}")
-            val_reg = self.build_expr(elt)
-            self.emit(f"IndexStore {name}, {idx_reg}, {val_reg}")
+        self._build_container_literal(name, decl_t, value_node, [])
 
-    def build_dict_declaration(self, name, capacity, suffix, value_node):
+    def build_list_declaration(self, name, decl_t, suffix, value_node):
+        """Emits a list declaration, with or without a list literal.
+
+        4.1. The valueless store comes first, exactly as for a tuple: it
+        reserves and zeroes the run, and both tiers size the flat leaf run from
+        it. A bare `xs: list[int[64], 6]` is the all-zero list and is legal.
+
+        A list literal then fills the run with one IndexStore per leaf. Unlike a
+        tuple, a list is mutable, so the same opcode is the ordinary `xs[k] = v`
+        write; there is no second constructor opcode to keep in sync.
+
+        The literal must name AT MOST `capacity` elements. `len(xs)` is the
+        live length -- the number of elements the literal names, or the full
+        capacity for a bare declaration -- carried in the companion `<name>.__len`
+        slot (Phase 6.7). A shorter literal therefore leaves room for
+        `list.append`; the unused slots stay zeroed and are not counted.
+        """
+        self.emit(f"store {name}{suffix}")
+        # 6.7. `parts: list[str[K], M] = s.split(sep)`: the pieces are produced at
+        # run time, so the length companion is written from the split's result
+        # rather than from a literal count.
+        if value_node is not None and self._is_split_call(value_node):
+            self._build_str_split(name, decl_t, value_node)
+            return
+        self._declare_list_length(name, decl_t.cap, value_node)
+        if value_node is None:
+            return
+        self._build_container_literal(name, decl_t, value_node, [])
+
+    @staticmethod
+    def _is_split_call(node):
+        """True for a `something.split(...)` call used as a list initializer.
+
+        `_build_str_split` then decides whether the receiver is a bounded-string
+        place and reports it if not. A struct method that happens to be called
+        `split` cannot be the initializer of a list -- Lithon has no list value
+        for a method to return -- so routing every `.split(...)` here is safe and
+        gives a better message than "needs a list literal".
+        """
+        return (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "split")
+
+    def _build_str_split(self, dest, decl_t, call):
+        """`parts: list[str[K], M] = s.split(sep)` (6.7).
+
+        The one way to produce a list of strings: a run-time split of a bounded
+        string into a DECLARED, fixed-capacity list of bounded strings. There is
+        no list value to hand back, so the destination is named on the left and
+        the split writes into it. One op (`strsplit`) scans the source, writes
+        each piece NUL-terminated (truncated to K-1 bytes if it is too long) and
+        returns the piece count; the frontend stores that count into the
+        destination's length companion, so len()/print()/a reduction see exactly
+        the pieces produced. More pieces than M pieces is the runtime trap.
+        """
+        if len(call.args) != 1 or call.keywords:
+            raise NotImplementedError(
+                "LITHON-E0114: str.split() takes exactly one separator, e.g. "
+                's.split(",") -- the whitespace-splitting form is not supported (6.7)')
+        if decl_t.kind != "list" or decl_t.elem is None or decl_t.elem.kind != "str":
+            raise NotImplementedError(
+                "LITHON-E0114: str.split() writes a list of bounded strings, so "
+                "the destination must be declared list[str[K], M] -- got "
+                f"{decl_t.render()} (6.7)")
+        src = self._str_place_name(call.func.value)
+        if src is None:
+            raise NotImplementedError(
+                "LITHON-E0114: str.split() must be called on a bounded-string "
+                "place -- a str variable, a str struct field, or valueof() of a "
+                "str pointer. A str function parameter is not yet a string place "
+                "(6.7)")
+        sub = call.args[0]
+        sep = self._str_place_name(sub)
+        if sep is None:
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                if sub.value == "":
+                    raise NotImplementedError(
+                        "LITHON-E0114: str.split() needs a non-empty separator -- "
+                        'Python raises on "" too (6.7)')
+                sep, _cap = self._materialize_str_literal(sub.value)
+            else:
+                raise NotImplementedError(
+                    "LITHON-E0114: str.split() needs a string literal or a str "
+                    "variable as its separator (6.7)")
+        r = self.new_reg()
+        self.emit(f"{r} = strsplit {src}, {sep}, {dest}{render_type_suffix(decl_t)}")
+        self.emit(f"store {self._list_len_name(dest)}, {r} : int[64]")
+        # The piece count is a run-time value: no reduction or membership scan
+        # over `dest` can be unrolled, and `dest` is not a compile-time length.
+        self.list_len[dest] = None
+
+    def _declare_list_length(self, name, cap, value_node):
+        """Declares and initialises the live-length companion of list `name`.
+
+        The companion is an ordinary `int[64]` variable named `<name>.__len`.
+        Like any scalar declaration, its type rides on its first (only)
+        assignment rather than on a separate valueless store -- the typechecker
+        binds a name from an annotated store, and a bare `store x : int[64]`
+        would leave the name declared but unassigned. Its initial value is the
+        literal's element count (a bare declaration counts every slot as live),
+        and it is what `len`, `print` and a reduction read back.
+        """
+        len_name = self._list_len_name(name)
+        if value_node is None:
+            count = cap
+        elif isinstance(value_node, (ast.List, ast.Tuple)):
+            count = len(value_node.elts)
+        else:
+            # A non-literal initialiser is refused by _build_container_literal;
+            # count the run as fully live here so the companion is still defined
+            # by the time that error is raised.
+            count = cap
+        init = self.new_reg()
+        self.emit(f"{init} = const_i64 {count}")
+        self.emit(f"store {len_name}, {init} : int[64]")
+        self.list_len[name] = count
+
+    def build_str_declaration(self, name, decl_t, suffix, value_node):
+        """Emits a `str[N]` declaration, with or without a string literal.
+
+        6.2. Like a list, the valueless typed store comes first: it reserves and
+        ZEROES the N bytes, so a bare `s: str[8]` is the empty string and both
+        tiers size the run from it. A string literal then arrives as one byte
+        IndexStore per UTF-8 byte -- the same op an ordinary `s[i] = v` uses, so
+        there is no separate constructor opcode to keep in sync. The bytes after
+        the literal stay zero, which is exactly the NUL terminator: a literal of
+        length L < N needs no explicit terminator store.
+        """
+        self.emit(f"store {name}{suffix}")
+        if value_node is None:
+            return
+        if not (isinstance(value_node, ast.Constant) and isinstance(value_node.value, str)):
+            raise NotImplementedError(
+                f"LITHON-E0114: a str is built from a string literal, so `{name}: ... = <expr>` "
+                f"needs \"...\", not a single expression (6.2)")
+        data = value_node.value.encode("utf-8")
+        n = decl_t.cap
+        if len(data) >= n:
+            raise NotImplementedError(
+                f"LITHON-E0111: `{name}: str[{n}]` holds at most {n - 1} bytes plus a NUL "
+                f"terminator, but the literal is {len(data)} bytes (6.2)")
+        for i, byte in enumerate(data):
+            idx = self.new_reg()
+            self.emit(f"{idx} = const_i64 {i}")
+            val = self.new_reg()
+            self.emit(f"{val} = const_i64 {byte}")
+            self.emit(f"IndexStore {name}, {idx}, {val}")
+
+    # ---- 6.2. Bounded strings as struct fields -----------------------------
+    #
+    # A `str[N]` field is N bytes of bounded-string storage inside a struct.
+    # The struct's own blob keeps the N reserved bytes (so every other field's
+    # offset is unchanged and `addressof(s)` still names a real run), but the
+    # string's bytes live in a COMPANION byte run declared under the dotted name
+    # `s.f` (or `s.inner.f`). That single choice lets every string operation --
+    # byte read/write (Index/IndexStore), len (strlen), print (print_container)
+    # and equality (streq) -- reuse the one code path a top-level `s: str[N]`
+    # already uses, in both tiers, with no new IR opcode. The companion run is
+    # kept in lock step with the blob's lifetime because it is declared right
+    # after it, so a struct declared inside a loop resets its strings too.
+
+    def _struct_str_slots(self, layout, prefix):
+        """Yields (dotted-name, cap) for every str field reachable from `layout`,
+        recursing through nested struct fields in declaration order."""
+        for fname, field in layout.fields.items():
+            path = prefix + "." + fname
+            if field["kind"] == "str":
+                yield path, field["cap"]
+            elif field["kind"] == "struct":
+                yield from self._struct_str_slots(
+                    self.structs[field["struct_name"]], path)
+
+    def _emit_struct_str_decls(self, var, layout):
+        """Declares the companion byte run of every str field of `var`, right
+        after the struct's own `store ... : struct[N]`. A struct with no str
+        field emits nothing."""
+        for path, cap in self._struct_str_slots(layout, var):
+            self.emit(f"store {path} : str[{cap}]")
+
+    def _assign_struct_str_field(self, synth, cap, value_node):
+        """`s.f = "literal"`: the field's whole-string write.
+
+        Exactly like a top-level `s: str[N] = "literal"`, one IndexStore per
+        byte, followed by zeros through the capacity so a shorter literal both
+        NUL-terminates and clears the tail of a longer previous value.
+        """
+        if not (isinstance(value_node, ast.Constant) and isinstance(value_node.value, str)):
+            raise NotImplementedError(
+                f"LITHON-E0114: a str is built from a string literal, so `{synth} = <expr>` "
+                f"needs \"...\", not a single expression (6.2)")
+        data = value_node.value.encode("utf-8")
+        if len(data) >= cap:
+            raise NotImplementedError(
+                f"LITHON-E0111: `{synth}` holds at most {cap - 1} bytes plus a NUL "
+                f"terminator, but the literal is {len(data)} bytes (6.2)")
+        for i in range(cap):
+            byte = data[i] if i < len(data) else 0
+            idx = self.new_reg()
+            self.emit(f"{idx} = const_i64 {i}")
+            val = self.new_reg()
+            self.emit(f"{val} = const_i64 {byte}")
+            self.emit(f"IndexStore {synth}, {idx}, {val}")
+
+    def _str_place_name(self, node):
+        """The companion/declared VARIABLE name of a bounded-string place, or
+        None when `node` does not name one.
+
+        A place is a plain str variable (`s`), an attribute chain ending at a
+        str field (`s.f`, `s.inner.f`), or `valueof(_p)` for a pointer whose
+        pointee is a str and which names a str variable (`_p = addressof(s)`).
+        It is used by `==`, by len(), by a print argument and by the index
+        chain, all of which name the string rather than loading a value. This is
+        a pure resolution: it never emits, which is what lets it be called for
+        both operands of a comparison in source order.
+        """
+        if isinstance(node, ast.Name):
+            decl = self.declared.get(node.id)
+            if decl is not None and decl.kind == "str":
+                return node.id
+            return None
+        if isinstance(node, ast.Attribute):
+            try:
+                _var, _off, kind, _w, synth = self._resolve_struct_field(node)
+            except NotImplementedError:
+                return None
+            if kind == "str":
+                return synth
+            return None
+        # 6.2. `valueof(_p)` where `_p` was minted from `addressof(s)` names the
+        # very variable `s`. A pointer whose target is not a known str variable
+        # (a parameter, or one walked by arithmetic) has no companion name, so
+        # the call is not a place and is left to the valueof refusal.
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "valueof" and len(node.args) == 1:
+            arg = node.args[0]
+            if isinstance(arg, ast.Name):
+                return self.ptr_str_names.get(arg.id)
+        return None
+
+    def _dict_key_operand(self, dict_name, key_expr):
+        """The key operand a dict READ emits: `%reg` for an int/bool key, or the
+        run's NAME for a str key.
+
+        A bounded string has no scalar form, so a str key is named rather than
+        held in a register. The dict's declared key type decides which shape is
+        right, and a key that cannot become that shape is refused here rather
+        than sent to the checker as a mismatched register.
+        """
+        decl = self.declared.get(dict_name)
+        key_t = decl.key if decl is not None and decl.kind == "dict" else None
+        if key_t is None or key_t.kind != "str":
+            return self.build_expr(key_expr)
+        place = self._str_place_name(key_expr)
+        if place is None:
+            if isinstance(key_expr, ast.Constant) and isinstance(key_expr.value, str):
+                place, _cap = self._materialize_str_literal(key_expr.value)
+            else:
+                raise NotImplementedError(
+                    f"LITHON-E0114: `{dict_name}` is a str-keyed dict, so its key must be a "
+                    f"str variable or a string literal, e.g. d[k] or d[\"a\"] (4.3)")
+        return place
+
+    def build_dict_declaration(self, name, decl_t, suffix, value_node):
         """Emits a dict declaration, with or without a dict literal.
 
         4.3. The valueless store comes first, for the same reason a tuple has
@@ -2701,17 +3893,25 @@ class IRBuilder:
         zero valued entries.
 
         Each entry then arrives as a DictStore carrying the key and the value.
-        There is deliberately no bucket operand. The bucket is the hash of the
-        key, and the key has to be a constant, so both execution tiers can
-        resolve it while they compile this instruction instead of walking a probe
-        sequence on every entry. Emitting the bucket here instead would mean two
-        independent hash implementations, one per tier, that could disagree and
-        only fail once a lookup missed.
+        There is deliberately no bucket operand: the bucket is derived from the
+        key by the one shared hash both tiers are written from, so they cannot
+        disagree about where an entry lives. Emitting the bucket here instead
+        would mean two independent hash implementations, one per tier.
 
         The literal may hold fewer entries than there are buckets, because N is
         the bucket count and not the entry count. That is the normal case for a
         hash table and it is what makes probing reachable at all.
+
+        The key is either a scalar register (an int or bool key) or -- for a
+        str key -- the NAME of the string run, because a bounded string has no
+        scalar form to put in a register. The two shapes are told apart by the
+        dict's declared key type, which is why the declaration travels with the
+        name. 6.9. The VALUE has the same split for the same reason: a list or
+        tuple value is one flat leaf run, so it too is built into a run and named
+        rather than loaded into a register.
         """
+        capacity = decl_t.cap
+        key_t = decl_t.key
         self.emit(f"store {name}{suffix}")
         if value_node is None:
             return
@@ -2724,6 +3924,22 @@ class IRBuilder:
                 f"LITHON-E0123: `{name}: dict[..., {capacity}]` has {capacity} bucket"
                 f"{'' if capacity == 1 else 's'}, so at most {capacity} entrie"
                 f"{'' if capacity == 1 else 's'} fit, got {len(value_node.keys)}")
+        str_key = key_t.kind == "str"
+        # 6.9. A dict's value type may itself be a container (4.3). Such a value
+        # has no scalar form to carry in a register, so it is built into a run
+        # and the run is named in the store -- exactly the split a str key uses
+        # between `args` and `name2`, one level over.
+        container_value = decl_t.elem.kind in ("list", "tuple")
+        # 6.8. A repeated string key is refused here, where the literals are, for
+        # the same reason the checker refuses a repeated int key: two entries
+        # cannot occupy one bucket, and the defined answer for a hand-written
+        # table (overwrite) is not the answer a source program should get. The
+        # checker cannot do it for a str key, because the run a literal
+        # materialises into is SHARED between literals of the same capacity, so
+        # the run name is not the key's identity -- two different two-byte texts
+        # would look like one duplicate and two identical ones would look like an
+        # overwrite.
+        seen_str_keys = set()
         for i, (key_node, val_node) in enumerate(zip(value_node.keys, value_node.values)):
             # A key must be a constant, because the bucket is its hash. A
             # computed key would turn construction into a run time insert and
@@ -2742,12 +3958,48 @@ class IRBuilder:
                 raise NotImplementedError(
                     f"LITHON-E0123: dict key {i} is not a literal; a dict key must be a "
                     f"constant, because the bucket is decided from it (4.3)")
+            # 6.9. A value that is a container (a list or a tuple) is built into
+            # its own run and the RUN is named in the store; a scalar value is a
+            # register. The two are told apart by the declared value type, which
+            # is why the declaration travels with the name -- the same
+            # name-vs-register split a str key already uses in `name2`.
+            if container_value:
+                val_spec = self._materialize_container_value(decl_t.elem, val_node, i)
+            else:
+                val_spec = self.build_expr(val_node)
+            if str_key:
+                # 4.3. A str key. The literal is materialised into its own bounded
+                # run and the run is NAMED in the store, so no register ever holds
+                # the key -- the comparison at run time is byte-wise by content.
+                if not isinstance(key_node.value, str):
+                    raise NotImplementedError(
+                        f"LITHON-E0123: dict key {i} is not a string, but this dict is "
+                        f"declared with a str key type (4.3)")
+                if key_node.value in seen_str_keys:
+                    raise NotImplementedError(
+                        f"LITHON-E0123: duplicate dict key {key_node.value!r} in the "
+                        f"literal for '{name}' (4.3)")
+                seen_str_keys.add(key_node.value)
+                key_name, key_cap = self._materialize_str_literal(key_node.value)
+                # 6.8. The literal is copied into a key_cap-wide slot, so it has
+                # to FIT the declared key type. A literal of L bytes needs a run
+                # of L+1 (the content plus its NUL), so the rule is L < N -- the
+                # same bound that decides whether the literal could have been
+                # assigned to a str[N] in the first place.
+                if key_cap > key_t.cap:
+                    raise NotImplementedError(
+                        f"LITHON-E0123: dict key {i} is {len(key_node.value)} byte(s) long, "
+                        f"so it does not fit this dict's key type str[{key_t.cap}] (4.3)")
+                self.emit(f"DictStore {name}, {key_name}, {val_spec}")
+                continue
             if isinstance(key_node.value, str):
                 raise NotImplementedError(
-                    f"LITHON-E0123: dict key {i} is a string; 4.3 keys are int or bool only")
+                    f"LITHON-E0123: dict key {i} is a string, but this dict is declared "
+                    f"with a {key_t.kind} key type; declare it dict[str[...], ...] (4.3)")
             if isinstance(key_node.value, float):
                 raise NotImplementedError(
-                    f"LITHON-E0123: dict key {i} is a float; 4.3 keys are int or bool only")
+                    f"LITHON-E0123: dict key {i} is a float; 4.3 keys are int, bool or "
+                    f"str only")
             key_reg = self.new_reg()
             # A bool key is emitted as a bool constant, not as int(key). The type
             # of the key register is what the checker compares against the
@@ -2757,8 +4009,7 @@ class IRBuilder:
                 self.emit(f"{key_reg} = const_bool {1 if key_node.value else 0}")
             else:
                 self.emit(f"{key_reg} = const_i64 {int(key_node.value)}")
-            val_reg = self.build_expr(val_node)
-            self.emit(f"DictStore {name}, {key_reg}, {val_reg}")
+            self.emit(f"DictStore {name}, {key_reg}, {val_spec}")
 
     def declared_suffix(self, name):
         """The " : T" a plain `name = ...` store must carry for a name this
@@ -2775,7 +4026,7 @@ class IRBuilder:
             return ""
         if decl[0] not in ("int", "float", "bool", "ptr"):
             return ""
-        return render_type_suffix(*decl)
+        return render_type_suffix(decl)
 
     def build_stmt(self, node):
         if isinstance(node, ast.AnnAssign):
@@ -2788,7 +4039,7 @@ class IRBuilder:
             # is a user-declared type, and only this builder's registry says so.
             if isinstance(node.annotation, ast.Name) and node.annotation.id in self.structs:
                 layout = self.structs[node.annotation.id]
-                decl_key = ("struct", layout.size, node.annotation.id, None, None, None)
+                decl_key = Type("struct", width=layout.size, ref=node.annotation.id)
                 prev_decl = self.declared.get(name)
                 if prev_decl is not None and prev_decl != decl_key:
                     raise NotImplementedError(
@@ -2802,6 +4053,9 @@ class IRBuilder:
                         f"time (4.6)")
                 self.struct_vars[name] = node.annotation.id
                 self.emit(f"store {name} : struct[{layout.size}]")
+                # 6.2. Declare the companion byte run of each str field (if any),
+                # so its storage exists and resets wherever the struct does.
+                self._emit_struct_str_decls(name, layout)
                 return
             # 4.7. An enum declaration looks like a struct one, but it may carry
             # a construction as its initializer: `e: E = E.A2(5)`. The blob is
@@ -2809,7 +4063,7 @@ class IRBuilder:
             # constructor writes the tag and payload into it.
             if isinstance(node.annotation, ast.Name) and node.annotation.id in self.enums:
                 layout = self.enums[node.annotation.id]
-                decl_key = ("enum", layout.size, node.annotation.id, None, None, None)
+                decl_key = Type("enum", width=layout.size, ref=node.annotation.id)
                 prev_decl = self.declared.get(name)
                 if prev_decl is not None and prev_decl != decl_key:
                     raise NotImplementedError(
@@ -2821,32 +4075,37 @@ class IRBuilder:
                 if node.value is not None:
                     self._build_enum_construction(name, 0, node.annotation.id, node.value)
                 return
-            kind, width, elem_kind, elem_width, key_kind, key_width = \
-                parse_type_annotation(node.annotation, self.structs)
-            suffix = render_type_suffix(kind, width, elem_kind, elem_width,
-                                        key_kind, key_width)
+            decl_t = parse_type_annotation(node.annotation, self.structs)
+            kind, width = decl_t.kind, decl_t.cap
+            suffix = render_type_suffix(decl_t)
             # 0.6.10. A name declares its type once per function. Writing a
             # DIFFERENT type on a second declaration of the same name has no
             # single answer for what the name holds, so it is refused here,
             # where both declarations are visible in source order. Same type
             # re-declaration is fine (it is how a name is re-opened, e.g. a
             # tuple restart).
-            decl_key = (kind, width, elem_kind, elem_width, key_kind, key_width)
+            decl_key = decl_t
             prev_decl = self.declared.get(name)
             if prev_decl is not None and prev_decl != decl_key:
                 def spell(d):
-                    return render_type_suffix(*d).lstrip(" :") or "?"
+                    return render_type_suffix(d).lstrip(" :") or "?"
                 raise NotImplementedError(
                     f"LITHON-E0122: `{name}` is re-declared with a different type: first "
                     f"declared {spell(prev_decl)}, now {spell(decl_key)} -- "
                     f"a name has one type (V1_SPEC 0.6.10)")
             self.declared[name] = decl_key
+            if kind == "str":
+                self.build_str_declaration(name, decl_t, suffix, node.value)
+                return
             if kind == "tuple":
-                self.build_tuple_declaration(name, width, suffix, node.value)
+                self.build_tuple_declaration(name, decl_t, suffix, node.value)
+                return
+            if kind == "list":
+                self.build_list_declaration(name, decl_t, suffix, node.value)
                 return
             if kind == "dict":
                 self.dict_names.add(name)
-                self.build_dict_declaration(name, width, suffix, node.value)
+                self.build_dict_declaration(name, decl_t, suffix, node.value)
                 return
             if kind == "ptr":
                 # 4.4. The underscore half of the naming rule, enforced here so
@@ -2858,7 +4117,16 @@ class IRBuilder:
                         f"`_{name}: ptr[...]` or pick a name that starts with "
                         f"'_' (4.4)")
                 self.ptr_names.add(name)
-                self.var_types[name] = (elem_kind, elem_width)
+                # 6.2. The str pointee carries its capacity in `cap`, not
+                # `width` (a str has no scalar width), so the stride used by
+                # pointer arithmetic is the capacity -- `_p + 1` walks a whole
+                # string. Every other pointee keeps its scalar width.
+                if decl_t.elem.kind == "str":
+                    self.var_types[name] = ("str", decl_t.elem.cap)
+                else:
+                    self.var_types[name] = (decl_t.elem.kind, decl_t.elem.width)
+                if decl_t.elem.kind == "struct" and decl_t.elem.ref:
+                    self.ptr_struct_names[name] = decl_t.elem.ref
                 if node.value is None:
                     # 0.6.10. A bare `_p: ptr[T]` is a legal declaration: it
                     # names the type and emits nothing else, so _p starts
@@ -2868,6 +4136,12 @@ class IRBuilder:
                     # "not definitely assigned" error as for any scalar.
                     return
                 value_reg = self.build_expr(node.value)
+                # 6.2. A pointer that is born from `addressof(s)` (s a str[N])
+                # names that run, so record the companion name alongside the
+                # value. Any other initializer (a load, arithmetic) has no
+                # companion until the plain-assignment path re-records one.
+                if decl_t.elem.kind == "str" and value_reg in self.ptr_str:
+                    self.ptr_str_names[name] = self.ptr_str[value_reg]
                 self.emit(f"store {name}, {value_reg}{suffix}")
                 return
             if kind in ("int", "float", "bool"):
@@ -2909,23 +4183,50 @@ class IRBuilder:
                 raise NotImplementedError("LITHON-E0121: only single-target assignment is supported")
             target = node.targets[0]
             if isinstance(target, ast.Subscript):
-                # `xs[i] = v`. Op::IndexStore carries the container name in `name`
-                # and only the index and value as ValueIds.
-                if not isinstance(target.value, ast.Name):
+                # `xs[i][j]... = v`. Op::IndexStore carries the container name in
+                # `name`, every index, and the value last. The chain is collected
+                # the same way the read path does (and reversed to source order),
+                # so `xs[i][j] = v` becomes one multi-index store.
+                slices = []
+                cur = target
+                while isinstance(cur, ast.Subscript):
+                    slices.append(cur.slice)
+                    cur = cur.value
+                if not isinstance(cur, ast.Name):
+                    # 6.2. `s.f[i] = byte` (a str field's companion run) and
+                    # `valueof(_p)[i] = byte` (the str a pointer names) take the
+                    # same one-level IndexStore a top-level str variable does.
+                    place = self._str_place_name(cur)
+                    if place is not None and len(slices) == 1:
+                        slices.reverse()
+                        idx = self.build_expr(slices[0])
+                        val = self.build_expr(node.value)
+                        self.emit(f"IndexStore {place}, {idx}, {val}")
+                        return
                     raise NotImplementedError(
-                        "LITHON-E0117: only a plain variable can be index-assigned, e.g. xs[i] = v")
+                        "LITHON-E0117: only a plain variable, a str field or a str pointer "
+                        "can be index-assigned one level deep, e.g. xs[i] = v, s.f[i] = v "
+                        "or valueof(_p)[i] = v")
+                slices.reverse()
                 # 4.3. A dict subscript read is DictIndex, but there is no dict
                 # subscript WRITE, so `d[k] = v` would quietly become an
                 # IndexStore into a dict and be reported as a missing index
                 # operation rather than as the immutability violation it is.
-                if target.value.id in self.dict_names:
+                if cur.id in self.dict_names:
                     raise NotImplementedError(
-                        f"LITHON-E0117: cannot store into '{target.value.id}': a dict is "
+                        f"LITHON-E0117: cannot store into '{cur.id}': a dict is "
                         f"immutable (4.3); it is filled by its own literal, and "
                         f"after that the only operations are a read and contains")
-                idx = self.build_expr(target.slice)
+                # 4.1. There is no container value to copy yet, so a
+                # container-valued right-hand side is refused by name rather than
+                # silently emitted as a one-cell store.
+                if isinstance(node.value, ast.Name) and node.value.id in self.dict_names:
+                    raise NotImplementedError(
+                        f"LITHON-E0117: cannot store a container value into '{cur.id}[...]'; "
+                        f"a container is not a value, so there is nothing to copy (4.1)")
+                idxs = [self.build_expr(s) for s in slices]
                 val = self.build_expr(node.value)
-                self.emit(f"IndexStore {target.value.id}, {idx}, {val}")
+                self.emit(f"IndexStore {cur.id}, {', '.join(idxs)}, {val}")
                 return
             # 4.7. `e = E.V(...)` (an enum variable) or `s.e = E.V(...)` (an
             # enum-typed struct field) is a construction written into the blob:
@@ -2942,7 +4243,22 @@ class IRBuilder:
             # struct-typed leaf is refused by the resolver), so no whole-struct
             # assignment can arise here.
             if isinstance(target, ast.Attribute):
-                var, offset, kind, width = self._resolve_struct_field(target)
+                pf = self._resolve_ptr_field(target)
+                if pf is not None:
+                    reg, offset, kind, width, _ = pf
+                    val_reg = self.build_expr(node.value)
+                    self.emit(f"fieldstore {reg}, {offset}, {val_reg}"
+                              f"{render_type_suffix(kind, width)}")
+                    return
+                var, offset, kind, width, synth = self._resolve_struct_field(target)
+                if kind == "str":
+                    # 6.2. `s.f = "literal"`: a whole-string write, like a
+                    # top-level `s: str[N] = "literal"`. It is stored as one
+                    # IndexStore per byte into the field's companion byte run,
+                    # and every remaining byte through the capacity is zeroed so
+                    # a shorter literal clears a longer previous one.
+                    self._assign_struct_str_field(synth, width, node.value)
+                    return
                 val_reg = self.build_expr(node.value)
                 self.emit(f"fieldstore {var}, {offset}, {val_reg}{render_type_suffix(kind, width)}")
                 return
@@ -2965,6 +4281,14 @@ class IRBuilder:
                     f"({', '.join(['1'] * len(node.value.elts))})` (4.2)")
             value_reg = self.build_expr(node.value)
             name = target.id
+            # 6.2. A pointer assignment re-binds which string (if any) the
+            # pointer names, mirroring what the load/store did to the register:
+            # `_q = _p` keeps the companion, `_p = addressof(s)` sets it, and
+            # any other value (`_p + k`) leaves the pointer without one.
+            if name in self.ptr_names:
+                self.ptr_str_names.pop(name, None)
+                if value_reg in self.ptr_str:
+                    self.ptr_str_names[name] = self.ptr_str[value_reg]
             # A declared scalar or pointer carries its type here, so the first
             # assignment after `x: T` is checked against T like an initializer
             # would be -- while an undeclared name stays unannotated and keeps
@@ -3020,12 +4344,25 @@ class IRBuilder:
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
             call = node.value
             if isinstance(call.func, ast.Name) and call.func.id == "print":
-                if len(call.args) != 1:
-                    raise NotImplementedError("LITHON-E0115: print() with exactly one argument is supported")
-                arg_reg = self.build_expr(call.args[0])
-                self.emit(f"call print, {arg_reg}")
+                # 6.1. Python's print takes any number of arguments, separated
+                # by a space, one trailing newline. No string is ever built:
+                # each argument is printed by a runtime call, the separator by
+                # another, and the newline by a third. Three small builtins
+                # rather than one variadic one keeps every tier's per-value
+                # kind/formatter decision exactly where it already was.
+                if not call.args:
+                    self.emit("call print_nl")
+                    return
+                for i, arg in enumerate(call.args):
+                    if i:
+                        self.emit("call print_sep")
+                    self._emit_print_arg(arg)
+                self.emit("call print_nl")
                 return
             if isinstance(call.func, ast.Attribute):
+                # Phase 6.7. `xs.append(v)` as a statement.
+                if call.func.attr == "append" and self._build_list_append(call):
+                    return
                 # 4.9. `recv.method(args)` as a statement. A method that returns
                 # a value is allowed here -- the result is simply discarded.
                 self._inline_method_call(call)
@@ -3173,9 +4510,8 @@ def build_program(tree):
                         raise NotImplementedError(
                             f"LITHON-E0124: parameter '{arg.arg}' cannot be an enum -- an enum "
                             f"has no value to pass; pass the fields a function can use (4.7)")
-                    kind, width, elem_kind, elem_width, key_kind, key_width = \
-                        parse_type_annotation(arg.annotation)
-                    if kind == "ptr":
+                    param_t = parse_type_annotation(arg.annotation)
+                    if param_t.kind == "ptr":
                         # 4.4. A pointer parameter cannot survive the function
                         # header: the header records a kind and a width but no
                         # pointee, so a passed pointer would degrade into a bare
@@ -3185,8 +4521,7 @@ def build_program(tree):
                             f"LITHON-E0124: parameter '{arg.arg}' cannot be a pointer: the "
                             f"function header records no pointee, so pointers "
                             f"are not passed by value (4.4)")
-                    suffix = render_type_suffix(kind, width, elem_kind, elem_width,
-                                                key_kind, key_width).replace(" : ", ":")
+                    suffix = render_type_suffix(param_t).replace(" : ", ":")
                     param_strs.append(f"{arg.arg}{suffix}")
                 else:
                     param_strs.append(arg.arg)
@@ -3201,16 +4536,14 @@ def build_program(tree):
                     raise NotImplementedError(
                         f"LITHON-E0124: function '{stmt.name}' cannot return an enum -- an "
                         f"enum has no value to return (4.7)")
-                kind, width, elem_kind, elem_width, key_kind, key_width = \
-                    parse_type_annotation(stmt.returns)
-                if kind == "ptr":
+                ret_t = parse_type_annotation(stmt.returns)
+                if ret_t.kind == "ptr":
                     raise NotImplementedError(
                         f"LITHON-E0124: function '{stmt.name}' cannot return a pointer: like "
                         f"parameters, the header records no pointee (4.4)")
                 # " : " is stripped because the return suffix uses " -> " and the
                 # scalar path below writes the brackets itself.
-                return_suffix = render_type_suffix(kind, width, elem_kind, elem_width,
-                                                   key_kind, key_width).replace(" : ", " -> ")
+                return_suffix = render_type_suffix(ret_t).replace(" : ", " -> ")
 
             emitted_name = fn_rename.get(stmt.name, stmt.name)
             header = f"function {emitted_name}({', '.join(param_strs)}){return_suffix}:"
@@ -3230,7 +4563,17 @@ def build_program(tree):
 
 def main():
     if len(sys.argv) != 2:
-        print("usage: frontend.py <source.py>", file=sys.stderr)
+        print("usage: frontend.py <source.lio>", file=sys.stderr)
+        return 1
+
+    # A Lithon source file is `.lio`, and only `.lio`. The language is its own
+    # thing now -- the extension is what says "this is a Lithon program" rather
+    # than a Python script that happens to be shaped like one, and the frontend
+    # is the one place every tier is entered through, so the check lives here
+    # and not in each driver.
+    if not sys.argv[1].endswith(".lio"):
+        print(f"LITHON-E0114: Lithon source files use the .lio extension, "
+              f"not '{sys.argv[1]}'", file=sys.stderr)
         return 1
 
     with open(sys.argv[1], "r") as f:

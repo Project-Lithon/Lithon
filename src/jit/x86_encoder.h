@@ -604,6 +604,54 @@ inline void emit_store_rbp_scaled(CodeBuffer& buf, Reg src, Reg index_reg, int32
     emit_rbp_mov_narrow(buf, src, index_reg, disp, stride, /*store=*/true, /*scaled=*/true);
 }
 
+// 6.9. Run copy: `index_reg` is a BYTE displacement from RBP (scale 1), while the
+// access width is the argument's own size. The scaled element form above cannot
+// express that, because it derives the SIB scale FROM the operand width -- a
+// 4-byte element is scale 4 and a 1-byte element is scale 1, so asking it for an
+// 8-byte access at scale 1 silently emits a ONE-BYTE access. That truncated every
+// leaf of a dict container value to its low byte, which only showed on values
+// above 255 (a 20 read back as 20, but a 300 read back as 44).
+//
+// These emit the same SIB addressing with SS=00 (scale 1) and the width chosen
+// independently, so a run copy can move whole 8-byte leaves through a
+// byte-indexed base. `opcode` is the byte-form 0x8A/0x88 set or the 0x8B/0x89
+// set; the width is carried by REX.W and the opcode choice, never by the scale.
+inline void emit_rbp_run_access(CodeBuffer& buf, Reg data_reg, Reg index_reg,
+                                int32_t disp, int bytes, bool store) {
+    if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8)
+        throw std::logic_error("x86_encoder: run access width " + std::to_string(bytes) +
+                               " is not 1, 2, 4 or 8");
+    const bool wide = bytes == 8;
+    const bool byte_form = bytes == 1;
+    const bool word_form = bytes == 2;
+    const bool byte_reg_needs_rex =
+        byte_form && (data_reg == Reg::RSP || data_reg == Reg::RBP ||
+                      data_reg == Reg::RSI || data_reg == Reg::RDI);
+    const bool rex_r = reg_is_extended(data_reg);
+    const bool rex_x = reg_is_extended(index_reg);
+    // A sub-8-byte load is a PARTIAL register write; zero the destination first
+    // so the store that follows writes the byte(s) it loaded and not the leftover
+    // upper bits of the same register (same reason emit_rbp_mov_narrow does it).
+    if (!store && (bytes == 1 || bytes == 2)) emit_xor_zero(buf, data_reg);
+    if (word_form) emit_u8(buf, 0x66);
+    if (wide || byte_reg_needs_rex || rex_r || rex_x)
+        emit_u8(buf, static_cast<uint8_t>(0x40 | (wide ? 8 : 0) |
+                                          (rex_r ? 4 : 0) | (rex_x ? 2 : 0)));
+    emit_u8(buf, byte_form ? (store ? 0x88 : 0x8A) : (store ? 0x89 : 0x8B));
+    emit_sib_tail(buf, data_reg, index_reg, kSibScale1);
+    emit_disp32_le(buf, disp);
+}
+
+inline void emit_load_rbp_run(CodeBuffer& buf, Reg dst, Reg index_reg, int32_t disp,
+                              int bytes) {
+    emit_rbp_run_access(buf, dst, index_reg, disp, bytes, /*store=*/false);
+}
+
+inline void emit_store_rbp_run(CodeBuffer& buf, Reg src, Reg index_reg, int32_t disp,
+                               int bytes) {
+    emit_rbp_run_access(buf, src, index_reg, disp, bytes, /*store=*/true);
+}
+
 inline void emit_store_rbp_offset(CodeBuffer& buf, Reg src, int32_t offset, int bytes = 8) {
     if (bytes == 8) {
         emit_u8(buf, rex(true, src, Reg::RBP));
@@ -785,6 +833,94 @@ inline void emit_store_reg_indirect(CodeBuffer& buf, Reg data_reg, Reg addr_reg,
     } else {
         emit_u8(buf, static_cast<uint8_t>(reg_low3(data_reg) << 3 | rm));
     }
+}
+
+// mov data, [addr + disp] / mov [addr + disp], src -- the general
+// base-plus-displacement operand. This is what a struct field through a
+// POINTER needs: the address lives in a register (`valueof(_p)` gives the raw
+// pointer) and the field offset is a compile-time constant, so the operand is
+// [ptr + offset] with no index register and no scale.
+//
+// The rbp+index*stride forms cannot express this: they tie the SIB scale to
+// the access width, so a 4-byte field at scale 1 has no encoding through them.
+// A first attempt reused emit_load_rbp_scaled_sext and printed -4 where 111
+// was expected -- a silent wrong answer.
+//
+// The displacement form is chosen to match GNU as byte-for-byte rather than
+// merely decoding to the same instruction, so the encoder comparison stays
+// "exact": mod=00 when the displacement is zero (rm=5's mod=00 is
+// RIP-relative, so rbp/r13 never take it), mod=01 when it fits int8, mod=10
+// otherwise. rm=4 (RSP/R12) always takes the no-index SIB byte.
+inline void emit_reg_disp_mov(CodeBuffer& buf, Reg data_reg, Reg addr_reg,
+                              int32_t disp, int bytes, bool store,
+                              bool zero_extend, bool sign_extend) {
+    if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8)
+        throw std::logic_error("x86_encoder: disp element width " + std::to_string(bytes) +
+                               " is not 1, 2, 4 or 8");
+    const uint8_t rm = reg_low3(addr_reg);
+    const bool needs_sib = rm == 4;   // RSP/R12
+    const bool base_is_bp = rm == 5;  // RBP/R13: mod=00 would be RIP-relative
+    uint8_t mod = 0x80;
+    if (disp == 0 && !base_is_bp) mod = 0x00;
+    else if (disp >= -128 && disp <= 127) mod = 0x40;
+    const auto modrm = [&](Reg r) -> uint8_t {
+        return static_cast<uint8_t>(mod | (reg_low3(r) << 3) | rm);
+    };
+    const auto sib = [&]() -> uint8_t {
+        return static_cast<uint8_t>(0x20 | rm);   // scale=0, index=100 (none), base=rm
+    };
+    const auto disp_bytes = [&]() {
+        if (mod == 0x00) return;
+        if (mod == 0x40) emit_u8(buf, static_cast<uint8_t>(disp));
+        else emit_u32_le(buf, static_cast<uint32_t>(disp));
+    };
+    if (!store && sign_extend && bytes != 8) {
+        emit_u8(buf, static_cast<uint8_t>(0x40 | 8 |
+                                         (reg_is_extended(data_reg) ? 4 : 0) |
+                                         (reg_is_extended(addr_reg) ? 1 : 0)));
+        if (bytes == 4) {
+            emit_u8(buf, 0x63);
+        } else {
+            emit_u8(buf, 0x0F);
+            emit_u8(buf, static_cast<uint8_t>(bytes == 1 ? 0xBE : 0xBF));
+        }
+        emit_u8(buf, modrm(data_reg));
+        if (needs_sib) emit_u8(buf, sib());
+        disp_bytes();
+        return;
+    }
+    if (!store && zero_extend && (bytes == 1 || bytes == 2)) emit_xor_zero(buf, data_reg);
+    const bool wide = bytes == 8;
+    const bool byte_form = bytes == 1;
+    const bool word_form = bytes == 2;
+    const bool byte_reg_needs_rex =
+        byte_form && (data_reg == Reg::RSP || data_reg == Reg::RBP ||
+                      data_reg == Reg::RSI || data_reg == Reg::RDI);
+    if (word_form) emit_u8(buf, 0x66);
+    if (wide || byte_reg_needs_rex || reg_is_extended(data_reg) || reg_is_extended(addr_reg))
+        emit_u8(buf, static_cast<uint8_t>(0x40 | (wide ? 8 : 0) |
+                                         (reg_is_extended(data_reg) ? 4 : 0) |
+                                         (reg_is_extended(addr_reg) ? 1 : 0)));
+    emit_u8(buf, store ? static_cast<uint8_t>(byte_form ? 0x88 : 0x89)
+                       : static_cast<uint8_t>(byte_form ? 0x8A : 0x8B));
+    emit_u8(buf, modrm(data_reg));
+    if (needs_sib) emit_u8(buf, sib());
+    disp_bytes();
+}
+
+inline void emit_load_reg_disp(CodeBuffer& buf, Reg dst, Reg base, int32_t disp, int bytes) {
+    emit_reg_disp_mov(buf, dst, base, disp, bytes, /*store=*/false,
+                      /*zero_extend=*/true, /*sign_extend=*/false);
+}
+
+inline void emit_load_reg_disp_sext(CodeBuffer& buf, Reg dst, Reg base, int32_t disp, int bytes) {
+    emit_reg_disp_mov(buf, dst, base, disp, bytes, /*store=*/false,
+                      /*zero_extend=*/true, /*sign_extend=*/true);
+}
+
+inline void emit_store_reg_disp(CodeBuffer& buf, Reg src, Reg base, int32_t disp, int bytes) {
+    emit_reg_disp_mov(buf, src, base, disp, bytes, /*store=*/true,
+                      /*zero_extend=*/false, /*sign_extend=*/false);
 }
 
 // push reg / pop reg. Encoding: [41] 50+r / [41] 58+r.

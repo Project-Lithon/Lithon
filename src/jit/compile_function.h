@@ -12,6 +12,7 @@
 #include <vector>
 #include "dict_hash.h"
 #include "cpu_features.h"
+#include "container_print.h"
 #include "float_runtime.h"
 #include "input_runtime.h"
 #include "ir/ir.h"
@@ -87,6 +88,19 @@ static const char kBoolFalseLiteral[] = "False\n";
 // produces CPython's exact text, so the format string carries no specifier
 // and can be passed as printf's sole argument like the bool case.
 static const char kFloatPrintFormat[] = "%s\n";
+// 6.1. Multi-argument print(): every argument but the last must be printed
+// with no trailing newline, the arguments separated by a single space, and one
+// newline printed at the end. These are the same formats as above minus the
+// "\n", plus the two literal pieces the separator and the final newline need.
+// Keeping them as printf calls (never a built string) is what lets this stay
+// tier-neutral: the interpreter prints the same bytes to std::cout.
+static const char kIntPrintFormatBare[] = "%lld";
+static const char kPtrPrintFormatBare[] = "0x%llx";
+static const char kBoolTrueLiteralBare[] = "True";
+static const char kBoolFalseLiteralBare[] = "False";
+static const char kFloatPrintFormatBare[] = "%s";
+static const char kPrintSepLiteral[] = " ";
+static const char kPrintNlLiteral[] = "\n";
 }
 
 struct CompileOptions {
@@ -1026,8 +1040,11 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
             emit_host_error_trap("error: list index out of range\n");
         };
 
-auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& name) {
-            const int cap = alloc.container_capacity(name);
+        // 4.1 (phase 3). Bounds-check one level of an index chain against that
+        // level's own capacity. The text of the trap is the same fixed string
+        // the one-level path uses, so a nested out-of-range access reports
+        // identically to a flat one (and to the interpreter).
+        auto emit_bounds_check_cap = [&](ValueId idx_id, Reg idx, int cap) {
             if (cap <= 0) return;
             // A literal index was already range-checked by the typechecker, so
             // the guard would be dead weight on every straight-line access.
@@ -1041,6 +1058,38 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             JumpPatch in_range = emit_jcc_rel32(code, Cond::LessEq);
             emit_index_out_of_range_trap();
             resolve_jump_patch(code, in_range, code.size());
+        };
+
+        auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& name) {
+            emit_bounds_check_cap(idx_id, idx, alloc.container_capacity(name));
+        };
+
+        // 4.1 (phase 3). Computes the row-major flat LEAF index of a nested
+        // access into kR: sum_k idx_k * (strides[k] / leaf_bytes). Every index
+        // is bounds-checked against its OWN level's capacity. The result is a
+        // leaf index, so the scaled accessors are used with the leaf size as the
+        // SIB scale (1/2/4/8) and the load/store stays at the leaf's own width.
+        auto compute_flat_leaf_index = [&](const Instr& in,
+                                           const lithon::ir::ContainerLayout& lay,
+                                           const lithon::ir::Type& type, size_t n_idx) {
+            if (n_idx != lay.strides.size()) {
+                throw std::runtime_error(
+                    "compile_module: nested index chain does not reach a leaf");
+            }
+            emit_xor_zero(code, kR);
+            const lithon::ir::Type* cur = &type;
+            for (size_t k = 0; k < n_idx; ++k) {
+                Reg iv = read_in(in.args.at(k), kL);
+                emit_bounds_check_cap(in.args.at(k), iv, cur->cap);
+                const int leaf_stride = lay.strides[k] / lay.leaf_bytes;
+                if (leaf_stride == 1) {
+                    emit_add_reg_reg(code, kR, iv);
+                } else {
+                    emit_imul_reg_reg_imm32(code, kL, iv, leaf_stride);
+                    emit_add_reg_reg(code, kR, kL);
+                }
+                cur = cur->elem.get();
+            }
         };
 
         // Integer remainder, C semantics: the result takes the sign of the
@@ -1916,6 +1965,81 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             emit_store_rbp_offset(code, key, d.key_slot_offset, 8);
         };
 
+        // 6.9. Copy a dict entry's VALUE into the bucket kL holds. A container
+        // value has no scalar form, so it is copied from the run its own
+        // declaration reserved (name3) rather than reloaded from the 8-byte
+        // value slot: the region is `value_stride` bytes per bucket, and the
+        // interpreter copies exactly the same leaves, so a partially filled
+        // top-level list value reads back identically in both tiers.
+        //
+        // A scalar value comes from the slot, which the caller staged before the
+        // probe for the same reason the key is spilled: the probe is a call for a
+        // str key, and a call clobbers every caller-saved register.
+        // 6.9. Byte-exact copy of one value's flat run. A container value's run
+        // is `bytes` CONTIGUOUS bytes of PACKED leaves -- `list[tuple[int[32],4],2]`
+        // is eight 4-byte leaves, not eight 8-byte words -- so the copy cannot
+        // simply move whole 8-byte slots: doing that reads past the run and
+        // skips every other leaf, turning (1,2,3,4) into (1,0,3,0). The run is
+        // copied in the largest lane that still divides the remaining length at
+        // each offset (8, then 4, then 2, then single bytes), which is exact for
+        // any stride the type layer admits.
+        //
+        // `dst_base` is a register holding the destination byte address and
+        // `dst_fixed` is an extra constant added to it, so the same code serves
+        // both a bucket slice (destination = values_offset + bucket*stride,
+        // already folded into `dst_base`) and a plain frame run. `src` is a
+        // fixed frame displacement from RBP.
+        auto emit_run_copy = [&](Reg dst_base, int dst_fixed, int src, int bytes) {
+            int off = 0;
+            while (off < bytes) {
+                const int remaining = bytes - off;
+                const int lane = remaining >= 8 ? 8 : remaining >= 4 ? 4
+                               : remaining >= 2 ? 2 : 1;
+                emit_load_rbp_narrow(code, Reg::RAX, src + off, lane);
+                emit_store_rbp_run(code, Reg::RAX, dst_base, dst_fixed + off, lane);
+                off += lane;
+            }
+        };
+
+        auto copy_value_to_bucket = [&](const RegisterAllocator::DictLayout& d,
+                                        const lithon::ir::Instr& in) {
+            if (d.value_kind == "list" || d.value_kind == "tuple") {
+                const int src = alloc.element_offset(in.name3, 0);
+                // 6.9. The bucket's slice of the value region is
+                // `values_offset + bucket * value_stride`, and a container value
+                // has a stride that is neither 1/2/4/8 (it is a whole run of
+                // leaves, e.g. 32 bytes for list[int[64],4]) so the SIB scale
+                // cannot express it. The bucket byte offset is computed
+                // explicitly with an imul into kR; kL keeps the bucket, which
+                // the read's continuation hands in and the occupancy write below
+                // still uses.
+                //
+                // Using a scale of 8 here would be correct only for an 8-byte
+                // scalar value. For a container it puts bucket N at N*8 instead
+                // of N*value_stride, so two buckets' slices overlap and the
+                // whole-dict print -- which walks i*value_stride -- reads a
+                // different place than the store wrote.
+                emit_mov_reg_reg(code, kR, kL);
+                emit_mov_reg_imm(code, Reg::RAX, static_cast<int64_t>(d.value_stride));
+                emit_imul_reg_reg(code, kR, Reg::RAX);
+                emit_add_reg_imm32(code, kR, d.values_offset);
+                emit_run_copy(kR, 0, src, d.value_stride);
+                return;
+            }
+            if (d.value_kind == "float") {
+                // XMM0 rather than a live float temp: every XMM register is
+                // caller-saved, so a str key's call has already taken them all,
+                // and this one is only ever read back from the slot written
+                // before the probe.
+                emit_movsd_xmm_rbp(code, Xmm::XMM0, d.value_slot_offset);
+                emit_movsd_rbp_scaled(code, Xmm::XMM0, kL, d.values_offset,
+                                      d.value_stride);
+                return;
+            }
+            emit_load_rbp_offset(code, kR, d.value_slot_offset);
+            emit_store_rbp_scaled(code, kR, kL, d.values_offset, d.value_stride);
+        };
+
         // 4.3. The probe. Walks forward from the key's own bucket until it finds a
         // matching key or an empty bucket, then runs one of two continuations: on_hit
         // with the bucket in kL, or on_miss with nothing live.
@@ -1993,6 +2117,80 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             JumpPatch over_hit = emit_jmp_rel32(code);
             resolve_jump_patch(code, hit, code.size());
             on_hit();
+            resolve_jump_patch(code, over_hit, code.size());
+        };
+
+        // 6.8. The str-key probe. Same two continuations as the integer one --
+        // on_hit with the bucket in kL, on_miss with nothing live -- so the store
+        // and the read below are written once each and shared between the two
+        // key kinds.
+        //
+        // The walk itself is not emitted. An int key hashes a word and compares a
+        // word, so emit_dict_bucket plus eight instructions is the walk. A str
+        // key hashes a run of bytes and compares a run of bytes, and the loop
+        // body would need the bucket, the search pointer, the stored pointer, a
+        // step count AND a byte position -- five live values for two scratch
+        // registers, which is not a squeeze, it is a missing register.
+        //
+        // So the walk runs in a host helper, and the helper calls the very
+        // function the interpreter walks: lithon::jit::dict_str_probe. The two
+        // tiers do not merely agree about which bucket a string belongs in, they
+        // cannot disagree, because there is one definition of it.
+        auto emit_dict_str_probe = [&](const std::string& name, const std::string& key_run,
+                                       const std::function<void()>& on_hit,
+                                       const std::function<void()>& on_miss,
+                                       bool insert) {
+            const auto& d = alloc.dict_layout(name);
+            if (d.buckets <= 0) {
+                throw std::runtime_error("compile_module: probe of '" + name +
+                                         "' which is not a dict");
+            }
+            const int cap = alloc.container_capacity(key_run);
+            if (cap <= 0)
+                throw std::runtime_error("compile_module: str key '" + key_run +
+                                         "' which is not a str");
+            // 6.8. The key run has to fit the table's key slot. A wider run could
+            // hold content the slot cannot store, so it would be truncated at
+            // construction and then fail to compare equal at a lookup made with
+            // the same text -- the wrong answer with no trap to catch it. The
+            // type checker refuses the same shape; this is the backstop for
+            // hand-written IR.
+            if (cap > d.key_stride)
+                throw std::runtime_error(
+                    "compile_module: str key '" + key_run + "' of capacity " +
+                    std::to_string(cap) + " exceeds dict '" + name + "'s key capacity of " +
+                    std::to_string(d.key_stride));
+            lithon::jit::DictStrDesc desc{};
+            desc.buckets = d.buckets;
+            desc.keys_offset = d.keys_offset;
+            desc.occupied_offset = d.occupied_offset;
+            desc.key_stride = d.key_stride;
+            desc.search_base = alloc.element_offset(key_run, 0);
+            desc.search_cap = cap;
+            const auto* descp = lithon::jit::register_print_desc(desc);
+            emit_mov_reg_reg(code, abi::kArgRegs[0], Reg::RBP);
+            emit_mov_reg_imm(code, abi::kArgRegs[1],
+                             reinterpret_cast<int64_t>(descp));
+            // A store needs the key WRITTEN on the way out, a read needs it
+            // looked up and nothing else -- two helpers rather than a flag
+            // argument, because a third argument would need a third arg register
+            // and there are exactly two.
+            emit_mov_reg_imm(code, kR,
+                reinterpret_cast<int64_t>(
+                    insert ? reinterpret_cast<void*>(&lithon::jit::host_dict_str_insert)
+                           : reinterpret_cast<void*>(&lithon::jit::host_dict_str_find)));
+            emit_call_reg(code, kR);
+            // The helper answers with the bucket in rax, or -1 for an absent key.
+            // kL takes it because that is where both continuations read the bucket
+            // from, which is the whole reason this lambda's callers do not have to
+            // know which probe ran.
+            emit_mov_reg_reg(code, kL, Reg::RAX);
+            emit_cmp_reg_imm32(code, kL, -1);
+            JumpPatch absent = emit_jcc_rel32(code, Cond::Equal);
+            on_hit();
+            JumpPatch over_hit = emit_jmp_rel32(code);
+            resolve_jump_patch(code, absent, code.size());
+            on_miss();
             resolve_jump_patch(code, over_hit, code.size());
         };
 
@@ -2263,8 +2461,35 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     }
                     break;
                 }
+                // 4.1 (phase 3). A nested container is one flat leaf run whose
+                // byte length is not a multiple of any single element stride, so
+                // it is zeroed as whole 8-byte slots (the run was rounded up to
+                // slots during layout, so the last word stays inside the frame).
+                if (instr.args.empty() && alloc.has_flat_layout(instr.name)) {
+                    const int base = alloc.element_offset(instr.name, 0);
+                    const auto* lay = alloc.flat_layout(instr.name);
+                    const int slots = (lay->total_bytes + 7) / 8;
+                    emit_xor_zero(code, kR);
+                    if (slots <= 16) {
+                        for (int i = 0; i < slots; ++i)
+                            emit_store_rbp_offset(code, kR, base + 8 * i, 8);
+                    } else {
+                        emit_xor_zero(code, kL);
+                        const size_t top = code.size();
+                        emit_store_rbp_scaled(code, kR, kL, base, 8);
+                        emit_add_reg_imm32(code, kL, 1);
+                        emit_cmp_reg_imm32(code, kL, slots);
+                        JumpPatch again = emit_jcc_rel32(code, Cond::Less);
+                        resolve_jump_patch(code, again, top);
+                    }
+                    break;
+                }
                 if (instr.args.empty() &&
-                    (instr.type_kind == "list" || instr.type_kind == "tuple")) {
+                    (instr.type_kind == "list" || instr.type_kind == "tuple" ||
+                     instr.type_kind == "str")) {
+                    // 6.2. A str[N] is zeroed byte by byte exactly like a
+                    // list[int[8], N]: stride 1, so the empty string's NUL
+                    // terminator is just the first of N zero bytes.
                     const int cap = alloc.container_capacity(instr.name);
                     if (cap > 0) {
                         const int base = alloc.element_offset(instr.name, 0);
@@ -2351,7 +2576,162 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 break;
             }
 
+            // 6.2. len(s): a run-time scan of the bytes before the NUL. The
+            // helper returns the count in RAX, so it is moved into the result's
+            // home and committed like any other produced value.
+            case Op::StrLen: {
+                const int cap = alloc.container_capacity(instr.name);
+                if (cap <= 0) {
+                    throw std::runtime_error("compile_module: strlen of '" + instr.name +
+                                             "' which is not a str");
+                }
+                lithon::jit::ContainerStrLenDesc desc{};
+                desc.cap = cap;
+                const auto* descp = lithon::jit::register_print_desc(desc);
+                const int base = alloc.element_offset(instr.name, 0);
+                emit_mov_reg_reg(code, abi::kArgRegs[0], Reg::RBP);
+                if (base != 0) emit_add_reg_imm32(code, abi::kArgRegs[0], base);
+                emit_mov_reg_imm(code, abi::kArgRegs[1],
+                                 reinterpret_cast<int64_t>(descp));
+                emit_mov_reg_imm(code, kR,
+                    reinterpret_cast<int64_t>(&lithon::jit::host_strlen));
+                emit_call_reg(code, kR);
+                Reg dst = compute_dest(instr.result);
+                if (dst != Reg::RAX) emit_mov_reg_reg(code, dst, Reg::RAX);
+                commit_result(instr.result, dst);
+                break;
+            }
+
+            // 6.2. s == t: both strings are addressed relative to the frame
+            // base, so RBP is the single pointer argument and the descriptor
+            // carries the two offsets and capacities. The helper returns 0/1 in
+            // RAX; the result is committed as a bool.
+            case Op::StrEq: {
+                const int cap1 = alloc.container_capacity(instr.name);
+                const int cap2 = alloc.container_capacity(instr.name2);
+                if (cap1 <= 0 || cap2 <= 0) {
+                    throw std::runtime_error("compile_module: streq of '" + instr.name +
+                                             "' and '" + instr.name2 +
+                                             "' which are not both strs");
+                }
+                lithon::jit::ContainerStrEqDesc desc{};
+                desc.base1 = alloc.element_offset(instr.name, 0);
+                desc.cap1 = cap1;
+                desc.base2 = alloc.element_offset(instr.name2, 0);
+                desc.cap2 = cap2;
+                const auto* descp = lithon::jit::register_print_desc(desc);
+                emit_mov_reg_reg(code, abi::kArgRegs[0], Reg::RBP);
+                emit_mov_reg_imm(code, abi::kArgRegs[1],
+                                 reinterpret_cast<int64_t>(descp));
+                emit_mov_reg_imm(code, kR,
+                    reinterpret_cast<int64_t>(&lithon::jit::host_streq));
+                emit_call_reg(code, kR);
+                Reg dst = compute_dest(instr.result);
+                if (dst != Reg::RAX) emit_mov_reg_reg(code, dst, Reg::RAX);
+                commit_result(instr.result, dst);
+                break;
+            }
+
+            // 6.4. s.find(sub) / s.count(sub): the same two-run descriptor
+            // streq uses, handed to host_strfind / host_strcount. Both return
+            // their int64 result in RAX, committed like any other produced
+            // value.
+            case Op::StrFind:
+            case Op::StrCount: {
+                const int cap1 = alloc.container_capacity(instr.name);
+                const int cap2 = alloc.container_capacity(instr.name2);
+                if (cap1 <= 0 || cap2 <= 0) {
+                    throw std::runtime_error(
+                        std::string("compile_module: ") +
+                        (instr.op == Op::StrFind ? "strfind" : "strcount") +
+                        " of '" + instr.name + "' and '" + instr.name2 +
+                        "' which are not both strs");
+                }
+                lithon::jit::ContainerStrFindDesc desc{};
+                desc.base1 = alloc.element_offset(instr.name, 0);
+                desc.cap1 = cap1;
+                desc.base2 = alloc.element_offset(instr.name2, 0);
+                desc.cap2 = cap2;
+                const auto* descp = lithon::jit::register_print_desc(desc);
+                emit_mov_reg_reg(code, abi::kArgRegs[0], Reg::RBP);
+                emit_mov_reg_imm(code, abi::kArgRegs[1],
+                                 reinterpret_cast<int64_t>(descp));
+                emit_mov_reg_imm(code, kR,
+                    reinterpret_cast<int64_t>(instr.op == Op::StrFind
+                        ? &lithon::jit::host_strfind
+                        : &lithon::jit::host_strcount));
+                emit_call_reg(code, kR);
+                Reg dst = compute_dest(instr.result);
+                if (dst != Reg::RAX) emit_mov_reg_reg(code, dst, Reg::RAX);
+                commit_result(instr.result, dst);
+                break;
+            }
+
+            // 6.7. `s.split(sep)`: split `name` on `name2`, writing the pieces
+            // into the list `name3` and returning the piece count. All three runs
+            // are addressed by RBP-relative offsets, so the helper is handed RBP
+            // as its base and the frame descriptor beside it -- the same two-arg
+            // convention host_strfind uses. The helper writes at most the
+            // destination's capacity and returns the TRUE count; the excess is
+            // trapped right here, byte-identically to the interpreter's throw.
+            case Op::StrSplit: {
+                if (function_vex_used) emit_vzeroupper(code);
+                const int src_cap = alloc.container_capacity(instr.name);
+                const int sep_cap = alloc.container_capacity(instr.name2);
+                if (src_cap <= 0 || sep_cap <= 0) {
+                    throw std::runtime_error(
+                        "compile_module: strsplit of '" + instr.name + "' and '" +
+                        instr.name2 + "' which are not both strs");
+                }
+                lithon::jit::StrSplitDesc desc{};
+                desc.src_offset = alloc.element_offset(instr.name, 0);
+                desc.src_cap = src_cap;
+                desc.sep_offset = alloc.element_offset(instr.name2, 0);
+                desc.sep_cap = sep_cap;
+                desc.dest_offset = alloc.element_offset(instr.name3, 0);
+                desc.piece_cap = instr.type_elem_width;
+                desc.max_pieces = instr.type_width;
+                const auto* descp = lithon::jit::register_print_desc(desc);
+                emit_mov_reg_reg(code, abi::kArgRegs[0], Reg::RBP);
+                emit_mov_reg_imm(code, abi::kArgRegs[1],
+                                 reinterpret_cast<int64_t>(descp));
+                emit_mov_reg_imm(code, kR,
+                    reinterpret_cast<int64_t>(&lithon::jit::host_strsplit));
+                emit_call_reg(code, kR);
+                // RAX is the true piece count. Anything past the destination's
+                // capacity was dropped by the helper, so trap rather than let the
+                // length run past the run it describes.
+                emit_cmp_reg_imm32(code, Reg::RAX, instr.type_width);
+                JumpPatch fits = emit_jcc_rel32(code, Cond::LessEq);
+                emit_host_error_trap("error: too many pieces for the list (str.split)\n");
+                resolve_jump_patch(code, fits, code.size());
+                Reg sdst = compute_dest(instr.result);
+                if (sdst != Reg::RAX) emit_mov_reg_reg(code, sdst, Reg::RAX);
+                commit_result(instr.result, sdst);
+                break;
+            }
+
             case Op::Index: {
+                // 4.1 (phase 3). A nested access is one flat-leaf index sum.
+                if (alloc.has_flat_layout(instr.name)) {
+                    const auto* lay = alloc.flat_layout(instr.name);
+                    const auto type = alloc.container_type(instr.name);
+                    compute_flat_leaf_index(instr, *lay, *type, instr.args.size());
+                    const int bdisp = alloc.element_offset(instr.name, 0);
+                    if (is_float_value(value_kinds, instr.result)) {
+                        Xmm dst = float_dest(instr.result);
+                        emit_movsd_xmm_rbp_scaled(code, dst, kR, bdisp, lay->leaf_bytes);
+                        commit_float_result(instr.result, dst);
+                    } else {
+                        Reg dst = compute_dest(instr.result);
+                        if (value_kinds[instr.result] == Kind::Bool)
+                            emit_load_rbp_scaled(code, dst, kR, bdisp, lay->leaf_bytes);
+                        else
+                            emit_load_rbp_scaled_sext(code, dst, kR, bdisp, lay->leaf_bytes);
+                        commit_result(instr.result, dst);
+                    }
+                    break;
+                }
                 const int disp = alloc.element_offset(instr.name, 0);
                 if (disp == 0 && alloc.container_capacity(instr.name) == 0) {
                     throw std::runtime_error("compile_module: index into '" + instr.name +
@@ -2390,6 +2770,26 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             }
 
             case Op::IndexStore: {
+                // 4.1 (phase 3). A nested store is one flat-leaf index sum, then
+                // a single leaf-width store. The value is read AFTER the index
+                // arithmetic so an index read can never disturb it (and vice
+                // versa: the offset lives in kR, which is never a value's home).
+                if (alloc.has_flat_layout(instr.name)) {
+                    const auto* lay = alloc.flat_layout(instr.name);
+                    const auto type = alloc.container_type(instr.name);
+                    const size_t n_idx = instr.args.size() - 1;
+                    compute_flat_leaf_index(instr, *lay, *type, n_idx);
+                    const int bdisp = alloc.element_offset(instr.name, 0);
+                    const ValueId vid = instr.args.at(n_idx);
+                    if (is_float_value(value_kinds, vid)) {
+                        Xmm src = read_float(vid);
+                        emit_movsd_rbp_scaled(code, src, kR, bdisp, lay->leaf_bytes);
+                    } else {
+                        Reg src = read_in(vid, kL);
+                        emit_store_rbp_scaled(code, src, kR, bdisp, lay->leaf_bytes);
+                    }
+                    break;
+                }
                 const int disp = alloc.element_offset(instr.name, 0);
                 if (alloc.container_capacity(instr.name) == 0) {
                     throw std::runtime_error("compile_module: index store into '" +
@@ -2410,6 +2810,194 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 break;
             }
 
+            // 6.1. Printing a whole container. The container has no value, so
+            // this is not a Call: the op names its variable and carries the
+            // shape. Emitted code calls a host helper with (base, descriptor),
+            // the only two arguments the call convention marshals in registers;
+            // every layout constant travels in the descriptor. The helper writes
+            // through the same C stdio buffer the scalar printf path uses, so
+            // the aggregate lands in order between the surrounding print_sep and
+            // print_nl pieces.
+            case Op::PrintContainer: {
+                if (function_vex_used) emit_vzeroupper(code);
+                const Reg reg0 = abi::kArgRegs[0];
+                const Reg reg1 = abi::kArgRegs[1];
+                if (instr.type_kind == "dict") {
+                    const auto& d = alloc.dict_layout(instr.name);
+                    if (d.buckets <= 0) {
+                        throw std::runtime_error("compile_module: print of '" +
+                                                 instr.name + "' which is not a dict");
+                    }
+                    lithon::jit::ContainerMappingDesc desc{};
+                    desc.buckets = d.buckets;
+                    desc.keys_offset = d.keys_offset;
+                    desc.occupied_offset = d.occupied_offset;
+                    desc.values_offset = d.values_offset;
+                    desc.key_stride = d.key_stride;
+                    desc.value_stride = d.value_stride;
+                    desc.key_code = lithon::jit::leaf_code_of(instr.type_key_kind);
+                    desc.key_width = instr.type_key_width;
+                    desc.value_code = lithon::jit::leaf_code_of(instr.type_elem_kind);
+                    desc.value_width = instr.type_elem_width;
+                    // 6.8. A str key is a run of bytes rather than a leaf, so the
+                    // helper renders it from its bytes as the Python repr -- the
+                    // same format_string_repr the interpreter uses, which is what
+                    // keeps the two tiers spelling a str-keyed table the same way.
+                    desc.key_is_str = d.key_kind == "str" ? 1 : 0;
+                    // 6.9. A dict value that is itself a list or a tuple has no
+                    // leaf code: it renders through the recursive flat descriptor
+                    // the SAME walk a list uses. `value_flat` is the node for one
+                    // VALUE (the walk starts at the bucket's slice), and the
+                    // strides come from the value type's own flat layout, which
+                    // is the byte shape the interpreter's leaf copy mirrors.
+                    desc.value_is_flat = 0;
+                    desc.value_flat = nullptr;
+                    if (d.value_kind == "list" || d.value_kind == "tuple") {
+                        if (!instr.decl_type || !instr.decl_type->elem) {
+                            throw std::runtime_error(
+                                "compile_module: print of dict '" + instr.name +
+                                "' has a container value with no type");
+                        }
+                        const lithon::ir::ContainerLayout vlay =
+                            lithon::ir::container_layout(*instr.decl_type->elem);
+                        if (!vlay.valid) {
+                            throw std::runtime_error(
+                                "compile_module: print of dict '" + instr.name +
+                                "' has a container value with no flat layout");
+                        }
+                        std::function<const lithon::jit::FlatPrintNode*(
+                            const lithon::ir::Type&, size_t)>
+                            vbuild = [&](const lithon::ir::Type& t,
+                                         size_t level) -> const lithon::jit::FlatPrintNode* {
+                            lithon::jit::FlatPrintNode node{};
+                            node.len_offset = lithon::jit::kNoLenOffset;
+                            if (t.kind == "list" || t.kind == "tuple") {
+                                node.is_leaf = 0;
+                                node.is_tuple = (t.kind == "tuple") ? 1 : 0;
+                                node.count = t.cap;
+                                node.byte_stride = vlay.strides.at(level);
+                                node.child = vbuild(*t.elem, level + 1);
+                            } else if (t.kind == "str") {
+                                node.is_leaf = 1;
+                                node.code = static_cast<int>(lithon::jit::LeafCode::Str);
+                                node.width = t.cap;
+                            } else {
+                                node.is_leaf = 1;
+                                node.code = lithon::jit::leaf_code_of(t.kind);
+                                node.width = (t.kind == "bool") ? 8 : t.width;
+                            }
+                            return lithon::jit::register_print_desc(node);
+                        };
+                        desc.value_is_flat = 1;
+                        desc.value_flat = vbuild(*instr.decl_type->elem, 0);
+                    }
+                    const auto* descp = lithon::jit::register_print_desc(desc);
+                    emit_mov_reg_reg(code, reg0, Reg::RBP);
+                    emit_mov_reg_imm(code, reg1, reinterpret_cast<int64_t>(descp));
+                    emit_mov_reg_imm(code, kR,
+                        reinterpret_cast<int64_t>(&lithon::jit::host_print_mapping));
+                    emit_call_reg(code, kR);
+                    break;
+                }
+                // 4.1 (phase 3). A nested list/tuple prints through the
+                // recursive flat descriptor, so its shape is rendered by the
+                // SAME depth-first walk the interpreter runs.
+                if (alloc.has_flat_layout(instr.name)) {
+                    const auto* lay = alloc.flat_layout(instr.name);
+                    const auto type = alloc.container_type(instr.name);
+                    // Phase 6.7. A list's ROOT node carries the live-length
+                    // offset; a tuple, or any inner level, has none (-1).
+                    const int base0 = alloc.element_offset(instr.name, 0);
+                    int64_t root_len_off = lithon::jit::kNoLenOffset;
+                    if (!instr.name2.empty()) {
+                        root_len_off = static_cast<int64_t>(
+                            alloc.variable_offset(instr.name2)) - base0;
+                    }
+                    std::function<const lithon::jit::FlatPrintNode*(
+                        const lithon::ir::Type&, size_t)>
+                        build = [&](const lithon::ir::Type& t,
+                                    size_t level) -> const lithon::jit::FlatPrintNode* {
+                        lithon::jit::FlatPrintNode node{};
+                        node.len_offset = lithon::jit::kNoLenOffset;
+                        if (t.kind == "list" || t.kind == "tuple") {
+                            node.is_leaf = 0;
+                            node.is_tuple = (t.kind == "tuple") ? 1 : 0;
+                            node.count = t.cap;
+                            node.byte_stride = lay->strides.at(level);
+                            if (level == 0) node.len_offset = root_len_off;
+                            node.child = build(*t.elem, level + 1);
+                        } else if (t.kind == "str") {
+                            // 6.2. A str element renders as a quoted repr; its
+                            // capacity rides in `width` (a byte count, not bits),
+                            // and render_flat_node reads it until the NUL.
+                            node.is_leaf = 1;
+                            node.code = static_cast<int>(lithon::jit::LeafCode::Str);
+                            node.width = t.cap;
+                        } else {
+                            node.is_leaf = 1;
+                            node.code = lithon::jit::leaf_code_of(t.kind);
+                            node.width = (t.kind == "bool") ? 8 : t.width;
+                        }
+                        return lithon::jit::register_print_desc(node);
+                    };
+                    const auto* root = build(*type, 0);
+                    emit_mov_reg_reg(code, reg0, Reg::RBP);
+                    if (base0 != 0) emit_add_reg_imm32(code, reg0, base0);
+                    emit_mov_reg_imm(code, reg1, reinterpret_cast<int64_t>(root));
+                    emit_mov_reg_imm(code, kR,
+                        reinterpret_cast<int64_t>(&lithon::jit::host_print_flat));
+                    emit_call_reg(code, kR);
+                    break;
+                }
+                // 6.2. A str prints its bytes as text, the one aggregate that is
+                // not bracketed, so it takes a dedicated helper rather than the
+                // sequence descriptor below (which would render [104, 105, ...]).
+                if (instr.type_kind == "str") {
+                    const int cap = alloc.container_capacity(instr.name);
+                    if (cap <= 0) {
+                        throw std::runtime_error("compile_module: print of '" + instr.name +
+                                                 "' which is not a str");
+                    }
+                    lithon::jit::ContainerStringDesc desc{};
+                    desc.cap = cap;
+                    const auto* descp = lithon::jit::register_print_desc(desc);
+                    const int base = alloc.element_offset(instr.name, 0);
+                    emit_mov_reg_reg(code, reg0, Reg::RBP);
+                    if (base != 0) emit_add_reg_imm32(code, reg0, base);
+                    emit_mov_reg_imm(code, reg1, reinterpret_cast<int64_t>(descp));
+                    emit_mov_reg_imm(code, kR,
+                        reinterpret_cast<int64_t>(&lithon::jit::host_print_string));
+                    emit_call_reg(code, kR);
+                    break;
+                }
+                const int cap = alloc.container_capacity(instr.name);
+                if (cap == 0) {
+                    throw std::runtime_error("compile_module: print of '" + instr.name +
+                                             "' which is not a container");
+                }
+                const int base = alloc.element_offset(instr.name, 0);
+                const int stride = alloc.container_stride(instr.name);
+                lithon::jit::ContainerSequenceDesc desc{};
+                desc.count = cap;
+                desc.stride = stride;
+                desc.code = lithon::jit::leaf_code_of(instr.type_elem_kind);
+                desc.width = instr.type_elem_width;
+                desc.is_tuple = (instr.type_kind == "tuple") ? 1 : 0;
+                desc.len_offset = lithon::jit::kNoLenOffset;
+                if (!instr.name2.empty()) {
+                    desc.len_offset = static_cast<int64_t>(
+                        alloc.variable_offset(instr.name2)) - base;
+                }
+                const auto* descp = lithon::jit::register_print_desc(desc);
+                emit_mov_reg_reg(code, reg0, Reg::RBP);
+                if (base != 0) emit_add_reg_imm32(code, reg0, base);
+                emit_mov_reg_imm(code, reg1, reinterpret_cast<int64_t>(descp));
+                emit_mov_reg_imm(code, kR,
+                    reinterpret_cast<int64_t>(&lithon::jit::host_print_sequence));
+                emit_call_reg(code, kR);
+                break;
+            }
+
             // 4.6. Struct field access. The field is at a fixed byte offset the
             // frontend computed (carried in int_imm), so there is no running
             // index and no runtime bounds check: the typechecker proved the
@@ -2420,6 +3008,29 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
             // the same width.
 
             case Op::FieldLoad: {
+                if (instr.name.empty()) {
+                    // 4.4. A field through a real pointer: args[0] is the base
+                    // register (`valueof(_p)`), int_imm is the byte offset
+                    // within the pointee, and the typechecker has already
+                    // bounded the offset by the pointee's size. The address is
+                    // [ptr + offset] with no index or scale, so the plain
+                    // base-plus-displacement form applies.
+                    if (instr.type_kind == "float") {
+                        throw std::runtime_error(
+                            "compile_module: float field through a pointer is not "
+                            "supported natively");
+                    }
+                    const int disp = static_cast<int>(instr.int_imm);
+                    const int bytes = instr.type_kind == "bool" ? 1 : instr.type_width / 8;
+                    Reg ptr = read_left(instr.args.at(0));
+                    Reg dst = compute_dest(instr.result);
+                    if (instr.type_kind == "bool")
+                        emit_load_reg_disp(code, dst, ptr, disp, bytes);
+                    else
+                        emit_load_reg_disp_sext(code, dst, ptr, disp, bytes);
+                    commit_result(instr.result, dst);
+                    break;
+                }
                 if (alloc.struct_size(instr.name) == 0) {
                     throw std::runtime_error("compile_module: field load from '" +
                                              instr.name + "' which is not a struct");
@@ -2444,6 +3055,23 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 break;
             }
             case Op::FieldStore: {
+                if (instr.name.empty()) {
+                    // 4.4. Store a field through a real pointer. args[0] is the
+                    // value, args[1] the base register; the parser put the value
+                    // first so the two can never collide. base goes in kL and
+                    // the value in kR so neither clobbers the other.
+                    if (instr.type_kind == "float") {
+                        throw std::runtime_error(
+                            "compile_module: float field through a pointer is not "
+                            "supported natively");
+                    }
+                    const int disp = static_cast<int>(instr.int_imm);
+                    const int bytes = instr.type_kind == "bool" ? 1 : instr.type_width / 8;
+                    Reg base = read_left(instr.args.at(1));
+                    Reg src = read_right(instr.args.at(0));
+                    emit_store_reg_disp(code, src, base, disp, bytes);
+                    break;
+                }
                 if (alloc.struct_size(instr.name) == 0) {
                     throw std::runtime_error("compile_module: field store into '" +
                                              instr.name + "' which is not a struct");
@@ -2486,10 +3114,66 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     throw std::runtime_error("compile_module: store into '" + instr.name +
                                              "' which is not a dict");
                 }
+                if (d.key_kind == "str") {
+                    // 6.8. A str-keyed store has one operand, the value, and the
+                    // key is a named run. The value is staged BEFORE the probe
+                    // because the probe is a call and a call clobbers every
+                    // caller-saved register -- which is all of the temp pool and
+                    // both scratches -- so reading the value after the probe
+                    // would read whatever the callee left behind.
+                    // 6.9. A container value is a run, not a register: it is
+                    // named (name3) and there is no operand to stage. It is also
+                    // the one value that survives the probe without staging,
+                    // because copy_value_to_bucket reloads it from the frame
+                    // rather than from a register the call clobbered.
+                    if (d.value_kind == "list" || d.value_kind == "tuple") {
+                        emit_dict_str_probe(
+                            instr.name, instr.name2,
+                            [&] {
+                                copy_value_to_bucket(d, instr);
+                                emit_mov_reg_imm(code, kR, 1);
+                                emit_store_rbp_scaled(code, kR, kL, d.occupied_offset, 8);
+                            },
+                            [] {},   /*insert cannot miss*/
+                            true);
+                        break;
+                    }
+                    if (d.value_kind == "float") {
+                        Xmm v = read_float(instr.args.at(0));
+                        emit_movsd_rbp_mem(code, v, d.value_slot_offset);
+                    } else {
+                        emit_store_rbp_offset(code, read_left(instr.args.at(0)),
+                                              d.value_slot_offset, 8);
+                    }
+                    emit_dict_str_probe(
+                        instr.name, instr.name2,
+                        [&] {
+                            // The bucket is in kL. The probe helper already wrote
+                            // the key's bytes and NUL padding, so only the value
+                            // and the occupancy marker are left.
+                            copy_value_to_bucket(d, instr);
+                            emit_mov_reg_imm(code, kR, 1);
+                            emit_store_rbp_scaled(code, kR, kL, d.occupied_offset, 8);
+                        },
+                        [] {},   /*insert cannot miss: it returns the bucket it wrote*/
+                        true);
+                    break;
+                }
                 spill_dict_key(d, read_left(instr.args.at(0)));
-                if (d.value_kind != "float")
+                if (d.value_kind == "float") {
+                    // A double survives the probe in the value slot, not in a
+                    // register: every XMM register is caller-saved and the probe
+                    // is a call, so a float left in one reads back as whatever
+                    // the probe left there. copy_value_to_bucket reloads it from
+                    // this slot. Without this staging the slot is never written
+                    // and every float value reads back as the stack's leftovers
+                    // (a denormal), which is silently wrong rather than a trap.
+                    Xmm v = read_float(instr.args.at(1));
+                    emit_movsd_rbp_mem(code, v, d.value_slot_offset);
+                } else if (d.value_kind != "list" && d.value_kind != "tuple") {
                     emit_store_rbp_offset(code, read_right(instr.args.at(1)),
                                           d.value_slot_offset, 8);
+                }
                 // 4.3. A store writes on both exits, so both continuations are
                 // the same body. A miss here is a bucket the key hashes to that is
                 // still free, which is where a new entry goes; making it a separate
@@ -2497,15 +3181,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                 // already present, skipped the write and built an empty table.
                 const auto write_entry = [&] {
                         // kL is the bucket the key landed in.
-                        if (d.value_kind == "float") {
-                            Xmm v = read_float(instr.args.at(1));
-                            emit_movsd_rbp_scaled(code, v, kL, d.values_offset,
-                                                  d.value_stride);
-                        } else {
-                            emit_load_rbp_offset(code, kR, d.value_slot_offset);
-                            emit_store_rbp_scaled(code, kR, kL, d.values_offset,
-                                                  d.value_stride);
-                        }
+                        copy_value_to_bucket(d, instr);
                         // The key is stored in the form the probe compares against,
                         // which is why it is reloaded from the slot rather than
                         // taken from the probe's own register: the probe leaves the
@@ -2525,14 +3201,43 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                     throw std::runtime_error("compile_module: read from '" + instr.name +
                                              "' which is not a dict");
                 }
-                spill_dict_key(d, read_left(instr.args.at(0)));
-                emit_dict_probe(
-                    instr.name,
-                    [&] {
+                const auto on_hit = [&] {
                         if (instr.op == Op::DictContains) {
                             Reg dst = compute_dest(instr.result);
                             emit_mov_reg_imm(code, dst, 1);
                             commit_result(instr.result, dst);
+                            return;
+                        }
+                        if (d.value_kind == "list" || d.value_kind == "tuple") {
+                            // 6.9. The value is a run, so it is copied out into
+                            // the run the frontend named for this read (name3)
+                            // rather than read into a register. The interpreter
+                            // does the same copy, so a nested subscript of the
+                            // result reads the same leaves in both tiers.
+                            //
+                            // The slice is `values_offset + bucket * value_stride`
+                            // and a container stride is not a SIB scale, so the
+                            // bucket byte offset is computed with an imul, exactly
+                            // as the store does; and the copy is byte-exact
+                            // because the run's leaves are packed. See
+                            // emit_run_copy for why whole 8-byte slots are wrong.
+                            const int dst = alloc.element_offset(instr.name3, 0);
+                            emit_mov_reg_reg(code, kR, kL);
+                            emit_mov_reg_imm(code, Reg::RAX,
+                                             static_cast<int64_t>(d.value_stride));
+                            emit_imul_reg_reg(code, kR, Reg::RAX);
+                            emit_add_reg_imm32(code, kR, d.values_offset);
+                            int off = 0;
+                            const int total = d.value_stride;
+                            while (off < total) {
+                                const int remaining = total - off;
+                                const int lane = remaining >= 8 ? 8
+                                               : remaining >= 4 ? 4
+                                               : remaining >= 2 ? 2 : 1;
+                                emit_load_rbp_run(code, Reg::RAX, kR, off, lane);
+                                emit_store_rbp_narrow(code, Reg::RAX, dst + off, lane);
+                                off += lane;
+                            }
                             return;
                         }
                         if (d.value_kind == "float") {
@@ -2546,8 +3251,8 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                                                  d.value_stride);
                             commit_result(instr.result, dst);
                         }
-                    },
-                    [&] {
+                    };
+                const auto on_miss = [&] {
                         if (instr.op == Op::DictContains) {
                             Reg dst = compute_dest(instr.result);
                             emit_xor_zero(code, dst);
@@ -2558,7 +3263,18 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                         // names no key, because the trap takes a literal string and
                         // the two tiers are compared byte for byte on stderr.
                         emit_host_error_trap("error: dict key not found\n");
-                    });
+                    };
+                // 6.8. Which probe runs is the only difference between the two
+                // key kinds: both hand the same continuations a bucket in kL, so
+                // the read above is written once. The str path never reads a key
+                // register -- a bounded string has none -- which is why it comes
+                // before the spill rather than after it.
+                if (d.key_kind == "str") {
+                    emit_dict_str_probe(instr.name, instr.name2, on_hit, on_miss, false);
+                    break;
+                }
+                spill_dict_key(d, read_left(instr.args.at(0)));
+                emit_dict_probe(instr.name, on_hit, on_miss);
                 break;
             }
             case Op::Add:
@@ -3201,13 +3917,22 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                         // callee's SSE works with stale state (and pays the
                         // transition penalty on every entry).
                         if (function_vex_used) emit_vzeroupper(code);
-                        if (instr.name == "print") {
+                        if (instr.name == "print" || instr.name == "print_bare") {
                             if (instr.args.size() != 1) {
                                 throw std::runtime_error(
-                                    "compile_module: print() with " +
+                                    "compile_module: " + instr.name + "() with " +
                                     std::to_string(instr.args.size()) +
                                     " arguments (native supports exactly 1)");
                             }
+                            // 6.1. print_bare is the same formatter with no
+                            // trailing newline; only the format-string constants
+                            // differ, so one path serves both.
+                            const bool nl = (instr.name == "print");
+                            const char* int_fmt = nl ? kIntPrintFormat : kIntPrintFormatBare;
+                            const char* ptr_fmt = nl ? kPtrPrintFormat : kPtrPrintFormatBare;
+                            const char* bool_true = nl ? kBoolTrueLiteral : kBoolTrueLiteralBare;
+                            const char* bool_false = nl ? kBoolFalseLiteral : kBoolFalseLiteralBare;
+                            const char* float_fmt = nl ? kFloatPrintFormat : kFloatPrintFormatBare;
                             ValueId arg = instr.args.at(0);
                             Kind k = arg < value_kinds.size() ? value_kinds[arg] : Kind::Unknown;
 
@@ -3238,7 +3963,7 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                                 // the second argument.
                                 emit_mov_reg_reg(code, abi::kArgRegs[1], Reg::RAX);
                                 emit_mov_reg_imm(code, abi::kArgRegs[0],
-                                                 reinterpret_cast<int64_t>(kFloatPrintFormat));
+                                                 reinterpret_cast<int64_t>(float_fmt));
                             } else if (k == Kind::Bool) {
                                 // Two literal strings, no format specifiers: select
                                 // which one is printf's sole argument by branching,
@@ -3247,23 +3972,23 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                                 emit_test_reg_reg(code, v);
                                 JumpPatch to_false = emit_jcc_rel32(code, Cond::Equal);
                                 emit_mov_reg_imm(code, abi::kArgRegs[0],
-                                    reinterpret_cast<int64_t>(kBoolTrueLiteral));
+                                    reinterpret_cast<int64_t>(bool_true));
                                 JumpPatch to_call = emit_jmp_rel32(code);
                                 resolve_jump_patch(code, to_false, code.size());
                                 emit_mov_reg_imm(code, abi::kArgRegs[0],
-                                    reinterpret_cast<int64_t>(kBoolFalseLiteral));
+                                    reinterpret_cast<int64_t>(bool_false));
                                 resolve_jump_patch(code, to_call, code.size());
                             } else if (k == Kind::Int) {
                                 materialize_into(abi::kArgRegs[1], arg);
                                 emit_mov_reg_imm(code, abi::kArgRegs[0],
-                                    reinterpret_cast<int64_t>(kIntPrintFormat));
+                                    reinterpret_cast<int64_t>(int_fmt));
                             } else if (k == Kind::Ptr) {
                                 // Same shape as the int path -- the pointer is
                                 // already a 64-bit address in a GP register --
                                 // with the hex format. AL stays 0 below.
                                 materialize_into(abi::kArgRegs[1], arg);
                                 emit_mov_reg_imm(code, abi::kArgRegs[0],
-                                    reinterpret_cast<int64_t>(kPtrPrintFormat));
+                                    reinterpret_cast<int64_t>(ptr_fmt));
                             } else {
                                 // Unresolved or mixed kind -- not float, which is
                                 // handled above. There is no format to fall back to
@@ -3274,7 +3999,8 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                                 // instead of a silently-wrong integer
                                 // reinterpretation of a double.
                                 throw std::runtime_error(
-                                    "compile_module: print() argument is not provably "
+                                    "compile_module: " + instr.name +
+                                    " argument is not provably "
                                     "int, bool, float or ptr (kind: " + std::string(kind_name(k)) +
                                     "); native cannot choose a format for it");
                             }
@@ -3283,6 +4009,20 @@ auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& n
                             // left the string pointer in the second argument
                             // register, so AL is 0 here for every kind: printf's
                             // only argument is now a pointer, never a double.
+                            emit_xor_zero(code, Reg::RAX);
+                            if (abi::kShadowSpace) emit_sub_rsp_imm32(code, abi::kShadowSpace);
+                            emit_call_reg(code, kR);
+                            if (abi::kShadowSpace) emit_add_rsp_imm32(code, abi::kShadowSpace);
+                            break;
+                        }
+                        if (instr.name == "print_sep" || instr.name == "print_nl") {
+                            // 6.1. The separator and the final newline: printf
+                            // with a literal format that contains no '%'.
+                            const char* lit = (instr.name == "print_nl")
+                                                  ? kPrintNlLiteral : kPrintSepLiteral;
+                            emit_mov_reg_imm(code, abi::kArgRegs[0],
+                                             reinterpret_cast<int64_t>(lit));
+                            emit_mov_reg_imm(code, kR, reinterpret_cast<int64_t>(&std::printf));
                             emit_xor_zero(code, Reg::RAX);
                             if (abi::kShadowSpace) emit_sub_rsp_imm32(code, abi::kShadowSpace);
                             emit_call_reg(code, kR);

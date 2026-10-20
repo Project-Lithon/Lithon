@@ -1,0 +1,10 @@
+class LithonStruct(Struct):
+	name:str[7];
+	year:int[32];
+#	release:bool
+
+Lithon:LithonStruct
+Lithon.name = "Lithon"
+Lithon.year = 2026
+#Lithon.release=true
+

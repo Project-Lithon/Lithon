@@ -1,0 +1,29 @@
+# 6.2. A bounded string nested through a STRUCT field: `o.inner.tag`. The
+# field's companion run is named by the whole dotted path, so a string two
+# struct levels deep is read, indexed and written exactly like a top-level one.
+# CPython cannot run this (Struct is not a Python builtin); the expected output
+# is written from the documented 6.2 semantics.
+class Inner(Struct):
+    tag: str[8]
+    score: int[8]
+
+
+class Outer(Struct):
+    inner: Inner
+    label: str[6]
+
+
+o: Outer
+o.inner.tag = "deep"
+o.inner.score = 5
+o.label = "top"
+print(o.inner.tag)
+print(len(o.inner.tag))
+print(o.inner.score)
+print(o.label)
+print(o.label[0])
+
+# A byte write into the nested field's run, read back through the same path.
+o.inner.tag[0] = 68
+print(o.inner.tag)
+print(o.inner.tag[0])

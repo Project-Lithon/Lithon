@@ -1,6 +1,7 @@
 # Pointer printing cases for tools/check_ptr_print.py. NOT part of tests/programs:
 # that suite demands byte-identical stdout across tiers, and a printed address
-# legitimately differs (interpreter: synthetic, native: a real frame address).
+# legitimately differs (4.4: each tier prints its own real frame/blob addresses,
+# so ASLR moves them every run).
 a: int[64] = 1
 b: int[64] = 2
 _a: ptr[int[64]] = addressof(a)

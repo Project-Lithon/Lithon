@@ -1,0 +1,9 @@
+a:int[8] = 24
+b:int[16] = 512
+c:float[64] = 22/7
+k:int[32] = 2147483647
+print(a,b,c)
+d:int[16] = int(16,c)
+e:float[64] = float(64,a)
+f:int[64] = k
+print(d, e, f)

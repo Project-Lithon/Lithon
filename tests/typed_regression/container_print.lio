@@ -1,0 +1,18 @@
+# 6.1. Printing whole containers. list/tuple render exactly as Python's repr
+# (so the expected output is the CPython one); a dict renders in BUCKET order,
+# which is Lithon's chosen, deterministic order rather than Python's insertion
+# order. Every line must match byte-for-byte across the interpreter and the JIT.
+xs: list[int[64], 4] = [10, 20, 30, 40]
+t: tuple[int[32], 3] = (1, 2, 3)
+one: tuple[bool, 1] = (True,)
+bs: list[bool, 3] = [True, False, True]
+fs: list[float[64], 3] = [1.5, 2.5, 0.5]
+d: dict[int[64], int[64], 4] = {1: 100, 2: 200, 7: 700}
+
+print(xs)
+print(t)
+print(one)
+print(bs)
+print(fs)
+print(d)
+print(xs, t, xs)

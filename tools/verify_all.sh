@@ -106,6 +106,12 @@ python3 tools/run_typed_regression.py
 step "tier diff: native output must equal interpreter output"
 python3 tools/run_tier_diff.py
 
+step "5.2 syscalls: loopback round trip (both tiers) == a raw C oracle"
+python3 tools/check_net_loopback.py
+
+step "4.4 pointer printing: hex address in both tiers, digit formats unchanged"
+python3 tools/check_ptr_print.py
+
 step "codegen self-tail-call elimination (--no-opt) vs the optimizer's pass, vs the interpreter"
 python3 tools/check_tco_noopt.py
 

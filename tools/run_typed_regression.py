@@ -48,7 +48,7 @@ def run_lithon_typed(py_file: pathlib.Path):
 
 
 def main():
-    programs = sorted(PROGRAMS_DIR.glob("*.py"))
+    programs = sorted(PROGRAMS_DIR.glob("*.lio"))
     if not programs:
         print("no typed test programs found")
         return 1

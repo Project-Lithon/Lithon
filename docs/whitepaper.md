@@ -20,10 +20,10 @@ kind of failure is this" readable from the code alone.
 | `E0108` | 1 (static refusal) | Unsupported type-annotation form |
 | `E0109` | 1 (static refusal) | Unknown or badly-sized annotation type name |
 | `E0110` | 1 (static refusal) | Annotation missing a required field |
-| `E0111` | 1 (static refusal) | Bad container capacity / literal count |
+| `E0111` | 1 (static refusal) | Bad container capacity / literal count / `str[N]` capacity or literal length |
 | `E0112` | 1 (static refusal) | Container element must be a plain scalar |
 | `E0113` | 1 (static refusal) | Pointer (`ptr[T]`) declaration rules (4.4) |
-| `E0114` | 1 (static refusal) | Unsupported or restricted program construct |
+| `E0114` | 1 (static refusal) | Unsupported or restricted program construct (including a non-literal `str[N]` value, or a whole `str` / `str` pointee used where a value is needed) |
 | `E0115` | 1 (static refusal) | Unsupported builtin call form |
 | `E0116` | 1 (static refusal) | Builtin argument rules (`valueof`/`addressof`/`wrap_*`) |
 | `E0117` | 1 (static refusal) | Indexing / container-subscript restrictions |
@@ -37,7 +37,7 @@ kind of failure is this" readable from the code alone.
 | `E0125` | 1 (static refusal) | Pointer arithmetic form |
 | `E0126` | 1 (static refusal) | Struct definition (must derive from `Struct`; fields are annotations only) |
 | `E0127` | 1 (static refusal) | Struct field type (int[w]/float[64]/bool or an earlier struct; no containers/pointers) |
-| `E0128` | 1 (static refusal) | Struct field access (unknown field, or a whole struct used where a value is needed) |
+| `E0128` | 1 (static refusal) | Struct field access (unknown field, a whole struct used where a value is needed, or a `str` field reached through a pointer into the struct) |
 | `E0129` | 1 (static refusal) | Enum definition (must derive from `Enum`; variants are bare unit names, payload annotations, or inline `class V(Struct)`) |
 | `E0130` | 1 (static refusal) | Enum variant construction (unknown variant, wrong payload shape, unknown/missing/duplicate struct-payload field) |
 | `E0131` | 1 (static refusal) | `match` on an enum (bad subject/pattern, non-exhaustive, a guard, a wildcard that is not last, or an enum used where a value is needed) |

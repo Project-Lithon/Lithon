@@ -1,0 +1,30 @@
+# Raw-address printing cases for tools/check_ptr_print.py.
+#
+# This file is deliberately NOT under tests/typed_regression: that suite compares
+# stdout byte-for-byte, and a printed address legitimately differs between runs
+# and between tiers (the interpreter now hands out REAL frame/blob addresses, so
+# ASLR moves them every run; the JIT prints its own frame addresses). What must
+# hold instead is the FORMAT -- every pointer line is `0x` + lowercase hex -- and
+# that the address arithmetic and valueof results are still exact.
+#
+# Program order is fixed (check_ptr_print.py reads the lines positionally):
+#   a, a2, b, a+1, valueof(a), a==a2, f, valueof(f), n, valueof(n)
+a: int[64] = 1
+b: int[64] = 2
+_a: ptr[int[64]] = addressof(a)
+_a2: ptr[int[64]] = addressof(a)
+_b: ptr[int[64]] = addressof(b)
+print(_a)
+print(_a2)
+print(_b)
+print(_a + 1)
+print(valueof(_a))
+print(_a == _a2)
+f: float[64] = 2.5
+_f: ptr[float[64]] = addressof(f)
+print(_f)
+print(valueof(_f))
+n: int[8] = 9
+_n: ptr[int[8]] = addressof(n)
+print(_n)
+print(valueof(_n))

@@ -176,7 +176,7 @@ def run_c_layout(tmp: pathlib.Path) -> dict[str, tuple[int, list[int]]]:
 
 
 def run_frontend(tmp: pathlib.Path) -> dict[str, tuple[int, list[int]]]:
-    src = tmp / "prog.py"
+    src = tmp / "prog.lio"
     src.write_text(PROGRAM)
     proc = subprocess.run(
         [sys.executable, str(FRONTEND), str(src)], capture_output=True, text=True

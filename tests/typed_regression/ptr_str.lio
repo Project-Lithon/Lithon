@@ -1,0 +1,29 @@
+# 6.2. A pointer to a bounded string (`ptr[str[N]]`). Like a pointer to a
+# struct, `_p = addressof(s)` names the string's real byte run, and
+# `valueof(_p)` resolves to that run's own place -- so len, indexed read and
+# write, print and == all apply to the named string in both tiers.
+s: str[8] = "hi"
+_p: ptr[str[8]] = addressof(s)
+
+# The whole string reads and prints through the pointer exactly as s does.
+print(valueof(_p))
+print(len(valueof(_p)))
+print(valueof(_p)[0])
+print(valueof(_p)[1])
+
+# A byte write through the pointer lands in s's run: read it back through s.
+valueof(_p)[0] = 120
+print(valueof(_p))
+print(s)
+
+# Equality names both runs, so a pointer-named string compares like a variable.
+print(valueof(_p) == s)
+
+t: str[8] = "ho"
+print(valueof(_p) == t)
+print(valueof(_p) == s)
+
+# The pointer's pointee carries the capacity, so `_p + 1` walks a whole string
+# and valueof of the walked pointer is still not a value -- but a byte through
+# the original is.
+print(valueof(_p)[1])

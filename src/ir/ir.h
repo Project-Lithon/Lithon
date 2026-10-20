@@ -69,6 +69,13 @@ enum class Op : uint8_t {
     BitOr,
     BitXor,
 
+    // A direct call. `name` is either a user function (args = its arguments)
+    // or one of the built-in runtime calls. The print family is a set of
+    // builtins, not a variadic one, so every tier's per-value format decision
+    // stays in one place: `print` (one value + "\n"), `print_bare` (one value,
+    // no newline), `print_sep` (" ") and `print_nl` ("\n"). The frontend lowers
+    // Python's `print(a, b, c)` to print_bare(print_sep|print_bare)* print_nl.
+    // `syscall` is the other builtin (see its opcode below).
     Call,
     Return,
 
@@ -82,9 +89,15 @@ enum class Op : uint8_t {
     // value: a list lives in a run of frame slots and only the variable knows
     // where that run starts. `args` therefore holds the operands.
     //
-    //   Index      args = {index}                 result = element
-    //   IndexStore args = {index, value}          no result
+    //   Index      args = {i0, i1, ...}           result = leaf
+    //   IndexStore args = {i0, i1, ..., value}    no result
     //   Len        args = {}                      result = capacity
+    //
+    // A nested access `xs[i][j]` is ONE instruction carrying the whole index
+    // chain, not a chain of single-index ops: an inner container has no value to
+    // be an intermediate, and the flat-leaf offset is a single sum over the
+    // levels (see ContainerLayout). A one-level access `xs[i]` is the chain of
+    // length one, so every existing producer and reader is unchanged.
     //
     // Len takes no operand and is not a runtime load: N is part of the type,
     // so `len(xs)` is a compile-time constant and is folded to one.
@@ -106,9 +119,46 @@ enum class Op : uint8_t {
     // DictIndex and DictContains take the key as a run-time value, so they emit
     // a real hash and a real probe. DictContains never traps and reports a
     // missing key as False. DictIndex traps on a missing key.
+    //
+    // 4.3. A str key is a run of bytes, not a value, so it cannot be an operand
+    // register. It is named in `name2` instead -- the key kind is part of the
+    // dict's declared type, so a reader that has the layout knows which of the
+    // two shapes it is holding. An int/bool key leaves `name2` empty and uses
+    // `args` exactly as above; a str key names its run in `name2` and shifts the
+    // remaining operands down:
+    //
+    //   DictStore     name2 = key, args = {value}
+    //   DictIndex     name2 = key, result = value
+    //   DictContains  name2 = key, result = bool
+    //
+    // 6.9. A dict's VALUE may itself be a container (a list or a tuple), and a
+    // container is a run of bytes with no scalar form, so it too is named rather
+    // than loaded -- the same split, one level over. A container value is named
+    // in `name3` (a str key and a container value can co-occur, which is exactly
+    // `dict[str[N], list[T, M], B]`). DictStore is the only op that can carry one
+    // (a dict is built by its literal and never assigned), so it is the only one
+    // that reads `name3`:
+    //
+    //   DictStore     name2 = str key (or ""), name3 = container value (or ""),
+    //                 args  = {value} for a named value, {} for a named key only,
+    //                 {key, value} for neither.
     DictStore,
     DictIndex,
     DictContains,
+
+    // 6.1. Printing a whole container. A container is a run of cells, not a
+    // value, so it cannot be an operand of print()/print_bare() -- the print
+    // family's closed set is scalars only. This op names the container VARIABLE
+    // (like Index/Len/DictStore), and each tier walks the cells and renders the
+    // Python-repr form of the aggregate: `[e0, e1, ...]` for a list,
+    // `(e0, e1, ...)` for a tuple (with the trailing comma a one-element tuple
+    // needs), and `{k0: v0, k1: v1, ...}` for a dict in bucket order. It writes
+    // no trailing newline, so the frontend still emits print_nl after it.
+    //
+    // The container's shape is carried in the trailing " : T" suffix exactly as
+    // a declaration carries it, so the op is self-describing and both engines
+    // agree on the element kind from the same fields.
+    PrintContainer,
 
     // 4.4. Pointers. A pointer is an address, not a value to print, so these
     // two ops together with the ptr[T] type are the whole surface exposed to
@@ -191,12 +241,13 @@ enum class Op : uint8_t {
     // is no `syscall` function to call and no fallible wrapper in this slice;
     // a program that wants to inspect the failure compares the result itself.
     //
-    // Arguments are integers in this slice. A pointer argument would name an
-    // address in the interpreter's synthetic address space, not real memory,
-    // so a kernel syscall taking a pointer (write/read) could not behave the
-    // same in both tiers -- pointer-taking syscalls are therefore rejected by
-    // the typechecker until the interpreter grows a real address-space story,
-    // rather than accepted and silently diverging.
+    // Arguments are int[64] or pointers. A pointer argument is a real host
+    // address in BOTH tiers (4.4), so a kernel syscall taking a pointer
+    // (`bind`/`connect` take `&sockaddr_in`, `send`/`recv` take a buffer) reads
+    // and writes exactly the bytes the language does; only the address value
+    // differs across tiers, and only the named bytes are observed. The
+    // typechecker accepts int and ptr and refuses a float or an aggregate --
+    // neither is passed by value.
     //
     // The instruction is deliberately platform-neutral: it names the raw
     // operation, and the platform fork (the x86-64 `syscall` instruction on
@@ -204,11 +255,138 @@ enum class Op : uint8_t {
     // lives in one place, jit/syscall_runtime.h. Both engines reach it through
     // that same helper, so the interpreter and the JIT cannot disagree about
     // the calling convention.
-    Syscall
+    Syscall,
+
+    // 6.2. Bounded strings. `str[N]` is N bytes of NUL-terminated storage -- the
+    // same packed byte run a `list[int[8], N]` has, but with string semantics:
+    // its length is the number of bytes before the first 0x00 (capped at N), and
+    // printing renders those bytes as text rather than as a bracketed byte list.
+    // It shares the container storage/index machinery -- the declaration is a
+    // valueless typed `store`, a byte read is `Index s, i` (int[8]) and a byte
+    // write is `IndexStore s, i, v` -- so only the three string-specific
+    // operations below need new opcodes.
+    //
+    //   StrLen    name = string var                            result = int[64]
+    //   StrEq     name = string var, name2 = other string var  result = bool
+    //   StrFind   name = string var, name2 = needle var        result = int[64]
+    //   StrCount  name = string var, name2 = needle var        result = int[64]
+    //
+    // StrEq compares the two runs byte for byte over the full N (both are
+    // NUL-terminated and zero-padded, so whole-run equality is content
+    // equality). A whole string is never a register value, so printing it goes
+    // through PrintContainer with a `str[N]` suffix rather than print().
+    //
+    // 6.4. s.find(sub) and s.count(sub) are the two substring scans. Both name
+    // TWO string runs, exactly as StrEq does, because a whole string is never a
+    // register value: the haystack is `name` and the needle is `name2`. The
+    // capacities need not match. find returns the lowest index or -1 (in band,
+    // as in Python); count returns the number of NON-overlapping matches. The
+    // empty needle is the Python edge: find -> 0, count -> len(haystack) + 1.
+    // 6.7. s.split(sep) writes the pieces of `name` into the list `name3`, whose
+    // shape (`list[str[K], M]`) rides the trailing type suffix. It is a bare
+    // statement (no result): a split produces a number of strings that is only
+    // known at run time, and a whole string is never a register value, so the
+    // destination must be a declared, fixed-capacity list of bounded strings.
+    // The op sets that list's live-length companion. `name2` is the separator.
+    StrLen,
+    StrEq,
+    StrFind,
+    StrCount,
+    StrSplit
 };
 
 using ValueId = uint32_t;
 constexpr ValueId kInvalidValue = 0xFFFFFFFF;
+
+// A resolved type, recursive so a container element or a dict key/value can
+// itself be a container. Mirrors the frontend `Type` field for field. The flat
+// per-Instr strings below are the legacy one-level projection; new readers
+// recurse through `elem`/`key` instead.
+struct Type {
+    std::string kind;             // int | float | str | bool | struct | ptr | list | tuple | dict
+    int width = -1;               // scalar width, or struct byte size
+    int cap = -1;                 // list/tuple capacity, or dict bucket count
+    std::shared_ptr<Type> elem;   // element (list/tuple), value (dict), pointee (ptr)
+    std::shared_ptr<Type> key;    // dict key
+    std::string ref;              // struct/enum name, source-level only
+
+    bool is_container() const {
+        return kind == "list" || kind == "tuple" || kind == "dict";
+    }
+    bool is_scalar() const {
+        return kind == "int" || kind == "float" || kind == "str" ||
+               kind == "bool" || kind == "struct";
+    }
+};
+
+// 4.1 (phase 3). Flat-leaf layout of a list/tuple type. Leaves are packed
+// contiguously in row-major order (last index varies fastest), so the whole
+// aggregate is one run of leaf cells with no per-level padding and no
+// indirection. This is the representation BOTH tiers use -- the JIT as frame
+// bytes, the interpreter as a flat vector of leaf values -- which is what keeps
+// them byte-identical.
+//
+// A scalar leaf occupies its packed sizeof: int/float -> width/8, bool -> 1.
+// Nesting only multiplies the cell count. `strides[k]` is the byte distance one
+// step in index level k covers, and the deepest stride equals the leaf size, so
+// the flat byte offset of `xs[i0][i1]...` is sum_k idx_k * strides[k].
+//
+// `valid` is false when the type is not a list/tuple, when a capacity is
+// non-positive, or when the leaf has no packed representation (str, a nested
+// dict, ...) -- callers must reject rather than lay anything out.
+struct ContainerLayout {
+    bool valid = false;
+    int leaf_bytes = 0;              // sizeof(leaf)
+    int leaf_count = 0;              // total leaves in the blob
+    int total_bytes = 0;             // leaf_bytes * leaf_count
+    std::vector<int> strides;        // one per index level; strides.back() == leaf_bytes
+};
+
+inline int scalar_leaf_bytes(const Type& t) {
+    if (t.kind == "bool") return 1;
+    if (t.kind == "int" || t.kind == "float")
+        return (t.width > 0 && t.width % 8 == 0) ? t.width / 8 : 0;
+    return 0;   // str, or anything else without packed storage
+}
+
+inline ContainerLayout container_layout(const Type& t) {
+    ContainerLayout out;
+    // 6.2. A str[N] has a flat-leaf layout (N byte leaves) even though it is not
+    // a list/tuple/dict. It shares the walk below so Index/IndexStore and the
+    // declaration zeroing can address it through one code path.
+    if (!t.is_container() && t.kind != "str") return out;
+    // Walk the list/tuple spine. A dict can only hold scalar values (4.3), so
+    // it never appears as an inner level here.
+    std::vector<const Type*> levels;
+    const Type* cur = &t;
+    // 6.2. A str[N] is a level too: it is N bytes whose element is the byte
+    // int[8], so `list[str[8], 4]` flattens to 32 byte leaves with strides
+    // [8, 1] exactly as `list[list[int[8], 8], 4]` would.
+    while (cur && (cur->kind == "list" || cur->kind == "tuple" ||
+                   cur->kind == "str")) {
+        levels.push_back(cur);
+        cur = cur->elem.get();
+    }
+    if (!cur || !cur->is_scalar()) return out;
+    const int lb = scalar_leaf_bytes(*cur);
+    if (lb <= 0) return out;
+    int count = 1;
+    for (const Type* lv : levels) {
+        if (lv->cap <= 0) return out;
+        count *= lv->cap;
+    }
+    out.leaf_bytes = lb;
+    out.leaf_count = count;
+    out.total_bytes = count * lb;
+    out.strides.resize(levels.size());
+    int stride = lb;
+    for (int k = static_cast<int>(levels.size()) - 1; k >= 0; --k) {
+        out.strides[static_cast<size_t>(k)] = stride;
+        stride *= levels[k]->cap;
+    }
+    out.valid = true;
+    return out;
+}
 
 struct Instr {
     Op op;
@@ -218,6 +396,13 @@ struct Instr {
     int64_t int_imm = 0;
     double float_imm = 0.0;
     std::string name;
+    // 6.2. A second variable name, for the one op that names two variables:
+    // StrEq compares two string runs, so it cannot carry both in `name`.
+    std::string name2;
+    // 6.7. A third variable name, for the one op that names three: StrSplit
+    // reads a source str (`name`), a separator str (`name2`) and writes a list
+    // of bounded strings (`name3`). Every other op leaves it empty.
+    std::string name3;
     std::string type_kind;   // "int" | "float" | "str" | "bool" | "list" | "" (none)
     int type_width = -1;      // bit width; for "list" this is the CAPACITY, not a width
 
@@ -243,6 +428,11 @@ struct Instr {
     // both empty, which is the state they were already in.
     std::string type_key_kind;    // key kind for dict; "" otherwise
     int type_key_width = -1;      // key width for dict; -1 otherwise
+
+    // The same declaration as a recursive tree, so a nested container
+    // (`list[tuple[int[64], 4], 2]`) survives with its inner shape. Null for an
+    // instruction with no type suffix.
+    std::shared_ptr<Type> decl_type;
 };
 
 struct BasicBlock {

@@ -70,6 +70,14 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|X86_64)$")
     target_include_directories(dict_hash_test PUBLIC src)
     add_test(NAME dict_hash_test COMMAND dict_hash_test)
 
+    # dict_str_probe_test: the shared str-key WALK (6.8), which both tiers now
+    # route through one definition. Header only too -- container_print.h pulls
+    # in float_runtime.h, both header-only, so src/jit on the include path is
+    # all it needs.
+    add_executable(dict_str_probe_test src/jit/dict_str_probe_test.cpp)
+    target_include_directories(dict_str_probe_test PUBLIC src src/jit)
+    add_test(NAME dict_str_probe_test COMMAND dict_str_probe_test)
+
     # These go through compile_module(), which is ABI-aware
     # (System V / Microsoft x64), so they run on every platform.
     set(LITHON_JIT_TESTS

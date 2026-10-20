@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <algorithm>
 #include <limits>
+#include <memory>
+#include <string>
 
 namespace lithon::typecheck {
 
@@ -13,15 +15,19 @@ using namespace lithon::ir;
 
 namespace {
 
-// 4.1. A type is now recursive: `list[int[64], 10]` is a kind, a capacity, and
-// an ELEMENT type. Element types are held one level deep rather than as a
-// shared_ptr tree, which is enough for list/tuple/ptr (4.2/4.3/4.4) and keeps
-// LType cheap to copy in the scope maps.
+// 4.1. A type is recursive: `list[int[64], 10]` is a kind, a capacity, and an
+// ELEMENT type, and the element may itself be a container. The full shape is
+// held as a shared_ptr tree in elem_tree/key_tree. The flat elem_kind/elem_width
+// (and key) are kept in parallel: they are the SAME one-level projection the
+// IR carries (`Instr::type_elem_kind`/...), so every pre-nesting reader of a
+// type still works unchanged. When a tree is present, element()/key() return
+// it; otherwise they fall back to the flat pair.
 //
 // The element MUST participate in equality. Without it `list[int[64],10]` and
 // `list[float[64],10]` would compare equal, and assigning one to the other
 // would pass the checker -- which is exactly the class of bug a typed container
-// is supposed to make impossible.
+// is supposed to make impossible. Equality walks the tree, so a nested element
+// is compared to its full depth rather than to a flattened approximation.
 struct LType {
     std::string kind;
     int width = -1;
@@ -34,10 +40,22 @@ struct LType {
     std::string key_kind;
     int key_width = -1;
 
+    // The full element/key types. Null for a scalar, and also for a one-level
+    // container built from flat IR fields only (then the flat pair is the
+    // element). Set when built from the recursive `ir::Type` decl_type.
+    std::shared_ptr<LType> elem_tree;
+    std::shared_ptr<LType> key_tree;
+
+    bool has_elem() const { return elem_tree != nullptr || !elem_kind.empty(); }
+    bool has_key() const { return key_tree != nullptr || !key_kind.empty(); }
+
     bool operator==(const LType& other) const {
-        return kind == other.kind && width == other.width &&
-               elem_kind == other.elem_kind && elem_width == other.elem_width &&
-               key_kind == other.key_kind && key_width == other.key_width;
+        if (kind != other.kind || width != other.width) return false;
+        if (has_elem() != other.has_elem()) return false;
+        if (has_elem() && !(element() == other.element())) return false;
+        if (has_key() != other.has_key()) return false;
+        if (has_key() && !(key() == other.key())) return false;
+        return true;
     }
     bool operator!=(const LType& other) const { return !(*this == other); }
 
@@ -58,7 +76,7 @@ struct LType {
     // valueless struct store down the same "binds storage" path a container
     // takes rather than the type-only scalar path.
     bool is_scalar() const {
-        return elem_kind.empty() && key_kind.empty() && kind != "struct";
+        return !has_elem() && !has_key() && kind != "struct";
     }
     bool is_list() const { return kind == "list"; }
     bool is_dict() const { return kind == "dict"; }
@@ -75,10 +93,72 @@ struct LType {
         return 1;
     }
 
-    // The element type of a container, as a standalone LType.
-    LType element() const { return LType{elem_kind, elem_width, "", -1, "", -1}; }
-    LType key() const { return LType{key_kind, key_width, "", -1, "", -1}; }
+    // The element type of a container, as a standalone LType. Returns the full
+    // recursive child when one is known, so `xs[i]` on a list of tuples is
+    // itself a tuple and can be indexed again.
+    LType element() const {
+        if (elem_tree) return *elem_tree;
+        return LType{elem_kind, elem_width};
+    }
+    LType key() const {
+        if (key_tree) return *key_tree;
+        return LType{key_kind, key_width};
+    }
 };
+
+// Builds the recursive LType from the IR's recursive type tree. The flat fields
+// are projected the same way `parse_type_string` projects them into the Instr,
+// so a type built here equals one built from flat fields alone.
+LType from_ir_type(const Type& t) {
+    LType out;
+    out.kind = t.kind;
+    // 6.2. A str[N]'s `width` is its byte capacity N and its element is the
+    // byte int[8], exactly as a container's width is its capacity and its
+    // element is the declared one. Keeping it out of is_container() (it prints
+    // and lengths as a string) is why it needs this explicit projection.
+    if (t.kind == "str") {
+        out.width = t.cap;
+        if (t.elem) {
+            out.elem_tree = std::make_shared<LType>(from_ir_type(*t.elem));
+            out.elem_kind = t.elem->kind;
+            // 6.8. The str's own ELEMENT is the byte, int[8], and that is what
+            // the projection above reads -- but a str used AS an element or a
+            // key of a container (a list[str[8], 4], a dict[str[16], ...]) has
+            // its capacity in `cap`, exactly as a list's own element type does.
+            // Reading `width` there returned -1 and the print guard called it
+            // "not provably a str", which refused the native tier on a str
+            // element it had just been told about.
+            out.elem_width = t.elem->is_container() ? t.elem->cap : t.elem->width;
+        }
+        return out;
+    }
+    out.width = t.is_container() ? t.cap : t.width;
+    if (t.elem && (t.is_container() || t.kind == "ptr")) {
+        out.elem_tree = std::make_shared<LType>(from_ir_type(*t.elem));
+        out.elem_kind = t.elem->kind;
+        out.elem_width = t.elem->kind == "str"
+                             ? t.elem->cap
+                             : (t.elem->is_container() ? t.elem->cap : t.elem->width);
+    }
+    if (t.kind == "dict" && t.key) {
+        out.key_tree = std::make_shared<LType>(from_ir_type(*t.key));
+        out.key_kind = t.key->kind;
+        // 6.8. A str key's width is its BYTE CAPACITY, not a bit width, exactly
+        // as a str variable's is -- and exactly as a container key's is its
+        // bucket count. `is_container()` deliberately excludes str, so without
+        // this the capacity fell through to `t.key->width`, which a str never
+        // has, and every str-keyed dict read back as a key with no capacity at
+        // all.
+        out.key_width = t.key->kind == "str"
+                            ? t.key->cap
+                            : (t.key->is_container() ? t.key->cap : t.key->width);
+        // 6.8. A str VALUE reads its capacity the same way a str key does, for
+        // the same reason: a dict's element type is a container's element type
+        // in every respect except that the capacity lives in `cap`.
+        if (t.elem && t.elem->kind == "str") out.elem_width = t.elem->cap;
+    }
+    return out;
+}
 
 std::pair<int64_t, int64_t> int_range(int width) {
     if (width >= 64) {
@@ -106,31 +186,39 @@ std::string type_str(const LType& t) {
     // be rendered before the scalar branch (which would print it as a width)
     // and before the container branch (which would invent a phantom element).
     if (t.is_struct()) return "struct[" + std::to_string(t.width) + "]";
+    // 6.2. A str prints as str[N], never as the implicit byte element, because
+    // the source never spells the element and a diagnostic must quote the
+    // source. Place it before the scalar branch (is_scalar() is false for a str,
+    // whose width is a byte capacity) and before the container branch.
+    if (t.kind == "str") return "str[" + std::to_string(t.width) + "]";
     if (t.is_scalar()) {
         if (t.width < 0) return t.kind;
         return t.kind + "[" + std::to_string(t.width) + "]";
     }
     // 4.1. Render a container back the way it was written, so a diagnostic
-    // quotes the source spelling rather than a flattened approximation.
-    // A nested container element is one level deeper than LType holds, so it is
-    // rendered as `list[...]`. Printing its capacity alone (`list[4]`) would
-    // read like a list of ints named 4, which is a different type entirely.
-    std::string elem = t.elem_kind.empty() ? "?" : t.elem_kind;
-    if (t.elem_kind == "list" || t.elem_kind == "tuple" || t.elem_kind == "ptr") {
-        return t.kind + "[" + elem + "[...], " + std::to_string(t.width) + "]";
-    }
+    // quotes the source spelling rather than a flattened approximation. When the
+    // full nested shape is known it is rendered to its depth; otherwise a
+    // one-level container element is rendered `list[...]` (printing its capacity
+    // alone, `list[4]`, would read like a list of ints named 4).
+    auto render_elem = [&]() -> std::string {
+        if (t.elem_tree) return type_str(t.element());
+        if (t.elem_kind.empty()) return "?";
+        if (t.elem_kind == "list" || t.elem_kind == "tuple" || t.elem_kind == "ptr")
+            return t.elem_kind + "[...]";
+        std::string s = t.elem_kind;
+        if (t.elem_width >= 0) s += "[" + std::to_string(t.elem_width) + "]";
+        return s;
+    };
     // 4.3. A dict prints as it was written, key first, because that is the
     // order it was declared in.
     if (t.is_dict()) {
         std::string k = t.key_kind.empty() ? "?" : t.key_kind;
         if (t.key_width >= 0) k += "[" + std::to_string(t.key_width) + "]";
-        if (t.elem_width >= 0) elem += "[" + std::to_string(t.elem_width) + "]";
-        return t.kind + "[" + k + ", " + elem + ", " + std::to_string(t.width) + "]";
+        return t.kind + "[" + k + ", " + render_elem() + ", " + std::to_string(t.width) + "]";
     }
-    if (t.elem_width >= 0) elem += "[" + std::to_string(t.elem_width) + "]";
     // ptr carries no capacity and must not print a phantom ", -1".
-    if (t.kind == "ptr") return t.kind + "[" + elem + "]";
-    return t.kind + "[" + elem + ", " + std::to_string(t.width) + "]";
+    if (t.kind == "ptr") return t.kind + "[" + render_elem() + "]";
+    return t.kind + "[" + render_elem() + ", " + std::to_string(t.width) + "]";
 }
 
 using Scope = std::unordered_map<std::string, LType>;
@@ -236,6 +324,16 @@ private:
         }
     }
 
+    // E0105, recursive form: a nested element or dict key/value can be an
+    // unsupported int/float width just as a one-level one can, and the flat
+    // instr fields only reach the first level. Walks the IR tree so the check
+    // sees every scalar in the declaration.
+    void check_scalar_width_type(const Type& t) {
+        check_scalar_width(t.kind, t.is_container() ? -1 : t.width);
+        if (t.elem) check_scalar_width_type(*t.elem);
+        if (t.key) check_scalar_width_type(*t.key);
+    }
+
     void add_edge(const std::string& from, const std::string& to) {
         predecessors_[to].push_back(from);
     }
@@ -262,6 +360,31 @@ private:
     // src/frontend/frontend.py, which mints the names.
     static bool is_lowered_merge_temp(const std::string& name) {
         return name.rfind("__ifexpr", 0) == 0;
+    }
+
+    // 6.3 Stage A. The bounded run a printed string literal / f-string chunk is
+    // materialised into before it is printed. Kept in sync with PRINT_LIT_TEMP
+    // in src/frontend/frontend.py. Like the merge temp it is compiler-generated
+    // and starts with '_', so it must be exempt from 4.4's pointer-name rule --
+    // it is a `str[N]`, not a pointer.
+    static bool is_print_literal_temp(const std::string& name) {
+        return name.rfind("__printlit", 0) == 0;
+    }
+
+    // 6.9. The run a dict's container VALUE is built into before the store copies
+    // it into the value slot. Kept in sync with DICT_VALUE_TEMP in
+    // src/frontend/frontend.py; compiler-generated like the two above, so it is
+    // exempt from 4.4's pointer-name rule.
+    static bool is_dict_value_temp(const std::string& name) {
+        return name.rfind("__dictval", 0) == 0;
+    }
+
+    // A name the frontend mints for its own lowering (never a source
+    // identifier). Exempt from the naming rule, which exists to police what the
+    // programmer writes, not what the compiler introduces.
+    static bool is_compiler_temp(const std::string& name) {
+        return is_lowered_merge_temp(name) || is_print_literal_temp(name) ||
+               is_dict_value_temp(name);
     }
 
     std::unordered_set<const Instr*> find_loop_increment_stores() {
@@ -367,9 +490,17 @@ private:
                 if (instr.op == Op::Store && instr.type_kind == "tuple" &&
                     instr.args.empty() && instr.type_width > 0) {
                     // A valueless tuple declaration OPENS construction for
-                    // exactly `type_width` element stores. Re-declaring the same
-                    // name restarts the count rather than extending it.
-                    open_init[instr.name] = {instr.type_width, &instr};
+                    // exactly one store per LEAF. For a flat tuple that is its
+                    // capacity, but a nested tuple literal writes every leaf
+                    // through one IndexStore, so the count is the flat-leaf
+                    // count (a `tuple[tuple[int[64],2],2]` opens for 4 stores,
+                    // not 2). Re-declaring the same name restarts the count.
+                    int open_count = instr.type_width;
+                    if (instr.decl_type) {
+                        const auto layout = lithon::ir::container_layout(*instr.decl_type);
+                        if (layout.valid) open_count = layout.leaf_count;
+                    }
+                    open_init[instr.name] = {open_count, &instr};
                     tuple_open_for_init_.insert(instr.name);
                 }
                 if (instr.op == Op::Store && instr.type_kind == "dict" &&
@@ -396,7 +527,31 @@ private:
                     // entries this literal has are known to be exactly the ones
                     // between the declaration and the first read.
                     auto kit = open_dict_keys.find(instr.name);
-                    if (kit != open_dict_keys.end() && !instr.args.empty()) {
+                    if (kit != open_dict_keys.end()) {
+                        bool dict_str_key = false;
+                        if (auto dit = scope.find(instr.name); dit != scope.end())
+                            dict_str_key = dit->second.key_kind == "str";
+                        if (dict_str_key) {
+                            // 4.3. A str key arrives as a NAMED run, and the
+                            // frontend shares one materialised run between every
+                            // literal of the same capacity -- so the name
+                            // carries neither the key's text nor a constant to
+                            // compare, and a run name would see two DIFFERENT
+                            // keys of the same length as one duplicate. The
+                            // frontend has the literals and has already refused a
+                            // duplicate string key, so only the entry count is
+                            // bounded here.
+                            std::vector<int64_t>& seen = kit->second;
+                            seen.push_back(-static_cast<int64_t>(seen.size()) - 1);
+                            int64_t buckets = 0;
+                            if (auto dit = scope.find(instr.name); dit != scope.end())
+                                buckets = dit->second.width;
+                            if (int64_t(seen.size()) > buckets) {
+                                error("'" + instr.name + "' has " +
+                                      std::to_string(seen.size()) + " entries but only " +
+                                      std::to_string(buckets) + " buckets (4.3)");
+                            }
+                        } else if (!instr.args.empty()) {
                         if (const Instr* kc = find_producing_const(instr.args[0])) {
                             std::vector<int64_t>& seen = kit->second;
                             // 4.3. Compared in the same canonical form the two
@@ -434,6 +589,7 @@ private:
                                 }
                             }
                         }
+                        }
                     }
                     continue;
                 }
@@ -442,6 +598,9 @@ private:
                 const bool mentions = instr.op == Op::Index ||
                                       instr.op == Op::DictIndex ||
                                       instr.op == Op::DictContains ||
+                                      // 6.1. Printing a container reads it, so it
+                                      // ends construction exactly as a load does.
+                                      instr.op == Op::PrintContainer ||
                                       instr.op == Op::Load ||
                                       instr.op == Op::Call ||
                                       (instr.op == Op::Store && !instr.args.empty());
@@ -449,7 +608,15 @@ private:
                 auto it = open_init.find(instr.name);
                 if (it == open_init.end()) continue;
                 const OpenInit& st = it->second;
-                const int64_t capacity = st.decl->type_width;
+                int64_t capacity = st.decl->type_width;
+                // 4.1 (phase 3). A nested tuple literal writes every LEAF, so a
+                // partial one is measured against the flat-leaf count, not the
+                // outer capacity.
+                if (st.decl->decl_type) {
+                    const auto layout =
+                        lithon::ir::container_layout(*st.decl->decl_type);
+                    if (layout.valid) capacity = layout.leaf_count;
+                }
                 if (st.decl->type_kind == "dict") {
                     // 4.3. A dict ends construction at the first read with no
                     // partial case to diagnose, so there is nothing to say here.
@@ -540,6 +707,23 @@ private:
             return;
         }
         if (source.kind == target.kind) {
+            // 4.1-4.3. Two containers of the same kind agree only if their
+            // element -- and, for a dict, key -- type matches too. Comparing
+            // capacity alone accepted `list[int[64],4]` into `list[float[64],4]`
+            // and `list[int[8],4]` into `list[int[64],4]`, which is exactly the
+            // class of mismatch a typed container exists to make impossible.
+            if (source.kind == "list" || source.kind == "tuple" || source.kind == "dict") {
+                const bool same_elem = source.element() == target.element();
+                const bool same_key =
+                    source.kind != "dict" || source.key() == target.key();
+                if (source.width != target.width || !same_elem || !same_key) {
+                    error(context + ": cannot convert " + type_str(source) + " to " +
+                          type_str(target) + " -- a " + source.kind +
+                          "'s element type must match (4.1)");
+                    return;
+                }
+                return;
+            }
             if (source.width < 0 && target.width < 0) return;
             if (source.width >= 0 && target.width >= 0) {
                 if (target.width >= source.width) return;
@@ -664,6 +848,27 @@ private:
         reg_types_[instr.result] = p;
     }
 
+    // 6.9. The NAMED form of the check above, for a dict value that is a
+    // container: the value arrives as the name of a run rather than as a
+    // register, so `find_producing_const` has nothing to look at and the literal
+    // checks above do not apply. What has to hold is that the named run was
+    // declared (it must be assigned, like a str key run) and that its type IS the
+    // declared value type -- a run of `list[int[32], 4]` cannot go into a slot
+    // the table sized for `list[int[64], 4]`.
+    void check_value_into_target_named(const std::string& name, const LType& target,
+                                       const Scope& scope,
+                                       const std::string& context) {
+        auto it = scope.find(name);
+        if (it == scope.end()) {
+            error(context + ": '" + name + "' is not definitely assigned here (V1_SPEC 0.6.10)");
+            return;
+        }
+        if (!(it->second == target)) {
+            error(context + ": '" + name + "' is " + type_str(it->second) +
+                  ", which is not " + type_str(target));
+        }
+    }
+
     void check_value_into_target(ValueId id, const LType& target, const std::string& context) {
         // 4.6. A struct has no value: it is storage, written one field at a
         // time. This is the backstop for hand-written IR, where a value store
@@ -778,19 +983,153 @@ private:
     }
 
     void check_print_call(const Instr& instr) {
-        if (instr.args.size() != 1) {
-            error("print() with exactly one argument is supported");
-            return;
-        }
-        LType t;
-        if (!reg_type(instr.args.at(0), t)) return;
+        // 6.1. print() takes any number of arguments; each is formatted
+        // independently, so each must be in the closed printable set. The
+        // frontend lowers an n-argument print to n print_bare/print calls plus
+        // separators, so a single call still carries exactly one value -- this
+        // loop is what keeps hand-written IR honest, and it accepts the
+        // zero-argument (bare-newline) case too.
         // 4.4. ptr[T] prints as a hexadecimal address (0x7ffd...), the way C's
         // %p and Rust's {:p} do. It is an address, not the pointee: print(p)
         // shows where, print(valueof(p)) shows what.
         static const std::unordered_set<std::string> allowed = {"int", "float", "str", "bool", "ptr"};
-        if (allowed.find(t.kind) == allowed.end()) {
-            error("print() does not accept " + type_str(t) + " -- V1_SPEC 0.6.9's closed "
-                  "overload set is int[N], float[N], str[N], bool and ptr[T] only");
+        for (ValueId id : instr.args) {
+            LType t;
+            if (!reg_type(id, t)) continue;
+            if (allowed.find(t.kind) == allowed.end()) {
+                error("print() does not accept " + type_str(t) + " -- V1_SPEC 0.6.9's closed "
+                      "overload set is int[N], float[N], str[N], bool and ptr[T] only");
+            }
+        }
+    }
+
+    // 6.1. PrintContainer names a container VARIABLE and carries its shape in
+    // the trailing type suffix. The name must be a live list/tuple/dict and
+    // every leaf it reaches must be a printable scalar -- the same closed set the
+    // scalar print family accepts, because a container is printed by rendering
+    // each of its leaves. The suffix is also checked against the declared type,
+    // since both engines lay out from the declaration but render from the suffix.
+    void check_print_container(const Instr& instr, const Scope& scope) {
+        auto it = scope.find(instr.name);
+        if (it == scope.end()) {
+            error("'" + instr.name + "' is not definitely assigned here (V1_SPEC 0.6.10)");
+            return;
+        }
+        const LType& ct = it->second;
+        if (ct.kind != "list" && ct.kind != "tuple" && !ct.is_dict() &&
+            ct.kind != "str") {
+            error("print() of " + type_str(ct) + " -- only a list, tuple or dict "
+                  "prints as an aggregate (6.1)");
+            return;
+        }
+        // Phase 6.7. A list names its live-length companion as name2; it must be
+        // a live int scalar (it is read as the element count at run time). A
+        // tuple, dict or str carries none.
+        if (!instr.name2.empty()) {
+            if (ct.kind != "list") {
+                error("print_container " + instr.name + " carries a length variable but " +
+                      instr.name + " is " + type_str(ct) + ", which has no length field (6.7)");
+                return;
+            }
+            auto lit = scope.find(instr.name2);
+            if (lit == scope.end()) {
+                error("'" + instr.name2 + "' is not definitely assigned here (V1_SPEC 0.6.10)");
+                return;
+            }
+            if (lit->second.kind != "int") {
+                error("print_container " + instr.name + "'s length variable " + instr.name2 +
+                      " is " + type_str(lit->second) + ", not an int (6.7)");
+                return;
+            }
+        }
+        if (ct.kind != instr.type_kind || ct.width != instr.type_width) {
+            error("print_container " + instr.name + " carries " + instr.type_kind +
+                  "[...," + std::to_string(instr.type_width) + "] but " + instr.name +
+                  " is " + type_str(ct) + " (6.1)");
+            return;
+        }
+        // 6.2. A top-level str prints its bytes as text, not as an aggregate of
+        // bytes. When a str is instead an ELEMENT (`list[str[8], N]`) it is a
+        // printable leaf: both engines render it with the Python repr, quoted,
+        // exactly as Python prints a list of strings. So str is added to the
+        // printable leaf set below, and the top-level case returns here.
+        if (ct.kind == "str") return;
+        const auto leaf_ok = [](const std::string& k) {
+            return k == "int" || k == "float" || k == "bool" || k == "str";
+        };
+        if (ct.is_dict()) {
+            if (ct.key_kind != instr.type_key_kind ||
+                ct.key_width != instr.type_key_width) {
+                error("print_container " + instr.name + " key type does not match " +
+                      type_str(ct) + " (6.1)");
+                return;
+            }
+            if (!leaf_ok(ct.key_kind)) {
+                error("print() of " + type_str(ct) + " -- a dict key of type " +
+                      type_str(ct.key()) + " is not printable (6.1)");
+            }
+            if (ct.elem_kind != instr.type_elem_kind ||
+                ct.elem_width != instr.type_elem_width) {
+                error("print_container " + instr.name + " element type does not match " +
+                      type_str(ct) + " (6.1)");
+                return;
+            }
+            // 6.9. A dict VALUE may itself be a list or a tuple (4.3). It is
+            // printable under the same rule a list element is: descend to the
+            // deepest leaf and require it to be in the closed set. A dict value
+            // can never be a dict (that is refused at the declaration), so the
+            // walk is bounded by the value type itself.
+            LType vleaf = ct.element();
+            while (vleaf.kind == "list" || vleaf.kind == "tuple")
+                vleaf = vleaf.element();
+            if (!leaf_ok(vleaf.kind)) {
+                error("print() of " + type_str(ct) + " -- an element of type " +
+                      type_str(ct.element()) + " is not printable (6.1)");
+            }
+            return;
+        }
+        // 4.1 (phase 3). A nested list/tuple is printable iff its LEAF is in the
+        // closed set; the intermediate levels are containers and have no scalar
+        // kind of their own, so the walk descends to the deepest element.
+        LType leaf = ct;
+        while (leaf.kind == "list" || leaf.kind == "tuple")
+            leaf = leaf.element();  // depth-bounded by the type itself
+        if (!leaf_ok(leaf.kind)) {
+            error("print() of " + type_str(ct) + " -- a leaf of type " +
+                  type_str(leaf) + " is not printable (6.1)");
+            return;
+        }
+        // Validate the WHOLE recursive shape the suffix carries, not just the
+        // immediate element: both engines lay out and render from the suffix, so
+        // a suffix that disagrees at any depth (`list[list[float[64],2],3]` over a
+        // declared `list[list[int[64],2],3]`) would silently re-read bytes.
+        const auto shape_matches = [](const LType& a, const Type& b) {
+            auto self = [](const LType& x, const Type& y, auto&& rec) -> bool {
+                if (x.kind != y.kind) return false;
+                if (x.kind == "list" || x.kind == "tuple") {
+                    if (x.width != y.cap || !y.elem) return false;
+                    return rec(x.element(), *y.elem, rec);
+                }
+                if (x.kind == "bool") return true;
+                // 6.2. A str's byte capacity rides in the IR `cap`, not `width`
+                // (its width is never a bit width), so it matches on cap.
+                if (x.kind == "str") return y.elem && x.width == y.cap;
+                return x.width == y.width;
+            };
+            return self(a, b, self);
+        };
+        if (instr.decl_type) {
+            if (!shape_matches(ct, *instr.decl_type)) {
+                error("print_container " + instr.name + " shape does not match " +
+                      type_str(ct) + " (6.1)");
+            }
+            return;
+        }
+        // Hand-written IR with no recursive suffix: fall back to the flat check.
+        if (ct.elem_kind != instr.type_elem_kind ||
+            ct.elem_width != instr.type_elem_width) {
+            error("print_container " + instr.name + " element type does not match " +
+                  type_str(ct) + " (6.1)");
         }
     }
 
@@ -825,9 +1164,13 @@ private:
         // instruction (a storage target, a value type such as valueof's pointee,
         // a container element or a dict key/value). Runs before the op logic so
         // the refusal can never be masked by a later, more specific check.
-        check_scalar_width(instr.type_kind, instr.type_width);
-        check_scalar_width(instr.type_elem_kind, instr.type_elem_width);
-        check_scalar_width(instr.type_key_kind, instr.type_key_width);
+        if (instr.decl_type) {
+            check_scalar_width_type(*instr.decl_type);
+        } else {
+            check_scalar_width(instr.type_kind, instr.type_width);
+            check_scalar_width(instr.type_elem_kind, instr.type_elem_width);
+            check_scalar_width(instr.type_key_kind, instr.type_key_width);
+        }
         switch (instr.op) {
             // 4.1. A const takes its width from the trailing " : T[N]" suffix
             // when one is present, and defaults to int[64] otherwise. Hardcoding
@@ -868,9 +1211,24 @@ private:
                           " -- a pointer is an address with no storage of its own (4.4)");
                     return;
                 }
-                if (!t.is_scalar() && !t.is_struct()) {
+                if (!t.is_scalar() && !t.is_struct() && t.kind != "str") {
                     error("cannot take the address of " + type_str(t) +
                           " -- addressof takes a plain scalar variable or a struct (4.4)");
+                    return;
+                }
+                // 6.2. A bounded string is real storage -- an N-byte run -- so it
+                // can be pointed at like a struct. The pointer must carry the
+                // WHOLE str element (its recursive shape included) so it equals
+                // the `ptr[str[N]]` the frontend declares; a flat-only element
+                // would compare unequal to a parsed one and be rejected here.
+                if (t.kind == "str") {
+                    LType p;
+                    p.kind = "ptr";
+                    p.width = -1;
+                    p.elem_kind = "str";
+                    p.elem_width = t.width;
+                    p.elem_tree = std::make_shared<LType>(t);
+                    reg_types_[instr.result] = p;
                     return;
                 }
                 // A struct's width IS its byte size, so ptr[struct[N]] carries
@@ -1076,14 +1434,15 @@ private:
             }
 
             // Phase III. The raw syscall primitive. `args` is the number
-            // followed by up to six arguments; each argument must be an int.
-            // A pointer is rejected on purpose: it would name an address in
-            // the interpreter's synthetic address space, so a kernel syscall
-            // that takes a pointer (write/read) could not behave the same in
-            // both tiers. Integer-only keeps the primitive tier-neutral. The
-            // result is the kernel's raw int64 return, unchecked: no fallible
-            // wrapper and no use-before-check rule in this slice, so it types
-            // as int[64].
+            // followed by up to six arguments; each argument is an int[64] or a
+            // pointer. 5.2 needs pointers: `bind`/`connect` take `&sockaddr_in`
+            // and `send`/`recv` take a buffer, all `ptr[struct[N]]` into real
+            // frame memory. A pointer is a real host address in BOTH tiers
+            // (4.4), so the kernel can read and write the bytes behind it -- the
+            // address itself is never compared across tiers, only the bytes it
+            // names. The result is the kernel's raw int64 return, unchecked: no
+            // fallible wrapper and no use-before-check rule in this slice, so it
+            // types as int[64].
             case Op::Syscall: {
                 if (instr.args.empty()) {
                     error("syscall() needs a syscall number");
@@ -1096,16 +1455,16 @@ private:
                 }
                 for (size_t i = 0; i < instr.args.size(); ++i) {
                     LType at;
-                    if (!reg_type(instr.args[i], at)) {
+                    if (!reg_type(instr.args.at(i), at)) {
                         error("syscall() argument " + std::to_string(i) +
                               " is unresolved");
                         return;
                     }
-                    if (at.kind != "int") {
+                    if (at.kind != "int" && at.kind != "ptr") {
                         error("syscall() argument " + std::to_string(i) + " has type " +
                               type_str(at) + " -- a raw syscall argument must be an "
-                              "integer in this slice; pointer-taking syscalls "
-                              "(write/read) are not yet supported (Phase III)");
+                              "integer or a pointer (a buffer or a sockaddr); floats "
+                              "and aggregates are not passed by value (Phase III)");
                         return;
                     }
                 }
@@ -1127,7 +1486,11 @@ private:
                     return;
                 }
                 const LType& ct = it->second;
-                if (ct.kind != "list" && ct.kind != "tuple") {
+                // 6.2. A str is indexable like a one-level container (its bytes),
+                // so it is admitted here alongside list and tuple. It is NOT a
+                // tuple, so the immutability store-refusal below never applies:
+                // `s[i] = byte` is the whole point of a mutable string.
+                if (ct.kind != "list" && ct.kind != "tuple" && ct.kind != "str") {
                     // 4.3. A dict is a container but not an array. It has no
                     // index and no length, so reaching here means the frontend
                     // picked the wrong opcode for it, and naming the dict
@@ -1183,6 +1546,15 @@ private:
                     return;
                 }
                 if (instr.op == Op::Len) {
+                    // 6.2. A string's len() is run-time, so the frontend emits
+                    // StrLen for it. Reaching Len with a str name would fold to
+                    // the capacity N and silently report the wrong thing, so it
+                    // is refused and the right opcode named.
+                    if (ct.kind == "str") {
+                        error("len() on " + type_str(ct) + " is run-time and lowers "
+                              "to strlen, not Len (6.2)");
+                        return;
+                    }
                     // 4.2 is indexed reads only, so len() on a tuple is
                     // rejected rather than quietly accepted.
                     //
@@ -1203,41 +1575,92 @@ private:
                     return;
                 }
 
-                const ValueId idx = instr.args.at(0);
-                if (instr.op == Op::IndexStore && instr.args.size() < 2) {
-                    error("IndexStore needs an index and a value");
+                // 4.1 (phase 3). A nested access carries the WHOLE index chain:
+                // `xs[i][j]` is one instruction. Every argument but the last is
+                // an index (for IndexStore the last is the value). Walk the
+                // chain down the container, each level must be indexable, and
+                // the walk must land on a scalar leaf -- a container intermediate
+                // has no value to read or write (Option A: only the outermost
+                // kind decides tuple immutability, which was checked above).
+                const bool is_store = instr.op == Op::IndexStore;
+                if (instr.args.empty() || (is_store && instr.args.size() < 2)) {
+                    error("IndexStore needs at least an index and a value");
                     return;
                 }
-                LType idx_t;
-                if (reg_type(idx, idx_t) && idx_t.kind != "int") {
-                    error("index into " + type_str(ct) + " must be an int, got " +
-                          type_str(idx_t));
-                    return;
-                }
-                // Static overflow. Only a LITERAL index is decidable here; a
-                // runtime index is checked in codegen, not guessed at here.
-                if (const Instr* c = find_producing_const(idx)) {
-                    const int64_t n = c->int_imm;
-                    if (n < 0 || n >= ct.width) {
-                        error("index " + std::to_string(n) + " is out of range for " +
-                              type_str(ct) + " -- valid indices are 0.." +
-                              std::to_string(ct.width - 1));
+                const size_t n_idx = is_store ? instr.args.size() - 1 : instr.args.size();
+                LType cur = ct;
+                for (size_t k = 0; k < n_idx; ++k) {
+                    // 6.2. A str is indexable as its bytes, so it is a valid
+                    // level here just like list and tuple; its `width` is N, the
+                    // bound the range check below uses.
+                    if (cur.kind != "list" && cur.kind != "tuple" && cur.kind != "str") {
+                        error("index " + std::to_string(k + 1) + " into " +
+                              type_str(ct) + " goes past its innermost level: " +
+                              type_str(cur) + " is not a list or tuple");
                         return;
                     }
+                    const ValueId idx = instr.args.at(k);
+                    LType idx_t;
+                    if (reg_type(idx, idx_t) && idx_t.kind != "int") {
+                        error("index into " + type_str(cur) + " must be an int, got " +
+                              type_str(idx_t));
+                        return;
+                    }
+                    // Static overflow. Only a LITERAL index is decidable here; a
+                    // runtime index is checked in codegen, not guessed at here.
+                    if (const Instr* c = find_producing_const(idx)) {
+                        const int64_t n = c->int_imm;
+                        if (n < 0 || n >= cur.width) {
+                            error("index " + std::to_string(n) + " is out of range for " +
+                                  type_str(cur) + " -- valid indices are 0.." +
+                                  std::to_string(cur.width - 1));
+                            return;
+                        }
+                    }
+                    cur = cur.element();
                 }
+                const bool cur_is_container =
+                    cur.kind == "list" || cur.kind == "tuple";
                 if (instr.op == Op::Index) {
-                    reg_types_[instr.result] = ct.element();
+                    if (cur_is_container) {
+                        error("reading " + type_str(cur) + " out of " + instr.name +
+                              " would need a container value, which the language does "
+                              "not have -- index all the way to a scalar (4.1)");
+                        return;
+                    }
+                    // 6.2. A str is storage too: reading a whole one would need a
+                    // str value, which the language does not have. Index all the
+                    // way to a byte: `xs[i][j]`, not `xs[i]`.
+                    if (cur.kind == "str") {
+                        error("reading " + type_str(cur) + " out of " + instr.name +
+                              " would need a str value, which the language does not "
+                              "have -- index to a byte, e.g. " + instr.name +
+                              "[i][j] (6.2)");
+                        return;
+                    }
+                    reg_types_[instr.result] = cur;
                 } else {
-                    // 4.1. Element stores go through check_value_into_target, the
+                    if (cur_is_container) {
+                        error("cannot store a " + type_str(cur) + " into " + instr.name +
+                              " -- the language has no container value to copy (4.1)");
+                        return;
+                    }
+                    if (cur.kind == "str") {
+                        error("cannot store a whole " + type_str(cur) + " into " + instr.name +
+                              " -- a str is storage, not a value; assign its bytes one "
+                              "at a time, e.g. " + instr.name + "[i][j] = v (6.2)");
+                        return;
+                    }
+                    // 4.1. Leaf stores go through check_value_into_target, the
                     // same path a scalar `x: int[32] = 11` takes, so a literal
                     // narrows into a narrower element when it fits and a runtime
-                    // value still may not. Checking `val_t != ct.element()`
-                    // instead made the two disagree in a way nothing explained:
-                    // `x: int[32] = 11` compiled and `xs[0] = 11` into a
-                    // list[int[32],4] did not, which left every packed-stride
-                    // element width unreachable from the frontend, because the
-                    // frontend cannot attach a width to an int literal.
-                    check_value_into_target(instr.args.at(1), ct.element(),
+                    // value still may not. Checking `val_t != cur` instead made
+                    // the two disagree in a way nothing explained: `x: int[32] =
+                    // 11` compiled and `xs[0] = 11` into a list[int[32],4] did
+                    // not, which left every packed-stride element width
+                    // unreachable from the frontend, because the frontend cannot
+                    // attach a width to an int literal.
+                    check_value_into_target(instr.args.at(n_idx), cur,
                                             "store into " + type_str(ct));
                 }
                 return;
@@ -1271,6 +1694,80 @@ private:
                 }
                 const std::string what =
                     instr.op == Op::DictContains ? "contains" : "key";
+                // 4.3. A str key is NAMED in name2 rather than held in a
+                // register, because a bounded string has no scalar form. The
+                // key run is checked against the declared key type here, and the
+                // remaining operands shift down by one (DictStore's value is
+                // then args[0], not args[1]).
+                if (dt.key_kind == "str") {
+                    if (instr.name2.empty()) {
+                        error(what + " into " + type_str(dt) +
+                              " needs a str key variable, e.g. d[k] with k: str[N] (4.3)");
+                        return;
+                    }
+                    auto kit = scope.find(instr.name2);
+                    if (kit == scope.end()) {
+                        error(what + " into " + type_str(dt) + " names '" + instr.name2 +
+                              "' which is not assigned here (V1_SPEC 0.6.10)");
+                        return;
+                    }
+                    if (kit->second.kind != "str") {
+                        error(what + " into " + type_str(dt) + " must be " +
+                              type_str(dt.key()) + ", got " + type_str(kit->second));
+                        return;
+                    }
+                    // 6.8. The key run's CAPACITY must not exceed the table's key
+                    // capacity, because construction copies a key's bytes into a
+                    // `key_cap` wide slot and a longer run's content could not
+                    // fit -- it would be truncated at construction and then fail
+                    // to compare equal at a lookup, with the same text. This is
+                    // the static form of the rule a literal already obeys ("a
+                    // literal of L bytes fits str[N] only when L < N"), applied
+                    // to a str variable as well.
+                    if (kit->second.width > dt.key_width) {
+                        error(what + " into " + type_str(dt) + ": '" + instr.name2 +
+                              "' is " + type_str(kit->second) + ", whose capacity exceeds the "
+                              "dict's key capacity of " + std::to_string(dt.key_width) +
+                              " (4.3)");
+                        return;
+                    }
+                    if (instr.op == Op::DictStore) {
+                        // 6.9. A container value is NAMED (name3) rather than
+                        // loaded, because a container is a run of bytes with no
+                        // scalar form. Check the named run against the declared
+                        // value type the same way a declaration is checked, so a
+                        // run that does not match is a type error rather than a
+                        // copy of the wrong shape into the value slot.
+                        if (!instr.name3.empty()) {
+                            check_value_into_target_named(instr.name3, dt.element(), scope,
+                                                          "store into " + type_str(dt));
+                            return;
+                        }
+                        if (instr.args.empty()) {
+                            error("DictStore needs a value");
+                            return;
+                        }
+                        check_value_into_target(instr.args.at(0), dt.element(),
+                                                "store into " + type_str(dt));
+                        return;
+                    }
+                    if (instr.op == Op::DictContains) {
+                        reg_types_[instr.result] = LType{"bool", -1};
+                    } else if (!instr.name3.empty()) {
+                        // 6.9. A container value has no register to land in, so
+                        // the frontend gives it a run instead and there is no
+                        // result to type. The run itself is what the following
+                        // subscripts are checked against.
+                    } else {
+                        reg_types_[instr.result] = dt.element();
+                    }
+                    return;
+                }
+                if (!instr.name2.empty()) {
+                    error(what + " into " + type_str(dt) + " carries a str key, but the "
+                          "dict is declared with key type " + type_str(dt.key()) + " (4.3)");
+                    return;
+                }
                 const ValueId key_id = instr.args.at(0);
                 LType kt;
                 if (!reg_type(key_id, kt)) return;
@@ -1320,6 +1817,13 @@ private:
                               "decided at compile time (4.3)");
                         return;
                     }
+                    if (!instr.name3.empty()) {
+                        // 6.9. A container value arrives as a run, so there is no
+                        // second operand: `DictStore d, %key, %valrun`.
+                        check_value_into_target_named(instr.name3, dt.element(), scope,
+                                                      "store into " + type_str(dt));
+                        return;
+                    }
                     if (instr.args.size() < 2) {
                         error("DictStore needs a key and a value");
                         return;
@@ -1330,8 +1834,132 @@ private:
                 }
                 if (instr.op == Op::DictContains) {
                     reg_types_[instr.result] = LType{"bool", -1};
+                } else if (!instr.name3.empty()) {
+                    // 6.9. A container value copy-out, as in the str-key branch.
                 } else {
                     reg_types_[instr.result] = dt.element();
+                }
+                return;
+            }
+            // 6.1. A whole-container print. It has no result and no operands;
+            // the variable is named and the shape rides the type suffix.
+            case Op::PrintContainer:
+                check_print_container(instr, scope);
+                return;
+            // 6.2. `len(s)` on a bounded string. It is a separate op from Len
+            // because a string's length is a RUN-TIME property -- the bytes
+            // before the NUL -- whereas a container's Len is its compile-time
+            // capacity. Reaching either op with the wrong kind of name is a
+            // frontend bug, so both are named concretely rather than folded.
+            case Op::StrLen: {
+                auto it = scope.find(instr.name);
+                if (it == scope.end()) {
+                    error("'" + instr.name + "' is not definitely assigned here (V1_SPEC 0.6.10)");
+                    return;
+                }
+                if (it->second.kind != "str") {
+                    error("strlen names " + type_str(it->second) +
+                          ", not a str (6.2)");
+                    return;
+                }
+                reg_types_[instr.result] = LType{"int", 64};
+                return;
+            }
+            // 6.2. `s == t` between two bounded strings. Byte-for-byte up to the
+            // NUL, so it is a run comparison rather than a scalar `eq`: neither
+            // operand is ever a register value. Both names must be str, and they
+            // may have different capacities -- comparing str[4] to str[8] is
+            // legal and equal when the contents agree.
+            case Op::StrEq: {
+                auto lit = scope.find(instr.name);
+                if (lit == scope.end()) {
+                    error("'" + instr.name + "' is not definitely assigned here (V1_SPEC 0.6.10)");
+                    return;
+                }
+                auto rit = scope.find(instr.name2);
+                if (rit == scope.end()) {
+                    error("'" + instr.name2 + "' is not definitely assigned here (V1_SPEC 0.6.10)");
+                    return;
+                }
+                if (lit->second.kind != "str" || rit->second.kind != "str") {
+                    error("streq compares two strings, got " +
+                          type_str(lit->second) + " and " + type_str(rit->second) + " (6.2)");
+                    return;
+                }
+                reg_types_[instr.result] = LType{"bool", -1};
+                return;
+            }
+            // 6.4. `s.find(sub)` and `s.count(sub)`. Like StrEq these name TWO
+            // string runs and produce a scalar; unlike StrEq the result is a
+            // full int[64] (an index or a count). Both names must be str, and
+            // their capacities may differ.
+            case Op::StrFind:
+            case Op::StrCount: {
+                auto lit = scope.find(instr.name);
+                if (lit == scope.end()) {
+                    error("'" + instr.name + "' is not definitely assigned here (V1_SPEC 0.6.10)");
+                    return;
+                }
+                auto rit = scope.find(instr.name2);
+                if (rit == scope.end()) {
+                    error("'" + instr.name2 + "' is not definitely assigned here (V1_SPEC 0.6.10)");
+                    return;
+                }
+                if (lit->second.kind != "str" || rit->second.kind != "str") {
+                    error(std::string(instr.op == Op::StrFind ? "strfind" : "strcount") +
+                          " scans two strings, got " + type_str(lit->second) + " and " +
+                          type_str(rit->second) + " (6.4)");
+                    return;
+                }
+                reg_types_[instr.result] = LType{"int", 64};
+                return;
+            }
+            // 6.7. `s.split(sep)`. Three names: the source str, the separator
+            // str, and the DESTINATION list of bounded strings, whose shape
+            // rides the trailing suffix. No result -- the piece count is a
+            // run-time value and the pieces land in the destination run.
+            case Op::StrSplit: {
+                auto sit = scope.find(instr.name);
+                if (sit == scope.end()) {
+                    error("'" + instr.name + "' is not definitely assigned here (V1_SPEC 0.6.10)");
+                    return;
+                }
+                auto eit = scope.find(instr.name2);
+                if (eit == scope.end()) {
+                    error("'" + instr.name2 + "' is not definitely assigned here (V1_SPEC 0.6.10)");
+                    return;
+                }
+                auto dit = scope.find(instr.name3);
+                if (dit == scope.end()) {
+                    error("'" + instr.name3 + "' is not definitely assigned here (V1_SPEC 0.6.10)");
+                    return;
+                }
+                if (sit->second.kind != "str" || eit->second.kind != "str") {
+                    error("strsplit splits a string by a string, got " +
+                          type_str(sit->second) + " and " + type_str(eit->second) + " (6.7)");
+                    return;
+                }
+                const LType& dest = dit->second;
+                if (dest.kind != "list" || dest.elem_kind != "str") {
+                    error("strsplit needs a destination list of bounded strings "
+                          "(list[str[K], M]), got " + type_str(dest) + " (6.7)");
+                    return;
+                }
+                // Both tiers lay the run out from the declaration but write it
+                // from the suffix, so the suffix must name the destination's own
+                // type. Both sides go through from_ir_type, so comparing the two
+                // LTops is the shape comparison: a `list[str[8], 4]` suffix and a
+                // `list[str[8], 4]` declaration agree; a `list[str[4], 8]` one
+                // does not.
+                if (!instr.decl_type) {
+                    error("strsplit needs a destination type suffix, e.g. "
+                          ": list[str[8], 4] (6.7)");
+                    return;
+                }
+                if (!(from_ir_type(*instr.decl_type) == dest)) {
+                    error("strsplit destination suffix does not match '" + instr.name3 +
+                          "', which is " + type_str(dest) + " (6.7)");
+                    return;
                 }
                 return;
             }
@@ -1549,6 +2177,21 @@ private:
                               "(V1_SPEC 0.6.1) -- write '" + instr.name + ": <type> = ...' first");
                         return;
                     }
+                    // 4.1 (phase 3). A container is storage, not a value, so
+                    // there is nothing to copy: `z = ys` has no defined meaning.
+                    // The frontend emits an unannotated store for a container
+                    // re-assignment (its declaration already carried the suffix),
+                    // so this is exactly where the copy is refused -- naming the
+                    // storage rather than letting it degrade into a runtime
+                    // "undefined variable" in the interpreter.
+                    if (it->second.kind == "list" || it->second.kind == "tuple" ||
+                        it->second.is_dict()) {
+                        error("cannot assign to '" + instr.name + "' -- " +
+                              type_str(it->second) + " is storage, not a value: it is built "
+                              "by its declaration and IndexStores, and Lithon has no "
+                              "container value to copy (4.1)");
+                        return;
+                    }
                     check_value_into_target(instr.args.at(0), it->second,
                                              "re-assignment of '" + instr.name + "'");
                     return;
@@ -1562,7 +2205,7 @@ private:
                 // backstop for hand-written IR. Lowered merge temps are exempt:
                 // the frontend generates `__ifexpr...` names that are not
                 // pointers and cannot help the spellings they start with.
-                if (!is_lowered_merge_temp(instr.name)) {
+                if (!is_compiler_temp(instr.name)) {
                     if (declared.is_ptr() && instr.name[0] != '_') {
                         error("'" + instr.name + "' is a pointer but does not start with "
                               "'_' -- 4.4's naming rule: a pointer is named `_p`, its "
@@ -1601,8 +2244,14 @@ private:
                 return;
             }
             case Op::Call: {
-                if (instr.name == "print") {
+                if (instr.name == "print" || instr.name == "print_bare") {
                     check_print_call(instr);
+                } else if (instr.name == "print_sep" || instr.name == "print_nl") {
+                    // 6.1. The separator and final newline of a multi-argument
+                    // print are argument-less; they cannot be misused.
+                    if (!instr.args.empty()) {
+                        error(instr.name + "() takes no arguments");
+                    }
                 } else {
                     check_user_call(instr);
                 }
@@ -1626,10 +2275,22 @@ private:
     // LType{"list", 10, "", -1} -- indistinguishable from a list whose element
     // failed to parse, and every later equality check would pass it.
     LType declared_type_of(const Instr& instr) {
-        LType t{instr.type_kind, instr.type_width, instr.type_elem_kind,
-                 instr.type_elem_width, instr.type_key_kind, instr.type_key_width};
+        LType t = instr.decl_type
+                      ? from_ir_type(*instr.decl_type)
+                      : LType{instr.type_kind, instr.type_width, instr.type_elem_kind,
+                              instr.type_elem_width, instr.type_key_kind, instr.type_key_width};
+        // 6.2. A str is a container here: it reserves a run and has a capacity,
+        // and the declaration must reach the frame with its name recorded. It is
+        // NOT added to the list/tuple branch below, because its element is
+        // always the byte int[8] -- there is no declared element to validate,
+        // and requiring one would refuse `s: str[16]` for spelling nothing.
         const bool container = t.kind == "list" || t.kind == "tuple" ||
-                               t.kind == "ptr" || t.kind == "dict";
+                               t.kind == "ptr" || t.kind == "dict" || t.kind == "str";
+
+        if (t.kind == "str" && t.width <= 0) {
+            error("'" + instr.name + ": str requires a capacity, e.g. str[16]");
+            return LType{};
+        }
 
         if (t.kind == "list" || t.kind == "tuple") {
             if (t.elem_kind.empty()) {
@@ -1653,20 +2314,22 @@ private:
                       "e.g. dict[int[64], int[64], 8]");
                 return LType{};
             }
-            if (t.key_kind != "int" && t.key_kind != "bool") {
-                error("'" + instr.name + ": dict keys are int or bool only, got " +
+            if (t.key_kind != "int" && t.key_kind != "bool" && t.key_kind != "str") {
+                error("'" + instr.name + ": dict keys are int, bool or str only, got " +
                       type_str(t.key()) + " (4.3)");
                 return LType{};
             }
-            // 4.3. A dict holds one scalar per slot, so a container in either
-            // position is refused here. The frontend refuses it too, but the IR
-            // is a surface of its own: `dict[int, list[...], 4]` typed nothing
-            // before, and then the print guard reported a closed overload set
-            // error about a value the user never wrote.
+            // 6.9. A dict value may be a container (a list or a tuple) as well as
+            // a scalar. A dict value is REFUSED (a dict has three regions, so it
+            // has no single leaf run a value slot can hold), exactly as it is as a
+            // list element. A str is a scalar here and a length-zero run is
+            // checked below, because a str VALUE has its capacity in `cap`, not
+            // in `elem_width`.
             if (t.elem_kind != "int" && t.elem_kind != "float" &&
-                t.elem_kind != "bool") {
-                error("'" + instr.name + ": dict values are int, float or bool only, got " +
-                      type_str(t.element()) + " (4.3)");
+                t.elem_kind != "bool" && t.elem_kind != "str" &&
+                t.elem_kind != "list" && t.elem_kind != "tuple") {
+                error("'" + instr.name + ": dict values are int, float, bool, str, list or "
+                      "tuple, got " + type_str(t.element()) + " (4.3)");
                 return LType{};
             }
             if (t.key_kind == "int" &&
@@ -1674,6 +2337,14 @@ private:
                  (t.key_width % 8) != 0)) {
                 error("'" + instr.name + ": dict int key width must be a multiple of 8 "
                       "up to 64, got " + std::to_string(t.key_width) + " (4.3)");
+                return LType{};
+            }
+            // 4.3. A str key's "width" is its byte capacity, and the table
+            // reserves that many bytes per bucket for it, so it has to be a real
+            // positive capacity rather than falling back to some default.
+            if (t.key_kind == "str" && t.key_width <= 0) {
+                error("'" + instr.name + ": dict str key needs a capacity, e.g. "
+                      "dict[str[16], int[64], 4] (4.3)");
                 return LType{};
             }
             if (t.width <= 0 || (t.width & (t.width - 1)) != 0) {
@@ -1696,8 +2367,8 @@ private:
         // container would have to carry the container's shape, which a pointer
         // cannot.
         if (t.kind == "ptr" && t.elem_kind != "int" && t.elem_kind != "float" &&
-            t.elem_kind != "bool" && t.elem_kind != "struct") {
-            error("'" + instr.name + ": ptr pointees are int, float, bool or struct, got " +
+            t.elem_kind != "bool" && t.elem_kind != "struct" && t.elem_kind != "str") {
+            error("'" + instr.name + ": ptr pointees are int, float, bool or struct or str, got " +
                   type_str(t.element()) + " (4.4)");
             return LType{};
         }
@@ -1719,6 +2390,22 @@ private:
             if (!t.elem_kind.empty() || !t.key_kind.empty()) {
                 error("'" + instr.name + ": struct carries no element or key type "
                       "-- its layout is decided by the frontend (4.6)");
+                return LType{};
+            }
+        }
+        // 6.2. A str's width is its byte capacity N, so it must be positive.
+        // A non-positive N would size the frame run to nothing (or negative) and
+        // turn every byte index into a range error on a string that has no bytes
+        // to hold. The element is implicit and must be the byte int[8].
+        if (t.kind == "str") {
+            if (t.width <= 0) {
+                error("'" + instr.name + ": str capacity must be positive, got " +
+                      std::to_string(t.width));
+                return LType{};
+            }
+            if (!(t.elem_kind == "int" && t.elem_width == 8)) {
+                error("'" + instr.name + ": str carries an implicit int[8] byte "
+                      "element, got " + type_str(t.element()) + " (6.2)");
                 return LType{};
             }
         }

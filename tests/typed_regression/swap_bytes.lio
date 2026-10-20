@@ -1,0 +1,33 @@
+# 5.2. Network byte order is big-endian; x86-64 is little-endian, so a port and
+# an IPv4 address must be byte-swapped EXPLICITLY before they go into a
+# `sockaddr_in`. The language will not do it silently -- the frontend offers
+# only shifts and bitwise ops, so the swap is written out here.
+#
+# This is not pedantry: a wrong swap does not crash. The kernel just reads a
+# different address -- 1.0.0.127 instead of 127.0.0.1 -- and `bind` fails with
+# EADDRNOTAVAIL (or, on a host where that happens to be local, quietly listens
+# somewhere else). tools/check_net_loopback.py therefore proves the swap against
+# a raw C program that issues the identical syscalls, and this file pins the
+# swap arithmetic itself with values computed independently in CPython.
+
+
+def swap16(v: int[64]) -> int[64]:
+    return ((v & 255) << 8) | ((v >> 8) & 255)
+
+
+def swap32(v: int[64]) -> int[64]:
+    return ((v & 255) << 24) | ((v & 65280) << 8) | ((v >> 8) & 65280) | ((v >> 24) & 255)
+
+
+# Port 8080 = 0x1F90 -> 0x901F = 36895.
+print(swap16(8080))
+# 127.0.0.1 = 0x7F000001 -> 0x0100007F = 16777343.
+print(swap32(2130706433))
+# Swapping twice is the identity, in both widths.
+print(swap16(swap16(8080)))
+print(swap32(swap32(2130706433)))
+
+# A `sockaddr_in` packed into one 64-bit word: the low 16 bits are sin_family,
+# the next 16 sin_port, the top 32 sin_addr. On a little-endian host the stored
+# bytes come out in exactly the struct's wire order (02 00 | 1f 90 | 7f 00 00 01).
+print(2 | (swap16(8080) << 16) | (swap32(2130706433) << 32))

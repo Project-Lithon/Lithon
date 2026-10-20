@@ -94,6 +94,24 @@ block0:
     call print, %2
     return
 """, "tier1"),
+    # 6.1. A multi-argument print must run natively, not silently fall back:
+    # the guard now proves print_bare's argument kind exactly as it did for
+    # print, and print_sep / print_nl carry no formattable value at all. Output
+    # is "7 2.5 True\n" -- the interpreter's bytes, byte for byte.
+    "print_multi_arg": ("""
+function main():
+block0:
+    %0 = const_i64 7
+    %1 = const_f64 2.5
+    %2 = const_bool 1
+    call print_bare, %0
+    call print_sep
+    call print_bare, %1
+    call print_sep
+    call print_bare, %2
+    call print_nl
+    return
+""", "tier1"),
     # int(w, x) truncates toward zero and, on success, must agree byte for
     # byte with the interpreter -- including the sign of zero and exact
     # integer arguments, which must pass through unchanged.
@@ -583,8 +601,8 @@ block0:
     # return, and getuid(2) is the same in both tier processes, so the printed
     # value proves the interpreter and the JIT agree on the call. A single
     # integer argument like this is tier-neutral by construction: no pointer
-    # crosses the boundary, so nothing depends on the interpreter's synthetic
-    # address space (pointer-taking syscalls are refused at typecheck).
+    # crosses the boundary, so nothing depends on the interpreter's address
+    # space (5.1 restricts syscall to integer args; pointer buffers are 5.2).
     "syscall_getuid": ("""
 function main():
 block0:
@@ -1038,7 +1056,7 @@ def main():
 
     with tempfile.TemporaryDirectory() as tmp:
         for suite in SUITES:
-            for py in sorted(suite.glob("*.py")):
+            for py in sorted(suite.glob("*.lio")):
                 ir = compile_to_ir(py, tmp)
                 ok, tier = check(f"{suite.name}/{py.stem}", ir)
                 results.append(ok)
@@ -1070,7 +1088,7 @@ def main():
     phi = {"match": 0, "gap": 0, "mismatch": 0}
     with tempfile.TemporaryDirectory() as tmp:
         for suite in SUITES:
-            for py in sorted(suite.glob("*.py")):
+            for py in sorted(suite.glob("*.lio")):
                 ir = compile_to_ir(py, tmp)
                 ok, kind = check_direct_phis(f"{suite.name}/{py.stem}", ir)
                 results.append(ok)

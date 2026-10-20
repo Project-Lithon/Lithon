@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """print(<pointer>) must emit a hexadecimal address, in BOTH tiers.
 
-The two tiers cannot print the same NUMBER (the interpreter hands out synthetic
-addresses, native prints real frame addresses), so tools/run_tier_diff.py's
-byte-identity rule does not apply to these programs. What must hold instead:
+The two tiers cannot print the same NUMBER (since 4.4 the interpreter hands out
+real frame/blob addresses and native prints its own real frame addresses, so
+ASLR moves both), so tools/run_tier_diff.py's byte-identity rule does not apply
+to these programs. What must hold instead:
 
   * every pointer line is `0x` + lowercase hex, no padding, nothing else;
   * the same variable's address prints identically every time;
@@ -17,7 +18,7 @@ import pathlib, re, subprocess, sys, tempfile
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 RUNNER = ROOT / "build" / "tier_runner"
 FRONTEND = ROOT / "src" / "frontend" / "frontend.py"
-CASES = ROOT / "tests" / "ptr_print" / "ptr_print_cases.py"
+CASES = ROOT / "tests" / "ptr_print" / "ptr_print_cases.lio"
 HEX = re.compile(r"^0x[0-9a-f]+$")
 
 

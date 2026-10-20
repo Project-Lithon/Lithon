@@ -32,7 +32,7 @@ FRONTEND = REPO / "src" / "frontend" / "frontend.py"
 # functions, `spelled` writes the expansions. The runtime statements are
 # identical, so the IR must be identical too.
 VIA = """\
-def Fixed(t, n) -> NewType:
+def Fixed(t, n: int[16]) -> NewType:
     return {list[t, n]}
 
 
@@ -91,8 +91,18 @@ REFUSALS = [
      "def T(a) -> NewType:\n    return {a, a}\nprint(0)\n", "LITHON-E0132"),
     ("definition: empty braces are a dict",
      "def T() -> NewType:\n    return {}\nprint(0)\n", "LITHON-E0132"),
-    ("definition: annotated parameter",
-     "def T(a: int[64]) -> NewType:\n    return {a}\nprint(0)\n", "LITHON-E0132"),
+    ("application: value parameter annotated with a container",
+     "def T(a: list[int[64], 4]) -> NewType:\n    return {int[64]}\n"
+     "x: T(1) = 1\nprint(0)\n", "LITHON-E0132"),
+    ("application: value parameter given a type",
+     "def T(n: int[16]) -> NewType:\n    return {list[int[64], n]}\n"
+     "x: T(int[64]) = 1\nprint(0)\n", "LITHON-E0132"),
+    ("application: value parameter argument out of range",
+     "def T(n: int[8]) -> NewType:\n    return {list[int[64], n]}\n"
+     "x: T(300) = 1\nprint(0)\n", "LITHON-E0132"),
+    ("application: bool value parameter given an int",
+     "def T(b: bool) -> NewType:\n    return {list[int[64], 1]}\n"
+     "x: T(1) = 1\nprint(0)\n", "LITHON-E0132"),
     ("definition: collides with a struct",
      "def T(a) -> NewType:\n    return {a}\nclass T(Struct):\n    x: int[64]\nprint(0)\n",
      "LITHON-E0132"),
@@ -114,7 +124,7 @@ REFUSALS = [
 
 
 def frontend_ir(source: str, tmp: pathlib.Path) -> tuple[int, str]:
-    path = tmp / "prog.py"
+    path = tmp / "prog.lio"
     path.write_text(source, encoding="utf-8")
     proc = subprocess.run([sys.executable, str(FRONTEND), str(path)],
                           capture_output=True, text=True)

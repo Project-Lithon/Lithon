@@ -1,0 +1,76 @@
+# bool as a first-class leaf: struct fields, enum payloads, struct-payload
+# fields, comparisons and list membership.
+#
+# A bool is a 1-byte scalar in both tiers. The JIT compares it with the same
+# full-width integer cmp/setcc path as an int, and the interpreter now agrees:
+# a bool compares as its 0/1 value, so True == 1 and True > False, exactly as in
+# Python. The expected output below is CPython's answer for the same values.
+
+
+class Flag(Struct):
+    on: bool
+    off: bool
+
+
+f: Flag
+f.on = True
+f.off = False
+print(f.on)
+print(f.off)
+
+# bool against bool, against an int, and against a float. Python: the first is
+# False, then True, True, True, True, True.
+print(f.on == f.off)
+print(f.on == True)
+print(f.off == False)
+print(f.on > f.off)
+print(f.off < f.on)
+print(f.on == 1)
+print(f.off == 0)
+print(f.on == 1.0)
+
+
+# A bool payload variant: construct, match, bind, compare.
+class E(Enum):
+    U
+    B: bool
+
+
+e: E = E.B(True)
+match e:
+    case E.U:
+        print(0)
+    case E.B(b):
+        print(b)
+        print(b == True)
+        print(b > False)
+
+
+# A bool field inside an enum's struct payload.
+class Pay(Struct):
+    flag: bool
+    n: int[32]
+
+
+class E2(Enum):
+    U
+    P: Pay
+
+
+e2: E2 = E2.P(flag=False, n=7)
+match e2:
+    case E2.U:
+        print(0)
+    case E2.P(flag=fl, n=n):
+        print(fl)
+        print(n)
+        print(fl == False)
+
+
+# `in` over a bool list lowers to the same `eq`, so it works now too.
+xs: list[bool, 3]
+xs[0] = True
+xs[1] = False
+xs[2] = True
+print(True in xs)
+print(False in xs)

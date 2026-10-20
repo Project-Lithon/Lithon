@@ -122,7 +122,7 @@ def dump_code(ir: pathlib.Path, out: pathlib.Path):
 
 
 def check_reject(tmp: pathlib.Path, name, source, needle, failures):
-    r = frontend(source, tmp / "src.py")
+    r = frontend(source, tmp / "src.lio")
     place = "frontend"
     if r.returncode == 0:
         ir = tmp / "src.ir"
@@ -140,7 +140,7 @@ def check_reject(tmp: pathlib.Path, name, source, needle, failures):
 
 
 def check_accept(tmp: pathlib.Path, name, source, expected, failures):
-    r = frontend(source, tmp / "src.py")
+    r = frontend(source, tmp / "src.lio")
     if r.returncode != 0:
         print(f"  FAIL accept: {name}: frontend refused\n        {r.stderr.strip()[:240]}")
         failures.append(name)
@@ -166,8 +166,8 @@ def check_accept(tmp: pathlib.Path, name, source, expected, failures):
 
 
 def check_identity(tmp: pathlib.Path, name, decl_src, init_src, failures):
-    ra = frontend(decl_src, tmp / "decl.py")
-    rb = frontend(init_src, tmp / "init.py")
+    ra = frontend(decl_src, tmp / "decl.lio")
+    rb = frontend(init_src, tmp / "init.lio")
     if ra.returncode != 0 or rb.returncode != 0:
         print(f"  FAIL identity: {name}: a form did not lower")
         failures.append(name)

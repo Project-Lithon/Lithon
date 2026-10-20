@@ -1,0 +1,4 @@
+# Lithon uses strings as C means, to initialize N characters for a variable you may need N+1 character size for that variable
+name:str[7] = "Lithon" # has 'L','i','t','h','o','n','\x0' ('\x0' means Null Terminator)
+print(name)
+print(len(name)) # now the len function calculates only the valid characters for a given string variable, which may not be include '\x0'(Null Terminator)

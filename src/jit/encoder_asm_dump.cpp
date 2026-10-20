@@ -267,6 +267,46 @@ int main() {
                 }
             }
         }
+        // 4.4. Base-plus-displacement accesses (struct field through a
+        // pointer). The operand is [ptr + offset]; the offset is a compile-time
+        // constant, so mod is always 10 (disp32). This block exists because the
+        // rbp+index*stride forms tie the SIB scale to the access width and a
+        // 4-byte field at scale 1 therefore cannot be encoded through them --
+        // an attempt that reused emit_load_rbp_scaled_sext silently read the
+        // wrong bytes. The bases are chosen to hit every mod=10 shape: rc1/r9
+        // plain (rm != 4,5), rsp/r12 need the no-index SIB byte, and rbp/r13
+        // are legal [reg+disp32] with no mod=00 RIP-relative escape. The
+        // displacements cross zero, the +-128 mod=01/10 boundary and a large
+        // positive value so a truncated disp32 cannot pass.
+        for (int wb : {1, 2, 4, 8}) {
+            const int wbytes = wb;
+            const std::string wsz_p = wsz(wbytes);
+            const std::string mnem = (wbytes == 4) ? "movsxd " : "movsx ";
+            for (int d = 0; d < 16; ++d) {
+                const Reg rd = static_cast<Reg>(d);
+                const std::string Dw = wname(wbytes, d);
+                const std::string D = R64[d];
+                for (int b : {1, 4, 5, 9, 12, 13}) {
+                    const Reg rb = static_cast<Reg>(b);
+                    const std::string B = R64[b];
+                    for (auto v : {0, 4, 8, -4, 100, -128, 127, 2000000}) {
+                        const std::string base = "[";
+                        const std::string at = base + B + (v < 0 ? "" : "+") +
+                                               std::to_string(v) + "]";
+                        { CodeBuffer b2; emit_reg_disp_mov(b2, rd, rb, v, wbytes,
+                                                          /*store=*/false, /*zero_extend=*/false,
+                                                          /*sign_extend=*/false);
+                          line("mov " + Dw + ", " + wsz_p + " " + at, b2); }
+                        { CodeBuffer b2; emit_store_reg_disp(b2, rd, rb, v, wbytes);
+                          line("mov " + wsz_p + " " + at + ", " + Dw, b2); }
+                        if (wbytes != 8) {
+                            { CodeBuffer b2; emit_load_reg_disp_sext(b2, rd, rb, v, wbytes);
+                              line(mnem + D + ", " + wsz_p + " " + at, b2); }
+                        }
+                    }
+                }
+            }
+        }
         // 4.4/4.6. Register-indirect loads (pointer dereference). `ValueOf` of
         // a narrow int pointee emits the sign-extending form. The base
         // registers cover all three addressing shapes: no SIB and no escape

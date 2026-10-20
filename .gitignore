@@ -19,6 +19,11 @@ docs/public/node_modules/
 
 *.log
 
+__pycache__/
+*.pyc
+# Minimized differential-fuzzer repros: written on a mismatch, never source.
+fuzz_failures/
+
 node_modules/
 
 /nul

@@ -2,10 +2,10 @@
 Python bridge for Lithon.
 
     import lithon
-    lithon.run("script.py")                    # native when provably safe, else interpreter
-    lithon.run("script.py", mode="strict")     # native only; raises if it cannot be proven safe
+    lithon.run("script.lio")                    # native when provably safe, else interpreter
+    lithon.run("script.lio", mode="strict")     # native only; raises if it cannot be proven safe
     lithon.run_source("print(2 + 3)")          # run a source string
-    ir = lithon.compile("script.py")           # just get the IR text
+    ir = lithon.compile("script.lio")           # just get the IR text
 
 How it works
 ------------
@@ -93,8 +93,19 @@ def compile_source(source: str, *, disable_gc: bool = True) -> str:
 
 
 def compile(path) -> str:  # noqa: A001 (shadowing the builtin is intentional here)
-    """Python file -> Lithon IR text."""
-    return compile_source(Path(path).read_text())
+    """Lithon file -> Lithon IR text.
+
+    A Lithon source is `.lio`. The check mirrors the frontend's own one, because
+    the library entry point calls `build_program` directly and so never passes
+    through the frontend's `main()`: without it, `lithon.run("prog.py")` would
+    quietly compile a plain Python script as Lithon.
+    """
+    p = Path(path)
+    if p.suffix != ".lio":
+        raise LithonError(
+            f"LITHON-E0114: Lithon source files use the .lio extension, "
+            f"not '{p}'")
+    return compile_source(p.read_text())
 
 
 def _tier_from(stderr: str) -> str:

@@ -1,0 +1,31 @@
+# 4.1. A list literal fills a fixed-capacity list at its declaration.
+#
+# The literal must name exactly the capacity, because len() is that static
+# capacity: a shorter literal would silently pad and make the printed length
+# disagree with the number of values the source shows. Like a tuple's literal,
+# it lowers to the same IndexStore an ordinary `xs[k] = v` uses -- there is no
+# separate constructor opcode.
+
+xs: list[int[64], 4] = [10, 20, 30, 40]
+print(xs[0], xs[1], xs[2], xs[3], len(xs))
+
+# A negative and a zero, to show the literal is not a positive-only path.
+ys: list[int[64], 3] = [-5, 0, 7]
+print(ys[0], ys[1], ys[2])
+
+# Floats and bools lower the same way, element kind and width checked by the
+# same rules an IndexStore is.
+fs: list[float[64], 3] = [1.5, 2.5, 0.5]
+print(fs[0], fs[1], fs[2])
+
+bs: list[bool, 3] = [True, False, True]
+print(bs[0], bs[1], bs[2])
+
+# A narrow element still narrows on the literal store, so an int[16] list keeps
+# signed values.
+ns: list[int[16], 3] = [-1, 2, -3]
+print(ns[0], ns[1], ns[2])
+
+# The literal can be written into afterwards, because a list is mutable.
+ys[1] = 42
+print(ys[0], ys[1], ys[2])

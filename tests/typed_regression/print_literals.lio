@@ -1,0 +1,57 @@
+# 6.3 Stage A. Printing string literals and f-strings.
+#
+# A constant chunk lowers to the same runtime pieces an ordinary multi-argument
+# print already uses -- a value printer, a separator, a newline -- with the
+# chunk's bytes materialised into a shared bounded run and printed through the
+# existing top-level str path. No format string carrying user text ever reaches
+# printf, so a `%` in a literal is an ordinary byte. `print("a", x)` inserts a
+# separator between arguments; an f-string inserts none between its pieces.
+# Every line here is byte-identical to CPython.
+
+x: int[32] = 3
+f: float[64] = 2.5
+b: bool = True
+s: str[16] = "world"
+
+# A bare literal, and a literal mixed with values (space-separated).
+print("hello")
+print("x is:", x)
+print("a", x, "b")
+print("first", "second")
+
+# Characters that would be special to a printf format are ordinary here.
+print("percent: 100%")
+print("braces: {{}} end")
+print("tab\there")
+
+# A literal against a float and a bool, through the ordinary value printer.
+print("f =", f, "b =", b)
+
+# An empty literal prints the separator/newline Python does.
+print("")
+print("a", "", "b")
+
+# f-strings: literal + value, several values adjacent, and an expression.
+print(f"x is {x}")
+print(f"f={f} b={b} s={s}")
+print(f"{x}{b}")
+print(f"{x + 1} and {-x}")
+print(f"braces {{}} in fstring")
+print(f"no values at all")
+print(f"{s}!")
+
+# A string place inside an f-string prints its text, not its repr.
+print(f"the word is {s}")
+
+# Evaluation order. Python evaluates EVERY `{...}` before it prints any piece, so
+# an expression with a side effect runs first: `noisy` prints its own line, and
+# that line appears BEFORE the f-string's, not interleaved with it. Emitting the
+# literal chunks as they are reached would write "a" and "b" around the call,
+# which is the wrong order the moment a value has an effect of its own.
+def noisy(v: int[64]) -> int[64]:
+    print("noisy ran")
+    return v
+
+
+n: int[64] = 7
+print(f"left {noisy(n)} right {n + 1}")

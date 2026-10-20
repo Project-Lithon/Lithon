@@ -1,0 +1,90 @@
+# 6.8. A dict keyed by bounded strings.
+#
+# This file lives in typed_regression rather than programs because a str-keyed
+# dict is not a Python dict in one respect that matters here: printing one
+# yields its buckets in hash order, while CPython yields insertion order. Every
+# READ below is the same relation in both languages; only the print of the whole
+# table depends on the layout, so the oracle is the two tiers agreeing byte for
+# byte rather than CPython.
+#
+# The keys chosen deliberately include a family of prefixes -- "a", "aa",
+# "aaa", "aaaa". A bounded string is a run of bytes whose text ends at the first
+# NUL, and a probe that read past that NUL would give "a" and "a\0" the same
+# hash, so a prefix of another key could be stored where its longer relative
+# lives and be unreachable. This is the case that catches it.
+
+k1: str[16] = "a"
+k2: str[16] = "aa"
+k3: str[16] = "aaa"
+k4: str[16] = "aaaa"
+
+d: dict[str[16], int[64], 4] = {"a": 10, "aa": 20, "aaa": 30, "aaaa": 40}
+print(d[k1])
+print(d[k2])
+print(d[k3])
+print(d[k4])
+
+# A string literal key resolves the same way a variable does: it is materialised
+# into its own bounded run and the run is named in the operand. The run's
+# capacity is the text's length plus one, which is NOT the table's key
+# capacity -- so this is also the case where the comparison has to be by
+# content rather than by capacity.
+print(d["aaa"])
+print(contains(d, "aaaa"))
+
+# Absence. A table that has never seen this text must answer False rather than
+# trap, and a prefix of a stored key must still be absent: "aa" is stored and
+# "a" is stored, but "ab" is neither.
+missing: str[16] = "ab"
+print(contains(d, missing))
+print(contains(d, k1))
+
+# An empty string is a key like any other. Its content length is zero, so it
+# hashes as the empty text and not as a run of whatever padding the run had.
+empty: str[16] = ""
+e: dict[str[16], int[64], 8] = {"": 1, "z": 2, "q": 3}
+print(contains(e, empty))
+print(e[""])
+
+# A table filled to its bucket count, so every probe walks to the end. Four
+# entries in four buckets is exactly full: a lookup for a key that is not there
+# has to stop after N steps rather than wrap, and every one of the four stored
+# keys had to be reached by walking past its neighbours.
+print(d)
+print(contains(d, "b"))
+
+# A different key capacity on the table than on the variable.
+#
+# The rule is that a key run's CAPACITY must not exceed the table's key
+# capacity, because construction copies a key's bytes into a key_cap wide slot
+# and a longer run's content could not survive the copy -- it would be
+# truncated when stored and then fail to compare equal at a lookup made with
+# the same text. So a str[4] table takes str[4] (or shorter) keys, and a
+# str[16] table takes str[16] keys; the capacity of a shorter run is not an
+# obstacle, only a longer one is.
+#
+# The narrower direction is the legal one exercised here: the table's slots are
+# str[4] and the variable is str[4], so the text fits and the capacities agree.
+small: dict[str[4], int[64], 4] = {"ab": 1, "cd": 2}
+ks: str[4] = "ab"
+print(small[ks])
+print(contains(small, "cd"))
+
+# A dict declared inside a loop is a fresh table each time, so a str key is
+# rebuilt from a run that is rewritten every iteration rather than reused.
+i: int[64] = 0
+while i < 3:
+    t: dict[str[16], int[64], 4] = {"x": 1, "y": 2}
+    probe: str[16] = "y"
+    if contains(t, probe):
+        print(t[probe])
+    i = i + 1
+
+# A bool valued and a float valued str-keyed table, so the VALUE type is
+# carried through the str-key probe rather than assumed to be an int.
+bv: dict[str[16], bool, 4] = {"on": True, "off": False}
+print(bv["on"])
+print(bv["off"])
+fv: dict[str[16], float[64], 4] = {"half": 1.5, "quarter": 0.25}
+print(fv["half"])
+print(fv["quarter"])

@@ -51,7 +51,7 @@ def run_lithon(py_file: pathlib.Path) -> str:
 
 
 def main():
-    programs = sorted(PROGRAMS_DIR.glob("*.py"))
+    programs = sorted(PROGRAMS_DIR.glob("*.lio"))
     if not programs:
         print("no test programs found under tests/programs/")
         return 1

@@ -302,8 +302,53 @@ inline void eliminate_dead_code(lithon::ir::Function& fn, OptimizeStats& stats) 
                 // otherwise look dead and its declaration -- the reservation of
                 // the byte run -- would be deleted, leaving every field op
                 // addressing unclaimed frame.
-                in.op == Op::FieldLoad || in.op == Op::FieldStore) {
+                in.op == Op::FieldLoad || in.op == Op::FieldStore ||
+                // 6.1. PrintContainer names its container variable, so the
+                // declaration that reserves the slot run must stay live, exactly
+                // as for Index/Len.
+                in.op == Op::PrintContainer ||
+                // 6.2. StrLen names its string variable, and StrEq names TWO
+                // strings; both reference the slot runs by name, so a variable
+                // used only through them would otherwise look dead and have its
+                // declaration deleted. 6.4's StrFind/StrCount name two strings
+                // the same way.
+                in.op == Op::StrLen || in.op == Op::StrEq ||
+                in.op == Op::StrFind || in.op == Op::StrCount ||
+                // 6.7. StrSplit names THREE runs: the source str, the separator
+                // str, and the destination list. Each is storage, so all three
+                // must stay live.
+                in.op == Op::StrSplit) {
                 mark_var(in.name);
+                if (in.op == Op::StrEq || in.op == Op::StrFind || in.op == Op::StrCount)
+                    mark_var(in.name2);
+                // 6.8. A str-keyed dict names its KEY RUN as name2: a bounded
+                // string has no register form to hold the key in, so it is the
+                // run's frame offset the probe reads. Dropping that declaration
+                // as dead would leave the offset unallocated and the probe
+                // hashing whatever bytes happen to sit there.
+                if ((in.op == Op::DictStore || in.op == Op::DictIndex ||
+                     in.op == Op::DictContains) &&
+                    !in.name2.empty())
+                    mark_var(in.name2);
+                // 6.9. A dict whose value is a container names the VALUE RUN as
+                // name3: the value slot holds no register form, so both the
+                // construction copy-in and the read copy-out address the run by
+                // frame offset. Dropping that run's last write as dead would
+                // leave the offset unallocated -- and, worse, the run's slot
+                // unclaimed -- so the copy would read unclaimed frame.
+                if ((in.op == Op::DictStore || in.op == Op::DictIndex) &&
+                    !in.name3.empty())
+                    mark_var(in.name3);
+                if (in.op == Op::StrSplit) {
+                    mark_var(in.name2);
+                    mark_var(in.name3);
+                }
+                // 6.7. A list print names its live-length companion as name2 and
+                // reads it by frame offset, so that companion's last store must
+                // survive: dropping it as dead would leave the offset
+                // unallocated and the helper reading the wrong bytes.
+                if (in.op == Op::PrintContainer && !in.name2.empty())
+                    mark_var(in.name2);
                 for (auto arg : in.args) mark_temp(arg);
             }
         }
@@ -326,9 +371,14 @@ inline void eliminate_dead_code(lithon::ir::Function& fn, OptimizeStats& stats) 
             // run of slots the Index ops address, so it is not dead code even
             // when nothing appears to read the variable -- dropping it would
             // turn every element access into an address into unclaimed frame.
+            // 6.2/6.7. A str[N] is such a run too: a declaration with no
+            // IndexStore of its own (an empty literal, or a split SOURCE that is
+            // only ever read) is still storage, so "str" belongs in this list
+            // beside the containers.
             if (in.op == Op::Store && in.args.empty() &&
                 (in.type_kind == "list" || in.type_kind == "tuple" ||
-                 in.type_kind == "dict" || in.type_kind == "struct")) {
+                 in.type_kind == "dict" || in.type_kind == "struct" ||
+                 in.type_kind == "str")) {
                 return false;
             }
             if (in.op == Op::Store) return live_vars.count(in.name) == 0;

@@ -20,7 +20,7 @@ should be read as "already true of Lithon today" unless section 10 says so.
 
 Lithon's stated promise is "if a type flow cannot be mathematically proven
 safe, Lithon will refuse to compile it." That promise has a silent gap in
-it today, and `find_e.py`'s factorial bug is the proof: `get_factorial`
+it today, and `find_e.lio`'s factorial bug is the proof: `get_factorial`
 multiplies a runtime-valued `int[64]` repeatedly, the true result outgrows
 64 bits, the compiler's static range check correctly determines it cannot
 prove this is safe — and then does *nothing further*. No error, no trap,
@@ -189,7 +189,7 @@ citations, formalized:
 ```
 LITHON-E0301: division by zero
 LITHON-E0302: shift amount out of range
-LITHON-E0303: integer overflow (dynamic operand, Tier-1 proof failed)   <- new, closes the find_e.py gap
+LITHON-E0303: integer overflow (dynamic operand, Tier-1 proof failed)   <- new, closes the find_e.lio gap
 LITHON-E0401: stack overflow
 ```
 
@@ -269,7 +269,7 @@ for each instruction I with a possible failure mode:
      trap, with a numbered error code. Stop.
 ```
 
-**Step 4 is the rule that closes the `find_e.py` gap.** Dynamic integer
+**Step 4 is the rule that closes the `find_e.lio` gap.** Dynamic integer
 overflow on `Add`/`Sub`/`Mul` currently has no tier at all — step 2 fails
 and nothing happens next. Under this algorithm, it falls through to step
 4 by construction: every fallible operation lands *somewhere*, because
@@ -295,12 +295,12 @@ op below with an unlisted or undefined fourth case.
 
 | Op | Tier 1 condition (proof succeeds) | Falls through to | Tier 2/3 behavior |
 |---|---|---|---|
-| `Add`, `Sub`, `Mul` (const operands, known width) | Full-range arithmetic stays within declared width | Dynamic operand → **Tier 3** | Runtime overflow check + trap (`E0303`) — **not yet built**, the `find_e.py` gap |
+| `Add`, `Sub`, `Mul` (const operands, known width) | Full-range arithmetic stays within declared width | Dynamic operand → **Tier 3** | Runtime overflow check + trap (`E0303`) — **not yet built**, the `find_e.lio` gap |
 | `Div`, `Mod` | Literal non-zero divisor | Dynamic divisor → **Tier 3** | Runtime zero-check + trap (`E0301`/`E0302`) — **shipped** |
 | `Shl`, `Shr` | Literal shift amount, `0 <= amount < width` | Dynamic amount → **Tier 3** | Runtime bounds check + trap (`E0304`) — **shipped** |
 | `IndexStore` (list/dict, capacity check) | Constant-provable index/length vs. declared capacity | Dynamic index/length → **Tier 3** | Runtime bounds check + trap (`E0305`) — **shipped for list**, dict TBD |
 | Stack depth (every function prologue) | N/A — always dynamic, no static proof form exists | Always **Tier 3** | Runtime depth check + trap (`E0401`) — **shipped**: both tiers increment a shared call-depth counter and trap at 4096 with byte-identical output |
-| `addressof`, `valueof`, syscall raw op | N/A — Tier 0 by definition, proof never attempted | **Tier 0** | No check. `_`-prefix required on the declaring identifier — **shipped**: the raw `syscall(number, a1..a6) -> int[64]` op is built and tier-neutral (both engines reach the same host trampoline). Arguments are integers in this slice; a pointer argument is refused because the interpreter's addresses are synthetic, not real memory, so pointer-taking syscalls (`write`/`read`) are deferred |
+| `addressof`, `valueof`, syscall raw op | N/A — Tier 0 by definition, proof never attempted | **Tier 0** | No check. `_`-prefix required on the declaring identifier — **shipped**: the raw `syscall(number, a1..a6) -> int[64]` op is built and tier-neutral (both engines reach the same host trampoline). Arguments are int[64] or pointers: 5.2's `bind`/`connect` pass `&sockaddr_in` and `send`/`recv` pass a buffer, and since 4.4 a pointer is a real host address in both tiers, so the kernel reads and writes the same bytes the language does. Floats and aggregates are refused |
 | A syscall's return value | N/A — environmental by deliberate classification | **Tier 2** | `fallible[T]` return, use-before-check enforced — **designed, not built**. The shipped form is the raw Tier-0 `int[64]` return (finite, enumerable; a negative value is `-errno` on Linux); the `fallible[T]` ergonomics here are future work |
 | `Not`, comparisons (`Lt`/`Gt`/`Eq`), `And`/`Or` | N/A — these ops cannot fail; not part of the tier system at all (see the "fifth case" in section 4) | — | No check of any kind, ever |
 
@@ -373,7 +373,7 @@ later" — the answer is always no, by construction.
   for every IR op with a possible failure mode, assert which tier fires
   under each representative input shape (compile-time-constant operand,
   runtime-dynamic operand, Tier-0-tainted operand). This is the test that
-  would have caught the `find_e.py` gap before a user did.
+  would have caught the `find_e.lio` gap before a user did.
 - **A mutation test**, same discipline as the Phi-resolution mutation test
   (25/25 failures when deliberately broken): pick one Tier-3 check,
   disable it, confirm some existing test in the suite fails. If nothing
@@ -385,7 +385,7 @@ later" — the answer is always no, by construction.
   strings share a code.
 - **Fuzzing**: extend `fuzz_diff.py` to generate programs with
   dynamic-valued arithmetic specifically designed to overflow (large
-  runtime-computed multiplicands, as in `find_e.py`) and confirm the
+  runtime-computed multiplicands, as in `find_e.lio`) and confirm the
   interpreter and JIT agree on *which tier fired*, not just on the final
   output value.
 
@@ -428,7 +428,7 @@ ad hoc handling per feature. Concretely:
 - **Retroactive fixes, landed independently of any future phase:**
   - dynamic integer overflow on `Add`/`Sub`/`Mul` (`E0303`) — a Tier-3
     runtime check with `wrap_*` opt-out; the one item with a known live bug
-    (`find_e.py`) demonstrating the gap;
+    (`find_e.lio`) demonstrating the gap;
   - the `E0401` stack-depth guard, so unbounded recursion traps rather than
     `SIGSEGV`.
 
@@ -474,9 +474,11 @@ ad hoc handling per feature. Concretely:
   through both engines with a hook installed and requires the hook to observe
   identical arguments — which is what pins the JIT's six-slot stack staging.
   The result is the kernel's raw return, unchecked (negative is `-errno` on
-  Linux). Arguments are integers in this slice; pointer arguments are refused
-  because the interpreter's pointer values are synthetic addresses rather than
-  real memory, so pointer-taking syscalls (`write`/`read`) are deferred
+  Linux). Arguments are int[64] or pointers; a pointer argument is a real host
+  address in both tiers (4.4), so 5.2's `bind`/`connect` (`&sockaddr_in`) and
+  `send`/`recv` (a buffer) read and write the same bytes on either side.
+  `tools/check_net_loopback.py` proves a loopback round trip against a raw C
+  oracle; floats and aggregates remain refused.
 - `tools/check_error_codes.py` (the code-discipline gate wired into
   `verify_all.sh`) and `tools/typecheck.py`'s mirror of the static checks
 

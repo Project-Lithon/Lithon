@@ -1,0 +1,38 @@
+# 6.2. A bounded string as a struct FIELD. A `str[N]` field's bytes live in a
+# companion byte run named by the dotted attribute path, so len, indexed read
+# and write, print and == all apply to the field exactly as they do to a
+# top-level string. CPython cannot run this (Struct is not a Python builtin),
+# so expected/struct_str.out is written from the documented 6.2 semantics, the
+# same split ptr_field.py and struct_basic.py use.
+class C(Struct):
+    name: str[8]
+    n: int[8]
+
+
+c: C
+c.name = "hi"
+c.n = 7
+print(c.name)
+print(len(c.name))
+print(c.name[0])
+print(c.name[1])
+print(c.n)
+
+# A byte write goes through the field's companion run; read it back the same way.
+c.name[0] = 120
+print(c.name)
+print(c.name[0])
+
+# Reassigning a shorter literal zeroes the tail, so len shrinks and the bytes
+# past the NUL read back as zero.
+c.name = "z"
+print(c.name)
+print(len(c.name))
+print(c.name[2])
+
+# Equality against a plain string variable.
+s: str[8] = "z"
+print(c.name == s)
+
+t: str[8] = "zz"
+print(c.name == t)

@@ -1,0 +1,47 @@
+# 4.4, second half. A struct field read and WRITTEN through a pointer:
+# `valueof(_p).field`. The frontend lowers it to a fieldload/fieldstore whose
+# subject is the pointer register rather than a struct variable name, so both
+# tiers address the same bytes the named form does. CPython cannot run this
+# (Struct is not a Python builtin), so expected/ptr_field.out is written from
+# the documented 4.4/4.6 semantics.
+
+
+class Point(Struct):
+    x: int[64]
+    y: int[64]
+
+
+p: Point
+p.x = 10
+p.y = 20
+_pp: ptr[Point] = addressof(p)
+
+print(valueof(_pp).x)
+print(valueof(_pp).y)
+
+# Write through the pointer, read through the name -- one set of bytes.
+valueof(_pp).x = 99
+print(p.x)
+print(p.y)
+
+# Write through the name, read through the pointer.
+p.y = -7
+print(valueof(_pp).y)
+
+
+# Narrow fields, so the pointer path's sign-extension is exercised at every
+# width the scalar path supports.
+class Narrow(Struct):
+    a: int[8]
+    b: int[16]
+    c: int[32]
+
+
+n: Narrow
+n.a = -5
+n.b = -300
+n.c = -70000
+_n: ptr[Narrow] = addressof(n)
+print(valueof(_n).a)
+print(valueof(_n).b)
+print(valueof(_n).c)

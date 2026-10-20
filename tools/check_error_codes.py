@@ -227,6 +227,14 @@ E0401_TRAPS = [
      "print(y)\n",
      "LITHON-E0401: stack overflow -- call depth 4097 exceeded the 4096-frame "
      "guard; rewrite the recursion as an explicit loop"),
+    # 6.7. str.split writes at most the destination's capacity and returns the
+    # true piece count; more pieces than slots is a run-time trap, and it must
+    # read identically in both tiers.
+    ("str.split produces more pieces than the list holds (source)",
+     "s: str[32] = \"a,b,c,d,e\"\n"
+     "parts: list[str[8], 3] = s.split(\",\")\n"
+     "print(parts)\n",
+     "too many pieces for the list (str.split)"),
 ]
 
 
@@ -235,7 +243,7 @@ def _run_source(tmp, tag, source, mode):
 
     Returns (returncode, normalized stdout, normalized stderr).
     """
-    src = tmp / f"{tag}.py"
+    src = tmp / f"{tag}.lio"
     src.write_text(source)
     ir = tmp / f"{tag}.ir"
     r = run(["python3", str(FRONTEND), str(src)])
@@ -410,6 +418,18 @@ FRONTEND_REFUSALS = [
      "d: dict[int[64], int[64], 8] = {x: 1}\nprint(0)\n", "LITHON-E0123"),
     ("tuple literal on a plain assignment (E0123)",
      "t: tuple[int[64], 2]\nt = (1, 2)\nprint(0)\n",      "LITHON-E0123"),
+    ("str key in an int-keyed dict (E0123)",
+     "d: dict[int[64], int[64], 8] = {\"a\": 1}\nprint(0)\n", "LITHON-E0123"),
+    ("non-str key in a str-keyed dict (E0123)",
+     "d: dict[str[16], int[64], 8] = {1: 1}\nprint(0)\n",  "LITHON-E0123"),
+    ("str key too long for the declared key type (E0123)",
+     "d: dict[str[2], int[64], 8] = {\"abc\": 1}\nprint(0)\n", "LITHON-E0123"),
+    ("duplicate str key in a dict literal (E0123)",
+     "d: dict[str[16], int[64], 4] = {\"a\": 1, \"a\": 2}\nprint(0)\n", "LITHON-E0123"),
+    ("dict-valued dict value is refused (E0112)",
+     "d: dict[int[64], dict[int[64], int[64], 4], 4]\nprint(0)\n", "LITHON-E0112"),
+    ("ptr-valued dict value is refused (E0112)",
+     "d: dict[int[64], ptr[int[64]], 4]\nprint(0)\n", "LITHON-E0112"),
     ("range(a,b,0) literal step is E0107",
      "for i in range(5, 1, 0):\n    print(i)\n", "LITHON-E0107"),
     ("struct without the Struct base (E0126)",
@@ -450,8 +470,9 @@ FRONTEND_REFUSALS = [
      "def T(a) -> NewType:\n    return {a, a}\nprint(0)\n", "LITHON-E0132"),
     ("type function body is an empty dict (E0132)",
      "def T() -> NewType:\n    return {}\nprint(0)\n", "LITHON-E0132"),
-    ("type function with an annotated parameter (E0132)",
-     "def T(a: int[64]) -> NewType:\n    return {a}\nprint(0)\n", "LITHON-E0132"),
+    ("type function value parameter given a type (E0132)",
+     "def T(n: int[16]) -> NewType:\n    return {list[int[64], n]}\nx: T(int[64]) = 1\nprint(0)\n",
+     "LITHON-E0132"),
     ("type function name collides with a struct (E0132)",
      "def T(a) -> NewType:\n    return {a}\nclass T(Struct):\n    x: int[64]\nprint(0)\n",
      "LITHON-E0132"),
@@ -503,6 +524,78 @@ FRONTEND_REFUSALS = [
     ("method with no result used as a value (E0135)",
      "class P(Struct):\n    x: int[64]\n    def f(self):\n        return\n"
      "p: P\nprint(p.f())\n", "LITHON-E0135"),
+    # 6.2. Bounded strings. A str[N] is N bytes, so a literal of L bytes needs
+    # L < N (the last byte is the NUL terminator), the capacity must be a
+    # positive literal, and the value must be a string literal -- there is no
+    # str value to copy or compute in the language.
+    ("str literal does not fit its capacity (E0111)",
+     "s: str[2] = \"abc\"\nprint(s)\n", "LITHON-E0111"),
+    ("str capacity must be positive (E0111)",
+     "s: str[0]\nprint(0)\n", "LITHON-E0111"),
+    ("str value must be a string literal (E0114)",
+     "t: str[4] = \"hi\"\ns: str[4] = t\nprint(s)\n", "LITHON-E0114"),
+    # 6.2. The same rules when the string is a struct FIELD or a pointer's
+    # pointee. A field's companion run is keyed by the dotted variable path, so
+    # a whole-str field read is valueless (E0114) and reading one through a
+    # pointer into the struct has no companion name (E0128). A pointer's
+    # pointee is a place, not a value, so valueof(_p) used as one is E0114.
+    ("str field literal does not fit its capacity (E0111)",
+     "class C(Struct):\n    a: str[2]\n\nc: C\nc.a = \"abc\"\nprint(c.a)\n", "LITHON-E0111"),
+    ("whole str field used as a value (E0114)",
+     "class C(Struct):\n    a: str[4]\n\nc: C\nx: str[4] = c.a\nprint(x)\n", "LITHON-E0114"),
+    ("str field read through a pointer into the struct (E0128)",
+     "class C(Struct):\n    a: str[4]\n\np: C\n_pp: ptr[C] = addressof(p)\n"
+     "print(valueof(_pp).a)\n", "LITHON-E0128"),
+    ("whole str pointee used as a value (E0114)",
+     "s: str[4] = \"hi\"\n_p: ptr[str[4]] = addressof(s)\n"
+     "x: int[64] = valueof(_p)\nprint(x)\n", "LITHON-E0114"),
+    # 6.3 Stage A. An f-string chunk is printed as bytes, so the only two
+    # Python f-string features this slice does not implement are refused where
+    # the source spells them, rather than silently dropped.
+    ("f-string format specifier is not supported (E0114)",
+     "x: int[32] = 3\nprint(f\"{x:.2f}\")\n", "LITHON-E0114"),
+    ("f-string conversion is not supported (E0114)",
+     "x: int[32] = 3\nprint(f\"{x!r}\")\n", "LITHON-E0114"),
+    # 6.4. find/count need a string needle and exactly one argument; anything
+    # else is named where the source spells it.
+    ("str.find with a non-string needle (E0114)",
+     "s: str[8] = \"hi\"\nx: int[32] = 1\nprint(s.find(x))\n", "LITHON-E0114"),
+    ("str.count with the wrong number of arguments (E0114)",
+     "s: str[8] = \"hi\"\nprint(s.count(\"h\", \"i\"))\n", "LITHON-E0114"),
+    # 6.7. list.append: one value, a list receiver, a statement, and somewhere to
+    # put the element. Each is refused where the source spells it.
+    ("list.append with the wrong number of arguments (E0114)",
+     "xs: list[int[64], 4] = [1, 2]\nxs.append(1, 2)\n", "LITHON-E0114"),
+    ("list.append used as a value (E0135)",
+     "xs: list[int[64], 4] = [1, 2]\ny: int[64] = xs.append(3)\n", "LITHON-E0135"),
+    ("list.append onto a full list (E0111)",
+     "xs: list[int[64], 2] = [1, 2]\nxs.append(3)\n", "LITHON-E0111"),
+    # 6.7. A reduction or membership scan unrolls over a compile-time length, so
+    # a list whose length is only known at run time has no fixed bound. The
+    # bound is given up by an append inside a loop.
+    ("sum over a run-time-length list (E0115)",
+     "xs: list[int[64], 5] = [1, 2]\nfor i in range(2):\n    xs.append(i)\n"
+     "print(sum(xs))\n", "LITHON-E0115"),
+    ("in over a run-time-length list (E0114)",
+     "xs: list[int[64], 5] = [1, 2]\nfor i in range(2):\n    xs.append(i)\n"
+     "print(3 in xs)\n", "LITHON-E0114"),
+    ("enumerate over a run-time-length list (E0119)",
+     "xs: list[int[64], 5] = [1, 2]\nfor i in range(2):\n    xs.append(i)\n"
+     "for j, v in enumerate(xs):\n    print(v)\n", "LITHON-E0119"),
+    # 6.7. str.split: a statement-shaped call with a string source, a NON-EMPTY
+    # string separator, and a destination that is a list of bounded strings.
+    # Each of those is refused where the source spells it.
+    ("str.split with an empty separator (E0114)",
+     "s: str[8] = \"a,b\"\np: list[str[4], 2] = s.split(\"\")\n", "LITHON-E0114"),
+    ("str.split with no separator (E0114)",
+     "s: str[8] = \"a,b\"\np: list[str[4], 2] = s.split()\n", "LITHON-E0114"),
+    ("str.split with a non-string separator (E0114)",
+     "s: str[8] = \"a,b\"\np: list[str[4], 2] = s.split(3)\n", "LITHON-E0114"),
+    ("str.split into a list that cannot hold strings (E0114)",
+     "s: str[8] = \"a,b\"\np: list[int[64], 2] = s.split(\",\")\n", "LITHON-E0114"),
+    ("sum over a split result's run-time length (E0115)",
+     "s: str[16] = \"a,b,c\"\np: list[str[4], 4] = s.split(\",\")\n"
+     "print(sum(p))\n", "LITHON-E0115"),
 ]
 
 
@@ -510,7 +603,7 @@ def check_frontend_refusals(failures):
     with tempfile.TemporaryDirectory() as td:
         tmp = pathlib.Path(td)
         for i, (name, source, needle) in enumerate(FRONTEND_REFUSALS):
-            src = tmp / f"r{i}.py"
+            src = tmp / f"r{i}.lio"
             src.write_text(source)
             r = run(["python3", str(FRONTEND), str(src)])
             if r.returncode == 0:
@@ -533,8 +626,8 @@ def check_e0105(failures):
         tmp = pathlib.Path(td)
         for name, where, body, needle in E0105_REJECTS:
             if where == "frontend":
-                (tmp / "in.py").write_text(body)
-                r = run(["python3", str(FRONTEND), str(tmp / "in.py")])
+                (tmp / "in.lio").write_text(body)
+                r = run(["python3", str(FRONTEND), str(tmp / "in.lio")])
             else:
                 ir = tmp / "in.ir"
                 ir.write_text(body)
@@ -546,8 +639,8 @@ def check_e0105(failures):
                       f"{'accepted' if r.returncode == 0 else 'refused without ' + needle!r}")
                 failures.append(name)
         for i, body in enumerate(E0105_ACCEPTS):
-            (tmp / "in.py").write_text(body)
-            r = run(["python3", str(FRONTEND), str(tmp / "in.py")])
+            (tmp / "in.lio").write_text(body)
+            r = run(["python3", str(FRONTEND), str(tmp / "in.lio")])
             if r.returncode != 0:
                 print(f"  FAIL accept: case {i + 1} refused by frontend: "
                       f"{r.stderr.strip()[:160]}")
@@ -564,6 +657,39 @@ def check_e0105(failures):
                 print(f"  ok   accept: case {i + 1} ({body.splitlines()[0].strip()})")
 
 
+def check_extension_gate(failures):
+    """A Lithon program is `.lio`, and only `.lio`.
+
+    The extension is the one marker that separates a Lithon source from an
+    ordinary Python script, so the frontend refuses anything else outright.
+    Both halves are checked: the SAME bytes are refused as `.py` and accepted
+    as `.lio`, which is what proves the gate keys on the extension and not on
+    the contents.
+    """
+    body = "x: int[64] = 7\nprint(x)\n"
+    with tempfile.TemporaryDirectory() as td:
+        tmp = pathlib.Path(td)
+        (tmp / "prog.py").write_text(body)
+        r = run(["python3", str(FRONTEND), str(tmp / "prog.py")])
+        if r.returncode == 0:
+            print("  FAIL extension gate: a .py source was accepted")
+            failures.append("extension gate (.py accepted)")
+        elif "LITHON-E0114" not in r.stderr:
+            print(f"  FAIL extension gate: .py refused without E0114: "
+                  f"{r.stderr.strip()[:160]}")
+            failures.append("extension gate (no E0114)")
+        else:
+            print("  ok   extension gate: .py source refused (E0114)")
+        (tmp / "prog.lio").write_text(body)
+        r = run(["python3", str(FRONTEND), str(tmp / "prog.lio")])
+        if r.returncode != 0:
+            print(f"  FAIL extension gate: the same bytes as .lio were refused: "
+                  f"{r.stderr.strip()[:160]}")
+            failures.append("extension gate (.lio refused)")
+        else:
+            print("  ok   extension gate: the same bytes as .lio compile")
+
+
 def main() -> int:
     missing = [p.name for p in (FRONTEND, TIER) if not p.exists()]
     if missing:
@@ -573,10 +699,12 @@ def main() -> int:
     check_discipline(failures)
     check_e0105(failures)
     check_frontend_refusals(failures)
+    check_extension_gate(failures)
     check_e0303(failures)
     check_e0401(failures)
     total = len(E0105_REJECTS) + len(E0105_ACCEPTS) + 1
     total += len(FRONTEND_REFUSALS)
+    total += 2   # check_extension_gate: the .py refusal and the .lio accept
     total += len(E0303_REJECTS) + len(E0303_WRAPS) + len(E0303_TRAPS)
     total += len(E0401_ACCEPTS) + len(E0401_TRAPS)
     done = total - len(failures)

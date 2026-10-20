@@ -79,6 +79,10 @@ struct ParsedType {
     // correct and does not need to learn about keys.
     std::string key_kind;
     int key_width = -1;
+
+    // The same declaration as a recursive tree, so a nested element survives
+    // with its inner shape. The flat fields above are its one-level projection.
+    std::shared_ptr<Type> tree;
 };
 
 // Splits on commas that are not inside a subscript. `int[64], bool, 8` has a
@@ -112,43 +116,62 @@ static size_t matching_close(const std::string& t, size_t open) {
     return std::string::npos;
 }
 
-ParsedType parse_type_string(const std::string& raw) {
-    std::string t = trim(raw);
-    size_t bracket = t.find('[');
-    if (bracket == std::string::npos) return ParsedType{t, -1, "", -1};
+// The type the OLD flat projection called its "width": a scalar's bit width, a
+// struct's byte size, or a container's capacity/bucket count. This is the value
+// that used to be stacked into elem_width/key_width, so projecting it keeps
+// every pre-nesting reader byte-for-byte correct.
+static int flat_width(const Type& t) {
+    // 6.2. A str[N]'s "width" projection is its byte capacity N, not a bit
+    // width, exactly as a container projects its capacity.
+    if (t.kind == "str") return t.cap;
+    return t.is_container() ? t.cap : t.width;
+}
 
-    ParsedType out;
-    out.kind = trim(t.substr(0, bracket));
+static std::shared_ptr<Type> parse_type_tree(const std::string& raw) {
+    const std::string t = trim(raw);
+    const size_t bracket = t.find('[');
+    auto ty = std::make_shared<Type>();
+    if (bracket == std::string::npos) {
+        ty->kind = t;
+        return ty;
+    }
+    ty->kind = trim(t.substr(0, bracket));
     const size_t close = matching_close(t, bracket);
     if (close == std::string::npos)
         throw std::runtime_error("malformed type annotation: " + raw);
 
     const std::string inner = trim(t.substr(bracket + 1, close - bracket - 1));
-    if (out.kind != "list" && out.kind != "tuple" && out.kind != "ptr" &&
-        out.kind != "dict") {
-        // A scalar: `int[8]` -- width is a bit width.
-        out.width = std::stoi(inner);
-        return out;
+    // 6.2. `str[N]` is a bounded string: N bytes with an implicit int[8] byte
+    // element, so it is laid out and indexed like a one-level container even
+    // though its kind is "str" (string printing and run-time length are what
+    // make it distinct). Building cap + elem here means every container-shaped
+    // reader already sees "N bytes of int[8]" without a second code path.
+    if (ty->kind == "str") {
+        ty->cap = inner.empty() ? -1 : std::stoi(inner);
+        ty->elem = std::make_shared<Type>();
+        ty->elem->kind = "int";
+        ty->elem->width = 8;
+        return ty;
+    }
+    if (ty->kind != "list" && ty->kind != "tuple" && ty->kind != "ptr" &&
+        ty->kind != "dict") {
+        // A scalar: `int[8]` -- width is a bit width; `struct[N]` is a byte size.
+        ty->width = std::stoi(inner);
+        return ty;
     }
 
-    // 4.3. A dict is the one container with three fields, `K, V, N`, so it is
-    // split separately rather than by extending the two field path below.
-    if (out.kind == "dict") {
+    // 4.3. A dict is the one container with three fields, `K, V, N`.
+    if (ty->kind == "dict") {
         const std::vector<std::string> parts = split_top_level(inner);
         if (parts.size() != 3)
             throw std::runtime_error("malformed dict type annotation: " + raw);
-        const ParsedType k = parse_type_string(parts[0]);
-        const ParsedType v = parse_type_string(parts[1]);
-        out.key_kind = k.kind;
-        out.key_width = k.width;
-        out.elem_kind = v.kind;
-        out.elem_width = v.width;
-        out.width = parts[2].empty() ? -1 : std::stoi(parts[2]);
-        return out;
+        ty->key = parse_type_tree(parts[0]);
+        ty->elem = parse_type_tree(parts[1]);
+        ty->cap = parts[2].empty() ? -1 : std::stoi(parts[2]);
+        return ty;
     }
 
-    // A container: `int[64], 10` or, for ptr, just `int[64]`. Split on the
-    // top-level comma only.
+    // A container: `T, N` or, for ptr, just `T`. Split on the top-level comma.
     size_t comma = std::string::npos;
     int depth = 0;
     for (size_t i = 0; i < inner.size(); ++i) {
@@ -156,31 +179,44 @@ ParsedType parse_type_string(const std::string& raw) {
         else if (inner[i] == ']') --depth;
         else if (inner[i] == ',' && depth == 0) { comma = i; break; }
     }
-    // ptr carries no capacity -- `ptr[int[64]]` is complete as written -- so a
-    // missing comma is only an error for the sized containers.
+    // ptr carries no capacity -- `ptr[T]` is complete as written -- so a missing
+    // comma is only an error for the sized containers.
     if (comma == std::string::npos) {
-        if (out.kind == "ptr") {
-            const ParsedType e = parse_type_string(trim(inner));
-            out.elem_kind = e.kind;
-            out.elem_width = e.width;
-            return out;
+        if (ty->kind == "ptr") {
+            ty->elem = parse_type_tree(inner);
+            return ty;
         }
         throw std::runtime_error("malformed container type annotation: " + raw);
     }
 
-    const std::string elem = trim(inner.substr(0, comma));
+    ty->elem = parse_type_tree(trim(inner.substr(0, comma)));
     const std::string rest = trim(inner.substr(comma + 1));
+    ty->cap = rest.empty() ? -1 : std::stoi(rest);
+    return ty;
+}
 
-    // The element is itself a type string, so `list[list[int[8],4],2]` nests.
-    const ParsedType e = parse_type_string(elem);
-    out.elem_kind = e.kind;
-    out.elem_width = e.width;
-    if (e.width < 0 && e.kind == "list") {
-        // A list element with no width carries its capacity in the element slot;
-        // keep it addressable rather than silently flattening to -1.
-        out.elem_width = e.width;
+ParsedType parse_type_string(const std::string& raw) {
+    ParsedType out;
+    out.tree = parse_type_tree(raw);
+    const Type& ty = *out.tree;
+    out.kind = ty.kind;
+    out.width = flat_width(ty);
+    if (ty.kind == "dict") {
+        if (ty.key) {
+            out.key_kind = ty.key->kind;
+            out.key_width = flat_width(*ty.key);
+        }
+        if (ty.elem) {
+            out.elem_kind = ty.elem->kind;
+            out.elem_width = flat_width(*ty.elem);
+        }
+    } else if (ty.kind == "ptr" || ty.kind == "list" || ty.kind == "tuple" ||
+               ty.kind == "str") {
+        if (ty.elem) {
+            out.elem_kind = ty.elem->kind;
+            out.elem_width = flat_width(*ty.elem);
+        }
     }
-    out.width = rest.empty() ? -1 : std::stoi(rest);
     return out;
 }
 
@@ -350,6 +386,7 @@ Module parse_ir_text(const std::string& text) {
             instr.type_elem_width = pt.elem_width;
             instr.type_key_kind = pt.key_kind;
             instr.type_key_width = pt.key_width;
+            instr.decl_type = pt.tree;
             rhs = trim(rhs.substr(0, type_sep));
         }
 
@@ -394,33 +431,116 @@ Module parse_ir_text(const std::string& text) {
         // not a ValueId: the address is derived from the variable's slot run,
         // so it is carried in `name` and only the real operands are refs.
         } else if (oa.op_name == "Index") {
+            // A nested access is one instruction with a whole chain of indices
+            // (see ContainerLayout): `Index xs, i, j` has name "xs" and indices
+            // i, j. A one-level `Index xs, i` is the chain of length one, so
+            // every existing producer and reader is unchanged.
             instr.op = Op::Index;
             instr.name = oa.raw_args.at(0);
-            instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+            for (size_t a = 1; a < oa.raw_args.size(); ++a)
+                instr.args.push_back(parse_value_ref(oa.raw_args.at(a)));
         } else if (oa.op_name == "IndexStore") {
+            // Same chain, but the LAST argument is the value being written and
+            // every argument before it is an index: `IndexStore xs, i, j, %v`.
             instr.op = Op::IndexStore;
             instr.name = oa.raw_args.at(0);
-            instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
-            instr.args.push_back(parse_value_ref(oa.raw_args.at(2)));
+            for (size_t a = 1; a + 1 < oa.raw_args.size(); ++a)
+                instr.args.push_back(parse_value_ref(oa.raw_args.at(a)));
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(oa.raw_args.size() - 1)));
         } else if (oa.op_name == "Len") {
             instr.op = Op::Len;
             instr.name = oa.raw_args.at(0);
+        // 6.2. String ops. Same `name`-carries-the-variable convention; StrEq
+        // names a SECOND variable as well, which lands in name2.
+        } else if (oa.op_name == "strlen") {
+            instr.op = Op::StrLen;
+            instr.name = oa.raw_args.at(0);
+        } else if (oa.op_name == "streq") {
+            instr.op = Op::StrEq;
+            instr.name = oa.raw_args.at(0);
+            instr.name2 = oa.raw_args.at(1);
+        // 6.4. The two substring scans. Same two-name convention as StrEq: the
+        // haystack is `name`, the needle is `name2`.
+        } else if (oa.op_name == "strfind") {
+            instr.op = Op::StrFind;
+            instr.name = oa.raw_args.at(0);
+            instr.name2 = oa.raw_args.at(1);
+        } else if (oa.op_name == "strcount") {
+            instr.op = Op::StrCount;
+            instr.name = oa.raw_args.at(0);
+            instr.name2 = oa.raw_args.at(1);
+        // 6.7. Three names: the source str, the separator str, and the
+        // destination list of bounded strings. The destination's shape rides the
+        // trailing type suffix.
+        } else if (oa.op_name == "strsplit") {
+            instr.op = Op::StrSplit;
+            instr.name = oa.raw_args.at(0);
+            instr.name2 = oa.raw_args.at(1);
+            instr.name3 = oa.raw_args.at(2);
         // 4.3. Dict ops. Same convention as the container ops above: the first
         // argument is the dict VARIABLE, so it lands in `name` and only the key
         // and the value are real operand references.
+        //
+        // A key that is a str is a NAME, not a value reference: a bounded string
+        // has no scalar form to put in a register, so the run is named in `name2`
+        // and the value shifts down into args[0]. The two forms are told apart by
+        // the token itself -- a register always starts with '%', a run never
+        // does -- so the parser does not need the dict's declared key type.
         } else if (oa.op_name == "DictStore") {
             instr.op = Op::DictStore;
             instr.name = oa.raw_args.at(0);
-            instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
-            instr.args.push_back(parse_value_ref(oa.raw_args.at(2)));
+            // 6.9. Up to two of the three operands may be NAMES rather than
+            // registers: a str key (name2) and a container value (name3). They
+            // are independent -- `dict[str[N], list[T, M], B]` has both -- so
+            // each is classified on its own. A container value is the LAST
+            // operand, so it is peeled first and the rest read as (key, value)
+            // or (key); then the key slot is a register or a named run.
+            size_t nargs = oa.raw_args.size();
+            if (nargs >= 3 && !oa.raw_args.back().empty() && oa.raw_args.back()[0] != '%') {
+                instr.name3 = oa.raw_args.back();
+                --nargs;
+            }
+            if (!oa.raw_args.at(1).empty() && oa.raw_args.at(1)[0] == '%') {
+                // A register key. The value, if the operand list still holds
+                // one, is the next slot; a peeled container value leaves none.
+                instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+                if (nargs >= 3) instr.args.push_back(parse_value_ref(oa.raw_args.at(2)));
+            } else {
+                instr.name2 = oa.raw_args.at(1);
+                if (nargs >= 3) instr.args.push_back(parse_value_ref(oa.raw_args.at(2)));
+            }
         } else if (oa.op_name == "DictIndex") {
             instr.op = Op::DictIndex;
             instr.name = oa.raw_args.at(0);
-            instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+            // 6.9. A container value is copied OUT into a named run rather than
+            // into a register, so the read names it as a third argument (the same
+            // split DictStore uses for a named value, at the other end).
+            if (oa.raw_args.size() >= 3 && !oa.raw_args.back().empty() &&
+                oa.raw_args.back()[0] != '%') {
+                instr.name3 = oa.raw_args.back();
+            }
+            if (!oa.raw_args.at(1).empty() && oa.raw_args.at(1)[0] == '%')
+                instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+            else
+                instr.name2 = oa.raw_args.at(1);
         } else if (oa.op_name == "DictContains") {
             instr.op = Op::DictContains;
             instr.name = oa.raw_args.at(0);
-            instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+            if (!oa.raw_args.at(1).empty() && oa.raw_args.at(1)[0] == '%')
+                instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+            else
+                instr.name2 = oa.raw_args.at(1);
+        // 6.1. Printing a whole container. Same convention as the container ops
+        // above: the first argument is the container VARIABLE, so it lands in
+        // `name`; the shape rides the generic trailing " : T" suffix already
+        // parsed above into the type fields. No operands, no result.
+        } else if (oa.op_name == "print_container") {
+            instr.op = Op::PrintContainer;
+            instr.name = oa.raw_args.at(0);
+            // Phase 6.7. A list names its live-length companion as a SECOND
+            // argument (`print_container xs, xs.__len : ...`); a tuple, dict or
+            // str has none and names only the run.
+            if (oa.raw_args.size() >= 2) instr.name2 = oa.raw_args.at(1);
         // 4.4. Pointer ops. AddressOf names the target VARIABLE like the
         // container ops; ValueOf's pointer arrives as a real operand ValueId.
         // `%v = valueof %p : int[64]` already works: the generic trailing

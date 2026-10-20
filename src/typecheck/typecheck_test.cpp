@@ -273,9 +273,9 @@ block0:
     return
 )", "needs an element type");
 
-    // ptr renders without a phantom capacity, and a nested element renders as
-    // `list[...]` rather than as its bare capacity -- `list[list[4], 2]` reads
-    // like a list of 4-element ints, which is not what it is.
+    // ptr renders without a phantom capacity, and a nested element is rendered
+    // to its full depth -- `list[list[4], 2]` would read like a list of
+    // 4-element ints, which is not what it is, so the tree is walked.
     expect_rejects("ptr renders with no capacity", R"(
 function __main__():
 block0:
@@ -284,13 +284,13 @@ block0:
     return
 )", "ptr[int[64]]");
 
-    expect_rejects("nested list renders its element as list[...]", R"(
+    expect_rejects("nested list renders its element to full depth", R"(
 function __main__():
 block0:
     %0 = const_i64 1
     store g, %0 : list[list[int[8],4],2]
     return
-)", "list[list[...], 2]");
+)", "list[list[int[8], 4], 2]");
 
     // 4.1 container access. The declarations below use a container that was
     // already built, so the shape rules are tested on their own terms: an
@@ -306,6 +306,61 @@ block0:
     store n, %2 : int[64]
     return
 )");
+
+    // 4.1 (phase 3). Nested containers use a flat-leaf model: an access carries
+    // the WHOLE index chain and lands on a scalar leaf. There is no container
+    // value, so `Index xs, 0` alone is refused (see the test below); a nested
+    // read is one multi-index Index.
+    expect_accepts("nested container: index a list[tuple[int[64],4],2] to the leaf", R"(
+function __main__():
+block0:
+    store xs : list[tuple[int[64],4],2]
+    %0 = const_i64 0
+    %2 = const_i64 1
+    %3 = Index xs, %0, %2
+    store n, %3 : int[64]
+    return
+)");
+
+    // An intermediate container has no value to bind, so stopping the chain
+    // short is refused with the container-value message, not accepted.
+    expect_rejects("nested container: a partial index chain is refused", R"(
+function __main__():
+block0:
+    store xs : list[list[int[64],4],2]
+    %0 = const_i64 0
+    %1 = Index xs, %0
+    store inner, %1 : list[int[64],4]
+    return
+)", "container value");
+
+    expect_rejects("nested container: wrong leaf element type is rejected", R"(
+function __main__():
+block0:
+    store xs : list[list[int[64],4],2]
+    %0 = const_i64 0
+    %2 = const_i64 1
+    %3 = Index xs, %0, %2
+    store f, %3 : float[64]
+    return
+)", "stored into float[64]");
+
+    // 4.1 (phase 3). A container is storage, not a value, so `z = ys` (which the
+    // frontend lowers to `%n = load ys` / `store z, %n`) has nothing to copy.
+    // The store carries no type suffix -- the declaration already did -- so it
+    // reaches the unannotated path, where the container re-assignment is
+    // refused. Before this the load/assignment slipped through and died at
+    // runtime in the interpreter with "undefined variable", which is not a
+    // language error at all.
+    expect_rejects("container copy: z = ys has no container value to copy", R"(
+function __main__():
+block0:
+    store z : list[int[64],2]
+    store ys : list[int[64],2]
+    %0 = load ys
+    store z, %0
+    return
+)", "container value to copy");
 
     // Static-only capacity overflow: the index is a literal and N is part of the
     // type, so this is decidable at compile time rather than being left to a
@@ -948,9 +1003,11 @@ block0:
     return
 )", "malformed dict type annotation");
 
-    // A key type has to be one a table can hold. There is no string key: a
-    // frame slot holds a number, and 4.3 is not a step toward string keys.
-    expect_rejects("string keyed dict", R"(
+    // 6.8. A str key is NAMED, not held in a register: a bounded string has no
+    // scalar form, so the key arrives as the run it lives in. A str-keyed dict
+    // probed with a key register has its operands shifted wrong, and refusing it
+    // here is what keeps the value from being read as a key.
+    expect_rejects("str keyed dict probed with an int key register", R"(
 function __main__():
 block0:
     store d : dict[str[64], int[64], 4]
@@ -958,7 +1015,49 @@ block0:
     %1 = DictIndex d, %0
     call print, %1
     return
-)", "dict keys are int or bool only");
+)", "needs a str key variable");
+
+    // 6.8. The same, the other way round: an int-keyed dict handed a key run by
+    // name. The run would be read as a key region the table does not have, so
+    // the declared key type and the operand have to agree here rather than in
+    // codegen.
+    expect_rejects("int keyed dict probed with a str key run", R"(
+function __main__():
+block0:
+    store d : dict[int[64], int[64], 4]
+    store k : str[64]
+    DictStore d, k, %0
+    call print, %0
+    return
+)", "dict is declared with key type int[64]");
+
+    // 6.8. A key run wider than the table's key slot cannot have its content
+    // copied into the slot, so it would be truncated on the way in and fail to
+    // compare equal on the way out -- the same text, two different answers,
+    // depending on which side of construction it was asked.
+    expect_rejects("str key wider than the dict key slot", R"(
+function __main__():
+block0:
+    store d : dict[str[8], int[64], 4]
+    store k : str[64]
+    DictIndex d, k
+    call print, %0
+    return
+)", "capacity exceeds the dict's key capacity");
+
+    // 6.8. The key run has to be a declared str, exactly as a key register has
+    // to be defined: the probe reads its bytes, and a name that was never
+    // declared has no bytes to read. (A valueless `store k : str[N]` DOES bind
+    // k -- a str is a container, so the declaration reserves its run -- which
+    // is why the reachable refusal here is the undeclared name.)
+    expect_rejects("str key run that was never declared", R"(
+function __main__():
+block0:
+    store d : dict[str[8], int[64], 4]
+    DictIndex d, missing
+    call print, %0
+    return
+)", "which is not assigned here");
 
     // An int key needs a width, because the key region is packed at the width
     // the type names. A widthless int would leave the stride undefined, and it
@@ -1056,7 +1155,9 @@ block0:
     return
 )", "must be bool, got int[64]");
 
-    // A value type a frame slot cannot hold. Same rule as a list element.
+    // A value type a frame slot cannot hold: a dict has three regions, so it has
+    // no single leaf run a value slot could be. (A list/tuple value IS accepted
+    // as of 6.9 -- it is one flat leaf run.)
     expect_rejects("dict of dicts", R"(
 function __main__():
 block0:
@@ -1065,7 +1166,21 @@ block0:
     %1 = DictIndex d, %0
     call print, %1
     return
-)", "dict values are int, float or bool only");
+)", "dict values are int, float, bool, str, list or tuple");
+
+    // 6.9. A container value is a legal dict value: it is laid out as one flat
+    // leaf run in the value region, exactly as the interpreter's leaf copy and
+    // the JIT's memcpy both assume.
+    expect_accepts("dict with a list value", R"(
+function __main__():
+block0:
+    store d : dict[int[64], list[int[64], 4], 4]
+    store v : list[int[64], 4]
+    %0 = const_i64 1
+    DictStore d, %0, v
+    print_container d : dict[int[64], list[int[64], 4], 4]
+    return
+)");
 
     std::printf("typecheck: pointers (4.4)\n");
 
@@ -1858,11 +1973,13 @@ block0:
     return
 )");
 
-    // A pointer argument is refused, and the refusal is the point: the
-    // interpreter's pointers are synthetic addresses, so a pointer-taking
-    // syscall (write/read) could not behave the same in both tiers. Accepting
-    // it would ship a construct that works natively and faults in the oracle.
-    expect_rejects("syscall refuses a pointer argument", R"(
+    // 5.2. A pointer argument is ACCEPTED: bind/connect take `&sockaddr_in`
+    // and send/recv take a buffer. Since 4.4 a pointer is a real host address
+    // in both tiers, so the kernel reads and writes the same bytes the language
+    // does; only the address differs across tiers, and only the bytes are
+    // observed. A float or an aggregate is still refused -- neither is passed
+    // by value.
+    expect_accepts("syscall accepts a pointer argument", R"(
 function __main__():
 block0:
     %0 = const_i64 65
@@ -1872,7 +1989,7 @@ block0:
     %3 = syscall %2, %1
     call print, %3
     return
-)", "a raw syscall argument must be an integer in this slice");
+)");
 
     expect_rejects("syscall refuses a float argument", R"(
 function __main__():
@@ -1882,7 +1999,7 @@ block0:
     %2 = syscall %0, %1
     call print, %2
     return
-)", "a raw syscall argument must be an integer in this slice");
+)", "a raw syscall argument must be an integer or a pointer");
 
     // A syscall needs a number; with no operands at all there is nothing to
     // call, so this is a static refusal rather than a runtime surprise.

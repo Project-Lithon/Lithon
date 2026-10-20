@@ -235,7 +235,7 @@ def main():
 
         irs = list(args.irs)
         if args.dir:
-            for py in sorted(args.dir.glob("*.py")):
+            for py in sorted(args.dir.glob("*.lio")):
                 fe = subprocess.run([sys.executable, str(ROOT / "src/frontend/frontend.py"), str(py)],
                                     capture_output=True, text=True)
                 if fe.returncode != 0:
