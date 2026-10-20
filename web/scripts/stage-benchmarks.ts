@@ -21,10 +21,14 @@ const OUT = join(WEB_ROOT, "apps", "web", "public", "benchmarks")
 
 /** Where a recorded command's script lives now. */
 const REMAP: Record<string, string> = {
-  "bench_vid_maker/tasks/python_sum.py": "test_codes_python/test_1b_fsum.py",
-  "bench_vid_maker/tasks/python_sum_1k.py": "test_codes_python/test_1k_fsum.py",
+  "bench_vid_maker/tasks/python_sum.py": "test_codes_python/Loops/test_1b_fsum.py",
+  "bench_vid_maker/tasks/python_sum_1k.py": "test_codes_python/Loops/test_1k_fsum.py",
   "bench_vid_maker/tasks/python_euler.py":
-    "test_codes_python/test_eulars_constant_lim_def.py",
+    "test_codes_python/Loops/test_eulars_constant_lim_def.py",
+  "test_codes_lithon/test_1b_fsum.py": "test_codes_lithon/Loops/test_1b_fsum.lio",
+  "test_codes_lithon/test_1k_fsum.py": "test_codes_lithon/Loops/test_1k_fsum.lio",
+  "test_codes_lithon/test_eulars_constant_lim_def.py":
+    "test_codes_lithon/Loops/test_eulars_constant_lim_def.lio",
 }
 
 function remapCommand(command: string[]): string[] {
@@ -57,7 +61,7 @@ for (const file of readdirSync(RESULTS).sort()) {
 
   const tasks = raw.results.map((task: any) => {
     const command = remapCommand(task.command.slice(1))
-    const script = command.find((c: string) => c.endsWith(".py"))
+    const script = command.find((c: string) => c.endsWith(".py") || c.endsWith(".lio"))
     if (script && !existsSync(join(REPO_ROOT, script))) {
       missing.push(`${id}: ${task.name} -> ${script}`)
     }

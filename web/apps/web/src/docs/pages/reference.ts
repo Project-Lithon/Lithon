@@ -68,20 +68,111 @@ const errors: DocPage = {
               "`range(a, b, 0)` with a literal zero step",
             ],
             [
-              "`E0108`-`E0125`, 1 (static refusal)",
-              "annotation, container, pointer, assignment, loop, declaration, tuple/dict, and function-header restrictions: one code per construct (see docs/lithon_error_system.md)",
+              "`E0108`, 1 (static refusal)",
+              "Unsupported type-annotation form",
             ],
             [
-              "`E0126`-`E0131`, 1 (static refusal)",
-              "struct/enum definition, field, access, variant construction, and `match` restrictions",
+              "`E0109`, 1 (static refusal)",
+              "Unknown or badly-sized annotation type name",
             ],
             [
-              "`E0132`-`E0135`, 1 (static refusal)",
-              "type-function and method definition/application restrictions",
+              "`E0110`, 1 (static refusal)",
+              "Annotation missing a required field",
+            ],
+            [
+              "`E0111`, 1 (static refusal)",
+              "Bad container capacity / literal count / `str[N]` capacity or literal length",
+            ],
+            [
+              "`E0112`, 1 (static refusal)",
+              "Container element must be a plain scalar",
+            ],
+            [
+              "`E0113`, 1 (static refusal)",
+              "Pointer (`ptr[T]`) declaration rules",
+            ],
+            [
+              "`E0114`, 1 (static refusal)",
+              "Unsupported or restricted program construct -- the catch-all: an operator that does not exist, a `try`/`except` shape that is not allowed, a string literal used where a value is needed",
+            ],
+            [
+              "`E0115`, 1 (static refusal)",
+              "Unsupported builtin call form",
+            ],
+            [
+              "`E0116`, 1 (static refusal)",
+              "Builtin argument rules (`valueof`/`addressof`/`wrap_*`)",
+            ],
+            [
+              "`E0117`, 1 (static refusal)",
+              "Indexing / container-subscript restrictions",
+            ],
+            [
+              "`E0118`, 1 (static refusal)",
+              "`else` clause on a `while`/`for` loop",
+            ],
+            ["`E0119`, 1 (static refusal)", "`for`-loop form restrictions"],
+            [
+              "`E0120`, 1 (static refusal)",
+              "`break`/`continue` outside a loop",
+            ],
+            [
+              "`E0121`, 1 (static refusal)",
+              "Assignment / target restrictions",
+            ],
+            [
+              "`E0122`, 1 (static refusal)",
+              "Declaration and re-declaration rules (including the `_` prefix rule for pointers)",
+            ],
+            ["`E0123`, 1 (static refusal)", "Tuple/dict literal shape"],
+            [
+              "`E0124`, 1 (static refusal)",
+              "Function-header restrictions",
+            ],
+            ["`E0125`, 1 (static refusal)", "Pointer arithmetic form"],
+            [
+              "`E0126`, 1 (static refusal)",
+              "Struct definition (must derive from `Struct`; fields are annotations only)",
+            ],
+            [
+              "`E0127`, 1 (static refusal)",
+              "Struct field type (int[w]/float[64]/bool or an earlier struct; no containers/pointers)",
+            ],
+            [
+              "`E0128`, 1 (static refusal)",
+              "Struct field access (unknown field, a whole struct used where a value is needed, or a `str` field reached through a pointer into the struct)",
+            ],
+            [
+              "`E0129`, 1 (static refusal)",
+              "Enum definition (must derive from `Enum`; variants are bare unit names, payload annotations, or inline `class V(Struct)`)",
+            ],
+            [
+              "`E0130`, 1 (static refusal)",
+              "Enum variant construction (unknown variant, wrong payload shape, unknown/missing/duplicate struct-payload field)",
+            ],
+            [
+              "`E0131`, 1 (static refusal)",
+              "`match` on an enum (bad subject/pattern, non-exhaustive, a guard, a wildcard that is not last, or an enum used where a value is needed)",
+            ],
+            [
+              "`E0132`, 1 (static refusal)",
+              "Type-function definition (`-> NewType`): bad signature, a body that is not a one-element `{ T }`, a duplicate name, or a name colliding with a runtime function/struct/enum",
+            ],
+            [
+              "`E0133`, 1 (static refusal)",
+              "Type-function application: an unknown callee, keyword/starred arguments, an arity mismatch, or a recursive expansion",
+            ],
+            [
+              "`E0134`, 1 (static refusal)",
+              "Method definition (a `def` in a struct/enum body): a decorator, `/`/`*`/`**`/defaults, a missing or annotated `self`, a non-scalar parameter/return, a duplicate name, or a name colliding with a field or variant",
+            ],
+            [
+              "`E0135`, 1 (static refusal)",
+              "Method application: an unknown method, a field where a method is called, a non-struct/enum receiver, an arity mismatch, a recursive inline, or a method with no result used as a value",
             ],
             [
               "`E0201`, 2 (environmental)",
-              "Fallible value read before `.ok` check",
+              "Fallible value read before `.ok` check -- designed, not built: `fallible[T]` does not exist yet",
             ],
             ["`E0301`, 3 (dynamic trap)", "Division by zero: shipped"],
             ["`E0302`, 3 (dynamic trap)", "Modulo by zero: shipped"],
@@ -113,6 +204,12 @@ const errors: DocPage = {
               "Stack overflow: shipped, 4096-depth shared counter, byte-identical in both tiers",
             ],
           ],
+        },
+        {
+          kind: "note",
+          tone: "note",
+          title: "the tier digit is the contract",
+          text: "The first digit after `E` is not decoration: it says whether the failure was knowable before the program ran. A tier-1 code is a refusal -- the program never started. A tier-3 code is a trap -- the program started, and stopped at a specific operation. `try`/`except` can only catch tier-3 traps, because a tier-1 refusal has no program to catch it in. Every code the source uses must be listed in docs/whitepaper.md; `tools/check_error_codes.py` fails the build otherwise.",
         },
       ],
     },
@@ -204,9 +301,13 @@ print(i)`,
           example: {
             lang: "bash",
             title: "terminal",
-            source: `$ lithon div_zero.py            # dynamic divisor
+            source: `$ lithon div_zero.lio            # dynamic divisor
 LITHON-E0301: division by zero`,
           },
+        },
+        {
+          kind: "p",
+          text: "Because the message is the same in both tiers, a trap can be caught by name and handled identically either way. `try`/`except` catches exactly these tier-3 traps -- see [Control flow](/docs/control-flow#try-except) for the catchable set and the three shapes that are deliberately refused.",
         },
       ],
     },
@@ -217,7 +318,7 @@ const builtins: DocPage = {
   slug: "builtins",
   title: "Built-in functions",
   description:
-    "print, len, range, addressof, valueof, contains, and the wrap_* family: the whole prelude.",
+    "print, len, range, addressof, valueof, contains, enumerate, zip, and the wrap_* family: the whole prelude.",
   group: "reference",
   tags: [
     "builtins",
@@ -227,6 +328,10 @@ const builtins: DocPage = {
     "addressof",
     "valueof",
     "contains",
+    "enumerate",
+    "zip",
+    "append",
+    "split",
     "wrap",
     "prelude",
   ],
@@ -306,10 +411,61 @@ const builtins: DocPage = {
           ],
         },
         {
+          kind: "p",
+          text: "Two more names are built in, but only in a `for` header: `enumerate(xs)` yields `(index, value)` and `zip(xs, ys)` yields pairs, stopping at the shortest input. Used anywhere else they are refused, because a general iteration protocol does not exist yet.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "enumerate and zip in a for header",
+            // tools/typecheck.py is a mirror of the older scalar-only static
+            // checks and does not know the container type language yet; the
+            // real checker (the C++ one, which runs inside tier_runner) does.
+            typecheck: false,
+            source: `xs: list[int[64], 3]
+ys: list[int[64], 3]
+xs[0] = 10
+xs[1] = 20
+xs[2] = 30
+ys[0] = 1
+ys[1] = 2
+ys[2] = 3
+for i, x in enumerate(xs):
+    print(i)
+for a, b in zip(xs, ys):
+    print(a)`,
+            output: "0\n1\n2\n10\n20\n30",
+          },
+        },
+        {
+          kind: "p",
+          text: "Three names behave like methods rather than free functions: `xs.append(v)` on a `list` (which never grows the list -- it can only fail with a full list), `s.find(sub)` / `s.count(sub)` on a bounded string, and `s.split(sep)` into a declared destination list.",
+        },
+        {
           kind: "note",
           tone: "note",
           title: "wrap_* is the explicit opt-in",
           text: "Provable static overflow of plain `+`/`-`/`*` is a compile error (E0101/E0303-family) that points you at `wrap_*`. The wrapping result is pinned to be identical across tiers by tools/check_error_codes.py.",
+        },
+        {
+          kind: "linkcards",
+          items: [
+            {
+              title: "Containers",
+              href: "/docs/containers",
+              text: "What `len`, `sum` and `append` actually operate on.",
+            },
+            {
+              title: "Semantics",
+              href: "/docs/semantics",
+              text: "Where Lithon deliberately diverges from CPython.",
+            },
+            {
+              title: "Errors & diagnostics",
+              href: "/docs/errors",
+              text: "The code family, and which of them you can catch.",
+            },
+          ],
         },
       ],
     },
@@ -320,8 +476,8 @@ const builtins: DocPage = {
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/int64_wrap.py",
-            sourceRef: "tests/typed_regression/int64_wrap.py",
+            title: "tests/typed_regression/int64_wrap.lio",
+            sourceRef: "tests/typed_regression/int64_wrap.lio",
             expectedRef: "tests/typed_regression/expected/int64_wrap.out",
             source: `x: int[64] = 9223372036854775807
 y: int[64] = 1
@@ -458,6 +614,41 @@ print(7 % -3)`,
             ["`and` / `or` on non-bool", "type error"],
             ["chained comparison `a < b < c`", "not supported"],
             ["`for`/`else`", "rejected, never silently dropped"],
+          ],
+        },
+        {
+          kind: "p",
+          text: "A trap raised by any of the rules above can be caught by name with `try`/`except` -- see [Control flow](/docs/control-flow#try-except) for the catchable set. A static refusal cannot: it happens before the program exists to catch it.",
+        },
+      ],
+    },
+    {
+      id: "where-to-go-next",
+      title: "Where to go next",
+      blocks: [
+        {
+          kind: "linkcards",
+          items: [
+            {
+              title: "Errors & diagnostics",
+              href: "/docs/errors",
+              text: "Every code, and which tier it belongs to.",
+            },
+            {
+              title: "Built-in functions",
+              href: "/docs/builtins",
+              text: "The whole prelude, one row per name.",
+            },
+            {
+              title: "Control flow",
+              href: "/docs/control-flow",
+              text: "if / while / for, and `try`/`except`.",
+            },
+            {
+              title: "Honest limits",
+              href: "/docs/limits",
+              text: "What does not work yet, stated plainly.",
+            },
           ],
         },
       ],
@@ -655,7 +846,7 @@ const limits: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: 'No stdlib, no import system beyond the built-ins, no classes, no closures, no exceptions. Lithon is an experiment in one narrow question: what happens to a Python-shaped language when the types are mandatory and the machine is visible, and the honest answer to "can it run my app?" is "almost certainly not, yet".',
+          text: 'No stdlib, no import system beyond the built-ins, no closures, and no exception objects: `try`/`except` catches the engine\'s own traps, but there is nothing to bind. Lithon is an experiment in one narrow question: what happens to a Python-shaped language when the types are mandatory and the machine is visible, and the honest answer to "can it run my app?" is "almost certainly not, yet".',
         },
         {
           kind: "linkcards",

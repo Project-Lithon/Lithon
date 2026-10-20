@@ -1,4 +1,4 @@
-"""Plain-CPython equivalent of test_codes_lithon/test_1b_fsum_simd.py.
+"""Plain-CPython equivalent of test_codes_lithon/Loops/test_1b_fsum_simd.lio.
 
 Same program: 1e9 iterations of a float[64] accumulator, adding 0.5 each
 time. Lithon runs this through the auto-vectorizer's AVX2 path.

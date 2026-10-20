@@ -167,12 +167,12 @@ export function lithonApi(): Plugin {
         }
         const dir = join(REPO_ROOT, "test_codes_lithon")
         const files = [
-          "test_1k_fsum.py",
-          "test_float.py",
-          "base_var.py",
-          "test_eulars_constant_lim_def.py",
-          "check_pointers.py",
-          "test_multi_ops.py",
+          "Loops/test_1k_fsum.lio",
+          "Loops/test_float.lio",
+          "DataTypes/base_var.lio",
+          "Loops/test_eulars_constant_lim_def.lio",
+          "Pointers/check_pointers.lio",
+          "Loops/test_multi_ops.lio",
         ]
         const out: { name: string; source: string }[] = []
         for (const name of files) {

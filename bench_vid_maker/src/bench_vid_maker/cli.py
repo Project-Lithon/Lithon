@@ -14,6 +14,7 @@ from rich.console import Console
 from .config import PROJECT_ROOT, load_config
 from .recorder import VideoRecorder
 from .ui import run_with_ui
+from .wsl import have_wsl, reexec_in_wsl
 
 # Sized so the default rendered frame lands comfortably in 2K+ territory
 # with the (larger, more legible) default font_size -- see VideoRecorder's
@@ -21,6 +22,26 @@ from .ui import run_with_ui
 DEFAULT_VIDEO_COLS = 234
 DEFAULT_VIDEO_ROWS = 56
 DEFAULT_FONT_SIZE = 34
+
+
+def _wsl_preferred() -> bool:
+    """Whether to prefer a WSL run over a Windows-native one by default.
+
+    The Lithon engine's fast tier is an x86-64 native binary; on Windows
+    it needs `build/tier_runner.exe`, and the repository is frequently
+    built on Linux/WSL only. Rather than failing with a confusing
+    "native runner not found" error, the tool measures on WSL when it can.
+    Set `BENCH_VID_MAKER_NO_WSL=1` to opt out.
+    """
+    if os.environ.get("BENCH_VID_MAKER_NO_WSL"):
+        return False
+    from .wsl import wsl_executable
+
+    if wsl_executable() is None:
+        return False
+    # A Windows-native engine build is a perfectly good place to measure --
+    # only prefer WSL when the repo has no Windows runner at all.
+    return not (PROJECT_ROOT / "build" / "tier_runner.exe").exists()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,7 +78,23 @@ def main(argv: list[str] | None = None) -> int:
         "--no-music", action="store_true",
         help="don't mux the procedurally-generated (non-copyright) background music into the video",
     )
+    ap.add_argument(
+        "--wsl", action="store_true",
+        help="re-execute the whole run inside WSL (both engines measured natively on Linux)",
+    )
+    ap.add_argument(
+        "--no-wsl", action="store_true",
+        help="never re-execute inside WSL, even when WSL is available",
+    )
     args = ap.parse_args(argv)
+
+    # WSL re-exec: the honest place to measure is a Linux kernel with both
+    # engines running natively. The child re-enters this same entry point,
+    # so the guard below keeps it from re-execing twice.
+    if args.wsl and not args.no_wsl and have_wsl():
+        return reexec_in_wsl()
+    if not args.no_wsl and not args.wsl and have_wsl() and _wsl_preferred():
+        return reexec_in_wsl()
 
     try:
         cfg = load_config(args.config)

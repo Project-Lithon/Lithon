@@ -71,7 +71,7 @@ export function actionEntries(): ActionEntry[] {
       title: "Go to Contributors",
       subtitle: "Who is building Lithon",
       tags: ["contributors", "people", "community", "navigate"],
-      run: "nav:/contributors",
+      run: "nav:/#contributors",
     },
     {
       id: "action:nav-benchmarks",

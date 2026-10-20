@@ -1,0 +1,10 @@
+title = "Summing 1,000,000,000 half-increments: CPython vs Lithon"
+subtitle = "float[64] accumulator -- the case Lithon's auto-vectorizer (AVX2) targets"
+
+[[tasks]]
+name = "CPython"
+command = ["{python}", "test_codes_python/Loops/test_1b_fsum_simd.py"]
+
+[[tasks]]
+name = "Lithon"
+command = ["{lithon}", "test_codes_lithon/Loops/test_1b_fsum_simd.lio"]

@@ -1,0 +1,10 @@
+title = "Fibonacci(30): CPython vs Lithon"
+subtitle = "same recursive program, run as-is in each engine"
+
+[[tasks]]
+name = "CPython"
+command = ["{python}", "test_codes_python/Functions/fibb.py"]
+
+[[tasks]]
+name = "Lithon"
+command = ["{lithon}", "test_codes_lithon/Functions/fibb.lio"]

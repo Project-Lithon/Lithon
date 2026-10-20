@@ -22,7 +22,7 @@ const welcome: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "Lithon is a **Python library and native x86-64 execution engine** that runs `.py` source using an extended PEP-526 static typing syntax. Python remains the source language, Lithon is not a separate language, but every supported program is statically verified and can execute as generated machine code, with no LLVM, no Cranelift, and no runtime package.",
+          text: "Lithon is a **Python library and native x86-64 execution engine** that runs `.lio` source using an extended PEP-526 static typing syntax. The source language is Python's syntax; the `.lio` extension is what marks a file as a Lithon program rather than an ordinary Python script. Every supported program is statically verified and can execute as generated machine code, with no LLVM, no Cranelift, and no runtime package.",
         },
         {
           kind: "code",
@@ -92,7 +92,7 @@ print(result)`,
           kind: "table",
           caption: "The design space Lithon explores",
           rows: [
-            ["Syntax", "Python `.py` + extended PEP-526"],
+            ["Syntax", "Python syntax + extended PEP-526, in a `.lio` file"],
             [
               "Primary execution",
               "Native x86-64 (CPython: bytecode; PyPy: tracing JIT)",
@@ -144,6 +144,16 @@ print(result)`,
               text: "Two tiers, one rule: prove before you run.",
             },
             {
+              title: "Types & widths",
+              href: "/docs/types",
+              text: "The one rule that makes the rest checkable: every type carries its width.",
+            },
+            {
+              title: "Control flow",
+              href: "/docs/control-flow",
+              text: "if / while / for, and `try`/`except` over the engine's own traps.",
+            },
+            {
               title: "Machine view",
               href: "/docs/source-to-machine",
               text: "See the IR and x86-64 behind the examples.",
@@ -181,7 +191,7 @@ const helloWorld: DocPage = {
         {
           kind: "code",
           example: {
-            title: "hello.py",
+            title: "hello.lio",
             source: `x: int[64] = 10
 y: int[64] = 20
 
@@ -207,8 +217,8 @@ print(result)`,
         {
           kind: "code",
           example: {
-            title: "tests/programs/arithmetic.py",
-            sourceRef: "tests/programs/arithmetic.py",
+            title: "tests/programs/arithmetic.lio",
+            sourceRef: "tests/programs/arithmetic.lio",
             expectedRef: "tests/programs/expected/arithmetic.out",
             source: `x: int[64] = 10
 y: int[64] = 20
@@ -261,15 +271,15 @@ print(x)`,
           items: [
             {
               title: "Type-check only",
-              text: "`tools/typecheck.py hello.py`: static analysis over the AST, no execution. Exits non-zero with an `RCR error` on the first violation.",
+              text: "`tools/typecheck.py hello.lio`: static analysis over the AST, no execution. Exits non-zero with an `RCR error` on the first violation.",
             },
             {
               title: "Compile to IR",
-              text: "`src/frontend/frontend.py hello.py`: lowers the typed AST to Lithon's text IR on stdout. No engine needed, pure Python.",
+              text: "`src/frontend/frontend.py hello.lio`: lowers the typed AST to Lithon's text IR on stdout. No engine needed, pure Python.",
             },
             {
               title: "Run natively",
-              text: "`lithon hello.py --strict`: the two-step dance: frontend to IR, then `tier_runner` emits x86-64 and calls it. `--strict` refuses rather than falling back to the interpreter.",
+              text: "`lithon hello.lio --strict`: the two-step dance: frontend to IR, then `tier_runner` emits x86-64 and calls it. `--strict` refuses rather than falling back to the interpreter.",
             },
           ],
         },
@@ -278,7 +288,7 @@ print(x)`,
           example: {
             lang: "bash",
             title: "terminal",
-            source: `$ lithon hello.py --strict
+            source: `$ lithon hello.lio --strict
 [tier1] native
 30`,
           },
@@ -349,7 +359,7 @@ $ cmake --build build -j$(nproc)`,
         },
         {
           kind: "p",
-          text: "There is no Makefile to hand-edit, CMake drives everything. Python appears at exactly one step, turning a `.py` file into IR; once IR exists the native program never touches CPython.",
+          text: "There is no Makefile to hand-edit, CMake drives everything. Python appears at exactly one step, turning a `.lio` file into IR; once IR exists the native program never touches CPython.",
         },
       ],
     },
@@ -363,10 +373,10 @@ $ cmake --build build -j$(nproc)`,
             lang: "bash",
             title: "install in editable mode, then",
             source: `$ pip install -e .
-$ lithon tests/programs/float.py
-$ lithon tests/programs/float.py --strict    # native only, refuse to fall back
-$ lithon tests/programs/float.py --ir       # print the IR and stop
-$ lithon tests/programs/float.py -v         # say which tier ran, and why`,
+$ lithon tests/programs/float.lio
+$ lithon tests/programs/float.lio --strict    # native only, refuse to fall back
+$ lithon tests/programs/float.lio --ir       # print the IR and stop
+$ lithon tests/programs/float.lio -v         # say which tier ran, and why`,
           },
         },
         {
@@ -385,7 +395,7 @@ $ lithon tests/programs/float.py -v         # say which tier ran, and why`,
           kind: "note",
           tone: "note",
           title: "Prefer scripts? The two-step dance is open",
-          text: "`python3 src/frontend/frontend.py prog.py > prog.ir` then `./build/tier_runner prog.ir --strict`. The `lithon` wrapper is convenience, not a black box.",
+          text: "`python3 src/frontend/frontend.py prog.lio > prog.ir` then `./build/tier_runner prog.ir --strict`. The `lithon` wrapper is convenience, not a black box.",
         },
       ],
     },
@@ -500,7 +510,7 @@ Unknown
           example: {
             lang: "bash",
             title: "terminal",
-            source: `$ lithon program.py --strict`,
+            source: `$ lithon program.lio --strict`,
           },
         },
         {
@@ -513,7 +523,7 @@ Unknown
             {
               title: "Inside the engine",
               href: "/docs/architecture",
-              text: "Four layers from `.py` source to executable memory.",
+              text: "Four layers from `.lio` source to executable memory.",
             },
             {
               title: "Dual-tier execution",

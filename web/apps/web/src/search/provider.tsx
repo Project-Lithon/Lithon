@@ -140,7 +140,22 @@ function runAction(entry: ActionEntry, navigate: (to: string) => void) {
       return
     default:
       if (entry.run.startsWith("nav:")) {
-        navigate(entry.run.slice(4))
+        const target = entry.run.slice(4)
+        // A `nav:` target may carry a `#hash`; the router takes the path and
+        // the browser has to scroll the anchor itself, because a same-page
+        // hash is not a navigation the router performs.
+        const [path, hash] = target.split("#", 2)
+        if (hash) {
+          navigate(path || "/")
+          // wait for the destination to render before scrolling to it
+          requestAnimationFrame(() => {
+            const el = document.getElementById(hash)
+            if (el) el.scrollIntoView({ behavior: "smooth", block: "start" })
+            else window.location.hash = hash
+          })
+        } else {
+          navigate(target)
+        }
       } else if (/^https?:\/\//.test(entry.run)) {
         window.open(entry.run, "_blank", "noreferrer")
       }

@@ -1,4 +1,4 @@
-"""Plain-CPython equivalent of test_codes_lithon/test_multi_ops.py.
+"""Plain-CPython equivalent of test_codes_lithon/Loops/test_multi_ops.lio.
 
 Same program: 1e9 iterations of mixed integer arithmetic -- a multiply, a
 bitwise xor, and a right shift -- accumulated into a total.

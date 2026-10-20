@@ -295,7 +295,7 @@ function Playground() {
             <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
               <CardHeader className="flex flex-row items-center justify-between border-b py-2">
                 <CardTitle className="font-mono text-xs font-normal text-muted-foreground">
-                  program.py
+                  program.lio
                 </CardTitle>
                 <div className="flex items-center gap-2">
                   <span className="hidden font-mono text-[10px] text-muted-foreground sm:block">

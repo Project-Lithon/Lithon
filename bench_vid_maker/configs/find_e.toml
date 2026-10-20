@@ -1,0 +1,10 @@
+title = "Finding e by its series: CPython vs Lithon"
+subtitle = "8,000 terms of 1/n!, computed with an explicit factorial loop"
+
+[[tasks]]
+name = "CPython"
+command = ["{python}", "test_codes_python/Loops/find_e.py"]
+
+[[tasks]]
+name = "Lithon"
+command = ["{lithon}", "test_codes_lithon/Loops/find_e.lio"]

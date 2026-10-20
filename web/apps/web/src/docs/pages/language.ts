@@ -175,11 +175,13 @@ block0:
     %2 = toint %1 : int[64]
     store n, %2 : int[64]
     %3 = load n
-    call print, %3
+    call print_bare, %3
+    call print_nl
     %4 = inputint 656e7465722061206e756d6265723a20 : int[32]
     store w, %4 : int[32]
     %5 = load w
-    call print, %5
+    call print_bare, %5
+    call print_nl
     return`,
               note: "`int()`/`float()` lower to `toint`/`tofloat`; `int(w, input(prompt))` lowers to one `inputint` op, the prompt hex-encoded so any character survives the text IR.",
             },
@@ -204,8 +206,8 @@ block0:
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/mixed_numeric.py",
-            sourceRef: "tests/typed_regression/mixed_numeric.py",
+            title: "tests/typed_regression/mixed_numeric.lio",
+            sourceRef: "tests/typed_regression/mixed_numeric.lio",
             expectedRef: "tests/typed_regression/expected/mixed_numeric.out",
             source: `i: int[64] = 10
 f: float[64] = 2.5
@@ -297,8 +299,8 @@ print(narrow)`,
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/uninit_decl.py",
-            sourceRef: "tests/typed_regression/uninit_decl.py",
+            title: "tests/typed_regression/uninit_decl.lio",
+            sourceRef: "tests/typed_regression/uninit_decl.lio",
             expectedRef: "tests/typed_regression/expected/uninit_decl.out",
             source: `i: int[8]
 i = 5
@@ -361,7 +363,7 @@ const controlFlow: DocPage = {
   slug: "control-flow",
   title: "Control flow",
   description:
-    "if / elif / else, while, for over range, and the one construct that does not exist.",
+    "if / elif / else, while, for over range, try / except over the built-in traps, and the one construct that does not exist.",
   group: "language",
   tags: [
     "control flow",
@@ -372,6 +374,10 @@ const controlFlow: DocPage = {
     "range",
     "branch",
     "loop",
+    "try",
+    "except",
+    "exception",
+    "trap",
   ],
   sections: [
     {
@@ -385,8 +391,8 @@ const controlFlow: DocPage = {
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/if.py",
-            sourceRef: "tests/typed_regression/if.py",
+            title: "tests/typed_regression/if.lio",
+            sourceRef: "tests/typed_regression/if.lio",
             expectedRef: "tests/typed_regression/expected/if.out",
             source: `x: int[64] = 5
 if x < 3:
@@ -405,11 +411,13 @@ block0:
     branch %3, block1, block2
 block1:
     %4 = const_i64 1
-    call print, %4
+    call print_bare, %4
+    call print_nl
     jump block3
 block2:
     %5 = const_i64 3
-    call print, %5
+    call print_bare, %5
+    call print_nl
     jump block3
 block3:
     return`,
@@ -430,8 +438,8 @@ block3:
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/while.py",
-            sourceRef: "tests/typed_regression/while.py",
+            title: "tests/typed_regression/while.lio",
+            sourceRef: "tests/typed_regression/while.lio",
             expectedRef: "tests/typed_regression/expected/while.out",
             typecheck: false,
             source: `i: int[64] = 0
@@ -447,7 +455,7 @@ print(total)`,
           kind: "note",
           tone: "warn",
           title: "The checker does not cover `while` yet",
-          text: "`tools/typecheck.py` still answers `statement While not supported by the type-checker yet`: including for the repo's own `while.py`. The engine lowers and executes `while` correctly (Tier-0 and Tier-1 both); it is the standalone Python checker that lags. Until it catches up, `while` programs are verified through the regression suites rather than the checker.",
+          text: "`tools/typecheck.py` still answers `statement While not supported by the type-checker yet`: including for the repo's own `while.lio`. The engine lowers and executes `while` correctly (Tier-0 and Tier-1 both); it is the standalone Python checker that lags. Until it catches up, `while` programs are verified through the regression suites rather than the checker.",
         },
       ],
     },
@@ -462,8 +470,8 @@ print(total)`,
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/for_range.py",
-            sourceRef: "tests/typed_regression/for_range.py",
+            title: "tests/typed_regression/for_range.lio",
+            sourceRef: "tests/typed_regression/for_range.lio",
             expectedRef: "tests/typed_regression/expected/for_range.out",
             source: `total: int[64] = 0
 i: int[64] = 0
@@ -501,7 +509,8 @@ block3:
     jump block4
 block2:
     %13 = load total
-    call print, %13
+    call print_bare, %13
+    call print_nl
     return`,
               note: "The `for` lowers to an init / test / body / increment block structure: a pre-test loop with an explicit back edge, exactly what the encoder emits a `jcc` for.",
             },
@@ -520,9 +529,9 @@ block2:
         {
           kind: "code",
           example: {
-            title: "tests/programs/range_step.py",
+            title: "tests/programs/range_step.lio",
             typecheck: false,
-            sourceRef: "tests/programs/range_step.py",
+            sourceRef: "tests/programs/range_step.lio",
             expectedRef: "tests/programs/expected/range_step.out",
             source: `for i in range(1, 10, 3):
     print(i)
@@ -560,9 +569,9 @@ for i in range(-1, -5, -2):
         {
           kind: "code",
           example: {
-            title: "tests/programs/break_continue.py",
+            title: "tests/programs/break_continue.lio",
             typecheck: false,
-            sourceRef: "tests/programs/break_continue.py",
+            sourceRef: "tests/programs/break_continue.lio",
             expectedRef: "tests/programs/expected/break_continue.out",
             source: `total: int[64] = 0
 for i in range(100):
@@ -592,9 +601,9 @@ print(total)`,
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/iter_helpers.py (excerpt)",
+            title: "tests/typed_regression/iter_helpers.lio (excerpt)",
             typecheck: false,
-            sourceRef: "tests/typed_regression/iter_helpers.py",
+            sourceRef: "tests/typed_regression/iter_helpers.lio",
             expectedRef: "tests/typed_regression/expected/iter_helpers.out",
             source: `xs: list[int[64], 5]
 xs[0] = 10
@@ -642,8 +651,8 @@ print(total)`,
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/if_expr.py (excerpt)",
-            sourceRef: "tests/typed_regression/if_expr.py",
+            title: "tests/typed_regression/if_expr.lio (excerpt)",
+            sourceRef: "tests/typed_regression/if_expr.lio",
             expectedRef: "tests/typed_regression/expected/if_expr.out",
             typecheck: false,
             source: `x: int[64] = 5
@@ -692,6 +701,125 @@ else:
         },
       ],
     },
+    {
+      id: "try-except",
+      title: "try / except, over the built-in traps",
+      blocks: [
+        {
+          kind: "p",
+          text: "`try`/`except` catches a trap the engine itself raises. There is no exception hierarchy to import and no exception object to bind: the catchable set is closed, and a caught trap is a plain jump in the IR. Both tiers run the same handler region, so a trap caught natively is caught identically in the interpreter.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "catching a division by zero",
+            // tools/typecheck.py is a mirror of the older scalar-only static
+            // checks and does not know `try` yet; the real checker (the C++
+            // one, which runs inside tier_runner) does.
+            typecheck: false,
+            source: `n: int[64] = 0
+try:
+    q: int[64] = 100 % n
+    print(q)
+except ZeroDivisionError:
+    print(1)`,
+            output: "1",
+            machine: {
+              ir: `function __main__():
+block0:
+    %0 = const_i64 0
+    store n, %0 : int[64]
+    tryenter ZeroDivisionError, block1
+    jump block2
+block2:
+    %1 = const_i64 100
+    %2 = load n
+    %3 = mod %1, %2
+    store q, %3 : int[64]
+    %4 = load q
+    call print_bare, %4
+    call print_nl
+    tryleave
+    jump block3
+block1:
+    trycatch ZeroDivisionError
+    %5 = const_i64 1
+    call print_bare, %5
+    call print_nl
+    jump block3
+block3:
+    return`,
+            },
+          },
+        },
+        {
+          kind: "p",
+          text: "The IR is the whole mechanism: `tryenter` marks the handler block and the region it guards, `tryleave` ends the protected region on the normal path, and `trycatch` is the landing pad. A caught trap is a branch, not an unwind -- there is no stack to unwind because there is no exception object.",
+        },
+        {
+          kind: "p",
+          text: "The catchable set is exactly seven names: `ZeroDivisionError`, `OverflowError`, `ValueError`, `IndexError`, `KeyError`, `EOFError`, and `Exception` for all of them. Anything else is refused at compile time, so a typo in the handler is a diagnostic rather than a silently-never-taken branch.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected: not a catchable trap",
+            expect: "error",
+            tool: "frontend",
+            errorMatch: "is not a catchable trap",
+            source: `try:
+    print(1)
+except RuntimeError:
+    print(2)`,
+            output:
+              "LITHON-E0114: `except RuntimeError:` is not a catchable trap -- the catchable set is EOFError, IndexError, KeyError, OverflowError, ValueError, ZeroDivisionError, plus `Exception` for all of them (6.10)",
+          },
+        },
+        {
+          kind: "table",
+          caption: "which trap lands in which handler",
+          rows: [
+            [
+              "`ZeroDivisionError`",
+              "division or modulo by zero",
+            ],
+            ["`OverflowError`", "a dynamic `int[64]` overflow (`LITHON-E0303`), or an input that does not fit the target width (`E0307`)"],
+            [
+              "`ValueError`",
+              "a float-to-int conversion out of range (`E0309`), a shift count outside 0..63, a `range` step of zero (`E0310`), a non-numeric input (`E0306`)",
+            ],
+            ["`IndexError`", "a dynamic index outside a list's bounds"],
+            ["`KeyError`", "a dict key that is not present"],
+            ["`EOFError`", "input() reached end of input (`E0308`)"],
+          ],
+        },
+        {
+          kind: "note",
+          tone: "warn",
+          title: "three things that are deliberately not supported",
+          text: "A bare `except:` is refused, because it would also catch a system exit and would suggest catching a segfault, which is not catchable. `except ... as e` is refused, because there is no exception object to bind. `try`/`finally` without an `except` is refused, because a `finally` that runs on the uncaught path is a different construct. And a trap raised inside a *callee* is not catchable by the caller: only traps raised in the same function as the `try` are.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected: a bare except",
+            expect: "error",
+            tool: "frontend",
+            errorMatch: "a bare `except:` is not supported",
+            source: `try:
+    print(1)
+except:
+    print(2)`,
+            output:
+              "LITHON-E0114: a bare `except:` is not supported -- it also catches system-exit, and here it would suggest catching a segfault, which is not catchable; name the trap (`except Exception:` catches every catchable trap) (6.10)",
+          },
+        },
+        {
+          kind: "p",
+          text: "An uncaught trap is still a trap: the program stops with the engine's own diagnostic, and the exit code is non-zero. See [Errors](/docs/errors) for the full code family and [Semantics](/docs/semantics) for the arithmetic traps in detail.",
+        },
+      ],
+    },
   ],
 }
 
@@ -721,8 +849,8 @@ const functions: DocPage = {
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/function.py",
-            sourceRef: "tests/typed_regression/function.py",
+            title: "tests/typed_regression/function.lio",
+            sourceRef: "tests/typed_regression/function.lio",
             expectedRef: "tests/typed_regression/expected/function.out",
             source: `def add(a: int[64], b: int[64]) -> int[64]:
     return a + b
@@ -745,7 +873,8 @@ block0:
     %2 = call add, %0, %1
     store x, %2 : int[64]
     %3 = load x
-    call print, %3
+    call print_bare, %3
+    call print_nl
     return`,
               note: "Real frontend output. Parameters live in the frame like any other slot; the call passes constants as immediates and stores the return value into the caller's `x` slot.",
             },
@@ -779,8 +908,8 @@ print(x)`,
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/recursion.py",
-            sourceRef: "tests/typed_regression/recursion.py",
+            title: "tests/typed_regression/recursion.lio",
+            sourceRef: "tests/typed_regression/recursion.lio",
             expectedRef: "tests/typed_regression/expected/recursion.out",
             source: `def fib(n: int[64]) -> int[64]:
     if n < 2:
@@ -841,7 +970,8 @@ block0:
     %1 = call fib, %0
     store x, %1 : int[64]
     %2 = load x
-    call print, %2
+    call print_bare, %2
+    call print_nl
     return`,
               note: "Real frontend output. The base case and the recursive case are separate blocks; `call fib` appears twice, once per recursive branch.",
             },
@@ -929,13 +1059,13 @@ print(-7 % 3)`,
       blocks: [
         {
           kind: "p",
-          text: "`==` `<` `>` and the other comparisons produce `bool`. `and` `or` `not` operate on `bool`. Note what is *not* here yet: `!=` (`NotEq`) is the one comparison the frontend has not lowered: write `not (a == b)` in the meantime.",
+          text: "`==` `!=` `<` `>` and the other comparisons produce `bool`. `and` `or` `not` operate on `bool`. `!=` is a first-class comparison with its own IR op (`ne`), not an `==` followed by a `not`, so the optimizer and branch fusion see the real predicate.",
         },
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/comparison.py",
-            sourceRef: "tests/typed_regression/comparison.py",
+            title: "tests/typed_regression/comparison.lio",
+            sourceRef: "tests/typed_regression/comparison.lio",
             expectedRef: "tests/typed_regression/expected/comparison.out",
             source: `a: int[64] = 1
 b: int[64] = 2
@@ -945,6 +1075,23 @@ print(b > a)
 print(a == a)
 print(c < b)`,
             output: "True\nTrue\nTrue\nTrue",
+          },
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/typed_regression/ne.lio (excerpt)",
+            sourceRef: "tests/typed_regression/ne.lio",
+            expectedRef: "tests/typed_regression/expected/ne.out",
+            typecheck: false,
+            source: `a: int[64] = 1
+b: int[64] = 2
+print(a != b)
+print(a != a)
+lo: int[8] = -128
+hi: int[8] = 127
+print(lo != hi)`,
+            output: "True\nFalse\nTrue",
           },
         },
         {
@@ -1015,8 +1162,8 @@ print(z)`,
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/int64_wrap.py",
-            sourceRef: "tests/typed_regression/int64_wrap.py",
+            title: "tests/typed_regression/int64_wrap.lio",
+            sourceRef: "tests/typed_regression/int64_wrap.lio",
             expectedRef: "tests/typed_regression/expected/int64_wrap.out",
             typecheck: false,
             source: `x: int[64] = 9223372036854775807
@@ -1090,8 +1237,8 @@ const containers: DocPage = {
         {
           kind: "code",
           example: {
-            title: "tests/programs/list_basic.py (excerpt)",
-            sourceRef: "tests/programs/list_basic.py",
+            title: "tests/programs/list_basic.lio (excerpt)",
+            sourceRef: "tests/programs/list_basic.lio",
             expectedRef: "tests/programs/expected/list_basic.out",
             typecheck: false,
             source: `xs: list[int[64], 6]
@@ -1174,8 +1321,8 @@ print(t[3])`,
         {
           kind: "code",
           example: {
-            title: "tests/programs/dict_basic.py (excerpt)",
-            sourceRef: "tests/programs/dict_basic.py",
+            title: "tests/programs/dict_basic.lio (excerpt)",
+            sourceRef: "tests/programs/dict_basic.lio",
             expectedRef: "tests/programs/expected/dict_basic.out",
             typecheck: false,
             source: `d: dict[int[64], int[64], 4] = {1: 10, 2: 20, 3: 30, 4: 40}
@@ -1193,7 +1340,43 @@ print(d[j])`,
           kind: "note",
           tone: "note",
           title: "More entries than buckets is a duplicate-bucket problem",
-          text: "`dict_basic.py` stays one short of it and leans on the probe instead. `key_pairs.py` is the test that pins a collision down to fixed keys rather than leaving it to chance.",
+          text: "`dict_basic.lio` stays one short of it and leans on the probe instead. `dict_table.lio` is the test that pins a collision down to fixed keys rather than leaving it to chance.",
+        },
+      ],
+    },
+    {
+      id: "where-to-go-next",
+      title: "Where to go next",
+      blocks: [
+        {
+          kind: "linkcards",
+          items: [
+            {
+              title: "Pointers",
+              href: "/docs/pointers",
+              text: "Raw addresses, `addressof`/`valueof`, and the `_` naming rule.",
+            },
+            {
+              title: "Structs",
+              href: "/docs/structs",
+              text: "Packed storage: fields at fixed offsets, no padding.",
+            },
+            {
+              title: "Enums",
+              href: "/docs/enums",
+              text: "A tag plus a payload, read with `match`.",
+            },
+            {
+              title: "Type functions",
+              href: "/docs/type-functions",
+              text: "Compile-time type constructors that expand structurally.",
+            },
+            {
+              title: "Built-in functions",
+              href: "/docs/builtins",
+              text: "The whole prelude, one row per name.",
+            },
+          ],
         },
       ],
     },
@@ -1251,8 +1434,8 @@ print(valueof(p))`,
         {
           kind: "code",
           example: {
-            title: "tests/programs/ptr_basic.py (excerpt)",
-            sourceRef: "tests/programs/ptr_basic.py",
+            title: "tests/programs/ptr_basic.lio (excerpt)",
+            sourceRef: "tests/programs/ptr_basic.lio",
             expectedRef: "tests/programs/expected/ptr_basic.out",
             typecheck: false,
             source: `x: int[64] = 5
@@ -1309,8 +1492,8 @@ print(_p == _q)`,
         {
           kind: "code",
           example: {
-            title: "reading through a pointer (ptr_basic.py excerpt)",
-            sourceRef: "tests/programs/ptr_basic.py",
+            title: "reading through a pointer (ptr_basic.lio excerpt)",
+            sourceRef: "tests/programs/ptr_basic.lio",
             typecheck: false,
             source: `f: float[64] = 2.5
 _pf: ptr[float[64]] = addressof(f)
@@ -1366,8 +1549,8 @@ const structs: DocPage = {
         {
           kind: "code",
           example: {
-            title: "tests/programs/struct_basic.py (excerpt)",
-            sourceRef: "tests/programs/struct_basic.py",
+            title: "tests/programs/struct_basic.lio (excerpt)",
+            sourceRef: "tests/programs/struct_basic.lio",
             expectedRef: "tests/programs/expected/struct_basic.out",
             typecheck: false,
             source: `class Point(Struct):
@@ -1396,8 +1579,8 @@ print(p.y)`,
         {
           kind: "code",
           example: {
-            title: "unwritten fields read zero (struct_basic.py excerpt)",
-            sourceRef: "tests/programs/struct_basic.py",
+            title: "unwritten fields read zero (struct_basic.lio excerpt)",
+            sourceRef: "tests/programs/struct_basic.lio",
             typecheck: false,
             source: `class SockAddrIn(Struct):
     family: int[16]
@@ -1458,8 +1641,8 @@ print(s.active)`,
         {
           kind: "code",
           example: {
-            title: "float fields (struct_basic.py excerpt)",
-            sourceRef: "tests/programs/struct_basic.py",
+            title: "float fields (struct_basic.lio excerpt)",
+            sourceRef: "tests/programs/struct_basic.lio",
             typecheck: false,
             source: `class Vec(Struct):
     x: float[64]
@@ -1568,8 +1751,8 @@ const enums: DocPage = {
         {
           kind: "code",
           example: {
-            title: "tests/programs/enum_basic.py (excerpt)",
-            sourceRef: "tests/programs/enum_basic.py",
+            title: "tests/programs/enum_basic.lio (excerpt)",
+            sourceRef: "tests/programs/enum_basic.lio",
             expectedRef: "tests/programs/expected/enum_basic.out",
             typecheck: false,
             source: `class Shape(Enum):
@@ -1632,8 +1815,8 @@ match s:
         {
           kind: "code",
           example: {
-            title: "tests/programs/enum_struct.py (excerpt)",
-            sourceRef: "tests/programs/enum_struct.py",
+            title: "tests/programs/enum_struct.lio (excerpt)",
+            sourceRef: "tests/programs/enum_struct.lio",
             typecheck: false,
             source: `class Endpoint(Enum):
     Empty
@@ -1683,8 +1866,8 @@ c.id = 7`,
         {
           kind: "code",
           example: {
-            title: "tests/programs/enum_struct.py (excerpt)",
-            sourceRef: "tests/programs/enum_struct.py",
+            title: "tests/programs/enum_struct.lio (excerpt)",
+            sourceRef: "tests/programs/enum_struct.lio",
             typecheck: false,
             source: `class Endpoint(Enum):
     Empty
@@ -1823,8 +2006,8 @@ const typeFunctions: DocPage = {
         {
           kind: "code",
           example: {
-            title: "tests/programs/typefunc_basic.py (excerpt)",
-            sourceRef: "tests/programs/typefunc_basic.py",
+            title: "tests/programs/typefunc_basic.lio (excerpt)",
+            sourceRef: "tests/programs/typefunc_basic.lio",
             expectedRef: "tests/programs/expected/typefunc_basic.out",
             typecheck: false,
             source: `def Fixed(t, n) -> NewType:
@@ -1860,8 +2043,8 @@ print(xs[0] + xs[1] + xs[2])`,
         {
           kind: "code",
           example: {
-            title: "tests/programs/typefunc_basic.py (excerpt)",
-            sourceRef: "tests/programs/typefunc_basic.py",
+            title: "tests/programs/typefunc_basic.lio (excerpt)",
+            sourceRef: "tests/programs/typefunc_basic.lio",
             typecheck: false,
             source: `def Alias(t) -> NewType:
     return {t}
@@ -1889,8 +2072,8 @@ print(a)`,
         {
           kind: "code",
           example: {
-            title: "tests/programs/typefunc_uses.py (excerpt)",
-            sourceRef: "tests/programs/typefunc_uses.py",
+            title: "tests/programs/typefunc_uses.lio (excerpt)",
+            sourceRef: "tests/programs/typefunc_uses.lio",
             expectedRef: "tests/programs/expected/typefunc_uses.out",
             typecheck: false,
             source: `def Word() -> NewType:
@@ -2000,8 +2183,8 @@ const methods: DocPage = {
         {
           kind: "code",
           example: {
-            title: "tests/programs/method_basic.py (excerpt)",
-            sourceRef: "tests/programs/method_basic.py",
+            title: "tests/programs/method_basic.lio (excerpt)",
+            sourceRef: "tests/programs/method_basic.lio",
             expectedRef: "tests/programs/expected/method_basic.out",
             typecheck: false,
             source: `class Counter(Struct):
@@ -2015,7 +2198,7 @@ const methods: DocPage = {
 c: Counter
 print(c.add(5))
 print(c.add(7))`,
-            output: "5",
+            output: "5\n12",
           },
         },
         {
@@ -2035,8 +2218,8 @@ print(c.add(7))`,
         {
           kind: "code",
           example: {
-            title: "tests/programs/method_enum.py (excerpt)",
-            sourceRef: "tests/programs/method_enum.py",
+            title: "tests/programs/method_enum.lio (excerpt)",
+            sourceRef: "tests/programs/method_enum.lio",
             expectedRef: "tests/programs/expected/method_enum.out",
             typecheck: false,
             source: `class Shape(Enum):

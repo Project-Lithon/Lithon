@@ -13,9 +13,9 @@
         "stdout": "2.7169239322355985\n",
         "returncode": 0,
         "command": [
-          "test_codes_python/test_eulars_constant_lim_def.py"
+          "test_codes_python/Loops/test_eulars_constant_lim_def.py"
         ],
-        "script": "test_codes_python/test_eulars_constant_lim_def.py"
+        "script": "test_codes_python/Loops/test_eulars_constant_lim_def.py"
       },
       {
         "name": "Lithon",
@@ -23,9 +23,9 @@
         "stdout": "2.7169239322355985\n",
         "returncode": 0,
         "command": [
-          "test_codes_lithon/test_eulars_constant_lim_def.py"
+          "test_codes_lithon/Loops/test_eulars_constant_lim_def.lio"
         ],
-        "script": "test_codes_lithon/test_eulars_constant_lim_def.py"
+        "script": "test_codes_lithon/Loops/test_eulars_constant_lim_def.lio"
       }
     ]
   },
@@ -43,9 +43,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "test_codes_python/test_1b_fsum.py"
+          "test_codes_python/Loops/test_1b_fsum.py"
         ],
-        "script": "test_codes_python/test_1b_fsum.py"
+        "script": "test_codes_python/Loops/test_1b_fsum.py"
       },
       {
         "name": "Lithon",
@@ -53,9 +53,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "test_codes_lithon/test_1b_fsum.py"
+          "test_codes_lithon/Loops/test_1b_fsum.lio"
         ],
-        "script": "test_codes_lithon/test_1b_fsum.py"
+        "script": "test_codes_lithon/Loops/test_1b_fsum.lio"
       }
     ]
   },
@@ -73,9 +73,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "test_codes_python/test_1b_fsum.py"
+          "test_codes_python/Loops/test_1b_fsum.py"
         ],
-        "script": "test_codes_python/test_1b_fsum.py"
+        "script": "test_codes_python/Loops/test_1b_fsum.py"
       },
       {
         "name": "Lithon",
@@ -83,9 +83,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "test_codes_lithon/test_1b_fsum.py"
+          "test_codes_lithon/Loops/test_1b_fsum.lio"
         ],
-        "script": "test_codes_lithon/test_1b_fsum.py"
+        "script": "test_codes_lithon/Loops/test_1b_fsum.lio"
       }
     ]
   },
@@ -103,9 +103,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "test_codes_python/test_1b_fsum.py"
+          "test_codes_python/Loops/test_1b_fsum.py"
         ],
-        "script": "test_codes_python/test_1b_fsum.py"
+        "script": "test_codes_python/Loops/test_1b_fsum.py"
       },
       {
         "name": "Lithon",
@@ -113,9 +113,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "test_codes_lithon/test_1b_fsum.py"
+          "test_codes_lithon/Loops/test_1b_fsum.lio"
         ],
-        "script": "test_codes_lithon/test_1b_fsum.py"
+        "script": "test_codes_lithon/Loops/test_1b_fsum.lio"
       }
     ]
   },
@@ -133,9 +133,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "test_codes_python/test_1b_fsum.py"
+          "test_codes_python/Loops/test_1b_fsum.py"
         ],
-        "script": "test_codes_python/test_1b_fsum.py"
+        "script": "test_codes_python/Loops/test_1b_fsum.py"
       },
       {
         "name": "Lithon",
@@ -143,9 +143,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "test_codes_lithon/test_1b_fsum.py"
+          "test_codes_lithon/Loops/test_1b_fsum.lio"
         ],
-        "script": "test_codes_lithon/test_1b_fsum.py"
+        "script": "test_codes_lithon/Loops/test_1b_fsum.lio"
       }
     ]
   },
@@ -163,9 +163,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "test_codes_python/test_1b_fsum.py"
+          "test_codes_python/Loops/test_1b_fsum.py"
         ],
-        "script": "test_codes_python/test_1b_fsum.py"
+        "script": "test_codes_python/Loops/test_1b_fsum.py"
       },
       {
         "name": "Lithon",
@@ -173,9 +173,9 @@
         "stdout": "499999999500000000\n",
         "returncode": 0,
         "command": [
-          "test_codes_lithon/test_1b_fsum.py"
+          "test_codes_lithon/Loops/test_1b_fsum.lio"
         ],
-        "script": "test_codes_lithon/test_1b_fsum.py"
+        "script": "test_codes_lithon/Loops/test_1b_fsum.lio"
       }
     ]
   },
@@ -193,9 +193,9 @@
         "stdout": "499500\n",
         "returncode": 0,
         "command": [
-          "test_codes_python/test_1k_fsum.py"
+          "test_codes_python/Loops/test_1k_fsum.py"
         ],
-        "script": "test_codes_python/test_1k_fsum.py"
+        "script": "test_codes_python/Loops/test_1k_fsum.py"
       },
       {
         "name": "Lithon",
@@ -203,9 +203,9 @@
         "stdout": "499500\n",
         "returncode": 0,
         "command": [
-          "test_codes_lithon/test_1k_fsum.py"
+          "test_codes_lithon/Loops/test_1k_fsum.lio"
         ],
-        "script": "test_codes_lithon/test_1k_fsum.py"
+        "script": "test_codes_lithon/Loops/test_1k_fsum.lio"
       }
     ]
   }

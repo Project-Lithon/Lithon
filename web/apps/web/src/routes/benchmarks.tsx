@@ -19,6 +19,7 @@ import {
 import { Separator } from "@workspace/ui/components/separator"
 
 import { PageHero, WRAP } from "../site"
+import { assetUrl } from "../lib/assets"
 import { metaForPath } from "../lib/seo"
 
 export const Route = createFileRoute("/benchmarks")({
@@ -118,7 +119,7 @@ function BenchmarkCard({ entry }: { entry: Entry }) {
           <div className="overflow-hidden rounded-lg border bg-muted">
             {playing ? (
               <video
-                src={entry.video}
+                src={assetUrl(entry.video)}
                 controls
                 autoPlay
                 className="w-full"
@@ -203,7 +204,7 @@ function Benchmarks() {
   const [entries, setEntries] = useState<Entry[] | null>(null)
 
   useEffect(() => {
-    fetch("/benchmarks/manifest.json")
+    fetch(assetUrl("/benchmarks/manifest.json"))
       .then((r) => r.json())
       .then((data: Entry[]) => setEntries(data))
       .catch(() => setEntries([]))

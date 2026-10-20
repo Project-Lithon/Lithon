@@ -4,7 +4,7 @@ const architecture: DocPage = {
   slug: "architecture",
   title: "Engine architecture",
   description:
-    "Four layers from .py source to executable memory: frontend, IR, verifier, encoder.",
+    "Four layers from .lio source to executable memory: frontend, IR, verifier, encoder.",
   group: "engine",
   tags: [
     "architecture",
@@ -29,7 +29,7 @@ const architecture: DocPage = {
           items: [
             {
               title: "1 · Frontend",
-              text: "`src/frontend/frontend.py`: parses `.py`, runs the extended PEP-526 checks, emits text IR. Pure Python, no engine needed.",
+              text: "`src/frontend/frontend.py`: parses `.lio`, runs the extended PEP-526 checks, emits text IR. Pure Python, no engine needed.",
             },
             {
               title: "2 · IR text format",
@@ -64,8 +64,8 @@ const architecture: DocPage = {
         {
           kind: "code",
           example: {
-            title: "tests/programs/arithmetic.py",
-            sourceRef: "tests/programs/arithmetic.py",
+            title: "tests/programs/arithmetic.lio",
+            sourceRef: "tests/programs/arithmetic.lio",
             expectedRef: "tests/programs/expected/arithmetic.out",
             source: `x: int[64] = 10
 y: int[64] = 20
@@ -86,15 +86,18 @@ block0:
     %4 = add %2, %3
     store z, %4 : int[64]
     %5 = load z
-    call print, %5
+    call print_bare, %5
+    call print_nl
     %6 = load x
     %7 = load y
     %8 = sub %6, %7
-    call print, %8
+    call print_bare, %8
+    call print_nl
     %9 = load x
     %10 = load y
     %11 = mul %9, %10
-    call print, %11
+    call print_bare, %11
+    call print_nl
     return`,
               asm: `main:
     push rbp
@@ -159,6 +162,37 @@ block0:
         },
       ],
     },
+    {
+      id: "where-to-go-next",
+      title: "Where to go next",
+      blocks: [
+        {
+          kind: "linkcards",
+          items: [
+            {
+              title: "Source to machine",
+              href: "/docs/source-to-machine",
+              text: "The four artifacts one program produces, end to end.",
+            },
+            {
+              title: "Registers & ABI",
+              href: "/docs/registers-abi",
+              text: "The register file and the calling discipline.",
+            },
+            {
+              title: "Instruction encoding",
+              href: "/docs/instruction-encoding",
+              text: "Why the encoder is hand-rolled, and how it is proven.",
+            },
+            {
+              title: "Verification",
+              href: "/docs/verification",
+              text: "How the claims on this page get checked.",
+            },
+          ],
+        },
+      ],
+    },
   ],
 }
 
@@ -192,7 +226,7 @@ const dualTier: DocPage = {
           example: {
             lang: "bash",
             title: "forcing the native lane",
-            source: `$ lithon tests/programs/float.py --strict
+            source: `$ lithon tests/programs/float.lio --strict
 [tier1] native
 0.3333333333333333`,
             note: "`[tier1] native` goes to stderr; program output goes to stdout. Under `--strict`, exit 0 means the native tier really ran.",
@@ -227,7 +261,7 @@ const dualTier: DocPage = {
           example: {
             lang: "bash",
             title: "terminal",
-            source: `$ lithon program.py --strict        # native only, refuse to fall back
+            source: `$ lithon program.lio --strict        # native only, refuse to fall back
 $ ./build/tier_runner prog.ir --strict   # same thing, two-step form`,
           },
         },
@@ -294,7 +328,7 @@ const typechecking: DocPage = {
           example: {
             lang: "bash",
             title: "terminal",
-            source: `$ python3 tools/typecheck.py program.py
+            source: `$ python3 tools/typecheck.py program.lio
 $ echo $?
 0`,
           },

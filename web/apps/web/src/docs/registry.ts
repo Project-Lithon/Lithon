@@ -20,7 +20,8 @@ function pageEntries(pages: readonly DocPage[]): SearchEntry[] {
         title: section.title,
         subtitle: page.title,
         group: page.group,
-        tags: [...page.tags, ...page.tags.slice(0, 2)],
+        // the page's own tags, plus the two most specific ones, deduplicated
+        tags: [...new Set([...page.tags, ...page.tags.slice(0, 2)])],
         href: `/docs/${page.slug}#${section.id}`,
       })
     }

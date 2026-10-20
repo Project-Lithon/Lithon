@@ -1,0 +1,10 @@
+title = "Mixed integer arithmetic, 1,000,000,000 iterations: CPython vs Lithon"
+subtitle = "multiply, bitwise xor and right shift, accumulated -- pure integer ALU work"
+
+[[tasks]]
+name = "CPython"
+command = ["{python}", "test_codes_python/Loops/test_multi_ops.py"]
+
+[[tasks]]
+name = "Lithon"
+command = ["{lithon}", "test_codes_lithon/Loops/test_multi_ops.lio"]

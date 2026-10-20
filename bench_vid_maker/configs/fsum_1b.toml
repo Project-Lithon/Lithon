@@ -3,8 +3,8 @@ subtitle = "same program, run as-is in each engine"
 
 [[tasks]]
 name = "CPython"
-command = ["{python}", "test_codes_python/test_1b_fsum.py"]
+command = ["{python}", "test_codes_python/Loops/test_1b_fsum.py"]
 
 [[tasks]]
 name = "Lithon"
-command = ["{lithon}", "test_codes_lithon/test_1b_fsum.py"]
+command = ["{lithon}", "test_codes_lithon/Loops/test_1b_fsum.lio"]

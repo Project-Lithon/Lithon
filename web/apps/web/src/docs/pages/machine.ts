@@ -4,7 +4,7 @@ const sourceToMachine: DocPage = {
   slug: "source-to-machine",
   title: "Source to machine",
   description:
-    "The full walk: .py → typed IR → verified SSA → x86-64 bytes, with the real artifacts at each step.",
+    "The full walk: .lio → typed IR → verified SSA → x86-64 bytes, with the real artifacts at each step.",
   group: "machine",
   tags: [
     "machine",
@@ -28,7 +28,7 @@ const sourceToMachine: DocPage = {
           kind: "steps",
           items: [
             {
-              title: "Source (.py)",
+              title: "Source (.lio)",
               text: "What you wrote. Annotations and all.",
             },
             {
@@ -50,8 +50,8 @@ const sourceToMachine: DocPage = {
           example: {
             lang: "bash",
             title: "seeing it yourself",
-            source: `$ lithon prog.py --ir              # stop after IR
-$ python3 src/frontend/frontend.py prog.py > prog.ir
+            source: `$ lithon prog.lio --ir              # stop after IR
+$ python3 src/frontend/frontend.py prog.lio > prog.ir
 $ ./build/tier_runner prog.ir --strict -v
 [tier1] native`,
           },
@@ -69,8 +69,8 @@ $ ./build/tier_runner prog.ir --strict -v
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/if.py → IR",
-            sourceRef: "tests/typed_regression/if.py",
+            title: "tests/typed_regression/if.lio → IR",
+            sourceRef: "tests/typed_regression/if.lio",
             source: `x: int[64] = 5
 if x < 3:
     print(1)
@@ -88,11 +88,13 @@ block0:
     branch %3, block1, block2
 block1:
     %4 = const_i64 1
-    call print, %4
+    call print_bare, %4
+    call print_nl
     jump block3
 block2:
     %5 = const_i64 3
-    call print, %5
+    call print_bare, %5
+    call print_nl
     jump block3
 block3:
     return`,
@@ -139,8 +141,8 @@ block3:
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/function.py → IR",
-            sourceRef: "tests/typed_regression/function.py",
+            title: "tests/typed_regression/function.lio → IR",
+            sourceRef: "tests/typed_regression/function.lio",
             source: `def add(a: int[64], b: int[64]) -> int[64]:
     return a + b
 
@@ -162,7 +164,8 @@ block0:
     %2 = call add, %0, %1
     store x, %2 : int[64]
     %3 = load x
-    call print, %3
+    call print_bare, %3
+    call print_nl
     return`,
               asm: `add:
     push rbp
@@ -202,8 +205,8 @@ main:
         {
           kind: "code",
           example: {
-            title: "tests/typed_regression/recursion.py",
-            sourceRef: "tests/typed_regression/recursion.py",
+            title: "tests/typed_regression/recursion.lio",
+            sourceRef: "tests/typed_regression/recursion.lio",
             expectedRef: "tests/typed_regression/expected/recursion.out",
             source: `def fib(n: int[64]) -> int[64]:
     if n < 2:
@@ -243,11 +246,43 @@ block0:
     %1 = call fib, %0
     store x, %1 : int[64]
     %2 = load x
-    call print, %2
+    call print_bare, %2
+    call print_nl
     return`,
               note: "Real frontend output. The base case is block1; block2 computes both recursive calls and adds them. The encoder turns each `call` into a real `call fib` with the frame discipline above.",
             },
           },
+        },
+      ],
+    },
+    {
+      id: "where-to-go-next",
+      title: "Where to go next",
+      blocks: [
+        {
+          kind: "linkcards",
+          items: [
+            {
+              title: "Registers & ABI",
+              href: "/docs/registers-abi",
+              text: "The register file and the calling discipline the IR maps onto.",
+            },
+            {
+              title: "Instruction encoding",
+              href: "/docs/instruction-encoding",
+              text: "How the IR becomes bytes, and how those bytes are proven.",
+            },
+            {
+              title: "Optimizer & SSA pipeline",
+              href: "/docs/pipeline",
+              text: "The passes that run between the IR and the encoder.",
+            },
+            {
+              title: "Dual-tier execution",
+              href: "/docs/dual-tier",
+              text: "What happens when the native tier refuses to run a program.",
+            },
+          ],
         },
       ],
     },

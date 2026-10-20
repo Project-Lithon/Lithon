@@ -1,4 +1,4 @@
-"""Plain-CPython equivalent of test_codes_lithon/test_float.py.
+"""Plain-CPython equivalent of test_codes_lithon/Loops/test_float.lio.
 
 Same program: a zero-argument function returning float[64] that adds 1.0 to
 a local, called three times. CPython's float is already binary64, so only
