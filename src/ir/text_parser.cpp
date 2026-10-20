@@ -459,6 +459,10 @@ Module parse_ir_text(const std::string& text) {
             instr.op = Op::StrEq;
             instr.name = oa.raw_args.at(0);
             instr.name2 = oa.raw_args.at(1);
+        } else if (oa.op_name == "strne") {
+            instr.op = Op::StrNe;
+            instr.name = oa.raw_args.at(0);
+            instr.name2 = oa.raw_args.at(1);
         // 6.4. The two substring scans. Same two-name convention as StrEq: the
         // haystack is `name`, the needle is `name2`.
         } else if (oa.op_name == "strfind") {
@@ -477,6 +481,17 @@ Module parse_ir_text(const std::string& text) {
             instr.name = oa.raw_args.at(0);
             instr.name2 = oa.raw_args.at(1);
             instr.name3 = oa.raw_args.at(2);
+        // 6.10. try/except markers. TryEnter carries the kinds and their handler
+        // labels in name/name2; TryCatch carries the one kind it catches.
+        } else if (oa.op_name == "tryenter") {
+            instr.op = Op::TryEnter;
+            instr.name = oa.raw_args.at(0);
+            instr.name2 = oa.raw_args.at(1);
+        } else if (oa.op_name == "tryleave") {
+            instr.op = Op::TryLeave;
+        } else if (oa.op_name == "trycatch") {
+            instr.op = Op::TryCatch;
+            instr.name = oa.raw_args.at(0);
         // 4.3. Dict ops. Same convention as the container ops above: the first
         // argument is the dict VARIABLE, so it lands in `name` and only the key
         // and the value are real operand references.
@@ -644,6 +659,10 @@ Module parse_ir_text(const std::string& text) {
             instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
         } else if (oa.op_name == "eq") {
             instr.op = Op::Eq;
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
+        } else if (oa.op_name == "ne") {
+            instr.op = Op::Ne;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
             instr.args.push_back(parse_value_ref(oa.raw_args.at(1)));
         } else if (oa.op_name == "and") {

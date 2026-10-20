@@ -317,6 +317,7 @@ struct Analysis {
                         raise(st.vals[in.result], Kind::Int);
                         break;
                     case Op::StrEq:
+                    case Op::StrNe:
                         raise(st.vals[in.result], Kind::Bool);
                         break;
                     // 6.4. s.find / s.count produce an int[64], exact in the
@@ -437,7 +438,7 @@ struct Analysis {
                         break;
                     }
 
-                    case Op::Lt: case Op::Gt: case Op::Eq: case Op::Not:
+                    case Op::Lt: case Op::Gt: case Op::Eq: case Op::Ne: case Op::Not:
                         raise(st.vals[in.result], Kind::Bool);
                         if (final_pass) check_arith_operands(st, block, in, verdict);
                         break;
@@ -546,7 +547,7 @@ struct Analysis {
         if (in.op != Op::Add && in.op != Op::Sub && in.op != Op::Mul &&
             in.op != Op::WrapAdd && in.op != Op::WrapSub && in.op != Op::WrapMul &&
             in.op != Op::Div && in.op != Op::Mod && in.op != Op::Lt &&
-            in.op != Op::Gt && in.op != Op::Eq) {
+            in.op != Op::Gt && in.op != Op::Eq && in.op != Op::Ne) {
             return;
         }
         std::string where = st.fn->name + "/" + block.label;
@@ -565,7 +566,8 @@ struct Analysis {
                               in.op == Op::WrapSub ? "wrapsub" :
                               in.op == Op::WrapMul ? "wrapmul" :
                               in.op == Op::Lt ? "lt" :
-                              in.op == Op::Gt ? "gt" : "eq") +
+                              in.op == Op::Gt ? "gt" :
+                              in.op == Op::Eq ? "eq" : "ne") +
                     " is " + kind_name(k) +
                     "; native cannot choose between the integer and double "
                     "path for it (a value stored both an int and a float "

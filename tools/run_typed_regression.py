@@ -34,9 +34,13 @@ def run_lithon_typed(py_file: pathlib.Path):
     ir_path.write_text(ir_result.stdout)
 
     try:
+        stdin_text = None
+        in_path = py_file.with_suffix(".in")
+        if in_path.exists():
+            stdin_text = in_path.read_text()
         run_result = subprocess.run(
             [str(INTERP_BIN), str(ir_path)],
-            capture_output=True, text=True
+            capture_output=True, text=True, input=stdin_text
         )
     finally:
         ir_path.unlink(missing_ok=True)

@@ -115,4 +115,30 @@ inline int64_t host_input_int(const char* prompt, int64_t width) {
     return value;
 }
 
+// 6.10. The try/except form. Same read and parse, but it does NOT exit on
+// failure. It returns a KIND code, not the value:
+//
+//   0 -> read succeeded; the parsed value is in *value_out
+//   1 -> kE0306Message -> ValueError
+//   2 -> kE0307Message -> OverflowError
+//   3 -> kE0308Message -> EOFError
+//
+// The kind and not the value, because a read of the literal `0` is a SUCCESS
+// that happens to return zero -- returning the value would make it
+// indistinguishable from the failure sentinel. A code and not the message
+// pointer, because comparing pointers to string constants the JIT would have to
+// know the address of is brittle; the caller maps the code back to the message
+// constant when it has to report instead of catch.
+inline int64_t host_input_int_ex(const char* prompt, int64_t width,
+                                 int64_t* value_out) {
+    int64_t value = 0;
+    const char* err = nullptr;
+    if (!read_int_line(prompt, static_cast<int>(width), &value, &err)) {
+        *value_out = 0;
+        return err == kE0306Message ? 1 : err == kE0307Message ? 2 : 3;
+    }
+    *value_out = value;
+    return 0;
+}
+
 }  // namespace lithon::jit

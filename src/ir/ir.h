@@ -44,6 +44,12 @@ enum class Op : uint8_t {
     Lt,
     Gt,
     Eq,
+    // The negation of Eq, first class rather than an Eq plus a Not: the
+    // optimizer, branch fusion and the print guard all then see the real
+    // predicate. It matters most for floats, where it is NOT the mirror of
+    // Eq's machine test -- ucomisd is unordered on NaN, so `!=` is
+    // `setne || setp` while `==` is `sete && setnp`.
+    Ne,
 
     And,
     Or,
@@ -290,13 +296,79 @@ enum class Op : uint8_t {
     // The op sets that list's live-length companion. `name2` is the separator.
     StrLen,
     StrEq,
+    // The negation of StrEq, first class for the same reason scalar Ne is:
+    // `s != t` is their length-or-byte difference, not "not streq" obscured by
+    // a following Not for the optimizer to unpick.
+    StrNe,
     StrFind,
     StrCount,
-    StrSplit
+    StrSplit,
+
+    // 6.10. try/except over the built-in Tier-3 traps. These three ops are
+    // control-flow *markers*, not work: they delimit a protected region and its
+    // handlers so both tiers can route a trap to the matching handler instead of
+    // terminating. There is no exception object and no unwind -- the handlers
+    // are ordinary blocks, and a trap is a jump.
+    //
+    //   TryEnter  name  = comma-separated exception kinds this try catches
+    //             name2 = their handler labels, in the same order
+    //             Marks the entry to the protected region. Pushes a region.
+    //   TryLeave  Pops the innermost region. Marks normal completion of the
+    //             protected region (the `else` runs after this point).
+    //   TryCatch  name = the exception kind this handler block catches, or
+    //             "Exception" for the catch-all. Placed as the FIRST instruction
+    //             of each handler block, so a trap inside a handler is not
+    //             re-caught by the same try.
+    TryEnter,
+    TryLeave,
+    TryCatch
 };
+
+// 6.10. The closed set of catchable Tier-3 traps, keyed by the message the
+// throwing site already uses. Both tiers call this, so they agree on which
+// exception a trap is: a program must not catch on one tier and die on the
+// other. Anything else -- a stack overflow, an internal invariant, a segfault --
+// classifies as "" and is NOT catchable, which is what stops `except Exception`
+// from swallowing a crash.
+inline std::string classify_trap_message(const std::string& what) {
+    if (what.find("division by zero") != std::string::npos) return "ZeroDivisionError";
+    if (what.find("modulo by zero") != std::string::npos) return "ZeroDivisionError";
+    if (what.find("list index out of range") != std::string::npos) return "IndexError";
+    if (what.find("LITHON-E0303") != std::string::npos) return "OverflowError";
+    if (what.find("LITHON-E0307") != std::string::npos) return "OverflowError";
+    if (what.find("LITHON-E0309") != std::string::npos) return "ValueError";
+    if (what.find("shift count out of range") != std::string::npos) return "ValueError";
+    if (what.find("LITHON-E0310") != std::string::npos) return "ValueError";
+    if (what.find("LITHON-E0306") != std::string::npos) return "ValueError";
+    if (what.find("LITHON-E0308") != std::string::npos) return "EOFError";
+    if (what.find("dict key not found") != std::string::npos) return "KeyError";
+    if (what.find("too many pieces for the list") != std::string::npos) return "ValueError";
+    return "";
+}
 
 using ValueId = uint32_t;
 constexpr ValueId kInvalidValue = 0xFFFFFFFF;
+
+// 6.10. Splits the `+`-separated payload of a TryEnter/TryCatch marker (the
+// frontend writes "" for an empty one). Shared by the interpreter's and the
+// JIT's handler-region tracking so the two tiers parse the marker identically.
+// `+` and not `,`: the IR text parser splits a line's arguments on commas, so a
+// comma-separated list inside `name` would be torn into extra arguments.
+inline std::vector<std::string> split_marks(const std::string& s) {
+    std::vector<std::string> out;
+    if (s.empty()) return out;
+    size_t start = 0;
+    while (true) {
+        size_t sep = s.find('+', start);
+        if (sep == std::string::npos) {
+            out.push_back(s.substr(start));
+            break;
+        }
+        out.push_back(s.substr(start, sep - start));
+        start = sep + 1;
+    }
+    return out;
+}
 
 // A resolved type, recursive so a container element or a dict key/value can
 // itself be a container. Mirrors the frontend `Type` field for field. The flat

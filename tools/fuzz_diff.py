@@ -189,7 +189,7 @@ class Gen:
         return f"{self.expr(depth + 1)} {op} {self.expr(depth + 1)}"
 
     def cond(self):
-        ops = ["<", ">", "=="]
+        ops = ["<", ">", "==", "!="]
         c = f"{self.expr(1)} {self.r.choice(ops)} {self.expr(1)}"
         k = self.r.random()
         if k < 0.15:
@@ -201,18 +201,24 @@ class Gen:
         self.declared.add(name)
 
     def float_program(self):
-        """A float-only program: no annotations, no loops, no helper calls.
+        """A float-only program: no loops, no helper calls, flat.
 
         Deliberately flat. Everything interesting about float support is in the
         arithmetic, the comparison and the formatting, and a flat shape keeps
         any mismatch attributable to one of those rather than to a control-flow
         transform on top of it.
+
+        Every float variable is declared `float[64]` up front. The typed
+        pipeline is mandatory now, so an unannotated `v = ...` is refused before
+        either engine sees it and the program would be skipped; the annotation
+        is what lets the float comparison paths -- including `!=`'s
+        setne-OR-setp -- actually reach the two engines.
         """
         # Declare every float variable up front, so a later statement can read
         # one that was written several statements earlier -- that distance is
         # what pushes a value across a `print` and out of a register.
         for v in self.FLOAT_VARS:
-            self.emit(0, f"{v} = {self.r.choice(self.FLOAT_LITERALS)}")
+            self.emit(0, f"{v}: float[64] = {self.r.choice(self.FLOAT_LITERALS)}")
             self.float_declared.add(v)
 
         for _ in range(self.r.randint(4, 10)):
@@ -226,7 +232,12 @@ class Gen:
                 self.emit(0, f"print({self.cond()})")
             elif k < 0.7:
                 name = self.r.choice(sorted(self.float_declared))
-                self.emit(0, f"{name} = {self.expr(1)}")
+                # Force a float: the typed pipeline refuses an int result into a
+                # float[64] slot (no implicit int -> float on assignment, only
+                # in arithmetic), and a bare int literal is exactly what
+                # `expr()` can hand back. `+ 0.0` promotes without changing the
+                # value, so the arithmetic being fuzzed is still the expression.
+                self.emit(0, f"{name} = {self.expr(1)} + 0.0")
             elif k < 0.85:
                 # A bare int print between float statements: the call here is
                 # what a float value has to survive.
@@ -754,7 +765,7 @@ class Gen:
             return f"{atom} {self.r.choice(['+', '-'])} {arith(depth + 1)}"
 
         def condition():
-            return f"{arith(1)} {self.r.choice(['<', '>', '=='])} {arith(1)}"
+            return f"{arith(1)} {self.r.choice(['<', '>', '==', '!='])} {arith(1)}"
 
         def merge(depth=0):
             if depth < 2 and self.r.random() < 0.25:

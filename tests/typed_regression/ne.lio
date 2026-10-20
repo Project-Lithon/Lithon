@@ -1,0 +1,71 @@
+# 6.9. `!=` (ast.NotEq), first class. It mirrors `==` in typing and differs
+# only in the result: Ne is its own IR op, not an Eq followed by a Not, so the
+# optimizer and branch fusion see the real predicate.
+#
+# The float case is the one with a machine-level trap. After ucomisd, `!=` is
+# true when the operands differ OR are unordered, so the JIT must emit
+# setne OR setp -- emitting only setne would make `nan != nan` false, while
+# `==` is the mirror (sete AND setnp). Every line here is byte-identical to
+# CPython.
+
+# Integers, including signed boundaries. -128 != 127 must be True, and a value
+# never differs from itself.
+a: int[64] = 1
+b: int[64] = 2
+print(a != b)
+print(a != a)
+lo: int[8] = -128
+hi: int[8] = 127
+print(lo != hi)
+
+# Bool is a 0/1 scalar, so != follows the same rule as ==.
+t: bool = True
+f: bool = False
+print(t != f)
+print(t != t)
+
+# Floats. 0.0 and -0.0 are equal (so != is False); a NaN is unequal to itself
+# (so != is True), which is what the setne-OR-setp encoding buys.
+p: float[64] = 0.0
+q: float[64] = -0.0
+print(p != q)
+big: float[64] = 1e308
+inf: float[64] = big * big
+nan: float[64] = inf - inf
+print(nan != nan)
+print(nan == nan)
+
+# str: != is "lengths differ, or any live byte differs". Equal strings are
+# False; a differing last byte and a differing length are both True.
+s: str[8] = "abc"
+t2: str[8] = "abc"
+u: str[8] = "abd"
+v: str[8] = "ab"
+e1: str[4] = ""
+e2: str[4] = ""
+w: str[4] = "a"
+print(s != t2)
+print(s != u)
+print(s != v)
+print(e1 != e2)
+print(e1 != w)
+print(s != e1)
+
+# As a value, in a condition, inside while, and combined with and/or.
+r: bool = a != b
+print(r)
+n: int[64] = 0
+while n != 5:
+    n = n + 1
+print(n)
+# A step-2 `!=` loop that lands on its bound exactly. It terminates (10, 8, ...,
+# 0) but is not unrolled or vectorized, because `i != n` has no guaranteed trip
+# count: another step would step over the bound and never end. Checked by
+# tools/check_loop_shape_stats.py, whose ne_step2 pin asserts unrolled=0.
+m: int[64] = 10
+z: int[64] = 0
+while m != z:
+    m = m - 2
+print(m)
+print((a != b) and (t != f))
+print((a != a) or (t != f))

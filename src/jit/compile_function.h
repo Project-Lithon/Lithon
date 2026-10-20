@@ -338,7 +338,8 @@ inline FunctionPlan plan_function(const lithon::ir::Function& fn, const Promotio
             // integer case emits cmp+jcc directly; the float case emits
             // ucomisd and then a branch that reads CF/ZF/PF, so neither ever
             // materialises the 0/1 boolean the standalone comparison would.
-            if ((in.op == Op::Lt || in.op == Op::Gt || in.op == Op::Eq) && has_next &&
+            if ((in.op == Op::Lt || in.op == Op::Gt || in.op == Op::Eq ||
+                 in.op == Op::Ne) && has_next &&
                 ins[p + 1].op == Op::Branch && ins[p + 1].args.size() == 1 &&
                 ins[p + 1].args[0] == in.result && uses[in.result].size() == 1) {
                 TempInfo ti; ti.kind = TempInfo::Kind::FusedCmp;
@@ -362,15 +363,26 @@ inline FunctionPlan plan_function(const lithon::ir::Function& fn, const Promotio
 
 // A loop header is worth duplicating at its back edge when it is tiny,
 // side-effect free, and ends in a conditional branch.
+//
+// 6.9. A header whose exit test is `!=` is deliberately NOT duplicated. The
+// rotation re-tests after every copy, so duplicating one would still be
+// correct for any trip count -- but `i != n` has no guaranteed trip count at
+// all: with step 2 from 0 toward 7 the body steps straight over the bound and
+// the loop never ends, and a duplicated body in front of an untaken exit is
+// exactly the shape an unroll/vectorize pass likes to assume a count for. The
+// loop is left alone, so `while i != n` always compiles to the plain compare,
+// branch and back edge. This is the same reason LSR and the vectorizer decline
+// on a non-`<`/`>` condition.
 inline bool is_rotatable_header(const lithon::ir::BasicBlock& block) {
     using lithon::ir::Op;
     if (block.instrs.empty() || block.instrs.size() > 10) return false;
     if (block.instrs.back().op != Op::Branch) return false;
     for (const auto& in : block.instrs) {
+        if (in.op == Op::Ne) return false;
         switch (in.op) {
             case Op::ConstInt: case Op::ConstBool: case Op::Load:
             case Op::Add: case Op::Sub: case Op::Mul:
-            case Op::Lt: case Op::Gt: case Op::Eq: case Op::Branch:
+            case Op::Lt: case Op::Gt: case Op::Eq: case Op::Ne: case Op::Branch:
                 break;
             default:
                 return false;
@@ -408,7 +420,7 @@ inline bool is_unrollable_op(lithon::ir::Op op) {
         case Op::Add: case Op::Sub: case Op::Mul:
         // E0303 opt-outs never trap, so duplicating them is trivially safe.
         case Op::WrapAdd: case Op::WrapSub: case Op::WrapMul:
-        case Op::Lt: case Op::Gt: case Op::Eq:
+        case Op::Lt: case Op::Gt: case Op::Eq: case Op::Ne:
         case Op::And: case Op::Or: case Op::Not:
         case Op::BitAnd: case Op::BitOr: case Op::BitXor:
         // Trapping, and therefore absent from is_pure_op: duplication cannot
@@ -955,6 +967,36 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
             }
         };
 
+        // 6.10. try/except state. Declared here, before the trap emitters, so a
+        // trap can jump to its handler block; `pending_blocks` is resolved after
+        // every block has been laid out (the same mechanism ordinary jumps use).
+        struct PendingBlockPatch {
+            JumpPatch patch;
+            std::string target_label;
+        };
+        std::vector<PendingBlockPatch> pending_blocks;
+        struct JitTryRegion {
+            std::vector<std::string> kinds;
+            std::vector<std::string> labels;
+            std::string handler_for(const std::string& kind) const {
+                for (size_t i = 0; i < kinds.size(); ++i)
+                    if (kinds[i] == kind || kinds[i] == "Exception") return labels[i];
+                return "";
+            }
+        };
+        std::vector<JitTryRegion> current_regions;
+
+        // The handler block label that catches `kind` at the current program
+        // point, or "" when nothing does. Searches innermost-first, and the
+        // region and everything nested in it are left by the jump.
+        auto trap_handler_label = [&](const std::string& kind) -> std::string {
+            for (size_t r = current_regions.size(); r-- > 0;) {
+                const std::string t = current_regions[r].handler_for(kind);
+                if (!t.empty()) return t;
+            }
+            return "";
+        };
+
         // Emits a call to the host handler that reports a runtime error the
         // way the interpreter's exception does, so a JIT program and an
         // interpreted one report the same failure on stderr. Declared before
@@ -975,6 +1017,18 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
         // run_tier_diff.py compares stderr, so anything less than an exact
         // match here is a diff.
         auto emit_host_error_trap = [&](const char* message) {
+            // 6.10. If an enclosing try catches this trap, the "trap" is a jump
+            // to that handler block rather than a program end. The kind is
+            // derived from the message with the SAME classifier the interpreter
+            // uses, so the two tiers route identically.
+            const std::string kind = lithon::ir::classify_trap_message(message);
+            if (!kind.empty()) {
+                const std::string target = trap_handler_label(kind);
+                if (!target.empty()) {
+                    pending_blocks.push_back({emit_jmp_rel32(code), target});
+                    return;
+                }
+            }
             emit_mov_reg_imm(code, abi::kArgRegs[0], reinterpret_cast<int64_t>(message));
             emit_mov_reg_imm(code, kR, reinterpret_cast<int64_t>(&host_report_error));
             emit_xor_zero(code, Reg::RAX);
@@ -1582,7 +1636,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
             coerce_to_float(rhs_r, in.args.at(1));
             Reg dst = compute_dest(in.result);
             // The operands are already in XMM registers, so kL is free as a
-            // bit to compute the "not unordered" flag in.
+            // bit to compute the second flag test in.
             constexpr Reg kL = abi::kScratchLeft;
 
             if (in.op == Op::Gt) {
@@ -1593,15 +1647,31 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 emit_ucomisd(code, lhs_r, rhs_r);
             }
 
-            // Eq tests ZF; Lt and Gt both test CF, since Gt swapped its
-            // operands above.
-            emit_setcc(code, in.op == Op::Eq ? Cond::Equal : Cond::Below, dst);
+            // Eq tests ZF set (Cond::Equal); Ne tests ZF clear (Cond::NotEqual);
+            // Lt and Gt both test CF, since Gt swapped its operands above.
+            // Both ZF tests are then guarded by the parity flag below, because
+            // ucomisd reports "unordered" (a NaN) by setting ZF, CF and PF all.
+            emit_setcc(code,
+                       in.op == Op::Eq ? Cond::Equal
+                       : in.op == Op::Ne ? Cond::NotEqual
+                                         : Cond::Below,
+                       dst);
             emit_movzx_reg_reg8(code, dst, dst);
-            // setnp (not parity) is 1 exactly when the compare was ordered,
-            // which is what keeps every NaN comparison False.
-            emit_setcc(code, Cond::NotParity, kL);
-            emit_movzx_reg_reg8(code, kL, kL);
-            emit_and_reg_reg(code, dst, kL);
+            if (in.op == Op::Ne) {
+                // `!=` is the OR of the two: true when the operands differ
+                // (ZF clear) OR are unordered (PF set). setp is 1 exactly on
+                // an unordered compare, so `nan != nan` is true -- Python's
+                // answer, and the mirror of Eq's `sete AND setnp`.
+                emit_setcc(code, Cond::Parity, kL);
+                emit_movzx_reg_reg8(code, kL, kL);
+                emit_or_reg_reg(code, dst, kL);
+            } else {
+                // setnp (not parity) is 1 exactly when the compare was ordered,
+                // which is what keeps every NaN comparison False.
+                emit_setcc(code, Cond::NotParity, kL);
+                emit_movzx_reg_reg8(code, kL, kL);
+                emit_and_reg_reg(code, dst, kL);
+            }
             commit_result(in.result, dst);
         };
 
@@ -1711,14 +1781,35 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
         // callee-saved slots and the incoming-argument area all unchanged.
         size_t self_tail_reentry = 0;
 
-        struct PendingBlockPatch {
-            JumpPatch patch;
-            std::string target_label;
-        };
-        std::vector<PendingBlockPatch> pending_blocks;
         std::unordered_map<std::string, size_t> block_offset;
         std::unordered_map<std::string, size_t> block_index;
         for (size_t b = 0; b < fn.blocks.size(); ++b) block_index[fn.blocks[b].label] = b;
+
+        // 6.10. try/except. A trap inside a protected region jumps to the
+        // matching handler block instead of calling host_report_error. The
+        // active regions are a property of the PROGRAM POINT, so they are
+        // precomputed per block (a block emitted out of order by the unroller
+        // must not inherit whatever regions the emitter happened to be in).
+        // The frontend lays a `try` out so its protected blocks sit between the
+        // TryEnter and TryLeave markers; a linear walk over the instructions in
+        // block order therefore reproduces the lexical nesting exactly.
+        std::vector<std::vector<JitTryRegion>> block_regions(fn.blocks.size());
+        {
+            std::vector<JitTryRegion> live;
+            for (size_t b = 0; b < fn.blocks.size(); ++b) {
+                block_regions[b] = live;   // snapshot on entry to this block
+                for (const auto& in : fn.blocks[b].instrs) {
+                    if (in.op == Op::TryEnter) {
+                        JitTryRegion r;
+                        r.kinds = lithon::ir::split_marks(in.name);
+                        r.labels = lithon::ir::split_marks(in.name2);
+                        live.push_back(std::move(r));
+                    } else if (in.op == Op::TryLeave) {
+                        if (!live.empty()) live.pop_back();
+                    }
+                }
+            }
+        }
 
         // 2.7. Direct Phi emission. A Phi is an EDGE copy: operand i arrives
         // on the edge out of pred(s)[i]. So the copy for `from -> to` is the
@@ -2350,17 +2441,81 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
             // with a RIP-relative lea; the width is a runtime argument so one
             // helper serves every width.
             case Op::InputInt: {
+                // 6.10. Inside a `try`, the read must NOT exit on a bad line:
+                // it has to report WHICH trap it is so the generated code can
+                // branch to a matching handler. host_input_int_ex returns the
+                // value and a small kind code (1 ValueError / 2 OverflowError /
+                // 3 EOFError) instead of ending the process. A kind nothing
+                // catches still reports its message and exits, exactly as the
+                // exiting host_input_int would have.
+                const char* const kKinds[3] = {
+                    lithon::jit::kE0306Message,
+                    lithon::jit::kE0307Message,
+                    lithon::jit::kE0308Message,
+                };
+                const char* const kNames[3] = {"ValueError", "OverflowError", "EOFError"};
+                bool any_catchable = false;
+                for (const char* n : kNames)
+                    if (!trap_handler_label(n).empty()) any_catchable = true;
+
+                if (!any_catchable) {
+                    // The common case: no enclosing try, or one that names none
+                    // of these. The original one-call form, byte for byte.
+                    emit_lea_pool_string(abi::kArgRegs[0], instr.name);
+                    emit_mov_reg_imm(code, abi::kArgRegs[1],
+                                     static_cast<int64_t>(instr.type_width));
+                    emit_mov_reg_imm(code, kR,
+                                     reinterpret_cast<int64_t>(&lithon::jit::host_input_int));
+                    emit_xor_zero(code, Reg::RAX);
+                    if (abi::kShadowSpace) emit_sub_rsp_imm32(code, abi::kShadowSpace);
+                    emit_call_reg(code, kR);
+                    if (abi::kShadowSpace) emit_add_rsp_imm32(code, abi::kShadowSpace);
+                    Reg dst0 = compute_dest(instr.result);
+                    emit_mov_reg_reg(code, dst0, Reg::RAX);
+                    commit_result(instr.result, dst0);
+                    break;
+                }
+
+                // Reserve 16 bytes: the value slot is [rsp], and the extra 8
+                // keeps the call site 16-byte aligned.
+                emit_sub_rsp_imm32(code, 16);
                 emit_lea_pool_string(abi::kArgRegs[0], instr.name);
                 emit_mov_reg_imm(code, abi::kArgRegs[1],
                                  static_cast<int64_t>(instr.type_width));
+                emit_mov_reg_reg(code, abi::kArgReg2, Reg::RSP);
                 emit_mov_reg_imm(code, kR,
-                                 reinterpret_cast<int64_t>(&lithon::jit::host_input_int));
+                                 reinterpret_cast<int64_t>(&lithon::jit::host_input_int_ex));
                 emit_xor_zero(code, Reg::RAX);
                 if (abi::kShadowSpace) emit_sub_rsp_imm32(code, abi::kShadowSpace);
                 emit_call_reg(code, kR);
                 if (abi::kShadowSpace) emit_add_rsp_imm32(code, abi::kShadowSpace);
+                // kR = the return KIND code (0 = success); kL = the value.
+                emit_mov_reg_reg(code, kR, Reg::RAX);
+                emit_load_reg_indirect(code, kL, Reg::RSP, 8);
+                emit_add_rsp_imm32(code, 16);
+
+                // Success falls through to the shared tail; a failure is a
+                // chain of kind tests, each either jumping to its handler or
+                // reporting its message.
+                emit_test_reg_reg(code, kR);
+                JumpPatch ok = emit_jcc_rel32(code, Cond::Equal);
+                for (int i = 0; i < 3; ++i) {
+                    const std::string target = trap_handler_label(kNames[i]);
+                    emit_cmp_reg_imm32(code, kR, i + 1);
+                    JumpPatch skip = emit_jcc_rel32(code, Cond::NotEqual);
+                    // This is the kind that fired.
+                    if (!target.empty()) {
+                        pending_blocks.push_back({emit_jmp_rel32(code), target});
+                    } else {
+                        emit_host_error_trap(kKinds[i]);
+                    }
+                    resolve_jump_patch(code, skip, code.size());
+                }
+                // Fallback: an unknown code should never happen; report E0306.
+                emit_host_error_trap(lithon::jit::kE0306Message);
+                resolve_jump_patch(code, ok, code.size());
                 Reg dst = compute_dest(instr.result);
-                emit_mov_reg_reg(code, dst, Reg::RAX);
+                emit_mov_reg_reg(code, dst, kL);
                 commit_result(instr.result, dst);
                 break;
             }
@@ -2606,13 +2761,17 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
             // base, so RBP is the single pointer argument and the descriptor
             // carries the two offsets and capacities. The helper returns 0/1 in
             // RAX; the result is committed as a bool.
-            case Op::StrEq: {
+            case Op::StrEq:
+            case Op::StrNe: {
                 const int cap1 = alloc.container_capacity(instr.name);
                 const int cap2 = alloc.container_capacity(instr.name2);
                 if (cap1 <= 0 || cap2 <= 0) {
-                    throw std::runtime_error("compile_module: streq of '" + instr.name +
-                                             "' and '" + instr.name2 +
-                                             "' which are not both strs");
+                    throw std::runtime_error(
+                        std::string("compile_module: ") +
+                        (instr.op == Op::StrEq ? "streq" : "strne") +
+                        " of '" + instr.name +
+                        "' and '" + instr.name2 +
+                        "' which are not both strs");
                 }
                 lithon::jit::ContainerStrEqDesc desc{};
                 desc.base1 = alloc.element_offset(instr.name, 0);
@@ -2628,6 +2787,11 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 emit_call_reg(code, kR);
                 Reg dst = compute_dest(instr.result);
                 if (dst != Reg::RAX) emit_mov_reg_reg(code, dst, Reg::RAX);
+                // host_streq returns 0/1, so `!=` is that XOR 1. Done on the
+                // destination so it is correct whichever register it landed in.
+                if (instr.op == Op::StrNe) {
+                    emit_xor_reg_imm32(code, dst, 1);
+                }
                 commit_result(instr.result, dst);
                 break;
             }
@@ -3370,7 +3534,8 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
 
                     case Op::Lt:
                     case Op::Gt:
-                    case Op::Eq: {
+                    case Op::Eq:
+                    case Op::Ne: {
                         if (info_of(instr.result).kind == TempInfo::Kind::FusedCmp) break;
                         // A float operand means the whole comparison is a
                         // double comparison -- the guard promotes int+float
@@ -3390,7 +3555,9 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                             emit_cmp_reg_reg(code, lhs, read_right(instr.args.at(1)));
                         }
                         Cond cond = instr.op == Op::Lt ? Cond::Less
-                                  : instr.op == Op::Gt ? Cond::Greater : Cond::Equal;
+                                  : instr.op == Op::Gt ? Cond::Greater
+                                  : instr.op == Op::Eq ? Cond::Equal
+                                                       : Cond::NotEqual;
                         emit_setcc(code, cond, dst);
                         emit_movzx_reg_reg8(code, dst, dst);
                         commit_result(instr.result, dst);
@@ -3624,7 +3791,9 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                                 if (imm32_of(cmp.args.at(1), imm)) emit_cmp_reg_imm32(code, lhs, imm);
                                 else emit_cmp_reg_reg(code, lhs, read_right(cmp.args.at(1)));
                                 cond = cmp.op == Op::Lt ? Cond::Less
-                                     : cmp.op == Op::Gt ? Cond::Greater : Cond::Equal;
+                                     : cmp.op == Op::Gt ? Cond::Greater
+                                     : cmp.op == Op::Eq ? Cond::Equal
+                                                        : Cond::NotEqual;
                             }
                         } else {
                             emit_test_reg_reg(code, read_left(cond_id));
@@ -3649,6 +3818,20 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                                 } else {
                                     push(emit_jcc_rel32(code, Cond::JumpParity));
                                     push(emit_jcc_rel32(code, Cond::NotEqual));
+                                }
+                            } else if (fop == Op::Ne) {
+                                // The mirror of Eq above. `!=` is true when the
+                                // operands differ OR are unordered, so jumping on
+                                // it is jp-or-jne with no guard. Jumping on its
+                                // NEGATION (ordered AND equal) is je guarded by
+                                // jnp -- the Eq-taken shape with the roles swapped.
+                                if (taken) {
+                                    push(emit_jcc_rel32(code, Cond::JumpParity));
+                                    push(emit_jcc_rel32(code, Cond::NotEqual));
+                                } else {
+                                    JumpPatch skip = emit_jcc_rel32(code, Cond::JumpParity);
+                                    push(emit_jcc_rel32(code, Cond::Equal));
+                                    resolve_jump_patch(code, skip, code.size());
                                 }
                             } else {
                                 // Lt and Gt are both decided by ja / its inverse
@@ -4159,6 +4342,15 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                         break;
                     }
 
+                    // 6.10. The try/except markers emit no code: they carry the
+                    // handler layout for the trap emitters (which consult the
+                    // per-block region snapshot), and the handler blocks are
+                    // ordinary blocks reached by a jump.
+                    case Op::TryEnter:
+                    case Op::TryLeave:
+                    case Op::TryCatch:
+                        break;
+
                     default:
                         throw std::runtime_error(
                             "compile_module: opcode not implemented in this slice "
@@ -4633,7 +4825,19 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
         // individually, so any trip count stays exact.
         std::unordered_map<size_t, detail::DiamondUnroll> diamond_at_header;
         std::unordered_set<size_t> inlined_blocks;
-        if (options.rotate_loops && options.unroll_factor > 1 && options.unroll_diamonds) {
+        // 6.10. A function that contains try/except is emitted straight: the
+        // rotation/unroll/vectorize paths duplicate blocks out of order, and a
+        // trap must jump to the handler of the region it is LEXICALLY in, which
+        // only the in-order layout preserves. Declining these passes on the
+        // handful of functions that use try costs nothing and removes the whole
+        // class of "the handler jumped to was in another copy" bugs.
+        bool has_try = false;
+        for (const auto& b : fn.blocks)
+            for (const auto& in : b.instrs)
+                if (in.op == Op::TryEnter || in.op == Op::TryLeave || in.op == Op::TryCatch)
+                    has_try = true;
+        if (!has_try && options.rotate_loops && options.unroll_factor > 1 &&
+            options.unroll_diamonds) {
             for (size_t latch = 1; latch < fn.blocks.size(); ++latch) {
                 detail::DiamondUnroll dia;
                 if (!detail::match_diamond_unroll(fn, block_index, latch, dia)) continue;
@@ -4650,6 +4854,8 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
         for (size_t bi = 0; bi < fn.blocks.size(); ++bi) {
             block_offset[fn.blocks[bi].label] = code.size();
             if (bi == 0) self_tail_reentry = code.size();
+            // 6.10. The regions in force for a trap emitted in this block.
+            current_regions = block_regions[bi];
             const std::string next_label = bi + 1 < fn.blocks.size() ? fn.blocks[bi + 1].label : "";
 
             if (inlined_blocks.count(bi)) continue;   // already inside an unrolled copy
@@ -4699,7 +4905,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
             // scalar tail (+ merge, for a reduction), then the untouched scalar
             // header as the fallback, which rotates onto the body/latch blocks
             // this loop emits next in their normal positions.
-            if (options.vectorize && options.rotate_loops) {
+            if (options.vectorize && options.rotate_loops && !has_try) {
                 if (try_emit_vectorized(bi, next_label)) {
                     ++loops_vectorized;
                     continue;
@@ -4714,7 +4920,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
             // test jumps back. Every iteration is still individually
             // tested, so any trip count (not just multiples of U) is exact.
             if (options.rotate_loops && options.unroll_factor > 1 && bi >= 1 &&
-                detail::is_unrollable_body(fn.blocks[bi])) {
+                !has_try && detail::is_unrollable_body(fn.blocks[bi])) {
                 const Instr& term = fn.blocks[bi].instrs.back();
                 auto hit = block_index.find(term.name);
                 if (hit != block_index.end() && hit->second == bi - 1 &&

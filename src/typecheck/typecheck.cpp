@@ -350,6 +350,17 @@ private:
                     size_t comma = instr.name.find(',');
                     add_edge(block.label, instr.name.substr(0, comma));
                     add_edge(block.label, instr.name.substr(comma + 1));
+                } else if (instr.op == Op::TryEnter) {
+                    // 6.10. A handler block is entered by a trap jump, not a
+                    // `jump`, so without this edge it would look predecessorless
+                    // and start from the entry scope -- losing every variable
+                    // assigned before the try. The edge is from the TryEnter's
+                    // own block, so a handler's in-scope is the try-entry scope,
+                    // which is exactly what is definitely assigned when a trap
+                    // fires anywhere in the body.
+                    for (const auto& label : lithon::ir::split_marks(instr.name2)) {
+                        add_edge(block.label, label);
+                    }
                 }
             }
         }
@@ -1870,7 +1881,8 @@ private:
             // operand is ever a register value. Both names must be str, and they
             // may have different capacities -- comparing str[4] to str[8] is
             // legal and equal when the contents agree.
-            case Op::StrEq: {
+            case Op::StrEq:
+            case Op::StrNe: {
                 auto lit = scope.find(instr.name);
                 if (lit == scope.end()) {
                     error("'" + instr.name + "' is not definitely assigned here (V1_SPEC 0.6.10)");
@@ -1882,7 +1894,8 @@ private:
                     return;
                 }
                 if (lit->second.kind != "str" || rit->second.kind != "str") {
-                    error("streq compares two strings, got " +
+                    error(std::string(instr.op == Op::StrEq ? "streq" : "strne") +
+                          " compares two strings, got " +
                           type_str(lit->second) + " and " + type_str(rit->second) + " (6.2)");
                     return;
                 }
@@ -2076,7 +2089,7 @@ private:
                 reg_types_[instr.result] = LType{"bool", -1};
                 return;
             }
-            case Op::Eq: {
+            case Op::Eq: case Op::Ne: {
                 LType lhs, rhs;
                 const bool lhs_ptr = reg_type(instr.args.at(0), lhs) && lhs.kind == "ptr";
                 const bool rhs_ptr = reg_type(instr.args.at(1), rhs) && rhs.kind == "ptr";

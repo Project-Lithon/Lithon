@@ -387,7 +387,7 @@ private:
                 // they clobber caller-saved registers for the same reason.
                 // 6.4's StrFind/StrCount reach a helper the same way.
                 if (op != Op::Call && op != Op::Syscall && op != Op::PrintContainer &&
-                    op != Op::StrLen && op != Op::StrEq &&
+                    op != Op::StrLen && op != Op::StrEq && op != Op::StrNe &&
                     op != Op::StrFind && op != Op::StrCount)
                     continue;
                 const int call_pos = static_cast<int>(pos);

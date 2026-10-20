@@ -1,0 +1,96 @@
+# 6.10. try/except over the built-in Tier-3 traps. A caught trap is a jump to the
+# matching handler, not a program end: there is no exception object and no
+# unwinding, and handler blocks are ordinary blocks. The catchable set is the
+# closed one (ZeroDivisionError, OverflowError, ValueError, IndexError,
+# KeyError, EOFError), plus `Exception` for all of them.
+#
+# The oracle is the interpreter, and the shapes below are chosen so CPython
+# agrees name for name. The one place a name has no CPython counterpart is
+# int64 overflow: Python integers are unbounded, so `big + big` raises nothing
+# there. That case asserts Lithon's own trap->OverflowError mapping.
+
+# A caught modulo-by-zero. Nothing after the trap in the body runs.
+n: int[64] = 0
+try:
+    q: int[64] = 100 % n
+    print("not reached")
+except ZeroDivisionError:
+    print("caught ZeroDivisionError")
+
+# The `else` clause runs only when the body completed with no trap.
+d: int[64] = 4
+try:
+    r: int[64] = 100 % d
+except ZeroDivisionError:
+    print("zero")
+else:
+    print("else ran")
+
+# `finally` runs on the normal path and on the caught path.
+t: int[64] = 0
+try:
+    z: int[64] = 1 % t
+except ZeroDivisionError:
+    print("zero again")
+finally:
+    print("finally ran")
+
+# A multi-name handler. int64 overflow traps as OverflowError.
+big: int[64] = 9223372036854775807
+try:
+    sum_: int[64] = big + big
+    print("not reached")
+except (OverflowError, ZeroDivisionError):
+    print("caught OverflowError")
+
+# The catch-all matches every catchable trap.
+i: int[64] = 0
+try:
+    w: int[64] = 7 % i
+except Exception:
+    print("caught by Exception")
+
+# An index past the end of a list is an IndexError.
+xs: list[int[64], 3] = [10, 20, 30]
+k: int[64] = 9
+try:
+    v: int[64] = xs[k]
+    print("not reached")
+except IndexError:
+    print("caught IndexError")
+
+# The first matching handler wins.
+try:
+    y: int[64] = 5 % 0
+except ZeroDivisionError:
+    print("first handler")
+except Exception:
+    print("second handler")
+
+# A nested try: the inner handler catches first.
+a: int[64] = 5
+try:
+    try:
+        inner: int[64] = a % 0
+    except ZeroDivisionError:
+        print("inner caught")
+except Exception:
+    print("outer caught")
+
+# The inner try does not catch what it does not name, so the outer does.
+try:
+    try:
+        deep: int[64] = a % 0
+    except IndexError:
+        print("inner wrong")
+except ZeroDivisionError:
+    print("outer caught")
+
+# No trap: the try is invisible, and the body's value reaches `else`.
+try:
+    c: int[64] = a % 2
+except ZeroDivisionError:
+    print("zero")
+else:
+    print(c)
+print("done")

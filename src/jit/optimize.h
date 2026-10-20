@@ -130,8 +130,12 @@ inline void fold_constants(lithon::ir::Function& fn, OptimizeStats& stats) {
                 case Op::Lt:
                 case Op::Gt:
                 case Op::Eq:
+                case Op::Ne:
                     if (in.args.size() == 2 && as_const(in.args[0], a) && as_const(in.args[1], b)) {
-                        bool r = in.op == Op::Lt ? a < b : in.op == Op::Gt ? a > b : a == b;
+                        bool r = in.op == Op::Lt ? a < b
+                               : in.op == Op::Gt ? a > b
+                               : in.op == Op::Eq ? a == b
+                                                 : a != b;
                         rewrite(in, r ? 1 : 0);
                     }
                     break;
@@ -201,7 +205,7 @@ inline bool is_pure_op(lithon::ir::Op op) {
         // WrapAdd/WrapSub/WrapMul only: the deliberate opt-outs are genuinely
         // total, so hoisting or deleting them is unobservable.
         case Op::WrapAdd: case Op::WrapSub: case Op::WrapMul:
-        case Op::Lt: case Op::Gt: case Op::Eq:
+        case Op::Lt: case Op::Gt: case Op::Eq: case Op::Ne:
         case Op::And: case Op::Or: case Op::Not:
         // BitAnd/BitOr/BitXor only: genuinely total, so hoisting or
         // duplicating them is unobservable. Shl/Shr and, since the E0303
@@ -312,14 +316,15 @@ inline void eliminate_dead_code(lithon::ir::Function& fn, OptimizeStats& stats) 
                 // used only through them would otherwise look dead and have its
                 // declaration deleted. 6.4's StrFind/StrCount name two strings
                 // the same way.
-                in.op == Op::StrLen || in.op == Op::StrEq ||
+                in.op == Op::StrLen || in.op == Op::StrEq || in.op == Op::StrNe ||
                 in.op == Op::StrFind || in.op == Op::StrCount ||
                 // 6.7. StrSplit names THREE runs: the source str, the separator
                 // str, and the destination list. Each is storage, so all three
                 // must stay live.
                 in.op == Op::StrSplit) {
                 mark_var(in.name);
-                if (in.op == Op::StrEq || in.op == Op::StrFind || in.op == Op::StrCount)
+                if (in.op == Op::StrEq || in.op == Op::StrNe ||
+                    in.op == Op::StrFind || in.op == Op::StrCount)
                     mark_var(in.name2);
                 // 6.8. A str-keyed dict names its KEY RUN as name2: a bounded
                 // string has no register form to hold the key in, so it is the
@@ -922,7 +927,7 @@ inline void accumulator_unroll(lithon::ir::Function& fn, OptimizeStats& stats,
             case Op::ConstInt: case Op::ConstBool: case Op::ConstFloat:
             case Op::Load: case Op::Store:
             case Op::Add: case Op::Sub: case Op::Mul:
-            case Op::Lt: case Op::Gt: case Op::Eq:
+            case Op::Lt: case Op::Gt: case Op::Eq: case Op::Ne:
             case Op::And: case Op::Or: case Op::Not:
             case Op::BitAnd: case Op::BitOr: case Op::BitXor:
             case Op::Shl: case Op::Shr:

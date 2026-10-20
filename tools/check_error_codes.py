@@ -596,6 +596,24 @@ FRONTEND_REFUSALS = [
     ("sum over a split result's run-time length (E0115)",
      "s: str[16] = \"a,b,c\"\np: list[str[4], 4] = s.split(\",\")\n"
      "print(sum(p))\n", "LITHON-E0115"),
+    # 6.10. The try/except slice is deliberately closed: a bare `except:`, an
+    # unnameable trap, an `as e` binding and a bare `try/finally` are each
+    # refused where the source spells them, not silently accepted or dropped.
+    ("try/except with a bare except (E0114)",
+     "a: int[64] = 1\ntry:\n    b: int[64] = a % 0\nexcept:\n    print(\"x\")\n",
+     "LITHON-E0114"),
+    ("try/except naming a non-trap (E0114)",
+     "a: int[64] = 1\ntry:\n    b: int[64] = a % 0\nexcept MyError:\n    print(\"x\")\n",
+     "LITHON-E0114"),
+    ("try/except with an `as e` binding (E0114)",
+     "a: int[64] = 1\ntry:\n    b: int[64] = a % 0\nexcept ZeroDivisionError as e:\n    print(\"x\")\n",
+     "LITHON-E0114"),
+    ("try/finally with no except (E0114)",
+     "a: int[64] = 1\ntry:\n    b: int[64] = a % 0\nfinally:\n    print(\"x\")\n",
+     "LITHON-E0114"),
+    ("raise (E0114)",
+     "a: int[64] = 1\ntry:\n    b: int[64] = a % 0\nexcept ZeroDivisionError:\n    raise\n",
+     "LITHON-E0114"),
 ]
 
 

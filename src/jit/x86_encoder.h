@@ -189,6 +189,10 @@ inline void emit_and_reg_imm32(CodeBuffer& buf, Reg dst, int32_t imm) {
     emit_u32_le(buf, static_cast<uint32_t>(imm));
 }
 
+// xor dst, imm32 (REX.W + 81 /6 id). A full 64-bit xor against a sign-extended
+// imm32, so `xor r, 1` flips the low bit of a 0/1 boolean and leaves the rest
+// of the register -- which is zero for a host_streq return -- untouched.
+inline void emit_xor_reg_imm32(CodeBuffer& buf, Reg dst, int32_t imm);
 // imul dst, src, imm32  (three-operand form, REX.W + 69 /r id).
 // Works even when dst == src.
 inline void emit_imul_reg_reg_imm32(CodeBuffer& buf, Reg dst, Reg src, int32_t imm) {
@@ -216,6 +220,7 @@ inline void emit_alu_reg_imm(CodeBuffer& buf, uint8_t digit, Reg dst, int32_t im
 inline void emit_add_reg_imm32(CodeBuffer& buf, Reg dst, int32_t imm) { emit_alu_reg_imm(buf, 0, dst, imm); }
 inline void emit_sub_reg_imm32(CodeBuffer& buf, Reg dst, int32_t imm) { emit_alu_reg_imm(buf, 5, dst, imm); }
 inline void emit_cmp_reg_imm32(CodeBuffer& buf, Reg lhs, int32_t imm) { emit_alu_reg_imm(buf, 7, lhs, imm); }
+inline void emit_xor_reg_imm32(CodeBuffer& buf, Reg dst, int32_t imm) { emit_alu_reg_imm(buf, 6, dst, imm); }
 
 // cmp lhs, rhs  (64-bit register to register)
 // Encoding: REX.W + 39 /r   (CMP r/m64, r64)
@@ -980,6 +985,17 @@ inline void emit_epilogue(CodeBuffer& buf) {
 inline void emit_and_reg_reg(CodeBuffer& buf, Reg dst, Reg src) {
     if (reg_is_extended(dst) || reg_is_extended(src)) emit_u8(buf, rex(false, src, dst));
     emit_u8(buf, 0x21);
+    emit_u8(buf, modrm_reg_reg(src, dst));
+}
+
+// or dst, src  (32-bit). Encoding: 09 /r. Like emit_and_reg_reg above, this is
+// the 0/1-boolean form (two setcc results): the 32-bit width is deliberate and
+// harmless because both operands are already 0 or 1, and ORing two of those
+// needs no REX.W. It is NOT a general 64-bit or -- use emit_or_reg_reg64 for
+// BitOr, where a 32-bit or would drop the high half.
+inline void emit_or_reg_reg(CodeBuffer& buf, Reg dst, Reg src) {
+    if (reg_is_extended(dst) || reg_is_extended(src)) emit_u8(buf, rex(false, src, dst));
+    emit_u8(buf, 0x09);
     emit_u8(buf, modrm_reg_reg(src, dst));
 }
 

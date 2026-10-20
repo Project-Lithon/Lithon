@@ -657,6 +657,20 @@ STRUCT_BASE = "Struct"
 # what a variant is.
 ENUM_BASE = "Enum"
 
+# 6.10. The closed set of Tier-3 traps a `try` may catch. It mirrors
+# `lithon::ir::classify_trap_message`: every name here has a corresponding trap,
+# every trap maps to one of these, and anything else (a stack overflow, a
+# segfault) is uncatchable. `Exception` is allowed as the catch-all and is not
+# in this set -- it is spelled separately, since it names no single trap.
+_CATCHABLE_TRAPS = {
+    "ZeroDivisionError",
+    "OverflowError",
+    "ValueError",
+    "IndexError",
+    "KeyError",
+    "EOFError",
+}
+
 
 class StructLayout:
     """The packed byte layout of one struct type.
@@ -1605,16 +1619,17 @@ class IRBuilder:
             # A str FIELD (`s.f == t.f`, or a field against a top-level string)
             # is such a place too, naming its companion run. Both operands are
             # resolved by a pure walk (no emission), so source order holds.
-            if op_type is ast.Eq:
+            if op_type is ast.Eq or op_type is ast.NotEq:
                 ln = self._str_place_name(node.left)
                 rn = self._str_place_name(node.comparators[0])
                 if ln is not None and rn is not None:
                     r = self.new_reg()
-                    self.emit(f"{r} = streq {ln}, {rn}")
+                    self.emit(f"{r} = {'streq' if op_type is ast.Eq else 'strne'} "
+                              f"{ln}, {rn}")
                     return r
             left = self.build_expr(node.left)
             right = self.build_expr(node.comparators[0])
-            op_map = {ast.Lt: "lt", ast.Gt: "gt", ast.Eq: "eq"}
+            op_map = {ast.Lt: "lt", ast.Gt: "gt", ast.Eq: "eq", ast.NotEq: "ne"}
             if op_type not in op_map:
                 raise NotImplementedError(f"LITHON-E0114: comparison {op_type.__name__} not supported yet")
             r = self.new_reg()
@@ -2726,6 +2741,124 @@ class IRBuilder:
         for stmt in body:
             self.build_stmt(stmt)
         self.loop_depth -= 1
+
+    # 6.10. try/except over the built-in Tier-3 traps. The whole construct is
+    # ordinary control flow plus three markers: TryEnter opens a protected
+    # region and names the handlers, TryLeave closes it on normal completion,
+    # and each handler block begins with TryCatch. Neither tier builds an
+    # exception object or unwinds a stack -- a caught trap is a jump.
+    #
+    # Layout:
+    #
+    #     tryenter <kinds>, <handler labels>
+    #     <body>
+    #   [ tryleave ; <else> ]                 # else runs only on normal completion
+    #     jump <finally-or-merge>
+    #   h1: trycatch <E1>  <H1>  jump <finally-or-merge>
+    #   h2: trycatch <E2,E3> <H2> jump <finally-or-merge>
+    #   finally: <FIN>
+    #   merge:
+    #
+    # `finally` is duplicated onto the normal path and onto the end of every
+    # handler, so it runs whichever way the try finished -- except when a trap
+    # is left UNCAUGHT, in which case the program still terminates (there is no
+    # `raise` in this slice, so there is nothing to re-raise with). That
+    # narrowing is recorded in the README's divergence table.
+    def build_try(self, node):
+        if node.finalbody and not node.handlers and not node.orelse:
+            raise NotImplementedError(
+                "LITHON-E0114: `try`/`finally` with no `except` is not supported yet -- "
+                "a `finally` here would have to run on the way out of an uncaught trap, "
+                "which needs `raise` (6.10)")
+        handlers = []
+        for h in node.handlers:
+            if h.type is None:
+                raise NotImplementedError(
+                    "LITHON-E0114: a bare `except:` is not supported -- it also catches "
+                    "system-exit, and here it would suggest catching a segfault, which is "
+                    "not catchable; name the trap (`except Exception:` catches every "
+                    "catchable trap) (6.10)")
+            if h.name is not None:
+                raise NotImplementedError(
+                    "LITHON-E0114: `except ... as e` is not supported yet -- there is no "
+                    "exception object to bind (6.10)")
+            kinds = self._except_kinds(h.type)
+            label = self.reserve_label()
+            # A trap jump targets this label, but it is named inside TryEnter
+            # rather than by a `jump`, so mark it reachable here.
+            self.reachable_labels.add(label)
+            handlers.append((kinds, label, h.body))
+
+        body_label = self.reserve_label()
+        else_label = self.reserve_label() if node.orelse else None
+        finally_label = self.reserve_label() if node.finalbody else None
+        merge_label = self.reserve_label()
+        after_label = finally_label if finally_label else merge_label
+
+        # TryEnter names every kind and its handler label, positionally: each
+        # handler label appears once per KIND it catches, so a `(A, B)` handler
+        # is reachable from either name. `+` joins the lists because the IR text
+        # parser splits arguments on commas.
+        flat_kinds = "+".join(k for kinds, _, _ in handlers for k in kinds)
+        flat_labels = "+".join(
+            label for kinds, label, _ in handlers for _ in kinds)
+        self.emit(f"tryenter {flat_kinds}, {flat_labels}")
+        self.emit(f"jump {body_label}")
+
+        self.start_block(body_label)
+        for stmt in node.body:
+            self.build_stmt(stmt)
+        if node.orelse:
+            self.emit("tryleave")
+            self.emit(f"jump {else_label}")
+            self.start_block(else_label)
+            for stmt in node.orelse:
+                self.build_stmt(stmt)
+            self.emit(f"jump {after_label}")
+        else:
+            self.emit("tryleave")
+            self.emit(f"jump {after_label}")
+
+        for kinds, label, body in handlers:
+            self.start_block(label)
+            # The handler's own kind list, for the reader of the IR; a trap
+            # already knows its target label from TryEnter, so this is a marker
+            # and not a lookup.
+            self.emit(f"trycatch {'+'.join(kinds)}")
+            for stmt in body:
+                self.build_stmt(stmt)
+            self.emit(f"jump {after_label}")
+
+        if node.finalbody:
+            self.start_block(finally_label)
+            for stmt in node.finalbody:
+                self.build_stmt(stmt)
+            self.emit(f"jump {merge_label}")
+
+        self.start_block(merge_label)
+
+    def _except_kinds(self, type_node):
+        """The exception names an `except` clause names, as a list.
+
+        `except ValueError:` -> ["ValueError"]; `except (A, B):` -> ["A", "B"];
+        `except Exception:` -> ["Exception"] (the catch-all). A dotted or
+        aliased name, or a non-name expression, is refused: the set is closed.
+        """
+        if isinstance(type_node, ast.Tuple):
+            return [self._except_name(e) for e in type_node.elts]
+        return [self._except_name(type_node)]
+
+    def _except_name(self, node):
+        if isinstance(node, ast.Name):
+            name = node.id
+            if name in _CATCHABLE_TRAPS or name == "Exception":
+                return name
+            raise NotImplementedError(
+                f"LITHON-E0114: `except {name}:` is not a catchable trap -- the catchable "
+                f"set is {', '.join(sorted(_CATCHABLE_TRAPS))}, plus `Exception` for all "
+                f"of them (6.10)")
+        raise NotImplementedError(
+            "LITHON-E0114: an `except` clause must name a built-in trap (6.10)")
 
     def build_if(self, node):
         cond_reg = self.build_expr(node.test)
@@ -4384,6 +4517,10 @@ class IRBuilder:
 
         if isinstance(node, ast.Match):
             self.build_match(node)
+            return
+
+        if isinstance(node, ast.Try):
+            self.build_try(node)
             return
 
         if isinstance(node, ast.Return):

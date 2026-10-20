@@ -64,6 +64,30 @@ drop-in Python replacement.
 
 ### Recently added
 
+- **`try`/`except` (6.10)** — the Python EAFP rhyme works: a `try` body whose
+  `int(8, input("..."))` meets a typo lands in `except ValueError:`, and the
+  program continues. It catches the closed set of built-in Tier-3 traps
+  (`ZeroDivisionError`, `OverflowError`, `ValueError`, `IndexError`,
+  `KeyError`, `EOFError`, or `Exception` for every one of them) with `else` and
+  `finally`. There is no exception object and no unwinding: a caught trap is a
+  plain jump to the matching handler block, and the whole construct is ordinary
+  control flow plus three markers both tiers read. That is also its one
+  narrowing — only a trap raised in the **same function** as the `try` is
+  catchable, because routing across a call boundary would need a real unwind.
+  `except X as e`, `raise`, `except*` and a bare `except:` are refused.
+  `tests/typed_regression/try_except.lio` and `try_except_eafp.lio` are the
+  tier-identical guards.
+- **`!=` (6.9)** — `ast.NotEq` is now a first-class compare, not an `==`
+  followed by a `Not`. It mirrors `==` in typing and differs only in the result:
+  a dedicated `Ne` IR op lets the optimizer, branch fusion and the print guard
+  see the real predicate. The float path is the one with a machine-level trap:
+  after `ucomisd`, `!=` is true when the operands differ **or** are unordered, so
+  the JIT emits `setne OR setp` (fused: `jp` and `jne` to the same target) while
+  `==` stays `sete AND setnp` — emitting only `setne` would make `nan != nan`
+  false. Integers compare exactly as `int64`, `str` compares as a run
+  (lengths-or-bytes, via `strne`), and `while i != n` loops are not strength-
+  reduced or vectorized because `i != n` has no guaranteed trip count.
+  `tests/typed_regression/ne.lio` is the byte-for-byte CPython guard.
 - **Raw syscalls** — `syscall(number, a1..a6) -> int[64]`, one IR instruction
   and one host trampoline that *both* tiers call, so the calling convention
   cannot drift between them. Takes int[64] and pointers.
@@ -1481,6 +1505,9 @@ Deliberate narrowings, collected next to `%` and `v == n`:
 | a `str` dict key | any string | `str[N]`: a literal key or a `str` variable whose **capacity** does not exceed the table's key capacity | a key is copied into a fixed `N`-byte slot; a wider run could not survive the copy |
 | a `dict` value | any value, including another `dict` | a scalar, or a `list`/`tuple` run; a `dict` value is refused (`E0112`) | a value slot is one flat leaf run; a `dict` has three regions, so it has no single run a slot could hold |
 | source file extension | `.py` | `.lio`; the frontend refuses any other extension (`E0114`) | the extension is what marks a file as a Lithon program, so a plain Python script is never silently compiled as Lithon |
+| `try`/`except` (6.10) | catches any exception, from anywhere, and `finally` always runs | catches the closed set of built-in Tier-3 traps (`ZeroDivisionError`, `OverflowError`, `ValueError`, `IndexError`, `KeyError`, `EOFError`, or `Exception` for all of them) **raised in the same function as the `try`**; a trap raised inside a called function ends the program, and an *uncaught* trap does not run a `finally` | a trap is routed statically, so a caught trap is a plain jump within one function; crossing a call boundary would need a real unwind, and re-running `finally` on a propagating trap would need `raise` |
+| a bare `except:` | catches everything | refused (`E0114`) | it would claim to catch a segfault, which no tier can catch; `except Exception:` is the spelled-out catch-all |
+| `except X as e` / `raise` / `except*` (6.10) | binds an exception object, re-raises, groups | refused (`E0114`) | there is no exception object -- a caught trap is a jump to a block, so there is nothing to bind or re-raise |
 
 ---
 
@@ -1590,6 +1617,24 @@ Deliberate narrowings, collected next to `%` and `v == n`:
 * [x] `x in xs` over a `bool` list — it lowers to `==`, and a bool now compares
   as its `0/1` value in both tiers, so membership works over every scalar element
   type (int, float, bool)
+* [x] `!=` (6.9) — a first-class `Ne` compare mirroring `==`, differing only in
+  the result. Integers compare exactly as `int64`, floats follow IEEE (`nan !=
+  nan` is true via `setne OR setp`; `0.0 != -0.0` is false), `str` compares as a
+  run (`strne`), pointers compare raw addresses, and `!=` is usable as a value,
+  in `if`/`while`, and inside `and`/`or`. A `while i != n` loop is not
+  strength-reduced or vectorized, since `i != n` has no guaranteed trip count.
+  `raise`, `try`/`except` and comparison on aggregates (struct/list/tuple/dict/
+  payload enum) remain deferred.
+* [x] `try`/`except` (6.10) — catches the closed set of built-in Tier-3 traps
+  (`ZeroDivisionError`, `OverflowError`, `ValueError`, `IndexError`,
+  `KeyError`, `EOFError`, or `Exception` for all of them), with `else` and
+  `finally`. A caught trap is a jump to the matching handler block, not an
+  exception object and not a stack unwind, so `try`/`except` is ordinary
+  control flow plus three markers (`TryEnter`/`TryLeave`/`TryCatch`) that both
+  tiers read. Only a trap raised in the same function as the `try` is
+  catchable; `except X as e`, `raise`, `except*` and a bare `except:` are
+  refused. The EAFP rhyme works: `int(8, input("..."))` on a typo lands in
+  `except ValueError:`.
 
 ---
 

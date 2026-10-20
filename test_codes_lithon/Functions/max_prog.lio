@@ -3,10 +3,17 @@ def get_max(a:int[8],b:int[8]) -> int[16]:
 		print(f"Delta is |a-b|: {a-b}")
 		return a
 	else:
-		print(f"Delta is |b-a|: {b-a}")
-		return b
+		if (b > a):
+			print(f"Delta is |b-a|: {b-a}")
+			return b
+		elif (a == b):
+			print(f"Delta is: 0")
+			return 0
 
 
 a:int[8] = int(8,input("Enter value 1: "))
 b:int[8] = int(8,input("Enter value 2: "))
-print(f"Larger value between {a} and {b} is: {get_max(a,b)}")
+if (get_max(a,b) != 0):
+	print(f"Larger value between {a} and {b} is: {get_max(a,b)}")
+else:
+	print("No larger value!")

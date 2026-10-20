@@ -1,0 +1,12 @@
+caught ZeroDivisionError
+else ran
+zero again
+finally ran
+caught OverflowError
+caught by Exception
+caught IndexError
+first handler
+inner caught
+outer caught
+1
+done

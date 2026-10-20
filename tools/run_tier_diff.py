@@ -735,6 +735,34 @@ block0:
     call print, %3
     return
 """, "tier1", "LITHON-E0309: float-to-int conversion is out of range or not finite"),
+    # 6.10. A trap raised INSIDE a handler block. The handler prints first, so
+    # the stdout produced before the trap is part of the comparison, and the
+    # region must not be re-entered: a `trycatch` handler region does not catch
+    # in itself, so this trap is uncaught and ends the program. The mutation
+    # that would break this is leaving the region live on entry to the handler,
+    # which would route the trap back to the same block forever.
+    "trap_inside_handler": ("""
+function __main__():
+block0:
+    tryenter ZeroDivisionError, block1
+    jump block2
+block2:
+    %0 = const_i64 5
+    %1 = const_i64 0
+    %2 = mod %0, %1
+    tryleave
+    jump block3
+block1:
+    trycatch ZeroDivisionError
+    %3 = const_i64 72
+    call print, %3
+    %4 = const_i64 5
+    %5 = const_i64 0
+    %6 = mod %4, %5
+    jump block3
+block3:
+    return
+""", "tier1", "error: modulo by zero"),
     # 6. range(a,b,step) with a dynamic step==0 must trap identically in both
     # tiers. The frontend lowers the dynamic step to guardnonzero; literal
     # `range(a,b,0)` is refused statically as E0107 and never reaches here.
@@ -927,9 +955,9 @@ def compile_to_ir(py_file, tmpdir):
     return ir
 
 
-def check(label, ir_path, expected_tier=None):
-    ref = run([str(ir_path), "--interp"])
-    auto = run([str(ir_path), "--auto"])
+def check(label, ir_path, expected_tier=None, stdin_text=None):
+    ref = run([str(ir_path), "--interp"], stdin_text)
+    auto = run([str(ir_path), "--auto"], stdin_text)
     tier = tier_of(auto.stderr)
 
     problems = []
@@ -995,7 +1023,7 @@ def check_trap(label, ir_path, expected_tier, expected_message):
     return not problems, tier
 
 
-def check_direct_phis(label, ir_path):
+def check_direct_phis(label, ir_path, stdin_text=None):
     """2.7: the direct-Phi path must agree with the memory path, exactly.
 
     The comparison is deliberately against --ssa, which resolves merges to
@@ -1017,8 +1045,8 @@ def check_direct_phis(label, ir_path):
 
     mismatch is anything else, so that is a fail.
     """
-    mem = run([str(ir_path), "--auto", "--ssa"])
-    direct = run([str(ir_path), "--auto", "--direct-phis"])
+    mem = run([str(ir_path), "--auto", "--ssa"], stdin_text)
+    direct = run([str(ir_path), "--auto", "--direct-phis"], stdin_text)
 
     mem_err = without_tier_markers(mem.stderr)
     direct_err = without_tier_markers(direct.stderr)
@@ -1058,7 +1086,9 @@ def main():
         for suite in SUITES:
             for py in sorted(suite.glob("*.lio")):
                 ir = compile_to_ir(py, tmp)
-                ok, tier = check(f"{suite.name}/{py.stem}", ir)
+                in_path = py.with_suffix(".in")
+                stdin_text = in_path.read_text() if in_path.exists() else None
+                ok, tier = check(f"{suite.name}/{py.stem}", ir, stdin_text=stdin_text)
                 results.append(ok)
                 tiers[tier] += 1
 
@@ -1090,7 +1120,9 @@ def main():
         for suite in SUITES:
             for py in sorted(suite.glob("*.lio")):
                 ir = compile_to_ir(py, tmp)
-                ok, kind = check_direct_phis(f"{suite.name}/{py.stem}", ir)
+                in_path = py.with_suffix(".in")
+                stdin_text = in_path.read_text() if in_path.exists() else None
+                ok, kind = check_direct_phis(f"{suite.name}/{py.stem}", ir, stdin_text)
                 results.append(ok)
                 phi[kind] += 1
 

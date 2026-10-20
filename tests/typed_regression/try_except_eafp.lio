@@ -1,0 +1,17 @@
+# The Python EAFP idiom (6.10): read a small number and recover from a typo.
+# `int(8, input(...))` on a non-integer line traps E0306, which is a
+# ValueError; inside a `try` it must land in the handler and NOT end the
+# program. The companion `try_except_eafp.in` is the stdin this reads.
+#
+# On the native tier the read goes through host_input_int_ex, which returns a
+# kind code instead of exiting, so the generated code can branch to the
+# handler -- the whole reason a caught trap can cross the input() boundary.
+try:
+    n: int[8] = int(8, input("n? "))
+    total: int[64] = 100 % n
+    print(total)
+except ValueError:
+    print("not a number")
+except ZeroDivisionError:
+    print("cannot divide by zero")
+print("after")

@@ -113,6 +113,25 @@ inline Cfg build_cfg(const lithon::ir::Function& fn) {
             g.succ[b].push_back(t);
             g.pred[t].push_back(b);
         }
+        // 6.10. A try's handler blocks are reached by a TRAP JUMP, not by any
+        // `jump`/`branch`, so without these edges the CFG would treat them as
+        // having no predecessor -- and a definite-assignment merge would then
+        // start them from the entry scope and lose every variable assigned
+        // before the try. The edge is from the TryEnter's own block, so a
+        // handler's in-scope is exactly the try-entry scope: a handler runs
+        // with whatever was definitely assigned BEFORE the try, never with a
+        // body local (which may not have been assigned when the trap fired).
+        for (const auto& in : block.instrs) {
+            if (in.op != Op::TryEnter) continue;
+            for (const auto& label : lithon::ir::split_marks(in.name2)) {
+                auto it = g.index.find(label);
+                if (it == g.index.end()) continue;
+                const size_t t = it->second;
+                if (std::find(g.succ[b].begin(), g.succ[b].end(), t) != g.succ[b].end()) continue;
+                g.succ[b].push_back(t);
+                g.pred[t].push_back(b);
+            }
+        }
     }
     return g;
 }

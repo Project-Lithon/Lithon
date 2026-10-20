@@ -619,6 +619,7 @@ LithonValue apply_compare(Op op, LithonValue lhs, LithonValue rhs) {
             case Op::Lt: return LithonValue::make_bool(a < b);
             case Op::Gt: return LithonValue::make_bool(a > b);
             case Op::Eq: return LithonValue::make_bool(a == b);
+            case Op::Ne: return LithonValue::make_bool(a != b);
             default:
                 throw std::runtime_error("interpreter: not a comparison op");
         }
@@ -629,6 +630,9 @@ LithonValue apply_compare(Op op, LithonValue lhs, LithonValue rhs) {
         case Op::Lt: return LithonValue::make_bool(a < b);
         case Op::Gt: return LithonValue::make_bool(a > b);
         case Op::Eq: return LithonValue::make_bool(a == b);
+        // IEEE: `!=` is true when the operands differ OR are unordered, so
+        // `nan != nan` is true, exactly as the JIT's setne||setp emits it.
+        case Op::Ne: return LithonValue::make_bool(a != b);
         default:
             throw std::runtime_error("interpreter: not a comparison op");
     }
@@ -843,6 +847,73 @@ std::pair<std::string, std::string> split_branch_targets(const std::string& s) {
     return {s.substr(0, comma), s.substr(comma + 1)};
 }
 
+// 6.10. try/except. The closed set of catchable Tier-3 traps is shared with the
+// JIT (`lithon::ir::classify_trap_message`) so both tiers agree on which
+// exception a trap is. The interpreter just names it here.
+std::string classify_trap(const std::string& what) {
+    return lithon::ir::classify_trap_message(what);
+}
+
+// 6.10. A trap that is on its way out of a CALLED function. The tiers must
+// agree, and the native tier routes a trap STATICALLY: a callee's frame is gone
+// by the time control reaches the caller, and the caller's handler block is
+// reached by a plain jump within ONE function, so a trap raised inside a
+// callee is not caught by the caller's `try`. The interpreter would otherwise
+// unwind a C++ exception straight into the caller's catch and route it, so it
+// wraps a propagating trap in this type and the routing catch deliberately lets
+// it pass -- leaving both tiers with "a trap raised in a callee is a program
+// end". That narrowing is recorded in the README's divergence table.
+struct TrapFromCallee {
+    std::string what;
+};
+
+// One active try region: the exception kinds it catches and the handler block
+// label for each, in the same order. `Exception` matches every catchable trap.
+struct TryRegion {
+    std::vector<std::string> kinds;
+    std::vector<std::string> labels;
+
+    // The handler label for `kind`, or "" when this region does not catch it.
+    // `Exception` is the catch-all. First match wins, as in Python.
+    std::string handler_for(const std::string& kind) const {
+        for (size_t i = 0; i < kinds.size(); ++i) {
+            if (kinds[i] == kind || kinds[i] == "Exception") return labels[i];
+        }
+        return "";
+    }
+};
+
+// Splits a `+`-separated marker payload (the frontend writes "" for an empty
+// one). Shared with the JIT.
+std::vector<std::string> split_commas(const std::string& s) {
+    return lithon::ir::split_marks(s);
+}
+
+// Routes a trap to the innermost region that catches it. On success the
+// matching region and every region nested inside it are popped (their protected
+// regions are left by the jump, exactly as Python unwinds to the handler), and
+// `cur` is set to the handler block. Returns false when nothing catches it, so
+// the caller rethrows and the program terminates as before.
+bool route_trap(const std::string& what, std::vector<TryRegion>& regions,
+                const std::unordered_map<std::string, const BasicBlock*>& label_to_block,
+                const BasicBlock*& cur) {
+    const std::string kind = classify_trap(what);
+    if (kind.empty()) return false;
+    for (size_t r = regions.size(); r-- > 0;) {
+        const std::string target = regions[r].handler_for(kind);
+        if (target.empty()) continue;
+        auto it = label_to_block.find(target);
+        if (it == label_to_block.end()) {
+            throw std::runtime_error("interpreter: exception handler targets unknown block '" +
+                                     target + "'");
+        }
+        regions.resize(r);   // pop this region and everything nested in it
+        cur = it->second;
+        return true;
+    }
+    return false;
+}
+
 // Executes one function call: builds a fresh Frame, binds arg_values to
 // fn.params, walks blocks until Return, and returns the result. Calls
 // to user-defined functions recurse into this same routine -- each
@@ -889,10 +960,14 @@ LithonValue execute_function(const Module& module, const Function& fn,
     LithonValue return_value = LithonValue::make_none();
     const BasicBlock* cur = &fn.blocks.front();
 
+    // 6.10. Active try regions for this frame, innermost last.
+    std::vector<TryRegion> regions;
+
     while (true) {
         bool jumped = false;
         bool returned = false;
 
+        try {
         for (const auto& instr : cur->instrs) {
             switch (instr.op) {
                 case Op::ConstInt:
@@ -1125,7 +1200,9 @@ LithonValue execute_function(const Module& module, const Function& fn,
                 }
                 // 6.2. s == t: byte-for-byte up to the NUL, so two strings with
                 // different capacities compare equal when their contents agree.
-                case Op::StrEq: {
+                // s != t is the exact negation.
+                case Op::StrEq:
+                case Op::StrNe: {
                     const auto bytes_of = [&](const std::string& name) {
                         std::vector<LithonValue>& b = frame.get_list(name, "str comparison");
                         int64_t cap = static_cast<int64_t>(b.size());
@@ -1147,7 +1224,8 @@ LithonValue execute_function(const Module& module, const Function& fn,
                             ((*rb)[static_cast<size_t>(i)].as_int() & 0xFF))
                             eq = false;
                     }
-                    frame.regs[instr.result] = LithonValue::make_bool(eq);
+                    frame.regs[instr.result] = LithonValue::make_bool(
+                        instr.op == Op::StrEq ? eq : !eq);
                     break;
                 }
                 // 6.4. s.find(sub) / s.count(sub): the same byte-run reads StrEq
@@ -1539,6 +1617,7 @@ LithonValue execute_function(const Module& module, const Function& fn,
                 case Op::Lt:
                 case Op::Gt:
                 case Op::Eq:
+                case Op::Ne:
                     frame.regs[instr.result] = apply_compare(
                         instr.op, frame.get_reg(instr.args.at(0)), frame.get_reg(instr.args.at(1)));
                     break;
@@ -1593,7 +1672,19 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     for (ValueId id : instr.args) {
                         args.push_back(frame.get_reg(id));
                     }
-                    LithonValue result = execute_function(module, *callee, args);
+                    LithonValue result;
+                    try {
+                        result = execute_function(module, *callee, args);
+                    } catch (const TrapFromCallee&) {
+                        throw;   // already on its way out of a callee -- not ours
+                    } catch (const std::runtime_error& e) {
+                        // The callee already had its chance to route this trap
+                        // and did not, so the native tier would have ended the
+                        // program in the callee. Re-tag it so the caller's
+                        // routing catch lets it pass too: only a trap raised in
+                        // THIS frame is catchable here.
+                        throw TrapFromCallee{e.what()};
+                    }
                     if (instr.result != kInvalidValue) {
                         frame.regs[instr.result] = result;
                     }
@@ -1626,10 +1717,37 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     }
                     returned = true;
                     break;
+                // 6.10. The try/except markers. TryEnter pushes a region,
+                // TryLeave pops it on normal completion, and TryCatch is a
+                // no-op label at the head of a handler (its whole purpose is to
+                // tell the code generators where the handler begins).
+                case Op::TryEnter: {
+                    TryRegion region;
+                    region.kinds = split_commas(instr.name);
+                    region.labels = split_commas(instr.name2);
+                    regions.push_back(std::move(region));
+                    break;
+                }
+                case Op::TryLeave:
+                    if (!regions.empty()) regions.pop_back();
+                    break;
+                case Op::TryCatch:
+                    break;
                 default:
                     throw std::runtime_error("interpreter: opcode not yet implemented in this slice");
             }
             if (jumped || returned) break;
+        }
+        } catch (const std::runtime_error& e) {
+            // A trap inside a protected region is a jump to the matching
+            // handler, not a program end. Anything not caught here propagates
+            // exactly as before.
+            if (!route_trap(e.what(), regions, label_to_block, cur)) throw;
+            jumped = true;
+        } catch (const TrapFromCallee& e) {
+            // Not this frame's to catch -- see the note above. Re-materialise
+            // the original runtime_error so the top level reports it verbatim.
+            throw std::runtime_error(e.what);
         }
 
         if (returned) return return_value;

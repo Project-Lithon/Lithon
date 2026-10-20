@@ -135,6 +135,34 @@ def main() -> int:
         finally:
             ir.unlink()
 
+    # 6.9. A loop whose exit test is `!=` must stay a plain compare/branch/back
+    # edge: `i != n` has no guaranteed trip count (with step 2 from 0 toward 7
+    # the body steps straight over the bound and the loop never ends), so no
+    # pass may assume one. Two steps, one that lands on the bound exactly and
+    # one that steps past it -- both must decline identically.
+    ne_loops = {
+        "ne_step1": "i: int[64] = 0\nn: int[64] = 5\nwhile i != n:\n    i = i + 1\nprint(i)\n",
+        "ne_step2": "i: int[64] = 10\nn: int[64] = 0\nwhile i != n:\n    i = i - 2\nprint(i)\n",
+    }
+    for label, src in ne_loops.items():
+        with tempfile.NamedTemporaryFile("w", suffix=".lio", delete=False) as f:
+            f.write(src)
+            py = Path(f.name)
+        ir = compile_to_ir(py)
+        py.unlink()
+        try:
+            for flags in FLAG_COMBOS:
+                unrolled, diamonds, vectorized, rotated = stats_for(ir, flags)
+                if (unrolled, diamonds, vectorized) != (0, 0, 0):
+                    print(
+                        f"FAIL {label} {flags}: a `!=` loop was "
+                        f"unrolled={unrolled} diamonds={diamonds} vectorized={vectorized}"
+                    )
+                    return 1
+            print(f"ok {label}: `!=` exit test not unrolled/vectorized under any flag combo")
+        finally:
+            ir.unlink()
+
     with tempfile.NamedTemporaryFile("w", suffix=".ir", delete=False) as f:
         f.write(CONTROL_IR)
         ctl = Path(f.name)

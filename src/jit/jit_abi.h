@@ -37,6 +37,16 @@ inline constexpr std::array<Reg, 5> kTempPool = {Reg::RAX, Reg::RCX, Reg::RDX, R
 inline constexpr int kShadowSpace = 0;
 #endif
 
+// The THIRD integer argument register. kArgRegs is deliberately only the two
+// the calling convention this compiler implements uses; a host helper that
+// needs a third argument (6.10's host_input_int_ex, which takes an out-parameter)
+// names it here rather than indexing past kArgRegs, which is undefined.
+#if defined(_WIN32)
+inline constexpr Reg kArgReg2 = Reg::R8;
+#else
+inline constexpr Reg kArgReg2 = Reg::RDX;
+#endif
+
 // A float[64] ARGUMENT arrives in XMM0/XMM1 on both ABIs, never in a GP
 // register, and it comes back in XMM0. This array did not exist, which is why
 // the prologue spilled every parameter from kArgRegs and float parameters came
