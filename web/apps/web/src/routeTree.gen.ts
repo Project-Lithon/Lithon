@@ -11,6 +11,8 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as BenchmarksRouteImport } from './routes/benchmarks'
+import { Route as ChangelogRouteImport } from './routes/changelog'
+import { Route as NextRouteImport } from './routes/next'
 import { Route as PlaygroundRouteImport } from './routes/playground'
 import { Route as RoadmapRouteImport } from './routes/roadmap'
 import { Route as UseCasesRouteImport } from './routes/use-cases'
@@ -30,6 +32,16 @@ const IndexRoute = IndexRouteImport.update({
 const BenchmarksRoute = BenchmarksRouteImport.update({
   id: '/benchmarks',
   path: '/benchmarks',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ChangelogRoute = ChangelogRouteImport.update({
+  id: '/changelog',
+  path: '/changelog',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const NextRoute = NextRouteImport.update({
+  id: '/next',
+  path: '/next',
   getParentRoute: () => rootRouteImport,
 } as any)
 const PlaygroundRoute = PlaygroundRouteImport.update({
@@ -86,6 +98,8 @@ const RoadmapVerificationRoute = RoadmapVerificationRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/benchmarks': typeof BenchmarksRoute
+  '/changelog': typeof ChangelogRoute
+  '/next': typeof NextRoute
   '/playground': typeof PlaygroundRoute
   '/roadmap': typeof RoadmapRouteWithChildren
   '/use-cases': typeof UseCasesRoute
@@ -100,6 +114,8 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/benchmarks': typeof BenchmarksRoute
+  '/changelog': typeof ChangelogRoute
+  '/next': typeof NextRoute
   '/playground': typeof PlaygroundRoute
   '/roadmap': typeof RoadmapRouteWithChildren
   '/use-cases': typeof UseCasesRoute
@@ -115,6 +131,8 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/benchmarks': typeof BenchmarksRoute
+  '/changelog': typeof ChangelogRoute
+  '/next': typeof NextRoute
   '/playground': typeof PlaygroundRoute
   '/roadmap': typeof RoadmapRouteWithChildren
   '/use-cases': typeof UseCasesRoute
@@ -131,6 +149,8 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/benchmarks'
+    | '/changelog'
+    | '/next'
     | '/playground'
     | '/roadmap'
     | '/use-cases'
@@ -145,6 +165,8 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/benchmarks'
+    | '/changelog'
+    | '/next'
     | '/playground'
     | '/roadmap'
     | '/use-cases'
@@ -159,6 +181,8 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/benchmarks'
+    | '/changelog'
+    | '/next'
     | '/playground'
     | '/roadmap'
     | '/use-cases'
@@ -174,6 +198,8 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   BenchmarksRoute: typeof BenchmarksRoute
+  ChangelogRoute: typeof ChangelogRoute
+  NextRoute: typeof NextRoute
   PlaygroundRoute: typeof PlaygroundRoute
   RoadmapRoute: typeof RoadmapRouteWithChildren
   UseCasesRoute: typeof UseCasesRoute
@@ -195,6 +221,20 @@ declare module '@tanstack/react-router' {
       path: '/benchmarks'
       fullPath: '/benchmarks'
       preLoaderRoute: typeof BenchmarksRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/changelog': {
+      id: '/changelog'
+      path: '/changelog'
+      fullPath: '/changelog'
+      preLoaderRoute: typeof ChangelogRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/next': {
+      id: '/next'
+      path: '/next'
+      fullPath: '/next'
+      preLoaderRoute: typeof NextRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/playground': {
@@ -292,6 +332,8 @@ const RoadmapRouteWithChildren =
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   BenchmarksRoute: BenchmarksRoute,
+  ChangelogRoute: ChangelogRoute,
+  NextRoute: NextRoute,
   PlaygroundRoute: PlaygroundRoute,
   RoadmapRoute: RoadmapRouteWithChildren,
   UseCasesRoute: UseCasesRoute,

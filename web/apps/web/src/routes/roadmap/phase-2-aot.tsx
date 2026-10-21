@@ -2,9 +2,28 @@ import { createFileRoute } from "@tanstack/react-router"
 
 import { Card, CardContent } from "@workspace/ui/components/card"
 
+import { metaForPath, structuredData } from "../../lib/seo"
 import { DocSection, Note, PageHero, SpecTable, WRAP } from "../../site"
 
 export const Route = createFileRoute("/roadmap/phase-2-aot")({
+  head: () => {
+    const meta = metaForPath("/roadmap/phase-2-aot")
+    return {
+      meta: [
+        { title: meta.title },
+        { name: "description", content: meta.description },
+        { property: "og:title", content: meta.title },
+        { property: "og:description", content: meta.description },
+        { property: "og:type", content: "website" },
+        { property: "og:url", content: meta.canonical },
+        { name: "twitter:card", content: "summary_large_image" },
+        { name: "twitter:title", content: meta.title },
+        { name: "twitter:description", content: meta.description },
+        { tagName: "link", rel: "canonical", href: meta.canonical },
+        { "script:ld+json": JSON.stringify(structuredData("/roadmap/phase-2-aot")) },
+      ],
+    }
+  },
   component: Phase2Aot,
 })
 

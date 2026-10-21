@@ -49,6 +49,12 @@ jobs:
         working-directory: web
         run: bun run scripts/gen-seo.ts "${{ steps.deployment.outputs.page_url || format('https://{0}.github.io/{1}', github.repository_owner, github.event.repository.name) }}"
 
+      # The AI-facing surfaces: a compact index and the whole documentation as
+      # plain text, both generated from the same registry the site renders.
+      - name: Generate the AI-facing surfaces
+        working-directory: web
+        run: bun run scripts/gen-llms.ts
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:

@@ -8,7 +8,12 @@
     "lint": "turbo lint",
     "format": "turbo format",
     "typecheck": "turbo typecheck",
-    "verify:docs": "bun scripts/verify-docs.ts"
+    "verify:docs": "bun scripts/verify-docs.ts",
+    "gen:ir": "bun scripts/gen-docs-ir.ts && bun scripts/gen-playground-ir.ts",
+    "gen:llms": "bun scripts/gen-llms.ts",
+    "gen:seo": "bun scripts/gen-seo.ts",
+    "gen": "bun run gen:ir && bun run gen:llms && bun run gen:seo",
+    "check:encoding": "bun scripts/fix-encoding.ts --check"
   },
   "devDependencies": {
     "happy-dom": "^20.14.6",

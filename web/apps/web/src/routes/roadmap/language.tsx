@@ -1,6 +1,7 @@
 import type { ReactNode } from "react"
 import { createFileRoute } from "@tanstack/react-router"
 
+import { metaForPath, structuredData } from "../../lib/seo"
 import {
   CodeBlock,
   DocSection,
@@ -11,6 +12,24 @@ import {
 } from "../../site"
 
 export const Route = createFileRoute("/roadmap/language")({
+  head: () => {
+    const meta = metaForPath("/roadmap/language")
+    return {
+      meta: [
+        { title: meta.title },
+        { name: "description", content: meta.description },
+        { property: "og:title", content: meta.title },
+        { property: "og:description", content: meta.description },
+        { property: "og:type", content: "website" },
+        { property: "og:url", content: meta.canonical },
+        { name: "twitter:card", content: "summary_large_image" },
+        { name: "twitter:title", content: meta.title },
+        { name: "twitter:description", content: meta.description },
+        { tagName: "link", rel: "canonical", href: meta.canonical },
+        { "script:ld+json": JSON.stringify(structuredData("/roadmap/language")) },
+      ],
+    }
+  },
   component: LanguageReference,
 })
 
@@ -27,7 +46,7 @@ const NAV = [
 
 const TYPES_ROWS: Rows = [
   ["signed integers", <code key="1">int[8] int[16] int[32] int[64]</code>],
-  ["floating point", <code key="2">float[32] float[64]</code>],
+  ["floating point", <code key="2">float[64]</code>],
   [
     "boolean",
     <span key="3">
@@ -92,7 +111,7 @@ const SUBSET_ROWS: Rows = [
       <code>for x in range(N)</code> · one argument
     </span>,
   ],
-  ["functions", "recursion, self tail calls · max 2 arguments"],
+  ["functions", "recursion, self tail calls · 32 arguments"],
   [
     "chained comparison",
     <span key="8" className="text-destructive">

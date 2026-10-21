@@ -1,0 +1,112 @@
+# Lithon
+
+> Lithon is a Python library and native x86-64 execution engine. Every supported program carries fixed-width type annotations, is statically verified before it runs, and executes as generated machine code with no LLVM and no runtime package.
+
+Lithon is a Python library and native x86-64 execution engine. Source files use the `.lio` extension. Every program is statically verified before it runs; a program the backend cannot prove is refused rather than guessed at.
+
+## The one rule
+
+> If Lithon cannot prove that a program satisfies the rules required by its native backend, it refuses native compilation rather than guessing.
+
+## Type system in one block
+
+```
+int[8]  int[16]  int[32]  int[64]   signed, fixed width
+float[64]                        IEEE-754 binary64 (float[32] is refused)
+bool                              1 byte, reads back as 0/1
+str[N]                            N bytes, NUL-terminated, bounded
+list[T, N]                        fixed capacity N
+tuple[T, N]                       fixed length N, homogeneous
+dict[K, V, B]                     B buckets, B must be a power of two
+ptr[T]                            typed pointer, variable name needs a leading _
+class P(Struct)                   packed fields, no padding
+class E(Enum)                    a tag plus the largest payload
+```
+
+There is no bare `int`, no `uint`, no `None`, no `lambda`, no closure, no `set`, no `bytes`, no `Optional`/`Union`, no `**`, no `//`, no `<=`/`>=`, and no chained comparison.
+
+## A small program
+
+```python
+x: int[64] = 10
+y: int[64] = 20
+
+result: int[64] = x + y
+
+print(result)
+```
+
+## Documentation index
+
+### Start here
+
+From zero to a natively running program.
+
+- [Welcome to Lithon](https://project-lithon.github.io/Lithon/docs/welcome)[essential] — Understand what Lithon is, what it refuses to do, and why the refusal is the feature.
+- [Hello, native](https://project-lithon.github.io/Lithon/docs/hello-world)[essential] — Write, verify and run your first natively-executed program end to end.
+- [Build & install](https://project-lithon.github.io/Lithon/docs/installation) — Build the engine and prove the install works.
+- [The mental model](https://project-lithon.github.io/Lithon/docs/mental-model)[essential] — Hold the one rule that makes the rest of the language checkable: prove before you run.
+
+### The language
+
+Types, flow, functions, containers, unsafe memory.
+
+- [Types & widths](https://project-lithon.github.io/Lithon/docs/types)[essential] — Pick the right width for every value, and know which conversions are legal.
+- [Declarations & assignment](https://project-lithon.github.io/Lithon/docs/declarations)[essential] — Give every name a type and a value, and be refused when you have not.
+- [Control flow](https://project-lithon.github.io/Lithon/docs/control-flow)[essential] — Write every branch and loop the language supports, and know which ones it does not.
+- [Functions](https://project-lithon.github.io/Lithon/docs/functions)[essential] — Give a function a contract the compiler can check, and call it safely.
+- [Operators](https://project-lithon.github.io/Lithon/docs/operators)[essential] — Predict the result of every expression, including the ones that surprise CPython.
+- [Containers](https://project-lithon.github.io/Lithon/docs/containers)[essential] — Model fixed-size data without a heap, and know each container's rules.
+- [Pointers](https://project-lithon.github.io/Lithon/docs/pointers) — Reach raw memory deliberately, with the naming rule that keeps it visible.
+- [Structs](https://project-lithon.github.io/Lithon/docs/structs)[essential] — Lay out packed storage whose bytes match a C struct exactly.
+- [Enums](https://project-lithon.github.io/Lithon/docs/enums)[essential] — Model a tagged union and read it back safely with match.
+- [Methods](https://project-lithon.github.io/Lithon/docs/methods) — Give a struct behaviour, and understand why it is inlined.
+- [Type Functions](https://project-lithon.github.io/Lithon/docs/type-functions)[reference] — Build reusable types at compile time.
+- [Syscalls](https://project-lithon.github.io/Lithon/docs/syscalls)[reference] — Call the kernel directly, with the argument rules both tiers agree on.
+- [Divergences from Python](https://project-lithon.github.io/Lithon/docs/python-divergences)[essential] — Port Python code without being surprised by a silent semantic change.
+- [Exceptions & traps](https://project-lithon.github.io/Lithon/docs/exceptions)[essential] — Recover from the seven engine traps and know the rest is refused.
+- [match](https://project-lithon.github.io/Lithon/docs/match)[essential] — Dispatch on an enum exhaustively, and read a variant's payload safely.
+- [Strings](https://project-lithon.github.io/Lithon/docs/strings)[essential] — Use bounded byte runs without a heap or an allocator.
+- [Networking](https://project-lithon.github.io/Lithon/docs/networking)[reference] — Open a real socket from Lithon and pass the byte-order test.
+
+### Inside the engine
+
+Dual tiers, verification, SSA, optimization, SIMD.
+
+- [Engine architecture](https://project-lithon.github.io/Lithon/docs/architecture)[essential] — Trace a program from .lio source to executable memory.
+- [Dual-tier execution](https://project-lithon.github.io/Lithon/docs/dual-tier) — Understand what Tier-0 and Tier-1 each do, and when each runs.
+- [The type checker](https://project-lithon.github.io/Lithon/docs/typechecking) — Read a diagnostic and know exactly which rule you broke.
+- [Optimizer & SSA pipeline](https://project-lithon.github.io/Lithon/docs/pipeline)[reference] — See the optimizer and SSA passes that run before the encoder.
+- [SIMD auto-vectorization](https://project-lithon.github.io/Lithon/docs/simd)[reference] — Know when a loop becomes AVX2 and why the result is still exact.
+
+### Reference
+
+Errors, builtins, verification gate, honest limits.
+
+- [Errors & diagnostics](https://project-lithon.github.io/Lithon/docs/errors)[essential] — Look up any error code and what it means.
+- [Built-in functions](https://project-lithon.github.io/Lithon/docs/builtins)[essential] — Look up any built-in, its signature and its rules.
+- [Semantics](https://project-lithon.github.io/Lithon/docs/semantics)[essential] — Look up the exact meaning of the operations that surprise people.
+- [Verification](https://project-lithon.github.io/Lithon/docs/verification) — Check the claims instead of taking them on trust.
+- [Honest limits](https://project-lithon.github.io/Lithon/docs/limits)[essential] — Know exactly what is not implemented yet.
+
+### Machine view
+
+For enthusiasts: IR, registers, x86-64 encodings.
+
+- [Source to machine](https://project-lithon.github.io/Lithon/docs/source-to-machine) — Read the IR and the machine code for any example.
+- [Registers & ABI](https://project-lithon.github.io/Lithon/docs/registers-abi)[reference] — Know where every argument and return value lives.
+- [Instruction encoding](https://project-lithon.github.io/Lithon/docs/instruction-encoding)[reference] — Read the encoder's output byte by byte.
+
+### Site sections
+
+- [Changelog](https://project-lithon.github.io/Lithon/changelog) — Every shipped change, newest first.
+- [Next actions](https://project-lithon.github.io/Lithon/next) — The open items, item by item.
+- [Roadmap](https://project-lithon.github.io/Lithon/roadmap) — The three phases and their milestones.
+- [Benchmarks](https://project-lithon.github.io/Lithon/benchmarks) — Recorded CPython vs Lithon runs.
+- [Use cases](https://project-lithon.github.io/Lithon/use-cases) — The problems Lithon is shaped for.
+- [Playground](https://project-lithon.github.io/Lithon/playground) — Write Lithon in the browser.
+
+## Optional
+
+- [Full documentation as plain text](https://project-lithon.github.io/Lithon/llms-full.txt) — every page, every section, every example.
+- [The repository](https://github.com/Project-Lithon/Lithon) — the source, the tests, and the verification suites.

@@ -67,6 +67,27 @@ export function actionEntries(): ActionEntry[] {
       run: "nav:/roadmap",
     },
     {
+      id: "action:nav-next",
+      title: "Go to Next actions",
+      subtitle: "The open items, item by item",
+      tags: ["next", "actions", "todo", "open", "gap", "navigate"],
+      run: "nav:/next",
+    },
+    {
+      id: "action:nav-changelog",
+      title: "Go to Changelog",
+      subtitle: "What changed, and when",
+      tags: ["changelog", "history", "releases", "notes", "navigate"],
+      run: "nav:/changelog",
+    },
+    {
+      id: "action:nav-use-cases",
+      title: "Go to Use cases",
+      subtitle: "The problems Lithon is shaped for",
+      tags: ["use cases", "cases", "examples", "navigate"],
+      run: "nav:/use-cases",
+    },
+    {
       id: "action:nav-contributors",
       title: "Go to Contributors",
       subtitle: "Who is building Lithon",
@@ -121,6 +142,13 @@ export function actionEntries(): ActionEntry[] {
       subtitle: "Community discussion",
       tags: ["discord", "chat", "community", "external"],
       run: "https://discord.gg/project-lithon",
+    },
+    {
+      id: "action:external-llms",
+      title: "Open llms.txt",
+      subtitle: "The documentation as plain text, for an AI reader",
+      tags: ["llms", "ai", "llm", "text", "markdown", "plain text", "external"],
+      run: "https://project-lithon.github.io/Lithon/llms.txt",
     },
   ]
 }

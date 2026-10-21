@@ -5,6 +5,7 @@ import {
   ArrowRightIcon,
   CpuIcon,
   ListIcon,
+  StarIcon,
 } from "@phosphor-icons/react"
 
 import { Badge } from "@workspace/ui/components/badge"
@@ -23,7 +24,7 @@ import {
 } from "@workspace/ui/components/tooltip"
 
 import { DOC_GROUPS } from "../../docs/model"
-import { flatPageOrder, pageBySlug } from "../../docs/registry"
+import { flatPageOrder, pageBySlug, priorityOf } from "../../docs/registry"
 import { metaForPath } from "../../lib/seo"
 import {
   BlockView,
@@ -107,6 +108,7 @@ function SidebarNav({
             <ul className="space-y-0.5">
               {pages.map((page) => {
                 const active = page.slug === currentSlug
+                const essential = priorityOf(page) === "essential"
                 return (
                   <li key={page.slug}>
                     <Link
@@ -116,11 +118,18 @@ function SidebarNav({
                       aria-current={active ? "page" : undefined}
                       className={
                         active
-                          ? "block rounded-md bg-primary/15 px-2 py-1 text-sm font-medium text-foreground"
-                          : "block rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-muted hover:text-foreground"
+                          ? "flex items-baseline gap-1.5 rounded-md bg-primary/15 px-2 py-1 text-sm font-medium text-foreground"
+                          : "flex items-baseline gap-1.5 rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-muted hover:text-foreground"
                       }
                     >
-                      {page.title}
+                      <span className="min-w-0 flex-1 truncate">{page.title}</span>
+                      {essential && (
+                        <StarIcon
+                          className="size-2.5 shrink-0 translate-y-px text-accent-strong"
+                          weight="fill"
+                          aria-label="on the reading path"
+                        />
+                      )}
                     </Link>
                   </li>
                 )
@@ -190,10 +199,18 @@ function DocsPage() {
           </div>
 
           <header className="mb-8 border-b pb-6">
-            <Badge variant="secondary" className="mb-3">
-              {DOC_GROUPS.find((g) => g.slug === page.group)?.title ??
-                page.group}
-            </Badge>
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <Badge variant="secondary">
+                {DOC_GROUPS.find((g) => g.slug === page.group)?.title ??
+                  page.group}
+              </Badge>
+              {priorityOf(page) === "essential" && (
+                <Badge variant="outline" className="border-accent-strong/50 text-accent-strong">
+                  <StarIcon className="size-3" weight="fill" />
+                  on the reading path
+                </Badge>
+              )}
+            </div>
             <h1 className="font-heading text-3xl font-extrabold tracking-tight">
               {page.title}
             </h1>
@@ -269,7 +286,7 @@ function DocsPage() {
         </article>
 
         <aside className="hidden lg:block">
-          <div className="sticky top-20 space-y-4">
+          <div className="sticky top-20 max-h-[calc(100vh-6rem)] space-y-4 overflow-y-auto">
             <div>
               <p className="mb-2 text-xs font-semibold text-muted-foreground">
                 On this page
@@ -311,6 +328,31 @@ function DocsPage() {
                 Opens every example on its IR / x86-64 tab instead of the source
               </TooltipContent>
             </Tooltip>
+            {next && (
+              <div className="rounded-lg border p-3">
+                <p className="mb-1.5 text-xs font-semibold text-muted-foreground">
+                  Read next
+                </p>
+                <Link
+                  to="/docs/$slug"
+                  params={{ slug: next.slug }}
+                  className="group flex flex-col gap-0.5 text-sm"
+                >
+                  <span className="font-medium group-hover:text-accent-strong">
+                    {next.title}
+                  </span>
+                  <span className="text-xs leading-relaxed text-muted-foreground">
+                    {next.description}
+                  </span>
+                </Link>
+              </div>
+            )}
+            <Link
+              to="/docs"
+              className="block text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
+            >
+              All documentation
+            </Link>
           </div>
         </aside>
       </div>

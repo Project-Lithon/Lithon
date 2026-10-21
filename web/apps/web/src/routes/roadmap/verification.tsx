@@ -3,6 +3,7 @@ import { createFileRoute } from "@tanstack/react-router"
 import { Button } from "@workspace/ui/components/button"
 import { Card, CardContent } from "@workspace/ui/components/card"
 
+import { metaForPath, structuredData } from "../../lib/seo"
 import {
   CodeBlock,
   DocSection,
@@ -13,6 +14,24 @@ import {
 } from "../../site"
 
 export const Route = createFileRoute("/roadmap/verification")({
+  head: () => {
+    const meta = metaForPath("/roadmap/verification")
+    return {
+      meta: [
+        { title: meta.title },
+        { name: "description", content: meta.description },
+        { property: "og:title", content: meta.title },
+        { property: "og:description", content: meta.description },
+        { property: "og:type", content: "website" },
+        { property: "og:url", content: meta.canonical },
+        { name: "twitter:card", content: "summary_large_image" },
+        { name: "twitter:title", content: meta.title },
+        { name: "twitter:description", content: meta.description },
+        { tagName: "link", rel: "canonical", href: meta.canonical },
+        { "script:ld+json": JSON.stringify(structuredData("/roadmap/verification")) },
+      ],
+    }
+  },
   component: Verification,
 })
 
@@ -114,12 +133,12 @@ function Verification() {
             </p>
             <CodeBlock title="the layers, in order">{`$ cmake -B build -DCMAKE_BUILD_TYPE=Release
 $ cmake --build build -j$(nproc)
-$ ctest --test-dir build --output-on-failure     # 28/28
+$ ctest --test-dir build --output-on-failure     # 33/33
 
 $ bash tools/verify_all.sh        # the whole gate
-$ python3 tools/run_regression.py         # 15/15 untyped
-$ python3 tools/run_typed_regression.py   # 13/13 typed
-$ python3 tools/run_tier_diff.py          # 39/39, both tiers`}</CodeBlock>
+$ python3 tools/run_regression.py         # 34/34 untyped
+$ python3 tools/run_typed_regression.py   # 46/46 typed
+$ python3 tools/run_tier_diff.py          # 168/168, both tiers`}</CodeBlock>
             <p>
               <code>run_tier_diff.py</code> is the highest-value of those. It
               runs every program through <em>both</em> tiers and requires
@@ -267,7 +286,7 @@ $ python3 tools/native_bench.py --runs 30 --pin 2 --compare /tmp/before.json`}</
             <Note title="Opcode coverage is not operand coverage">
               <div className="space-y-2">
                 <p>
-                  25 of 26 opcodes are emitted and each is exercised through{" "}
+                  All 55 opcodes are emitted and each is exercised through{" "}
                   <code>tier_runner --strict</code>, which proves the opcode
                   really executed natively rather than fell back. It does not
                   prove every operand shape is right, that is what the encoder's

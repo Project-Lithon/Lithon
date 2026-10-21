@@ -52,12 +52,65 @@ export type Block =
       kind: "linkcards"
       items: readonly { title: string; text: string; href: string }[]
     }
+  /**
+   * A highlighted "remember this" box. Unlike `note`, a callout has no tone
+   * axis: it is always the single most important idea on the page, so it
+   * reads as a statement of fact rather than a caveat.
+   */
+  | { kind: "callout"; title: string; text: string }
+  /**
+   * A page-level tabset: the same concept shown several ways side by side
+   * (CPython vs Lithon, one tier vs another, one width vs another).
+   */
+  | {
+      kind: "tabs"
+      caption?: string
+      items: readonly {
+        label: string
+        blocks: readonly Block[]
+      }[]
+    }
+  /**
+   * A three-column comparison table. The middle column is the "answer"
+   * (usually Lithon) and is rendered with emphasis.
+   */
+  | {
+      kind: "comparison"
+      caption?: string
+      columns: readonly [string, string, string]
+      rows: readonly (readonly [string, string, string])[]
+    }
+  /**
+   * A definition list: term on the left, description on the right, no
+   * header row. Used for API-shaped content (builtins, error codes, IR ops).
+   */
+  | {
+      kind: "deflist"
+      caption?: string
+      items: readonly { term: string; detail: string }[]
+    }
+  /**
+   * A byte-layout diagram: a run of fields with their offsets and sizes.
+   */
+  | {
+      kind: "layout"
+      caption?: string
+      size: string
+      fields: readonly { name: string; offset: string; size: string }[]
+    }
+  /**
+   * A quoted principle or rule, set apart from the surrounding prose.
+   */
+  | { kind: "quote"; text: string; source?: string }
 
 export type DocSection = {
   id: string
   title: string
   blocks: readonly Block[]
 }
+
+/** How prominently a page should be surfaced on the docs index. */
+export type PagePriority = "essential" | "recommended" | "reference"
 
 export type DocPage = {
   slug: string
@@ -66,6 +119,15 @@ export type DocPage = {
   group: string
   tags: readonly string[]
   sections: readonly DocSection[]
+  /**
+   * Index-page emphasis. `essential` pages are the reading path and are
+   * listed first; `reference` pages are looked up, not read end to end.
+   */
+  priority?: PagePriority
+  /** One-line "what you will be able to do after this" summary. */
+  outcome?: string
+  /** Minutes of reading time, used as a "short read" marker on the index. */
+  minutes?: number
 }
 
 export type DocGroup = {
@@ -118,6 +180,11 @@ export type SearchEntry = {
   group?: string
   tags: readonly string[]
   href: string
+  /**
+   * The searchable body text. Populated for pages and sections so a query
+   * can find an error code or an operator that only appears in the prose.
+   */
+  body?: string
 }
 
 export type ActionEntry = {

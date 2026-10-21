@@ -9,9 +9,29 @@ import {
   CardTitle,
 } from "@workspace/ui/components/card"
 
+import { metaForPath, structuredData } from "../lib/seo"
 import { PageHero, SectionHead, WRAP } from "../site"
 
-export const Route = createFileRoute("/use-cases")({ component: UseCases })
+export const Route = createFileRoute("/use-cases")({
+  head: () => {
+    const meta = metaForPath("/use-cases")
+    return {
+      meta: [
+        { title: meta.title },
+        { name: "description", content: meta.description },
+        { property: "og:title", content: meta.title },
+        { property: "og:description", content: meta.description },
+        { property: "og:type", content: "website" },
+        { property: "og:url", content: meta.canonical },
+        { name: "twitter:card", content: "summary_large_image" },
+        { name: "twitter:title", content: meta.title },
+        { name: "twitter:description", content: meta.description },
+        { tagName: "link", rel: "canonical", href: meta.canonical },
+        { "script:ld+json": JSON.stringify(structuredData("/use-cases")) },
+      ],
+    }
+  },
+  component: UseCases })
 
 const CASES = [
   {

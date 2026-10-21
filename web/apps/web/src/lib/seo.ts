@@ -60,8 +60,8 @@ export function metaForPath(pathname: string): PageMeta {
       facts: [
         "Zero third-party dependencies: no LLVM, no Cranelift, no runtime package",
         "Dual-tier: native x86-64 with an honest interpreter fallback under --strict",
-        "Fixed-width types: int[8..64], float[64], bool, typed pointers",
-        "32/32 CTest, 9,239 encoder cases with 0 incorrect",
+        "Fixed-width types: int[8..64], float[64], bool, bounded str[N], typed pointers",
+        "33/33 CTest, 18,379 encoder cases with 0 incorrect",
       ],
       keywords: ["lithon", "python", "native", "x86-64", "compiler", "jit"],
     }
@@ -71,12 +71,12 @@ export function metaForPath(pathname: string): PageMeta {
     return {
       title: `Playground | run Lithon against the real frontend`,
       description:
-        "Write Lithon in the browser with syntax highlighting and autocomplete, then run it through this repository's actual type checker and frontend to get the typed IR back.",
+        "Write Lithon in the browser with syntax highlighting and autocomplete, and read the typed IR the engine emits for it. The live compiler runs in local development; the built-in examples carry their recorded IR.",
       canonical: `${site}/playground`,
       facts: [
-        "Runs tools/typecheck.py and src/frontend/frontend.py locally",
-        "Returns the real typed IR for valid programs",
-        "Shows the engine's own diagnostic for invalid ones",
+        "The built-in examples show the real frontend output",
+        "The live runner is wired up in `bun run dev`",
+        "Syntax highlighting and hover documentation for the whole type language",
       ],
       keywords: ["lithon", "playground", "repl", "compiler", "online"],
     }
@@ -93,6 +93,49 @@ export function metaForPath(pathname: string): PageMeta {
         "Both engines print the same value",
       ],
       keywords: ["lithon", "benchmark", "performance", "cpython", "speedup"],
+    }
+  }
+
+  if (clean === "/changelog") {
+    return {
+      title: `Changelog | Lithon`,
+      description:
+        "Every shipped change to the Lithon language, engine, toolchain and website, newest first. Each entry links to the documentation that covers it.",
+      canonical: `${site}/changelog`,
+      facts: [
+        "Language, engine, toolchain, verification, docs and build changes",
+        "Each entry links to the documentation that covers it",
+        "Built from the repository's own commit history",
+      ],
+      keywords: [
+        "lithon",
+        "changelog",
+        "release notes",
+        "history",
+        "what changed",
+      ],
+    }
+  }
+
+  if (clean === "/next") {
+    return {
+      title: `Next actions | Lithon`,
+      description:
+        "The open items: the language gaps, the engine work, the toolchain debt, and the recently shipped changes that closed them.",
+      canonical: `${site}/next`,
+      facts: [
+        "Every open item is a design decision, not a bug",
+        "Each item names the phase it belongs to",
+        "The recently shipped list is the changelog in reverse",
+      ],
+      keywords: [
+        "lithon",
+        "roadmap",
+        "next",
+        "todo",
+        "planned",
+        "contribute",
+      ],
     }
   }
 
@@ -138,13 +181,19 @@ export function metaForPath(pathname: string): PageMeta {
   }
 }
 
-/** JSON-LD describing the project, for search engines and AI answer engines. */
+/**
+ * JSON-LD describing the project, for search engines and AI answer engines.
+ *
+ * Every route that calls `metaForPath` should also emit this, so a page is
+ * never invisible to a structured-data reader.
+ */
 export function structuredData(pathname: string) {
   const meta = metaForPath(pathname)
   const site = originFor()
+  const isDoc = pathname.startsWith("/docs")
   return {
     "@context": "https://schema.org",
-    "@type": pathname.startsWith("/docs") ? "TechArticle" : "WebSite",
+    "@type": isDoc ? "TechArticle" : "WebPage",
     name: meta.title,
     headline: meta.title,
     description: meta.description,
@@ -165,5 +214,30 @@ export function structuredData(pathname: string) {
       programmingLanguage: "Python",
       description: SITE.description,
     },
+    // The factual summary an answer engine can quote without parsing prose.
+    ...(meta.facts.length
+      ? {
+          "abstract": meta.facts.join(" · "),
+          "disambiguatingDescription": meta.facts.join(" · "),
+        }
+      : {}),
+  }
+}
+
+/** The `script:ld+json` tag for a route, ready to drop into a `head()`. */
+export function jsonLdTag(pathname: string) {
+  return {
+    "script:ld+json": JSON.stringify(structuredData(pathname)),
+  }
+}
+
+/**
+ * The same JSON-LD, as a `head()` entry. TanStack's `meta` array only
+ * accepts `<meta>` elements, so the script tag goes in `scripts`.
+ */
+export function jsonLdScript(pathname: string) {
+  return {
+    type: "application/ld+json",
+    children: JSON.stringify(structuredData(pathname)),
   }
 }

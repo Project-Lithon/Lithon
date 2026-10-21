@@ -448,6 +448,12 @@ export function Example({ spec }: { spec: ExampleSpec }) {
   const [tab, setTab] = useState(initial)
   const [playCount, setPlayCount] = useState(0)
 
+  // the machine-view toggle can change which tab should open first, but it
+  // must not yank the reader away from the tab they are actually on.
+  useEffect(() => {
+    setTab(initial)
+  }, [initial])
+
   const onTabChange = (value: string) => {
     setTab(value)
     if (value === "execution") setPlayCount((c) => c + 1)
@@ -788,6 +794,210 @@ function TableBlock({
   )
 }
 
+function ComparisonBlock({
+  caption,
+  columns,
+  rows,
+}: {
+  caption?: string
+  columns: readonly [string, string, string]
+  rows: readonly (readonly [string, string, string])[]
+}) {
+  return (
+    <div className="overflow-x-auto rounded-lg border">
+      <table className="w-full text-sm">
+        {caption && (
+          <caption className="border-b px-3 py-2 text-xs text-muted-foreground">
+            {caption}
+          </caption>
+        )}
+        <thead>
+          <tr className="border-b bg-muted/50">
+            <th className="px-3 py-2 text-start font-medium">{columns[0]}</th>
+            <th className="px-3 py-2 text-start font-medium text-accent-strong">
+              {columns[1]}
+            </th>
+            <th className="px-3 py-2 text-start font-medium">{columns[2]}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(([label, left, right]) => (
+            <tr key={label} className="border-b last:border-b-0">
+              <td
+                dir="ltr"
+                className="px-3 py-2 text-start font-medium text-foreground [unicode-bidi:isolate]"
+              >
+                {renderInline(label)}
+              </td>
+              <td
+                dir="ltr"
+                className="px-3 py-2 text-start text-muted-foreground [unicode-bidi:isolate]"
+              >
+                {renderInline(left)}
+              </td>
+              <td
+                dir="ltr"
+                className="px-3 py-2 text-start bg-accent/10 font-medium text-foreground [unicode-bidi:isolate]"
+              >
+                {renderInline(right)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function DefListBlock({
+  caption,
+  items,
+}: {
+  caption?: string
+  items: readonly { term: string; detail: string }[]
+}) {
+  return (
+    <div className="overflow-hidden rounded-lg border">
+      {caption && (
+        <div className="border-b bg-muted/50 px-3 py-2 text-xs font-medium text-muted-foreground">
+          {caption}
+        </div>
+      )}
+      <dl className="divide-y">
+        {items.map((item) => (
+          <div
+            key={item.term}
+            className="grid gap-1 px-3 py-2.5 sm:grid-cols-[minmax(0,14rem)_1fr] sm:gap-4"
+          >
+            <dt
+              dir="ltr"
+              className="font-mono text-xs font-medium text-foreground [unicode-bidi:isolate]"
+            >
+              {renderInline(item.term)}
+            </dt>
+            <dd className="text-sm leading-relaxed text-muted-foreground">
+              {renderInline(item.detail)}
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  )
+}
+
+function LayoutBlock({
+  caption,
+  size,
+  fields,
+}: {
+  caption?: string
+  size: string
+  fields: readonly { name: string; offset: string; size: string }[]
+}) {
+  return (
+    <div className="overflow-hidden rounded-lg border">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-muted/50 px-3 py-2">
+        <span className="font-mono text-xs text-muted-foreground">
+          byte layout
+        </span>
+        <span className="font-mono text-xs text-foreground">{size}</span>
+      </div>
+      {caption && (
+        <p className="border-b px-3 py-2 text-xs text-muted-foreground">
+          {caption}
+        </p>
+      )}
+      <div className="flex flex-wrap gap-1 p-3">
+        {fields.map((f) => (
+          <div
+            key={`${f.name}@${f.offset}`}
+            className="min-w-[6rem] flex-1 rounded-md border bg-muted/40 px-2 py-1.5"
+          >
+            <div className="font-mono text-xs font-medium text-foreground">
+              {f.name}
+            </div>
+            <div className="font-mono text-[10px] text-muted-foreground">
+              @{f.offset} · {f.size}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function CalloutBlock({ title, text }: { title: string; text: string }) {
+  return (
+    <div className="rounded-lg border-2 border-accent-strong/50 bg-accent/10 p-5">
+      <div className="font-heading text-base font-bold text-foreground">
+        {title}
+      </div>
+      <div className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+        {renderInline(text)}
+      </div>
+    </div>
+  )
+}
+
+function QuoteBlock({ text, source }: { text: string; source?: string }) {
+  return (
+    <blockquote className="border-s-4 border-primary/50 ps-4">
+      <p className="text-base leading-relaxed text-foreground italic">
+        {renderInline(text)}
+      </p>
+      {source && (
+        <footer className="mt-2 text-xs text-muted-foreground">
+          {source}
+        </footer>
+      )}
+    </blockquote>
+  )
+}
+
+function TabsBlock({
+  caption,
+  items,
+}: {
+  caption?: string
+  items: readonly { label: string; blocks: readonly Block[] }[]
+}) {
+  const [active, setActive] = useState(0)
+  if (items.length === 0) return null
+  return (
+    <div className="overflow-hidden rounded-lg border">
+      {caption && (
+        <p className="border-b bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          {caption}
+        </p>
+      )}
+      <Tabs value={String(active)} onValueChange={(v) => setActive(Number(v))}>
+        <div className="flex items-center border-b px-2">
+          <TabsList variant="line" className="bg-transparent p-0 shadow-none">
+            {items.map((item, i) => (
+              <TabsTrigger
+                key={item.label}
+                value={String(i)}
+                className="rounded-none border-b-2 border-transparent px-2.5 shadow-none data-[state=active]:border-primary data-[state=active]:shadow-none"
+              >
+                {item.label}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </div>
+        {items.map((item, i) => (
+          <TabsContent key={item.label} value={String(i)} className="m-0">
+            <div className="space-y-4 p-4">
+              {item.blocks.map((block, j) => (
+                <BlockView key={j} block={block} />
+              ))}
+            </div>
+          </TabsContent>
+        ))}
+      </Tabs>
+    </div>
+  )
+}
+
 export function BlockView({ block }: { block: Block }) {
   switch (block.kind) {
     case "p":
@@ -820,6 +1030,30 @@ export function BlockView({ block }: { block: Block }) {
       return <CardsBlock items={block.items} />
     case "linkcards":
       return <LinkCardsBlock items={block.items} />
+    case "callout":
+      return <CalloutBlock title={block.title} text={block.text} />
+    case "quote":
+      return <QuoteBlock text={block.text} source={block.source} />
+    case "comparison":
+      return (
+        <ComparisonBlock
+          caption={block.caption}
+          columns={block.columns}
+          rows={block.rows}
+        />
+      )
+    case "deflist":
+      return <DefListBlock caption={block.caption} items={block.items} />
+    case "layout":
+      return (
+        <LayoutBlock
+          caption={block.caption}
+          size={block.size}
+          fields={block.fields}
+        />
+      )
+    case "tabs":
+      return <TabsBlock caption={block.caption} items={block.items} />
   }
 }
 

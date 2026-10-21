@@ -19,6 +19,7 @@ function scoreTerm(entry: SearchEntry, term: string): number {
   const subtitle = entry.subtitle?.toLowerCase() ?? ""
   const tags = entry.tags.map((t) => t.toLowerCase())
   const group = entry.group?.toLowerCase() ?? ""
+  const body = entry.body?.toLowerCase() ?? ""
 
   if (title === term) return 100
   if (title.startsWith(term)) return 80
@@ -30,8 +31,20 @@ function scoreTerm(entry: SearchEntry, term: string): number {
   }
   if (subtitle.includes(term)) return 30
   if (group.includes(term)) return 20
+  // The body is the last resort before the fuzzy match, so an exact hit in
+  // the prose still beats a subsequence hit in the title.
+  if (body) {
+    if (body.includes(term)) return 18
+    // an error code like E0301, or a symbol like `wrap_add`
+    if (new RegExp(`\\b${escapeRegExp(term)}\\b`).test(body)) return 25
+  }
   if (fuzzy(title, term)) return 15
+  if (body && fuzzy(body, term)) return 8
   return 0
+}
+
+function escapeRegExp(text: string) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
 function fuzzy(haystack: string, needle: string): boolean {

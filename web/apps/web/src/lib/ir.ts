@@ -232,6 +232,13 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
     memory.get(`${frames.length}:${name}`)
 
   /**
+   * The scope key of a frame slot. A slot is float-typed per frame, so
+   * `floatSlots` has to be scoped the same way `memory` is: a recursive
+   * call must not inherit the caller's float-ness for the same name.
+   */
+  const slotKey = (name: string) => `${frames.length}:${name}`
+
+  /**
    * A struct is one blob with several fields at fixed byte offsets, so each
    * field needs its own storage: `fieldstore p, 0, %N` and
    * `fieldstore p, 8, %N` must not overwrite each other. The blob itself
@@ -278,11 +285,17 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
   // Set when a trap fires: the block to jump to, or undefined when the trap
   // is not catchable and the run has to stop.
   let trapTarget: string | undefined
+  /** Names the IR referenced but the model has never seen. */
+  const unresolved = new Set<string>()
+  /** Opcodes the browser model does not implement. */
+  const unmodelled = new Set<string>()
 
   const snapshot = () => ({
     registers: [...registers.entries()]
       .filter(([k]) => k.startsWith("%"))
-      .slice(-8)
+      // the last 12 registers of the current frame, so a long program does
+      // not drown the reader in a hundred stale names
+      .slice(-12)
       .map(([name, value]) => ({ name, value: fmtValue(value) })),
     memory: [
       ...memory.values(),
@@ -331,7 +344,13 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
       if (tok.startsWith("%")) {
         // %N is per-function and per-frame: fib(3) and fib(2) both use %8
         const key = `${frames.length}:${current.name}:${tok}`
-        const v = registers.get(key) ?? registers.get(tok) ?? 0n
+        const v = registers.get(key) ?? registers.get(tok)
+        if (v === undefined) {
+          // An unresolved register is a modelling gap, not a zero. Record it
+          // so the run can say so instead of quietly computing with 0.
+          unresolved.add(tok)
+          return 0n
+        }
         if (printedArg !== tok)
           consumed.push({ register: tok, value: fmtValue(v) })
         return v
@@ -342,6 +361,7 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
           consumed.push({ register: tok, value: fmtValue(cell.value) })
         return cell.value
       }
+      unresolved.add(tok)
       return 0n
     }
 
@@ -382,7 +402,7 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
           registers.set(`${frames.length}:${current.name}:${instr.dest}`, v)
           if (isFloat)
             floatRegs.add(`${frames.length}:${current.name}:${instr.dest}`)
-          else floatRegs.delete(instr.dest)
+          else floatRegs.delete(`${frames.length}:${current.name}:${instr.dest}`)
           produced = { register: instr.dest, value: fmtValue(v) }
         }
         break
@@ -391,7 +411,7 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
         const v = read(instr.args[0])
         if (instr.dest) {
           registers.set(`${frames.length}:${current.name}:${instr.dest}`, v)
-          if (instr.args[0] && floatSlots.has(instr.args[0]))
+          if (instr.args[0] && floatSlots.has(slotKey(instr.args[0])))
             floatRegs.add(`${frames.length}:${current.name}:${instr.dest}`)
           produced = { register: instr.dest, value: fmtValue(v) }
         }
@@ -412,10 +432,11 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
           (instr.args[1] &&
             floatRegs.has(`${frames.length}:${current.name}:${instr.args[1]}`))
         )
-          floatSlots.add(name)
+          floatSlots.add(slotKey(name))
+        else floatSlots.delete(slotKey(name))
         note =
           instr.args.length > 1
-            ? `${cell.address} â† ${fmtValue(cell.value)}`
+            ? `${cell.address} ← ${fmtValue(cell.value)}`
             : `${cell.address} reserved`
         break
       }
@@ -427,7 +448,7 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
         const cell = allocField(name, offset, instr.width ?? "int[64]")
         cell.value = v as number | bigint | boolean
         written = { ...cell }
-        note = `${cell.address} â† ${fmtValue(v)}`
+        note = `${cell.address} ← ${fmtValue(v)}`
         break
       }
       case "fieldload": {
@@ -442,7 +463,7 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
             floatRegs.add(`${frames.length}:${current.name}:${instr.dest}`)
           produced = { register: instr.dest, value: fmtValue(v) }
         }
-        note = `${cell.address} â†’ ${fmtValue(v)}`
+        note = `${cell.address} → ${fmtValue(v)}`
         break
       }
       case "guardnonzero": {
@@ -462,7 +483,7 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
         const trapName = instr.args[0] ?? "Exception"
         const handler = instr.args[1]
         pendingHandler = { trapName, handler }
-        note = `guard against ${trapName} â†’ ${handler}`
+        note = `guard against ${trapName} → ${handler}`
         break
       }
       case "tryleave": {
@@ -491,7 +512,7 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
         }
         note = known
           ? `syscall ${fmtValue(number)}`
-          : `syscall ${fmtValue(number)} â†’ -ENOSYS (-38)`
+          : `syscall ${fmtValue(number)} → -ENOSYS (-38)`
         break
       }
       case "add":
@@ -644,7 +665,7 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
           type: instr.width ?? "int[64]",
           value: v as number,
         }
-        note = `${name}[${key}] â† ${fmtValue(v)}`
+        note = `${name}[${key}] ← ${fmtValue(v)}`
         break
       }
       case "Index":
@@ -682,7 +703,7 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
             `&${instr.args[0]}`
           )
           produced = { register: instr.dest, value: `&${instr.args[0]}` }
-          note = `&${instr.args[0]} â†’ stack address`
+          note = `&${instr.args[0]} → stack address`
         }
         break
       }
@@ -698,7 +719,10 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
           const isFloat =
             floatRegs.has(
               `${frames.length}:${current.name}:${instr.args[1]}`
-            ) || (instr.args[1] ? floatSlots.has(instr.args[1]) : false)
+            ) ||
+            (instr.args[1] && !instr.args[1].startsWith("%")
+              ? floatSlots.has(slotKey(instr.args[1]))
+              : false)
           const line =
             isFloat && typeof v === "number" ? fmtFloat(v) : fmtValue(v)
           if (callee === "print") {
@@ -739,7 +763,7 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
         const truthy =
           cond === true || (typeof cond === "bigint" && cond !== 0n)
         const target = truthy ? instr.args[1] : instr.args[2]
-        note = `branch on ${fmtValue(cond)} â†’ ${target}`
+        note = `branch on ${fmtValue(cond)} → ${target}`
         jumpTo = target
         break
       }
@@ -770,7 +794,11 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
         continue
       }
       default:
-        note = `${instr.op} (not modelled)`
+        // An opcode the browser model does not implement. Say so plainly
+        // rather than pretending the instruction did nothing: the reader
+        // needs to know the trace is incomplete.
+        unmodelled.add(instr.op)
+        note = `${instr.op} (not modelled by the browser trace)`
     }
 
     const snap = snapshot()
@@ -818,6 +846,13 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
   const run: IrRun = { steps, stdout }
   if (error) run.error = error
   else if (guard >= maxSteps) run.error = `stopped after ${maxSteps} steps`
+  else if (unmodelled.size > 0) {
+    // The trace is a browser model of the IR, not the IR itself. Say which
+    // opcodes it does not implement, so a reader is never misled.
+    run.error = `this trace does not model: ${[...unmodelled].sort().join(", ")}`
+  } else if (unresolved.size > 0) {
+    run.error = `this trace could not resolve: ${[...unresolved].sort().join(", ")}`
+  }
   return run
 }
 

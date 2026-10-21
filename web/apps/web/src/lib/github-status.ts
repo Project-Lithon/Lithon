@@ -1,6 +1,12 @@
 const REPO = "Project-Lithon/Lithon"
 const ENDPOINT = `https://api.github.com/repos/${REPO}/actions/runs?per_page=12`
 
+/**
+ * The branch the deployed site tracks. A run on a feature branch should not
+ * make the footer say the project is failing.
+ */
+const TRACKED_BRANCH = "master"
+
 export type RunStatus =
   | "success"
   | "failure"
@@ -90,12 +96,50 @@ export function overallStatus(runs: WorkflowRun[]): RunStatus {
 }
 
 /**
- * Fetch live CI state from GitHub. Unauthenticated, cached, and it degrades to
- * a null result rather than throwing when the network or API is unavailable.
+ * Fetch live CI state from GitHub.
+ *
+ * Unauthenticated, cached in `localStorage` for a few minutes, and it
+ * degrades to a null result rather than throwing when the network or the
+ * API is unavailable. The cache matters: the unauthenticated GitHub API
+ * allows 60 requests per hour per IP, and the footer is on every page, so
+ * an uncached poll would exhaust the budget for every visitor behind the
+ * same NAT.
  */
+const CACHE_KEY = "lithon:ci-status"
+const CACHE_TTL_MS = 5 * 60 * 1000
+
+type CachedStatus = { at: number; status: RepoStatus }
+
+function readCache(): CachedStatus | null {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Partial<CachedStatus>
+    if (typeof parsed.at !== "number" || !parsed.status) return null
+    if (Date.now() - parsed.at > CACHE_TTL_MS) return null
+    return { at: parsed.at, status: parsed.status }
+  } catch {
+    return null
+  }
+}
+
+function writeCache(status: RepoStatus) {
+  try {
+    localStorage.setItem(
+      CACHE_KEY,
+      JSON.stringify({ at: Date.now(), status } satisfies CachedStatus),
+    )
+  } catch {
+    // a full or disabled storage is not a reason to fail the page
+  }
+}
+
 export async function fetchRepoStatus(
   signal?: AbortSignal
 ): Promise<RepoStatus> {
+  const cached = readCache()
+  if (cached) return cached.status
+
   try {
     const res = await fetch(ENDPOINT, {
       headers: { Accept: "application/vnd.github+json" },
@@ -115,17 +159,19 @@ export async function fetchRepoStatus(
         updated_at: string
       }[]
     }
-    const runs = data.workflow_runs.map((r) => ({
-      id: r.id,
-      name: r.name,
-      status: r.status,
-      conclusion: r.conclusion,
-      branch: r.head_branch,
-      sha: r.head_sha.slice(0, 7),
-      url: r.html_url,
-      createdAt: r.created_at,
-      updatedAt: r.updated_at,
-    }))
+    const runs = data.workflow_runs
+      .filter((r) => r.head_branch === TRACKED_BRANCH)
+      .map((r) => ({
+        id: r.id,
+        name: r.name,
+        status: r.status,
+        conclusion: r.conclusion,
+        branch: r.head_branch,
+        sha: r.head_sha.slice(0, 7),
+        url: r.html_url,
+        createdAt: r.created_at,
+        updatedAt: r.updated_at,
+      }))
 
     let stars: number | null = null
     let openIssues: number | null = null
@@ -149,7 +195,7 @@ export async function fetchRepoStatus(
       // metadata is a bonus, not required
     }
 
-    return {
+    const status: RepoStatus = {
       runs,
       stars,
       openIssues,
@@ -157,6 +203,8 @@ export async function fetchRepoStatus(
       fetchedAt: new Date().toISOString(),
       ok: true,
     }
+    writeCache(status)
+    return status
   } catch {
     return FALLBACK
   }

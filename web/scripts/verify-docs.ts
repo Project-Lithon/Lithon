@@ -14,6 +14,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { dirname, join, resolve } from "node:path"
 
 import { DOCS } from "../apps/web/src/docs/registry"
+import { requireUv, runTool } from "./toolchain"
 
 const APP_DIR = dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"))
 const WEB_ROOT = resolve(APP_DIR, "..")
@@ -22,16 +23,7 @@ const REPO_ROOT = resolve(WEB_ROOT, "..")
 const TYPECHECK = join(REPO_ROOT, "tools", "typecheck.py")
 const FRONTEND = join(REPO_ROOT, "src", "frontend", "frontend.py")
 
-const UV =
-  process.env.UV_PATH ??
-  join(
-    process.env.LOCALAPPDATA ?? "",
-    "Microsoft",
-    "WinGet",
-    "Packages",
-    "astral-sh.uv_Microsoft.Winget.Source_8wekyb3d8bbwe",
-    "uv.exe",
-  )
+const UV = requireUv()
 
 type Failure = { where: string; detail: string }
 
@@ -43,15 +35,6 @@ let refs = 0
 
 function fail(where: string, detail: string) {
   failures.push({ where, detail })
-}
-
-function run(cmd: string[]): { code: number; out: string; err: string } {
-  const proc = Bun.spawnSync(cmd, { stdout: "pipe", stderr: "pipe" })
-  return {
-    code: proc.exitCode,
-    out: new TextDecoder().decode(proc.stdout),
-    err: new TextDecoder().decode(proc.stderr),
-  }
 }
 
 function normalise(text: string): string {
@@ -140,9 +123,9 @@ function checkExample(
   const useTypecheck = example.typecheck !== false
 
   const tc = useTypecheck
-    ? run([UV, "run", "--quiet", "--python", "3.12", TYPECHECK, tmp])
+    ? runTool(UV, [TYPECHECK, tmp], REPO_ROOT)
     : null
-  const fe = run([UV, "run", "--quiet", "--python", "3.12", FRONTEND, tmp])
+  const fe = runTool(UV, [FRONTEND, tmp], REPO_ROOT)
   const tcText = tc ? `${tc.out}${tc.err}` : ""
   const feText = `${fe.out}${fe.err}`
 
@@ -195,6 +178,25 @@ function checkExample(
   }
 }
 
+/** Every code block in a page, including the ones nested inside a tabset. */
+function codeBlocks(
+  blocks: readonly unknown[],
+  out: { example: Parameters<typeof checkExample>[1] }[] = [],
+) {
+  for (const block of blocks as { kind: string; example?: unknown; items?: unknown }[]) {
+    if (block.kind === "code" && block.example) {
+      out.push({
+        example: block.example as Parameters<typeof checkExample>[1],
+      })
+    } else if (block.kind === "tabs" && Array.isArray(block.items)) {
+      for (const item of block.items as { blocks: unknown[] }[]) {
+        codeBlocks(item.blocks, out)
+      }
+    }
+  }
+  return out
+}
+
 function checkRegistry() {
   const slugs = new Set<string>()
   const ids = new Set<string>()
@@ -222,12 +224,6 @@ function checkRegistry() {
 }
 
 function main() {
-  if (!existsSync(UV)) {
-    console.error(
-      `uv not found at ${UV}\nInstall it with: winget install --id=astral-sh.uv -e`,
-    )
-    process.exit(2)
-  }
   if (!existsSync(TYPECHECK) || !existsSync(FRONTEND)) {
     console.error("Lithon repo toolchain not found — run this from web/")
     process.exit(2)
@@ -238,11 +234,9 @@ function main() {
     checkRegistry()
     for (const page of DOCS.pages) {
       for (const section of page.sections) {
-        section.blocks.forEach((block, i) => {
-          if (block.kind === "code") {
-            checkExample(`${page.slug}#${section.id}[${i}]`, block.example)
-          }
-        })
+        for (const { example } of codeBlocks(section.blocks)) {
+          checkExample(`${page.slug}#${section.id}`, example)
+        }
       }
     }
   } finally {

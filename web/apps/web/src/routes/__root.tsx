@@ -85,17 +85,20 @@ const NAV_LINKS = [
   { to: "/docs", label: "Docs" },
   { to: "/use-cases", label: "Use cases" },
   { to: "/roadmap", label: "Roadmap" },
+  { to: "/changelog", label: "Changelog" },
+  { to: "/next", label: "Next actions" },
   { to: "/benchmarks", label: "Benchmarks" },
   { to: "/playground", label: "Playground" },
 ] as const
 
 const QUICK_LINKS = [
   { to: "/docs", label: "Browse docs" },
+  { to: "/changelog", label: "Changelog" },
+  { to: "/next", label: "Next actions" },
   { to: "/playground", label: "Playground" },
   { to: "/use-cases", label: "Use cases" },
   { to: "/benchmarks", label: "Benchmarks" },
 ] as const
-
 function NotFoundPage() {
   return (
     <div className="mx-auto flex min-h-[70vh] w-full max-w-6xl flex-col items-start justify-center px-4 py-16">
@@ -338,7 +341,7 @@ function SearchButton() {
     >
       <MagnifyingGlassIcon />
       <span className="text-xs">Search</span>
-      <Kbd>âŒ˜</Kbd>
+      <Kbd>⌘</Kbd>
       <Kbd>K</Kbd>
     </Button>
   )
@@ -443,10 +446,17 @@ function SiteFooter() {
           </span>
         </Link>
         <p className="text-sm text-muted-foreground sm:ms-4">
-          Not a revolution but an evolution of the same bloodline. Â© 2026 Lithon
+          Not a revolution but an evolution of the same bloodline. © 2026 Lithon
           contributors.
         </p>
         <div className="flex gap-3 text-sm sm:ms-auto">
+          <Button
+            variant="link"
+            size="sm"
+            render={<a href={assetUrl("/llms.txt")} target="_blank" rel="noreferrer" />}
+          >
+            llms.txt
+          </Button>
           <Button
             variant="link"
             size="sm"

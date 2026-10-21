@@ -17,9 +17,29 @@ import {
 } from "@workspace/ui/components/card"
 import { Separator } from "@workspace/ui/components/separator"
 
+import { metaForPath, structuredData } from "../lib/seo"
 import { Note, PageHero, SectionHead, WRAP } from "../site"
 
-export const Route = createFileRoute("/roadmap")({ component: Roadmap })
+export const Route = createFileRoute("/roadmap")({
+  head: () => {
+    const meta = metaForPath("/roadmap")
+    return {
+      meta: [
+        { title: meta.title },
+        { name: "description", content: meta.description },
+        { property: "og:title", content: meta.title },
+        { property: "og:description", content: meta.description },
+        { property: "og:type", content: "website" },
+        { property: "og:url", content: meta.canonical },
+        { name: "twitter:card", content: "summary_large_image" },
+        { name: "twitter:title", content: meta.title },
+        { name: "twitter:description", content: meta.description },
+        { tagName: "link", rel: "canonical", href: meta.canonical },
+        { "script:ld+json": JSON.stringify(structuredData("/roadmap")) },
+      ],
+    }
+  },
+  component: Roadmap })
 
 type Status = "done" | "active" | "next" | "later"
 
@@ -95,7 +115,7 @@ const PHASES: readonly {
       {
         t: "VEX/SSE transition discipline",
         s: "done",
-        d: "A scanner that disassembles each function and flags legacy SSE after a VEX prefix with no vzeroupper. No AVX is emitted yet, so this is a guardrail laid before the road, and its --self-test mode proves the scanner actually fires.",
+        d: "A scanner that disassembles each function and flags legacy SSE after a VEX prefix with no vzeroupper. AVX2 is now emitted by the vectorizer, so this guardrail is live rather than hypothetical, and its --self-test mode proves the scanner actually fires.",
         e: "tools/check_vex_transitions.py --self-test proves the scanner fires",
       },
       {
@@ -108,13 +128,13 @@ const PHASES: readonly {
         t: "Static type flow verifier",
         s: "done",
         d: "Mandatory annotations, explicit integer widths, automatic widening and no narrowing anywhere. A bare int is not a type here: the checker rejects it by name, because a type that cannot be written down cannot be proven.",
-        e: "tools/typecheck.py · run_typed_regression.py 13/13",
+        e: "tools/typecheck.py · run_typed_regression.py 46/46",
       },
       {
         t: "IR text format",
         s: "done",
         d: "The intermediate representation is parsed inside the engine, so the native tier carries no Python dependency of any kind. CPython stops existing once IR exists.",
-        e: "src/ir/text_parser.cpp · run_regression.py 15/15",
+        e: "src/ir/text_parser.cpp · run_regression.py 34/34",
       },
       {
         t: "Calls, recursion and tail calls",
@@ -132,7 +152,7 @@ const PHASES: readonly {
         t: "Floating point, end to end",
         s: "done",
         d: "SSE2 arithmetic, comparisons, load and store, and native print. One formatter serves both tiers, so the two agree byte for byte rather than approximately.",
-        e: "compile_module_float_test · float_format_test · run_tier_diff.py 39/39",
+        e: "compile_module_float_test · float_format_test · run_tier_diff.py 168/168",
       },
       {
         t: "Modulo with C semantics",
@@ -149,7 +169,7 @@ const PHASES: readonly {
       {
         t: "A direct Phi emitter",
         s: "active",
-        d: "25 of 26 IR opcodes are emitted; this is the last one. What is owed is value-kind inference for a float merge, an allocator slot for the result, and codegen for the join's parallel copies.",
+        d: "All 55 IR opcodes are emitted. The direct-Phi path and the edge-copy path both ship; what is still owed is value-kind inference for a float merge and an XMM allocator pool, so a float phi does not have to round-trip through memory.",
         e: "compute_edge_uses() in liveness.h · resolve_phis() in optimize.h",
       },
       {
@@ -207,7 +227,7 @@ const PHASES: readonly {
       {
         t: "AVX2 and SIMD vectorization",
         s: "later",
-        d: "Parallel list processing across a vector unit. The detection gate and the VEX transition guardrail are already in place underneath it; no AVX is emitted yet.",
+        d: "Parallel list processing across a vector unit. The AVX2 vectorizer now emits 8-wide ymm code over int[32] lists; the detection gate and the VEX transition guardrail underneath it are what keep the result exact.",
         e: "cpu_features.h gates it · check_vex_transitions.py keeps it honest",
       },
       {

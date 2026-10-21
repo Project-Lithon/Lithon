@@ -36,6 +36,8 @@ const STATIC_PATHS = [
   "/benchmarks",
   "/roadmap",
   "/use-cases",
+  "/changelog",
+  "/next",
   "/roadmap/language",
   "/roadmap/phase-1-dual-tier",
   "/roadmap/phase-2-aot",
@@ -53,15 +55,20 @@ const weightFor = (path: string) => {
   if (path === "/") return "1.0"
   if (path === "/docs") return "0.9"
   if (path.startsWith("/docs/")) return "0.8"
+  if (path === "/changelog" || path === "/next") return "0.7"
   if (path === "/playground") return "0.7"
   if (path === "/benchmarks") return "0.7"
   return "0.6"
 }
 
+// The last-modified date of the tree, so a crawler gets a freshness signal.
+const lastmod = new Date().toISOString().slice(0, 10)
+
 const urls = all
   .map(
     (path) => `  <url>
     <loc>${origin}${path}</loc>
+    <lastmod>${lastmod}</lastmod>
     <changefreq>weekly</changefreq>
     <priority>${weightFor(path)}</priority>
   </url>`
@@ -77,6 +84,9 @@ ${urls}
 const robots = `User-agent: *
 Allow: /
 Disallow: /api/
+
+# The AI-facing surfaces: a compact index and the full documentation.
+# Both are generated from the same registry the site renders.
 
 Sitemap: ${origin}/sitemap.xml
 `
