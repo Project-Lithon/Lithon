@@ -1,9 +1,10 @@
 /**
  * Repairs Windows-1252 -> UTF-8 mojibake in the web app's source files.
  *
- * A character like `â†’` (U+2192) is three UTF-8 bytes: E2 86 92. If those
- * bytes are read as Windows-1252 they become `Ã¢` `â€ ` `â€™` -- three visible
- * characters. This script finds those runs and decodes them back.
+ * A character like U+2192 (RIGHTWARDS ARROW) is three UTF-8 bytes:
+ * E2 86 92. If those bytes are read as Windows-1252 they become three
+ * visible characters: U+00E2, U+2020 and U+2019. This script finds those
+ * runs and decodes them back.
  *
  * Run: bun scripts/fix-encoding.ts [--check]
  */
@@ -32,7 +33,7 @@ function cp1252Byte(cp: number): number {
 /**
  * The three lead characters of a mojibake run: the UTF-8 encoding of
  * U+00E2, U+00C2 and U+00C3 are the two- and three-byte sequences that
- * Windows-1252 renders as `Ã¢`, `Ã‚` and `Ãƒ`.
+ * Windows-1252 renders as three separate characters.
  */
 const LEADS = new Set([0x00e2, 0x00c2, 0x00c3, 0x00e3, 0x00c5])
 
