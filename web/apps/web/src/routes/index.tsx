@@ -18,9 +18,29 @@ import {
   CardHeader,
   CardTitle,
 } from "@workspace/ui/components/card"
+import { metaForPath, structuredData } from "../lib/seo"
 import { Separator } from "@workspace/ui/components/separator"
 
-export const Route = createFileRoute("/")({ component: Home })
+export const Route = createFileRoute("/")({
+  head: () => {
+    const meta = metaForPath("/")
+    return {
+      meta: [
+        { title: meta.title },
+        { name: "description", content: meta.description },
+        { property: "og:title", content: meta.title },
+        { property: "og:description", content: meta.description },
+        { property: "og:type", content: "website" },
+        { property: "og:url", content: meta.canonical },
+        { name: "twitter:card", content: "summary_large_image" },
+        { name: "twitter:title", content: meta.title },
+        { name: "twitter:description", content: meta.description },
+        { tagName: "link", rel: "canonical", href: meta.canonical },
+        { "script:ld+json": JSON.stringify(structuredData("/")) },
+      ],
+    }
+  },
+  component: Home })
 
 const WRAP = "mx-auto w-full max-w-6xl px-4"
 
@@ -106,7 +126,7 @@ const CONVICTIONS = [
       ["engine", "C++20"],
       ["output", "x86-64"],
     ] as const,
-    text: "The distance between an idea and the instruction that runs it is three deliberate layers. No abstraction tax, and no intermediate representation that nobody owns.",
+    text: "The distance between an idea and the instruction that runs it is three deliberate layers, and the IR between them is a plain text format the project owns end to end: you can read the whole thing it emits.",
   },
   {
     index: "04",

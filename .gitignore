@@ -26,4 +26,7 @@ fuzz_failures/
 
 node_modules/
 
+# Local Python virtualenv for the frontend toolchain.
+.venv/
+
 /nul

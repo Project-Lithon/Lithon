@@ -227,10 +227,10 @@ const errors: DocPage = {
             lang: "text",
             title: "the same operation, two verdicts",
             source: `x: int[64] = 9223372036854775807
-x = x + 50    # LITHON-E0101: compile-time refusal, not a runtime event
+x = x + 50    # provable at compile time: a refusal, not a runtime event
 
-b: int[64] = input_value()   # unknown until run
-c: int[64] = b + 50          # Tier-3 trap (E0303) iff it overflows`,
+b: int[64] = int(64, input("n: "))   # unknown until run
+c: int[64] = b + 50                   # Tier-3 trap (E0303) iff it overflows`,
           },
         },
         {
@@ -302,12 +302,27 @@ print(i)`,
             lang: "bash",
             title: "terminal",
             source: `$ lithon div_zero.lio            # dynamic divisor
-LITHON-E0301: division by zero`,
+error: division by zero`,
           },
         },
         {
           kind: "p",
-          text: "Because the message is the same in both tiers, a trap can be caught by name and handled identically either way. `try`/`except` catches exactly these tier-3 traps -- see [Control flow](/docs/control-flow#try-except) for the catchable set and the three shapes that are deliberately refused.",
+          text: "Because the message is the same in both tiers, a trap can be caught by name and handled identically either way. The `try`/`except` classifier matches on the message text, not on a code, which is why the text is part of the contract.",
+        },
+        {
+          kind: "linkcards",
+          items: [
+            {
+              title: "Exceptions & traps",
+              href: "/docs/exceptions",
+              text: "The seven catchable traps, and the `else`/`finally` clauses.",
+            },
+            {
+              title: "Control flow",
+              href: "/docs/control-flow#try-except",
+              text: "The `try` statement in the context of the other flow forms.",
+            },
+          ],
         },
       ],
     },
@@ -349,18 +364,18 @@ const builtins: DocPage = {
           caption: "built-ins",
           rows: [
             [
-              "`print(x)`",
-              "write one scalar value and a newline: the only output primitive",
+              "`print(x)` / `print(a, b, c)`",
+              "write one or more values, space-separated, and a newline: the only output primitive. `print()` with no arguments writes a bare newline.",
             ],
             [
               "`len(xs)`",
-              "capacity of a `list`/`tuple`/`dict`: part of the type, cannot change at run time",
+              "the **live** length of a `list`/`tuple`/`dict`, or the run-time byte count of a `str[N]`. Carried in a companion slot, so it can change at run time.",
             ],
             [
               "`range(n)` / `range(a, b)`",
               "loop values, checked against the loop variable's width at compile time when known (0.6.12)",
             ],
-            ["`addressof(x)`", "`ptr[T]` to scalar `x`"],
+            ["`addressof(x)`", "`ptr[T]` to a scalar, a `str[N]`, or a struct"],
             ["`valueof(_p)`", "read the scalar at `_p`"],
             [
               "`contains(d, k)`",
@@ -368,7 +383,7 @@ const builtins: DocPage = {
             ],
             [
               "`sum(xs)`",
-              "sum of a `list[int[64]|float[64], N]`: unrolled over the compile-time capacity N",
+              "sum of a `list[int[64]|float[64], N]`: unrolled over the compile-time length",
             ],
             [
               "`min(xs)` / `max(xs)`",
@@ -384,7 +399,7 @@ const builtins: DocPage = {
             ],
             [
               "`x in xs` / `x not in xs`",
-              "`bool`: OR of `x == xs[k]` over the compile-time N",
+              "`bool`: OR of `x == xs[k]` over the compile-time length",
             ],
             [
               "`int(w, v)`",
@@ -400,7 +415,7 @@ const builtins: DocPage = {
             ],
             [
               "`syscall(n, a1..a6)`",
-              "raw unchecked syscall, integer args only, returns `int[64]` (`-errno` on Linux)",
+              "raw unchecked syscall; integer or pointer arguments, returns `int[64]` (`-errno` on Linux)",
             ],
             [
               "`wrap_add(a, b)`",
@@ -439,7 +454,18 @@ for a, b in zip(xs, ys):
         },
         {
           kind: "p",
-          text: "Three names behave like methods rather than free functions: `xs.append(v)` on a `list` (which never grows the list -- it can only fail with a full list), `s.find(sub)` / `s.count(sub)` on a bounded string, and `s.split(sep)` into a declared destination list.",
+          text: "Three names behave like methods rather than free functions: `xs.append(v)` on a `list` (which never grows the list -- it writes into the next live slot and can only fail with a full list), `s.find(sub)` / `s.count(sub)` on a bounded string, and `parts: list[str[K], M] = s.split(sep)` into a declared destination list.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "print takes several values",
+            typecheck: false,
+            source: `a: int[64] = 1
+b: int[64] = 2
+print(a, b, "x")`,
+            output: "1 2 x",
+          },
         },
         {
           kind: "note",
@@ -454,6 +480,11 @@ for a, b in zip(xs, ys):
               title: "Containers",
               href: "/docs/containers",
               text: "What `len`, `sum` and `append` actually operate on.",
+            },
+            {
+              title: "Strings",
+              href: "/docs/strings",
+              text: "`find`, `count`, `split`, and the bounded-string model.",
             },
             {
               title: "Semantics",
@@ -660,7 +691,7 @@ const verification: DocPage = {
   slug: "verification",
   title: "Verification",
   description:
-    "The numbers behind the claims: 32/32 CTest, 9,239 encoder cases with 0 wrong, both tiers byte-identical.",
+    "The numbers behind the claims: 33/33 CTest, 18,379 encoder cases with 0 wrong, both tiers byte-identical.",
   group: "reference",
   tags: [
     "verification",
@@ -680,18 +711,24 @@ const verification: DocPage = {
           kind: "table",
           caption: "from README.md: run it yourself, don't trust it",
           rows: [
-            ["CTest", "32 / 32 passed"],
-            ["x86-64 encoder comparisons", "9,239 cases"],
+            ["CTest", "33 / 33 passed"],
+            ["x86-64 encoder comparisons", "18,379 cases"],
             ["Incorrect encoder cases", "0"],
             ["Typed differential fuzzing", "300 / 300 passed"],
             ["Bitwise / shift fuzzing", "200 / 200 passed"],
             ["Conditional-expression / SSA fuzzing", "200 / 200 per suite"],
             ["Direct float Phi sweep", "38 matched / 0 mismatched"],
-            ["ABI modules audited", "23"],
+            ["ABI modules audited", "34"],
             ["ABI stack/callee-saved failures", "0"],
-            ["Typed regression suite", "15 / 15 passed"],
-            ["General regression suite", "23 / 23 passed"],
+            ["Typed regression suite", "46 / 46 passed"],
+            ["General regression suite", "34 / 34 passed"],
+            ["Type-checker unit checks", "145 ok"],
+            ["Error-code discipline checks", "86 ok"],
+            ["Tier differential (interp vs JIT)", "168 / 168 passed"],
+            ["Syscall hook parity (both tiers)", "4 / 4 passed"],
+            ["Networking loopback vs a C oracle", "verified"],
             ["SIMD vectorizer loop cases", "6 / 6 passed"],
+            ["SIMD vectorizer gate + fallback", "verified"],
           ],
         },
         {
@@ -699,6 +736,12 @@ const verification: DocPage = {
           tone: "good",
           title: "The gate concludes",
           text: "`bash tools/verify_all.sh` runs the whole stack and ends with `ALL CHECKS PASSED` or it does not pass.",
+        },
+        {
+          kind: "note",
+          tone: "note",
+          title: "Where the corpus lives",
+          text: "The general suite is `tests/programs/` (34 programs), the typed suite is `tests/typed_regression/` (46 programs), and the negative suite is `tests/typed_programs/` (22 programs the checker must reject). Every one has a pinned expected-output file, and the tier differential runs the whole corpus through both engines and requires byte-identical stdout.",
         },
       ],
     },
@@ -727,6 +770,12 @@ WRONG = 0`,
           kind: "p",
           text: "The only number that matters is `WRONG = 0`.",
         },
+        {
+          kind: "note",
+          tone: "note",
+          title: "Two numbers, two moments",
+          text: "The README quotes both figures: **18,379** is the size of the case corpus, and the 9,239 / 7,949 / 1,290 block is a snapshot of one run of the classifier over the cases exercised at that time. Neither is a claim about correctness — the claim is `WRONG = 0`.",
+        },
       ],
     },
     {
@@ -742,7 +791,7 @@ WRONG = 0`,
           example: {
             lang: "bash",
             title: "the full gate",
-            source: `$ ctest --test-dir build --output-on-failure      # 32/32
+            source: `$ ctest --test-dir build --output-on-failure      # 33/33
 $ python3 tools/run_regression.py                # general suite
 $ python3 tools/run_typed_regression.py          # typed suite
 $ python3 tools/run_tier_diff.py                 # both tiers, byte-identical
@@ -765,7 +814,7 @@ $ python3 tools/fuzz_diff.py --phi --count 300        # merges, with and without
           kind: "note",
           tone: "warn",
           title: "What a green run does not prove",
-          text: "Opcode coverage is not operand coverage. 26 of 27 opcodes are emitted and exercised, but that does not prove every operand shape is right: `Mod` is the standing example: the general fuzzer only emits finite constants, so it cannot generate `1.0 % inf`, which was returning NaN natively while the interpreter was correct.",
+          text: "Opcode coverage is not operand coverage. All 55 IR opcodes are emitted and exercised, but that does not prove every operand shape is right: `Mod` is the standing example: the general fuzzer only emits finite constants, so it cannot generate `1.0 % inf`, which was returning NaN natively while the interpreter was correct.",
         },
       ],
     },
@@ -777,11 +826,15 @@ $ python3 tools/fuzz_diff.py --phi --count 300        # merges, with and without
           kind: "table",
           caption: "fib(30), from benchmarks/results/latest.json",
           rows: [
-            ["CPython 3.12", "790.2430 ms"],
-            ["Lithon native", "4.1810 ms"],
-            ["Speedup", "**189.0×**"],
+            ["CPython 3.12", "1731.0983 ms"],
+            ["Lithon native", "10.3053 ms"],
+            ["Speedup", "**168.0×**"],
             ["Result", "832040: identical on both"],
           ],
+        },
+        {
+          kind: "p",
+          text: "The file is written by the benchmark bot in CI (`.github/workflows/lithon-report-mamba.yml`), which also keeps one snapshot per commit under `benchmarks/results/history/`. The numbers above are the current `latest.json`; the table is regenerated rather than hand-edited.",
         },
         {
           kind: "p",
@@ -796,7 +849,7 @@ const limits: DocPage = {
   slug: "limits",
   title: "Honest limits",
   description:
-    "The gaps as they stand: Phi not emitted, Win64 unproven, x86-64 only.",
+    "The gaps as they stand: no closures, no stdlib, no float promotion on merges, Win64 unproven, x86-64 only.",
   group: "reference",
   tags: ["limits", "gaps", "roadmap", "not supported", "honest", "TODO"],
   sections: [
@@ -811,10 +864,10 @@ const limits: DocPage = {
         {
           kind: "table",
           rows: [
-            ["IR opcodes emitted", "26 of 27"],
+            ["IR opcodes emitted", "55 of 55"],
             [
               "`Phi`",
-              "lowered, not emitted: blocks if-as-expression merges without a memory round-trip",
+              "emitted on the incoming edges; a direct-Phi native path also exists and is tested",
             ],
             ["arguments per function / call", "two in registers, the rest on the stack · budget 32"],
             ["float merges", "never promoted · needs an XMM pool"],
@@ -822,10 +875,18 @@ const limits: DocPage = {
             ["AOT binary emit", "none · everything runs in-process"],
             ["architectures", "x86-64 only · ARM64 is Phase III"],
             ["AVX-512", "not emitted · feature gating only"],
-            ["`dict` capacity trapping", "`list` bounds trap shipped, `dict`'s equivalent doesn't yet"],
-            ["`//` floor division", "not yet implemented"],
-            ["`**` power", "limited: see the regression corpus"],
+            [
+              "`dict` capacity trapping",
+              "`list` bounds trap shipped, `dict`'s equivalent doesn't yet",
+            ],
+            ["`//` floor division", "refused outright: *operator FloorDiv not supported yet*"],
+            ["`**` power", "refused outright: *operator Pow not supported yet*"],
+            ["`<=` and `>=`", "refused: *comparison LtE not supported yet*"],
             ["unsigned ints", "no `uint`: signed at every width"],
+            ["closures", "none: a function body cannot capture a caller's variable"],
+            ["first-class functions", "none: a function name is not a value"],
+            ["`lambda`", "refused: *expression node Lambda not supported yet*"],
+            ["`None`", "refused: *expression node Constant not supported yet*"],
             [
               "diamond unrolling",
               "opt-in via `--unroll-diamonds`, 1.10× slower today",
@@ -835,8 +896,8 @@ const limits: DocPage = {
         {
           kind: "note",
           tone: "note",
-          title: "The blocker worth knowing",
-          text: "`Phi` is the single unemitted opcode: blocks if-as-expression merges without a memory round-trip, and most of the remaining test programs are waiting on it. It is engineering, not research.",
+          title: "A `str` cannot be passed to a function",
+          text: "Strings are addressed, not passed: a `str` function parameter is refused with *a str function parameter is not yet a string place*. This is the same rule that makes a struct unusable as an argument: Lithon passes scalars and containers, and addresses anything with an identity.",
         },
       ],
     },
@@ -855,6 +916,11 @@ const limits: DocPage = {
               title: "Roadmap",
               href: "/roadmap",
               text: "What is next, which phase each item belongs to.",
+            },
+            {
+              title: "Divergences from Python",
+              href: "/docs/python-divergences",
+              text: "The eleven places Lithon deliberately differs from CPython.",
             },
             {
               title: "Verification",

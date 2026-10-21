@@ -56,7 +56,7 @@ print(result)`,
             },
             {
               title: "Fixed-width values",
-              text: "`int[8]` through `int[64]`, `float[32]`, `float[64]`. Widths are explicit; there is no arbitrary-precision integer behind your back. Every integer width is **signed** (there is no `uint`), so a negative `int[w]` keeps its sign when read back from a list element, struct field, or pointer; `bool` is the one narrow type that reads back as `0`/`1`.",
+              text: "`int[8]` through `int[64]`, `float[64]`, `bool`, and bounded `str[N]`. Widths are explicit; there is no arbitrary-precision integer behind your back. Every integer width is **signed** (there is no `uint`), so a negative `int[w]` keeps its sign when read back from a list element, struct field, or pointer; `bool` is the one narrow type that reads back as `0`/`1`.",
             },
             {
               title: "Native execution",

@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router"
 
 import { Card, CardContent } from "@workspace/ui/components/card"
 
+import { metaForPath, structuredData } from "../../lib/seo"
 import {
   CodeBlock,
   DocSection,
@@ -12,6 +13,24 @@ import {
 } from "../../site"
 
 export const Route = createFileRoute("/roadmap/phase-1-dual-tier")({
+  head: () => {
+    const meta = metaForPath("/roadmap/phase-1-dual-tier")
+    return {
+      meta: [
+        { title: meta.title },
+        { name: "description", content: meta.description },
+        { property: "og:title", content: meta.title },
+        { property: "og:description", content: meta.description },
+        { property: "og:type", content: "website" },
+        { property: "og:url", content: meta.canonical },
+        { name: "twitter:card", content: "summary_large_image" },
+        { name: "twitter:title", content: meta.title },
+        { name: "twitter:description", content: meta.description },
+        { tagName: "link", rel: "canonical", href: meta.canonical },
+        { "script:ld+json": JSON.stringify(structuredData("/roadmap/phase-1-dual-tier")) },
+      ],
+    }
+  },
   component: Phase1DualTier,
 })
 
@@ -62,7 +81,7 @@ function Phase1DualTier() {
           </>
         }
         lede="How a block of typed Python becomes x86-64 bytes, what the optimizer does to them on the way, and the eight SSA phases that turned a memory-based JIT into an SSA one."
-        meta={["In progress", "25 of 26 opcodes", "8 SSA phases"]}
+        meta={["Shipped", "55 of 55 opcodes", "8 SSA phases"]}
       />
 
       <section className={`${WRAP} grid gap-10 py-10 lg:grid-cols-[200px_1fr]`}>
@@ -411,7 +430,7 @@ phi copies: 5 of 9 in registers`}</CodeBlock>
             <Note title="resolve_phis() is a lowerer, not an emitter">
               <div className="space-y-2">
                 <p>
-                  No codegen path emits <code>Op::Phi</code>, so resolution
+                  <code>Op::Phi</code> is emitted on the incoming edges, and a direct-Phi native path also exists, so resolution
                   stores each incoming value on its predecessor <em>edge</em>{" "}
                   and turns the Phi into a load. That is what makes conditional
                   expressions work today, and it is correct, <code>--ssa</code>{" "}
@@ -455,7 +474,7 @@ phi copies: 5 of 9 in registers`}</CodeBlock>
           <DocSection id="owed" index="06" title="What Phase I still owes">
             <SpecTable
               rows={[
-                ["IR opcodes emitted", <code key="1">25 of 26</code>],
+                ["IR opcodes emitted", <code key="1">55 of 55</code>],
                 [
                   "Phi",
                   <span key="2" className="text-destructive">

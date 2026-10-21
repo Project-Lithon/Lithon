@@ -1,37 +1,47 @@
-import type { DocPage, DocsRegistry, SearchEntry } from "./model"
+import type {
+  DocGroup,
+  DocPage,
+  DocsRegistry,
+  PagePriority,
+} from "./model"
 import { PAGES } from "./pages"
-
-function pageEntries(pages: readonly DocPage[]): SearchEntry[] {
-  const entries: SearchEntry[] = []
-  for (const page of pages) {
-    entries.push({
-      id: `page:${page.slug}`,
-      kind: "page",
-      title: page.title,
-      subtitle: page.description,
-      group: page.group,
-      tags: page.tags,
-      href: `/docs/${page.slug}`,
-    })
-    for (const section of page.sections) {
-      entries.push({
-        id: `section:${page.slug}#${section.id}`,
-        kind: "section",
-        title: section.title,
-        subtitle: page.title,
-        group: page.group,
-        // the page's own tags, plus the two most specific ones, deduplicated
-        tags: [...new Set([...page.tags, ...page.tags.slice(0, 2)])],
-        href: `/docs/${page.slug}#${section.id}`,
-      })
-    }
-  }
-  return entries
-}
+import { PAGE_OUTCOME, PAGE_PRIORITY } from "./priority"
+import { buildEntries } from "./search-index"
 
 export const DOCS: DocsRegistry = {
   pages: PAGES,
-  entries: pageEntries(PAGES),
+  entries: buildEntries(),
+}
+
+/** The priority of a page, defaulting to `recommended` for an unlisted one. */
+export function priorityOf(page: DocPage): PagePriority {
+  return PAGE_PRIORITY[page.slug] ?? page.priority ?? "recommended"
+}
+
+/** The one-line outcome of a page, if it has one. */
+export function outcomeOf(page: DocPage): string | undefined {
+  return PAGE_OUTCOME[page.slug] ?? page.outcome
+}
+/** Every page in reading order, with its priority resolved. */
+export function rankedPages(): readonly {
+  page: DocPage
+  priority: PagePriority
+  outcome: string | undefined
+}[] {
+  const rank: Record<PagePriority, number> = {
+    essential: 0,
+    recommended: 1,
+    reference: 2,
+  }
+  return PAGES.map((page) => ({
+    page,
+    priority: priorityOf(page),
+    outcome: outcomeOf(page),
+  })).sort((a, b) => {
+    const byPriority = rank[a.priority] - rank[b.priority]
+    if (byPriority !== 0) return byPriority
+    return PAGES.indexOf(a.page) - PAGES.indexOf(b.page)
+  })
 }
 
 export function pageBySlug(slug: string): DocPage | undefined {
@@ -41,3 +51,6 @@ export function pageBySlug(slug: string): DocPage | undefined {
 export function flatPageOrder(): readonly DocPage[] {
   return PAGES
 }
+
+export { DOC_GROUPS } from "./model"
+export type { DocGroup }

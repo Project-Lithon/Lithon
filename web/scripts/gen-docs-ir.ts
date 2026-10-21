@@ -6,23 +6,17 @@ import { mkdirSync, writeFileSync } from "node:fs"
 import { dirname, join, resolve } from "node:path"
 
 import { DOCS } from "../apps/web/src/docs/registry"
+import { requireUv, runTool } from "./toolchain"
 
-const WEB_ROOT = resolve(dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..")
+const WEB_ROOT = resolve(
+  dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")),
+  "..",
+)
 const REPO_ROOT = resolve(WEB_ROOT, "..")
 const FRONTEND = join(REPO_ROOT, "src", "frontend", "frontend.py")
-const UV =
-  process.env.UV_PATH ??
-  join(
-    process.env.LOCALAPPDATA ?? "",
-    "Microsoft",
-    "WinGet",
-    "Packages",
-    "astral-sh.uv_Microsoft.Winget.Source_8wekyb3d8bbwe",
-    "uv.exe",
-  )
 const CACHE_DIR = join(WEB_ROOT, "node_modules", ".cache")
 
-function hash(source: string) {
+export function hash(source: string) {
   // FNV-1a, matching irKey() in apps/web/src/docs/templates.tsx
   let h = 0x811c9dc5
   for (let i = 0; i < source.length; i++) {
@@ -31,6 +25,25 @@ function hash(source: string) {
   }
   return h.toString(16).padStart(8, "0")
 }
+
+/**
+ * Normalises the frontend's output to LF, with no trailing blank lines.
+ *
+ * The frontend emits its IR with the platform's line ending, so the same
+ * program produces CRLF on Windows and LF on Linux. The generated file has
+ * to be byte-identical on every platform, or the CI freshness check fails
+ * on one of them.
+ */
+export function normalise(text: string): string {
+  return text
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0)
+    .join("\n")
+}
+
+const UV = requireUv()
 
 const out: Record<string, string> = {}
 const failed: { where: string; why: string }[] = []
@@ -48,15 +61,12 @@ for (const page of DOCS.pages) {
       mkdirSync(CACHE_DIR, { recursive: true })
       writeFileSync(file, ex.source, "utf8")
 
-      const proc = Bun.spawnSync(
-        [UV, "run", "--quiet", "--python", "3.12", FRONTEND, file],
-        { stdout: "pipe", stderr: "pipe" },
-      )
-      const text = new TextDecoder().decode(proc.stdout).trim()
-      if (proc.exitCode === 0 && text) {
+      const res = runTool(UV, [FRONTEND, file], REPO_ROOT)
+      const text = normalise(res.out)
+      if (res.code === 0 && text) {
         out[hash(ex.source)] = text
       } else {
-        const err = new TextDecoder().decode(proc.stderr).trim().split("\n").pop()
+        const err = res.err.trim().split("\n").pop()
         failed.push({
           where: `${page.slug}#${section.id}[${i}]`,
           why: err ?? "frontend refused",
@@ -78,8 +88,12 @@ export const EXAMPLE_IR: Record<string, string> = ${JSON.stringify(out, null, 2)
   "utf8",
 )
 
-console.log(`wrote ${Object.keys(out).length} IR blobs to apps/web/src/docs/generated/ir.ts`)
+console.log(
+  `wrote ${Object.keys(out).length} IR blobs to apps/web/src/docs/generated/ir.ts`,
+)
 if (failed.length > 0) {
-  console.log(`\n${failed.length} example(s) the frontend refused (expected for rejected-by-design examples):`)
+  console.log(
+    `\n${failed.length} example(s) the frontend refused (expected for rejected-by-design examples):`,
+  )
   for (const f of failed) console.log(`  ${f.where}: ${f.why.slice(0, 110)}`)
 }

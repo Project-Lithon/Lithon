@@ -7,6 +7,53 @@ on:
     branches: [ master, main ]
 
 jobs:
+  docs:
+    name: Docs verification
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      # Every example on the website is compiled by the real Lithon frontend
+      # and pinned to the repo's regression outputs. This job is what makes
+      # that claim true rather than aspirational: a doc that drifts from the
+      # engine fails the build instead of misleading a reader.
+      - name: Verify every docs example against the real toolchain
+        working-directory: web
+        run: bun run verify:docs
+
+      # The generated IR and the AI-facing surfaces are committed, so they
+      # have to match what the frontend produces today. The generators
+      # normalise line endings, so the comparison is the same on every
+      # platform.
+      - name: Check the generated IR is up to date
+        working-directory: web
+        run: |
+          bun scripts/gen-docs-ir.ts
+          bun scripts/gen-playground-ir.ts
+          git diff --exit-code -- apps/web/src/docs/generated/ir.ts apps/web/src/lib/playground-ir.ts
+
+      - name: Type-check the web app
+        working-directory: web
+        run: bun run typecheck
+
+      - name: Lint the web app
+        working-directory: web
+        run: bun run lint
+
   build-and-test:
     name: Build & Test (Ubuntu x86-64)
     runs-on: ubuntu-latest

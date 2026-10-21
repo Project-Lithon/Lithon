@@ -692,7 +692,7 @@ for i in range(3):
 else:
     print(1)`,
             output:
-              "NotImplementedError: for/else is not supported (the else clause would be silently dropped)",
+              "LITHON-E0118: for/else is not supported (the else clause would be silently dropped)",
           },
         },
         {
@@ -1033,8 +1033,22 @@ const operators: DocPage = {
               "float division producing `float[64]`, **not** C-style truncation",
             ],
             ["`%`", "C-style remainder: sign follows the **left** operand"],
-            ["`**`", "power: see the limitation note below"],
-            ["`//`", "not yet implemented: rejected at parse time"],
+            [
+              "`**`",
+              "**refused**: *LITHON-E0114: operator Pow not supported yet*. There is no power operator.",
+            ],
+            [
+              "`//`",
+              "**refused**: *LITHON-E0114: operator FloorDiv not supported yet*. There is no floor division; use a shift for a power-of-two divisor.",
+            ],
+            [
+              "`<=` `>=`",
+              "**refused**: *LITHON-E0114: comparison LtE not supported yet*. Only `<`, `>`, `==` and `!=` exist.",
+            ],
+            [
+              "`a < b < c`",
+              "**refused**: chained comparisons are not supported.",
+            ],
           ],
         },
         {
@@ -1049,6 +1063,18 @@ print(7 % 3)
 print(-7 % 3)`,
             output: "-1\n1\n-1",
             note: "`%` follows C, not Python: `-7 % 3` is `-1`, not `2`. Python's floor-mod and C's trunc-mod disagree on negatives, and Lithon chose the machine's behaviour. (The checker cannot infer the type of a negated-literal binding yet; the frontend and both tiers handle it.)",
+          },
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected: a power operator",
+            expect: "error",
+            tool: "frontend",
+            errorMatch: "operator Pow not supported yet",
+            source: `x: int[64] = 2
+print(x ** 3)`,
+            output: "LITHON-E0114: operator Pow not supported yet",
           },
         },
       ],
@@ -1259,7 +1285,11 @@ print(xs[2])`,
           rows: [
             [
               "Capacity",
-              "`N` is in the type; `len(xs)` returns `N` and cannot change at run time",
+              "`N` is in the type. It is the number of slots the declaration reserves, and it never changes.",
+            ],
+            [
+              "Length",
+              "`len(xs)` is the **live** length, carried in a companion `xs.__len` slot. It is a run-time value, not the capacity: a short literal leaves the trailing slots reserved but not live.",
             ],
             [
               "Unwritten slots",
@@ -1274,6 +1304,33 @@ print(xs[2])`,
               "element `k` lands at `base + k * sizeof(T)`: packed, no pointers per element",
             ],
           ],
+        },
+        {
+          kind: "p",
+          text: "A short literal is the normal case, and it is why `len(xs)` is not the capacity:",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "the live length is not the capacity",
+            typecheck: false,
+            source: `xs: list[int[64], 6] = [1, 2, 3]
+print(len(xs))
+print(xs)
+print(sum(xs))
+
+xs.append(10)
+xs.append(20)
+print(len(xs))
+print(xs)`,
+            output: "3\n[1, 2, 3]\n6\n5\n[1, 2, 3, 10, 20]",
+          },
+        },
+        {
+          kind: "note",
+          tone: "note",
+          title: "A reduction over a list whose length is not known at compile time is refused",
+          text: "`sum`, `min`, `max`, `any`, `all` and `in` are unrolled over the live length at compile time. When the length is only known at run time — an `append` inside a loop, or a `split` — they are refused rather than guessed at. A plain literal or a bare declaration keeps the length a compile-time constant, so the reductions still work.",
         },
       ],
     },
@@ -1418,7 +1475,7 @@ const pointers: DocPage = {
 p: ptr[int[64]] = addressof(x)
 print(valueof(p))`,
             output:
-              "NotImplementedError: a pointer is named with a leading underscore, write `_p: ptr[...]` or pick a name that starts with '_' (4.4)",
+              "LITHON-E0122: a pointer is named with a leading underscore, write `_p: ptr[...]` or pick a name that starts with '_' (4.4)",
           },
         },
       ],
@@ -1487,7 +1544,7 @@ print(_p == _q)`,
       blocks: [
         {
           kind: "p",
-          text: "`ptr` works for any scalar pointee: `float[32]`, `float[64]`, `bool`. Reading through a `ptr[float[64]]` after the pointee changed gives you the new value, because the pointer names a location, not a snapshot:",
+          text: "`ptr` works for any scalar pointee: `float[64]`, `bool`, and any `int[w]`. Reading through a `ptr[float[64]]` after the pointee changed gives you the new value, because the pointer names a location, not a snapshot:",
         },
         {
           kind: "code",
@@ -2330,28 +2387,48 @@ print(r)`,
     },
     {
       id: "integer-arguments",
-      title: "Arguments are integers",
+      title: "Arguments are integers or pointers",
       blocks: [
         {
           kind: "p",
-          text: "A raw syscall argument must be an `int` in this slice. A pointer is **rejected at compile time**, and the reason is worth stating plainly: the interpreter does not have real memory addresses. It proves pointer semantics on a synthetic address space of its own (see [Pointers](/docs/pointers)), so a pointer handed to a kernel syscall would name nothing in the interpreter while naming a real frame slot natively. The two tiers would silently disagree.",
+          text: "A raw syscall argument must be an `int` or a **pointer**. The type checker says so plainly: *a raw syscall argument must be an integer or a pointer (a buffer or a sockaddr); floats and aggregates are not passed by value*.",
         },
         {
-          kind: "p",
-          text: "Refusing the pointer is the honest answer: it keeps the primitive tier-neutral. Pointer-taking syscalls such as `write` and `read` are deferred until the interpreter grows a real address-space story, rather than shipping as a construct that works in one tier and faults in the other.",
+          kind: "callout",
+          title: "A pointer argument is a real host address in both tiers",
+          text: "This is the load-bearing fact. The interpreter does **not** emulate a synthetic address space: a pointer to a variable is the address of that variable, in the interpreter and in the JIT alike. So a kernel syscall that reads a buffer reads exactly the bytes the language wrote, and one that writes a `sockaddr` writes into the very struct you handed it. `tests/net/loopback.lio` is a shipped TCP round trip that depends on it.",
         },
         {
           kind: "code",
           example: {
-            title: "rejected · a pointer argument",
-            lang: "text",
+            title: "a syscall with a pointer argument",
+            typecheck: false,
             source: `x: int[64] = 65
 _ptrX: ptr[int[64]] = addressof(x)
 r: int[64] = syscall(1, _ptrX)
 print(r)`,
-            output:
-              "a raw syscall argument must be an integer in this slice",
+            output: "-38",
+            note: "The number 1 is not a valid Linux syscall number, so the kernel returns -ENOSYS (-38) — the same answer in both tiers, which is what makes it a checkable example.",
           },
+        },
+        {
+          kind: "p",
+          text: "A `float[64]` argument is refused: the kernel ABI passes floats differently, and a syscall that takes one by value is not reachable from Lithon. A struct argument is refused for the same reason: it is not a scalar, and a struct is not passed by value.",
+        },
+        {
+          kind: "linkcards",
+          items: [
+            {
+              title: "Networking",
+              href: "/docs/networking",
+              text: "A real TCP loopback, checked against a C oracle.",
+            },
+            {
+              title: "Pointers",
+              href: "/docs/pointers",
+              text: "Why a pointer to a struct is a real address.",
+            },
+          ],
         },
       ],
     },

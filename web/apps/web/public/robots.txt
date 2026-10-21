@@ -2,4 +2,7 @@ User-agent: *
 Allow: /
 Disallow: /api/
 
+# The AI-facing surfaces: a compact index and the full documentation.
+# Both are generated from the same registry the site renders.
+
 Sitemap: https://project-lithon.github.io/Lithon/sitemap.xml

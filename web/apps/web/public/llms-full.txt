@@ -1,0 +1,3709 @@
+# Lithon — full documentation
+
+> Lithon is a Python library and native x86-64 execution engine. Every supported program carries fixed-width type annotations, is statically verified before it runs, and executes as generated machine code with no LLVM and no runtime package.
+
+Generated from the site's own docs registry. Every example below is verified against the real Lithon frontend.
+
+---
+
+## Start here
+
+From zero to a natively running program.
+
+### Welcome to Lithon
+
+*Native execution for typed Python: what Lithon is, what it is not, and why it refuses instead of guessing.*
+
+URL: https://project-lithon.github.io/Lithon/docs/welcome
+
+#### What is Lithon?
+
+Lithon is a Python library and native x86-64 execution engine that runs .lio source using an extended PEP-526 static typing syntax. The source language is Python's syntax; the .lio extension is what marks a file as a Lithon program rather than an ordinary Python script. Every supported program is statically verified and can execute as generated machine code, with no LLVM, no Cranelift, and no runtime package.
+
+**a small Lithon program**
+```text
+x: int[64] = 10
+y: int[64] = 20
+
+result: int[64] = x + y
+
+print(result)
+```
+Output:
+```
+30
+```
+
+That is the whole trick: familiar Python syntax, one annotation per binding, and the compiler now knows enough to verify the program and emit x86-64 for it.
+
+#### Built around a few principles
+
+- **Mandatory static typing** — Types are verified before execution. Removing annotations does not disable verification: it makes the program invalid.
+- **Fixed-width values** — int[8] through int[64], float[64], bool, and bounded str[N]. Widths are explicit; there is no arbitrary-precision integer behind your back. Every integer width is signed (there is no uint), so a negative int[w] keeps its sign when read back from a list element, struct field, or pointer; bool is the one narrow type that reads back as 0/1.
+- **Native execution** — Supported programs run as x86-64 machine code emitted by a hand-written encoder, straight into executable memory.
+- **No mandatory LLVM** — The backend is a self-contained C++20 encoder. as is only used to verify it, never to build it.
+- **Honest fallback** — What the native tier cannot prove runs through the Tier-0 interpreter in automatic mode, and --strict turns that fallback into a refusal.
+- **Explicit unsafe memory** — Pointers exist, and every pointer variable carries a mandatory _ prefix so raw memory is visible in the source.
+
+> **The load-bearing rule** — If Lithon cannot prove that a program satisfies the rules required by its native backend, it refuses native compilation rather than guessing. Unknown or unprovable → REFUSE: never "generate potentially incorrect machine code".
+
+#### How is Lithon different?
+
+*The design space Lithon explores*
+| Syntax | Python syntax + extended PEP-526, in a .lio file |
+| --- | --- |
+| Primary execution | Native x86-64 (CPython: bytecode; PyPy: tracing JIT) |
+| Static typing | Mandatory (CPython/PyPy: no; mypyc: optional) |
+| Fixed-width integers | Built into the type (int[64], int[32], …) |
+| Raw typed pointers | Built in (ptr[T], addressof, valueof) |
+| Native backend | Custom x86-64 emitter: no LLVM |
+| Interpreter fallback | Yes, Tier-0, same program, refused under --strict |
+| Target | x86-64 today (ARM64 is roadmap Phase III) |
+
+Lithon is not trying to replace Python's ecosystem. It explores one question: what if Python code kept its familiar source model while giving the execution engine explicit static types, fixed-width values, native execution, and controlled low-level memory access?
+
+> **Experimental project** — Lithon is a community-preview project. The compiler already executes substantial typed programs natively with a serious verification suite, but it is not a stable production library and not a drop-in CPython replacement.
+
+#### Where to go next
+
+- **Hello, native** — Write, type-check, and run your first program end to end.
+- **The mental model** — Two tiers, one rule: prove before you run.
+- **Types & widths** — The one rule that makes the rest checkable: every type carries its width.
+- **Control flow** — if / while / for, and try/except over the engine's own traps.
+- **Machine view** — See the IR and x86-64 behind the examples.
+
+---
+
+### Hello, native
+
+*Your first Lithon program: annotate, type-check, compile to IR, and run it on the native tier.*
+
+URL: https://project-lithon.github.io/Lithon/docs/hello-world
+
+#### The first program
+
+Every binding carries an explicit type. A bare integer literal is int[64], so this program is fully typed without any ceremony beyond the annotations:
+
+**hello.lio**
+```text
+x: int[64] = 10
+y: int[64] = 20
+
+result: int[64] = x + y
+
+print(result)
+```
+Output:
+```
+30
+```
+
+The same shape from the regression corpus: three operations, three lines of output:
+
+**tests/programs/arithmetic.lio**
+```text
+x: int[64] = 10
+y: int[64] = 20
+z: int[64] = x + y
+print(z)
+print(x - y)
+print(x * y)
+```
+Output:
+```
+30
+-10
+200
+```
+Source: `tests/programs/arithmetic.lio`
+
+#### The annotation rule
+
+Dropping the annotations is not an option: the type checker runs unconditionally, on every module, whether it annotates anything or not:
+
+**rejected · V1_SPEC 0.6.1**
+```text
+x = 10
+print(x)
+```
+Expected to be refused with: `without ever being declared with a type annotation`
+
+This is not ceremony. The annotation is the contract that lets the backend skip boxing, dynamic dispatch, and hot-path checks: it is what makes the native tier possible at all.
+
+#### Running it, three ways
+
+- **Type-check only** — tools/typecheck.py hello.lio: static analysis over the AST, no execution. Exits non-zero with an RCR error on the first violation.
+- **Compile to IR** — src/frontend/frontend.py hello.lio: lowers the typed AST to Lithon's text IR on stdout. No engine needed, pure Python.
+- **Run natively** — lithon hello.lio --strict: the two-step dance: frontend to IR, then tier_runner emits x86-64 and calls it. --strict refuses rather than falling back to the interpreter.
+
+**terminal**
+```bash
+$ lithon hello.lio --strict
+[tier1] native
+30
+```
+
+> **[tier1] native is the proof** — [tier1] native goes to stderr; the program's own output goes to stdout. Under --strict, a clean exit status means the code was really emitted and executed: a fallback cannot hide behind success.
+
+---
+
+### Build & install
+
+*Requirements, the CMake build, the development CLI, and the verification commands.*
+
+URL: https://project-lithon.github.io/Lithon/docs/installation
+
+#### Requirements
+
+| CMake | ≥ 3.20 |
+| --- | --- |
+| Compiler | C++20 (gcc, clang, or MSVC) |
+| Python | ≥ 3.10 (frontend only: the native tier never touches CPython) |
+| Architecture | x86-64 Linux or Windows |
+| Third-party libraries | none: no LLVM, no Cranelift, no runtime package |
+
+#### Build the engine
+
+**terminal**
+```bash
+$ git clone git@github.com:Project-Lithon/lithon.git
+$ cd lithon
+$ cmake -B build -DCMAKE_BUILD_TYPE=Release
+$ cmake --build build -j$(nproc)
+```
+
+There is no Makefile to hand-edit, CMake drives everything. Python appears at exactly one step, turning a .lio file into IR; once IR exists the native program never touches CPython.
+
+#### The development CLI
+
+**install in editable mode, then**
+```bash
+$ pip install -e .
+$ lithon tests/programs/float.lio
+$ lithon tests/programs/float.lio --strict    # native only, refuse to fall back
+$ lithon tests/programs/float.lio --ir       # print the IR and stop
+$ lithon tests/programs/float.lio -v         # say which tier ran, and why
+```
+
+*CLI flags*
+| --strict | Native only. Refuse rather than fall back to Tier-0. |
+| --- | --- |
+| --ir | Print the typed IR and stop before execution. |
+| -v | Verbose: report which tier ran and why. |
+
+> **Prefer scripts? The two-step dance is open** — python3 src/frontend/frontend.py prog.lio > prog.ir then ./build/tier_runner prog.ir --strict. The lithon wrapper is convenience, not a black box.
+
+#### Prove the install works
+
+**the full gate**
+```bash
+$ ctest --test-dir build --output-on-failure      # unit tests
+$ python3 tools/run_regression.py                # untyped suite
+$ python3 tools/run_typed_regression.py          # typed suite
+$ python3 tools/run_tier_diff.py                 # every program, both tiers
+$ bash tools/verify_all.sh                       # all of the above
+```
+
+run_tier_diff.py is the highest-value of these: it runs every program through both tiers and requires byte-identical stdout, then reports which tier actually ran, so a green run cannot hide "everything silently fell back to the interpreter".
+
+---
+
+### The mental model
+
+*A two-lane road: prove before you run, emit native for what is proven, refuse everything else.*
+
+URL: https://project-lithon.github.io/Lithon/docs/mental-model
+
+#### A two-lane road
+
+A block whose types are provably static takes the Tier-1 native path and is compiled straight to x86-64. Anything the verifier cannot establish falls to the Tier-0 C++ interpreter: a real fallback rather than a guess, and --strict turns that fallback into a refusal.
+
+- **Prove before run** — Types are settled before execution begins. A flow that cannot be established is never emitted.
+- **Emit native** — Verified IR blocks become guard-free x86-64 in executable memory. No guards, no checks, no boxing on the hot path.
+- **Fall back honestly** — Tier-0 runs the same program when the native tier refuses. --strict refuses instead: success cannot hide a fallback.
+
+#### Refuse over guess
+
+**the decision procedure**
+```text
+Unknown / unprovable
+        │
+        ▼
+     REFUSE
+
+Unknown
+  │
+  ▼
+ Guess
+  │
+  ▼
+     Generate potentially incorrect machine code   ← never
+```
+
+Every strange-looking rule in the language: mandatory annotations, fixed widths, no narrowing, definite assignment, shift-count ranges: exists to keep the verifier on the left path. Each one turns something the backend would have to guess about into something it knows.
+
+> **What this buys you** — When a Lithon program runs on Tier-1, the machine code has no runtime type checks, no overflow guards it could have proven away, and no hidden allocation. The verifier already did that work, once, at compile time.
+
+#### Strict mode is the honesty test
+
+**terminal**
+```bash
+$ lithon program.lio --strict
+```
+
+Under --strict, "the program printed the right number" becomes meaningful: printing at all means the native tier compiled and executed it. This is how the test suites keep the interpreter from quietly carrying the project.
+
+- **Inside the engine** — Four layers from .lio source to executable memory.
+- **Dual-tier execution** — What Tier-0 and Tier-1 each do, and when.
+- **The verification gate** — How the claims get checked: layer by layer.
+
+---
+
+## The language
+
+Types, flow, functions, containers, unsafe memory.
+
+### Types & widths
+
+*Fixed-width integers, floats, bool, and the three rules the verifier enforces on every conversion.*
+
+URL: https://project-lithon.github.io/Lithon/docs/types
+
+#### The widths
+
+Integers carry their width in the type. There is no bare int: it is rejected, and no arbitrary-precision integer behind your back:
+
+**every scalar type**
+```text
+i8:  int[8]  = 7
+i16: int[16] = 7
+i32: int[32] = 7
+i64: int[64] = 7
+f64: float[64] = 0.5
+b:   bool = True
+print(i64)
+```
+Output:
+```
+7
+```
+
+*Scalar types*
+| int[8] … int[64] | signed fixed-width two's-complement integer |
+| --- | --- |
+| float[64] | IEEE-754 binary64 |
+| bool | one byte, True / False |
+| ptr[T] | typed pointer to a scalar T: see Pointers (/docs/pointers) |
+
+> **Signed only, 64-bit floats only** — There is no unsigned uint type: uint[8] is rejected as an unknown type, so masking with & is how you get unsigned behaviour, explicitly. float[32] is rejected too (LITHON-E0105: unsupported float width 32): every float is float[64].
+
+> **Why fixed widths are load-bearing** — A fixed width is a fact the backend can plan around: the register, the memory slot, the overflow instruction. An unbounded int would mean boxing, big-integer fallbacks, and guards: exactly what the native tier is built to not have.
+
+#### Widening is automatic, narrowing is never
+
+A value may be widened to a provably larger width of the same signedness class, automatically. Narrowing, the reverse direction, is rejected even when you are certain the value fits:
+
+**widening · accepted**
+```text
+small: int[8] = 5
+big: int[64] = small
+print(big)
+```
+Output:
+```
+5
+```
+
+**rejected · V1_SPEC 0.6.11**
+```text
+wide: int[64] = 5
+narrow: int[8] = wide
+print(narrow)
+```
+Expected to be refused with: `cannot narrow`
+
+No cast syntax exists anywhere in the language. If you need a bit pattern reinterpreted, that is what pointers are for: explicitly, with the _ prefix.
+
+#### int → float is automatic; float → int is not
+
+int[64] into float[64] is a widening conversion and happens silently. The reverse is rejected: it would truncate, and truncation is not a conversion Lithon will perform for you.
+
+> **The literal exception (V1_SPEC 0.6.11)** — An int literal is not a float, so j: float[64] = 0 is a type error: write 0.0. The int→float conversion does not apply to a literal.
+
+**rejected · V1_SPEC 0.6.11**
+```text
+j: float[64] = 0
+print(j)
+```
+Expected to be refused with: `must hold a float`
+
+**accepted**
+```text
+j: float[64] = 0.0
+print(j)
+```
+Output:
+```
+0.0
+```
+
+#### Explicit conversions and terminal input
+
+int() and float() are not type constructors you call with one argument: the two-argument compiler-recognized form takes an explicit width, int(w, v) and float(64, v). int(w, v) converts a float[64] to int[w] and traps (E0309) if the value is out of range or not finite; float(64, v) converts an int[8|16|32] or float[64] and is refused at compile time (E0106) for a lossy int[64] source, since 53 mantissa bits cannot hold every int[64] value.
+
+int(w, input(prompt)) reads a line from stdin and parses it as int[w], with an optional prompt string. Three traps cover a bad terminal: E0306 invalid integer literal, E0307 value outside the target width, E0308 end of input.
+
+**int(w, v), float(64, v), and int(w, input(prompt))**
+```text
+f: float[64] = 42.0
+n: int[64] = int(64, f)
+print(n)
+
+w: int[32] = int(32, input("enter a number: "))
+print(w)
+```
+
+> **tools/typecheck.py lags here too** — Like while, the standalone checker does not yet recognize int()/float() as compiler builtins (call to unknown function 'int'); src/frontend/frontend.py lowers them correctly today. Verified against the real frontend, not the standalone checker, until it catches up.
+
+#### Mixed int/float arithmetic
+
+An int operand combined with a float operand produces a float. The int is converted to the float's width first, then the operation happens in float land:
+
+**tests/typed_regression/mixed_numeric.lio**
+```text
+i: int[64] = 10
+f: float[64] = 2.5
+print(i + f)
+print(f + i)
+print(i / 4)
+```
+Output:
+```
+12.5
+12.5
+2.5
+```
+Source: `tests/typed_regression/mixed_numeric.lio`
+
+#### There is no bare `int`
+
+int without a width is rejected: the width is part of the type, not an implementation detail the compiler may pick for you. The same goes for int[128]: only 8/16/32/64 exist, matching the machine.
+
+> **Provable overflow is a compile-time error** — Integer literal overflow and provable-range overflow for binary operations are compile-time errors (V1_SPEC 0.6.5): the checker points you at wrap_add()/wrap_sub()/wrap_mul() when wrap-around is what you want. Overflow the verifier cannot prove at compile time on int[64] traps at run time instead (E0303), identically in both tiers; wrap_add/wrap_sub/wrap_mul are the explicit opt-out that keeps the machine's two's-complement wrap instead of trapping.
+
+---
+
+### Declarations & assignment
+
+*Definite assignment, one type per name, and the loop-variable rules the verifier enforces.*
+
+URL: https://project-lithon.github.io/Lithon/docs/declarations
+
+#### One type per name
+
+A name is declared once with an explicit type. Re-assignment is checked against that declared type: you cannot quietly reuse the name for a different width or a different type:
+
+**accepted · re-assignment within the type**
+```text
+x: int[64] = 10
+x = 20
+print(x)
+```
+Output:
+```
+20
+```
+
+**rejected · re-assignment narrows**
+```text
+x: int[64] = 10
+x = 20
+narrow: int[8] = x
+print(narrow)
+```
+Expected to be refused with: `cannot narrow`
+
+#### Definite assignment
+
+Every use of a variable must be dominated by an assignment whose value the verifier can trace. You may declare first and assign later, but you may not read before the first assignment.
+
+**tests/typed_regression/uninit_decl.lio**
+```text
+i: int[8]
+i = 5
+print(i)
+```
+Output:
+```
+5
+```
+Source: `tests/typed_regression/uninit_decl.lio`
+
+**rejected · V1_SPEC 0.6.10**
+```text
+i: int[8]
+print(i)
+```
+Expected to be refused with: `never assigned a value`
+
+> **Declaration is not initialization: except for containers** — For a scalar, a bare i: int[64] only records the type. For containers the bare declaration is real work: it reserves the run/table and zeroes it. See Containers (/docs/containers).
+
+#### Branches and loops
+
+Scoping is function-scoped, not block-scoped: a name declared inside an if is visible after the if. Definite assignment, however, requires that every branch that reaches a use has assigned the variable:
+
+**rejected · one branch forgets**
+```text
+x: int[64] = 1
+if x < 3:
+    y: int[64] = 2
+print(y)
+```
+Expected to be refused with: `not definitely assigned here`
+
+The same rule applies to loop variables: a while condition that reads a counter requires the counter to have been assigned before the loop, and the update inside the body is what makes the next iteration's read valid.
+
+---
+
+### Control flow
+
+*if / elif / else, while, for over range, try / except over the built-in traps, and the one construct that does not exist.*
+
+URL: https://project-lithon.github.io/Lithon/docs/control-flow
+
+#### if / elif / else
+
+Exactly the Python you know. Conditions are boolean expressions; there is no truthiness conversion: a condition must be a bool.
+
+**tests/typed_regression/if.lio**
+```text
+x: int[64] = 5
+if x < 3:
+    print(1)
+else:
+    print(3)
+```
+Output:
+```
+3
+```
+Source: `tests/typed_regression/if.lio`
+
+#### while
+
+A while is a conditional backward branch. The verifier tracks the loop-carried types across the back edge, so the body may narrow nothing and widen only what was already declared:
+
+**tests/typed_regression/while.lio**
+```text
+i: int[64] = 0
+total: int[64] = 0
+while i < 10:
+    total = total + i
+    i = i + 1
+print(total)
+```
+Output:
+```
+45
+```
+Source: `tests/typed_regression/while.lio`
+
+> **The checker does not cover while yet** — tools/typecheck.py still answers statement While not supported by the type-checker yet: including for the repo's own while.lio. The engine lowers and executes while correctly (Tier-0 and Tier-1 both); it is the standalone Python checker that lags. Until it catches up, while programs are verified through the regression suites rather than the checker.
+
+#### for over range()
+
+range(stop) and range(start, stop) produce values checked against the loop variable's declared width at compile time when known (V1_SPEC 0.6.12). The loop variable is a normal declared binding:
+
+**tests/typed_regression/for_range.lio**
+```text
+total: int[64] = 0
+i: int[64] = 0
+for i in range(10):
+    total = total + i
+print(total)
+```
+Output:
+```
+45
+```
+Source: `tests/typed_regression/for_range.lio`
+
+#### range with a step
+
+range(start, stop, step) is the full three-argument form, including a negative step for a descending loop. A literal zero step is a compile-time refusal (E0107); a runtime-computed zero step traps (E0310) instead, since the checker cannot prove it in advance:
+
+**tests/programs/range_step.lio**
+```text
+for i in range(1, 10, 3):
+    print(i)
+for i in range(10, 1, -3):
+    print(i)
+for i in range(0, 5, 1):
+    print(i)
+for i in range(5, 5, 1):
+    print(i)
+for i in range(1, 5, 6):
+    print(i)
+for i in range(-5, -1, 1):
+    print(i)
+for i in range(-1, -5, -2):
+    print(i)
+```
+Output:
+```
+1
+4
+7
+10
+7
+4
+0
+1
+2
+3
+4
+1
+-5
+-4
+-3
+-2
+-1
+-3
+```
+Source: `tests/programs/range_step.lio`
+
+> **Empty ranges are not an error** — range(5, 5, 1) and a step pointed the wrong way (e.g. range(1, 5, -1)) both produce zero iterations, matching CPython: only step == 0 is refused or trapped.
+
+#### break and continue
+
+break and continue work in for and while bodies: break exits the innermost loop, continue jumps to its back edge. Either one used outside a loop is a compile-time refusal (E0120). The lowering rotates the loop body so a multi-exit loop still has one guarded back edge, not a spaghetti of jumps:
+
+**tests/programs/break_continue.lio**
+```text
+total: int[64] = 0
+for i in range(100):
+    if i == 5:
+        continue
+    if i == 10:
+        break
+    total = total + i
+print(total)
+```
+Output:
+```
+40
+```
+Source: `tests/programs/break_continue.lio`
+
+#### enumerate and zip
+
+enumerate(xs) and zip(xs, ys) work in a for header. Neither is a value: both are a rewrite of a counted loop over constructs that already exist, so there is no new opcode and no runtime helper. for i, x in enumerate(xs) becomes for i in range(N): x = xs[i], and for a, b in zip(xs, ys) becomes the same loop bounded at min(N1, N2) — a compile-time constant, because the declared capacity is what len() folds to.
+
+zip stops at the shortest input, exactly as Python does. Elements bind with their declared type, and break/continue work inside either header because the rewrite is a real loop.
+
+**tests/typed_regression/iter_helpers.lio (excerpt)**
+```text
+xs: list[int[64], 5]
+xs[0] = 10
+xs[1] = 20
+xs[2] = 30
+xs[3] = 40
+xs[4] = 50
+
+for ei, ex in enumerate(xs):
+    print(ei)
+    print(ex)
+
+long6: list[int[64], 6]
+short3: list[int[64], 3]
+long6[0] = 1
+long6[1] = 2
+long6[2] = 3
+short3[0] = 7
+short3[1] = 8
+short3[2] = 9
+
+total: int[64] = 0
+for za, zb in zip(long6, short3):
+    total = za + zb
+print(total)
+```
+Output:
+```
+0
+10
+1
+20
+2
+30
+3
+40
+4
+50
+12
+```
+Source: `tests/typed_regression/iter_helpers.lio`
+
+> **They are for-header only** — z = zip(a, b) is refused (LITHON-E0115). The pair never needs to exist as a value, and a homogeneous tuple could not represent enumerate's (int, T) anyway — so the rewrite is the whole design rather than an optimisation of a real iterator.
+
+#### if as an expression
+
+An if used where a value is expected is an if-expression with else mandatory. Both arms are fully evaluated expressions: statements inside the arms are rejected:
+
+**tests/typed_regression/if_expr.lio (excerpt)**
+```text
+x: int[64] = 5
+y: int[64] = 2
+
+print(x if x > y else y)
+print(1 if x < y else 2 if x == 5 else 3)
+```
+Output:
+```
+5
+2
+```
+Source: `tests/typed_regression/if_expr.lio`
+
+> **The checker cannot infer a nested merge** — tools/typecheck.py answers cannot statically determine the type of this expression yet for a chained if-expression, even though the frontend lowers the real file correctly and CI passes it. Read the Output tab as the oracle here.
+
+#### There is no for/else
+
+for/else: where the else runs when the loop completes without break: is rejected. The else binds to if, not to for; if you need the "loop finished" signal, test the loop variable after the loop.
+
+**rejected by the frontend**
+```text
+i: int[8] = 0
+for i in range(3):
+    print(i)
+else:
+    print(1)
+```
+Expected to be refused with: `for/else is not supported`
+
+It is rejected loudly rather than dropped, because the alternative: binding the else to the if: would silently change what the program means.
+
+#### try / except, over the built-in traps
+
+try/except catches a trap the engine itself raises. There is no exception hierarchy to import and no exception object to bind: the catchable set is closed, and a caught trap is a plain jump in the IR. Both tiers run the same handler region, so a trap caught natively is caught identically in the interpreter.
+
+**catching a division by zero**
+```text
+n: int[64] = 0
+try:
+    q: int[64] = 100 % n
+    print(q)
+except ZeroDivisionError:
+    print(1)
+```
+Output:
+```
+1
+```
+
+The IR is the whole mechanism: tryenter marks the handler block and the region it guards, tryleave ends the protected region on the normal path, and trycatch is the landing pad. A caught trap is a branch, not an unwind -- there is no stack to unwind because there is no exception object.
+
+The catchable set is exactly seven names: ZeroDivisionError, OverflowError, ValueError, IndexError, KeyError, EOFError, and Exception for all of them. Anything else is refused at compile time, so a typo in the handler is a diagnostic rather than a silently-never-taken branch.
+
+**rejected: not a catchable trap**
+```text
+try:
+    print(1)
+except RuntimeError:
+    print(2)
+```
+Expected to be refused with: `is not a catchable trap`
+
+*which trap lands in which handler*
+| ZeroDivisionError | division or modulo by zero |
+| --- | --- |
+| OverflowError | a dynamic int[64] overflow (LITHON-E0303), or an input that does not fit the target width (E0307) |
+| ValueError | a float-to-int conversion out of range (E0309), a shift count outside 0..63, a range step of zero (E0310), a non-numeric input (E0306) |
+| IndexError | a dynamic index outside a list's bounds |
+| KeyError | a dict key that is not present |
+| EOFError | input() reached end of input (E0308) |
+
+> **three things that are deliberately not supported** — A bare except: is refused, because it would also catch a system exit and would suggest catching a segfault, which is not catchable. except ... as e is refused, because there is no exception object to bind. try/finally without an except is refused, because a finally that runs on the uncaught path is a different construct. And a trap raised inside a *callee* is not catchable by the caller: only traps raised in the same function as the try are.
+
+**rejected: a bare except**
+```text
+try:
+    print(1)
+except:
+    print(2)
+```
+Expected to be refused with: `a bare `except:` is not supported`
+
+An uncaught trap is still a trap: the program stops with the engine's own diagnostic, and the exit code is non-zero. See Errors (/docs/errors) for the full code family and Semantics (/docs/semantics) for the arithmetic traps in detail.
+
+---
+
+### Functions
+
+*Mandatory contracts, the calling convention, and recursion.*
+
+URL: https://project-lithon.github.io/Lithon/docs/functions
+
+#### Contracts are mandatory
+
+Every parameter and the return type are mandatory and checked (V1_SPEC 0.6.8). A call site is checked against the declared signature, and a declared return type must be provably wide enough for what is returned: the compiler never auto-widens your return.
+
+**tests/typed_regression/function.lio**
+```text
+def add(a: int[64], b: int[64]) -> int[64]:
+    return a + b
+
+x: int[64] = add(3, 4)
+print(x)
+```
+Output:
+```
+7
+```
+Source: `tests/typed_regression/function.lio`
+
+**rejected · missing return type**
+```text
+def add(a: int[64], b: int[64]):
+    return a + b
+
+x: int[64] = add(3, 4)
+print(x)
+```
+Expected to be refused with: `return`
+
+#### Recursion
+
+Recursion works like it does in Python: each call gets its own frame. The verifier checks each call against the declared signature, including recursive calls to the function being defined:
+
+**tests/typed_regression/recursion.lio**
+```text
+def fib(n: int[64]) -> int[64]:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+x: int[64] = fib(10)
+print(x)
+```
+Output:
+```
+55
+```
+Source: `tests/typed_regression/recursion.lio`
+
+#### The calling convention
+
+A native call passes the first two arguments in registers (rdi/rsi, or XMM0/XMM1 for floats) and every further argument in an 8-byte stack slot, exactly as SysV passes its later arguments. Up to 32 parameters are supported; a call or function past that budget is refused by the native tier and runs in the interpreter rather than mis-passing arguments.
+
+> **beyond the budget** — If a signature genuinely needs more than 32 parameters, run that function under the interpreter (the native tier refuses automatically) or restructure the call.
+
+---
+
+### Operators
+
+*Arithmetic, comparison, boolean, bitwise and shift: including C-style `%` and two's-complement wrap.*
+
+URL: https://project-lithon.github.io/Lithon/docs/operators
+
+#### Arithmetic
+
+*Operators and their result rules*
+| + - * | same-width result; int×int wraps, float follows IEEE-754 |
+| --- | --- |
+| / | float division producing float[64], not C-style truncation |
+| % | C-style remainder: sign follows the left operand |
+| ** | refused: *LITHON-E0114: operator Pow not supported yet*. There is no power operator. |
+| // | refused: *LITHON-E0114: operator FloorDiv not supported yet*. There is no floor division; use a shift for a power-of-two divisor. |
+| <= >= | refused: *LITHON-E0114: comparison LtE not supported yet*. Only <, >, == and != exist. |
+| a < b < c | refused: chained comparisons are not supported. |
+
+**C-style % (README)**
+```text
+a: int[64] = -7
+b: int[64] = 3
+print(a % b)
+print(7 % 3)
+print(-7 % 3)
+```
+Output:
+```
+-1
+1
+-1
+```
+*% follows C, not Python: -7 % 3 is -1, not 2. Python's floor-mod and C's trunc-mod disagree on negatives, and Lithon chose the machine's behaviour. (The checker cannot infer the type of a negated-literal binding yet; the frontend and both tiers handle it.)*
+
+**rejected: a power operator**
+```text
+x: int[64] = 2
+print(x ** 3)
+```
+Expected to be refused with: `operator Pow not supported yet`
+
+#### Comparison and boolean
+
+== != < > and the other comparisons produce bool. and or not operate on bool. != is a first-class comparison with its own IR op (ne), not an == followed by a not, so the optimizer and branch fusion see the real predicate.
+
+**tests/typed_regression/comparison.lio**
+```text
+a: int[64] = 1
+b: int[64] = 2
+c: float[64] = 1.5
+print(a < b)
+print(b > a)
+print(a == a)
+print(c < b)
+```
+Output:
+```
+True
+True
+True
+True
+```
+Source: `tests/typed_regression/comparison.lio`
+
+**tests/typed_regression/ne.lio (excerpt)**
+```text
+a: int[64] = 1
+b: int[64] = 2
+print(a != b)
+print(a != a)
+lo: int[8] = -128
+hi: int[8] = 127
+print(lo != hi)
+```
+Output:
+```
+True
+False
+True
+```
+Source: `tests/typed_regression/ne.lio`
+
+> **int and float compare across widths** — The fourth line compares a float[64] against an int[64] and returns True: the int is widened to float for the comparison, the same promotion rule as arithmetic.
+
+#### Bitwise and shift
+
+<< >> & | ^ are integer-only and not part of the arithmetic promotion rule: 2.5 & 1 is a type error, because Lithon has no float bit pattern to reinterpret. Their result takes the left operand's width.
+
+A literal shift count must be 0..63: the machine word is 64 bits and x86 masks the count to 6 bits, so a count of 64 would silently execute as 0. A non-literal count is checked at runtime instead. This is a deliberate divergence from CPython, where ints are unbounded and 1 << 64 is a valid 65-bit result:
+
+**rejected · bitwise on a float**
+```text
+print(2.5 & 1)
+```
+Expected to be refused with: `bitwise operand has type float`
+
+**rejected · shift count out of range**
+```text
+print(1 << 64)
+```
+Expected to be refused with: `shift count`
+
+**accepted**
+```text
+x: int[64] = 1 << 10
+y: int[64] = x >> 3
+z: int[64] = x & 0xFF
+print(x)
+print(y)
+print(z)
+```
+Output:
+```
+1024
+128
+0
+```
+
+#### Explicit wrap-around arithmetic
+
+Plain +/-/* on fixed-width ints wraps in two's complement at run time, but overflow the verifier can prove statically is rejected at compile time (E0303) and points you at the wrap_* family. wrap_add/wrap_sub/wrap_mul are the explicit way to say "wrap-around is what I want": the same wrapped value in both tiers:
+
+**tests/typed_regression/int64_wrap.lio**
+```text
+x: int[64] = 9223372036854775807
+y: int[64] = 1
+z: int[64] = wrap_add(x, y)
+print(z)
+
+a: int[64] = -9223372036854775808
+b: int[64] = 1
+c: int[64] = wrap_sub(a, b)
+print(c)
+
+p: int[64] = 3037000500
+q: int[64] = 3037000500
+r: int[64] = wrap_mul(p, q)
+print(r)
+```
+Output:
+```
+-9223372036854775808
+9223372036854775807
+-9223372036709301616
+```
+Source: `tests/typed_regression/int64_wrap.lio`
+
+---
+
+### Containers
+
+*Fixed-capacity lists, tuples, and constant-keyed dicts: declared, reserved, sized at compile time.*
+
+URL: https://project-lithon.github.io/Lithon/docs/containers
+
+#### list: fixed capacity
+
+A list[T, N] has a compile-time capacity N that is part of the type. The element type is a fixed-width scalar. The bare declaration xs: list[int[64], 6] is real work: it reserves the run and zeroes it: drop it and the first store writes to a name that was never allocated.
+
+**tests/programs/list_basic.lio (excerpt)**
+```text
+xs: list[int[64], 6]
+
+xs[0] = 10
+xs[1] = 20
+xs[2] = 30
+
+print(xs[0])
+print(xs[1])
+print(xs[2])
+```
+Output:
+```
+10
+20
+30
+```
+Source: `tests/programs/list_basic.lio`
+
+*list rules*
+| Capacity | N is in the type. It is the number of slots the declaration reserves, and it never changes. |
+| --- | --- |
+| Length | len(xs) is the live length, carried in a companion xs.__len slot. It is a run-time value, not the capacity: a short literal leaves the trailing slots reserved but not live. |
+| Unwritten slots | read back as zero of their kind (the declaration zeroes the run) |
+| Index bound | checked against N: a runtime index is checked, not a literal the compiler happened to see |
+| Element address | element k lands at base + k * sizeof(T): packed, no pointers per element |
+
+A short literal is the normal case, and it is why len(xs) is not the capacity:
+
+**the live length is not the capacity**
+```text
+xs: list[int[64], 6] = [1, 2, 3]
+print(len(xs))
+print(xs)
+print(sum(xs))
+
+xs.append(10)
+xs.append(20)
+print(len(xs))
+print(xs)
+```
+Output:
+```
+3
+[1, 2, 3]
+6
+5
+[1, 2, 3, 10, 20]
+```
+
+> **A reduction over a list whose length is not known at compile time is refused** — sum, min, max, any, all and in are unrolled over the live length at compile time. When the length is only known at run time — an append inside a loop, or a split — they are refused rather than guessed at. A plain literal or a bare declaration keeps the length a compile-time constant, so the reductions still work.
+
+#### tuple
+
+A fixed-length product of scalar types. Indexing with a literal is checked at compile time against the declared length:
+
+**a tuple**
+```text
+t: tuple[int[64], 4] = (1, 2, 3, 4)
+print(t[0])
+print(t[3])
+```
+Output:
+```
+1
+4
+```
+
+> **One element type, a literal capacity** — A tuple is tuple[T, N]: one element type and a literal length. Anything else is rejected: tuple[int[64], float[64], bool] fails with *needs an element type and a literal capacity*.
+
+> **Containers are ahead of the standalone checker** — tools/typecheck.py answers unknown type 'list': the container types are implemented in the engine (and covered by the regression suites) but the standalone Python checker has not been taught them yet.
+
+#### dict: constant-keyed
+
+A dict[K, V, B] is a fixed-capacity open-addressing table with B buckets, built from a constant-keyed literal. The valueless declaration reserves and zeroes the table, so the literal is a fill of a table that already exists: not an allocation trick. Literal keys are resolved while compiling; a runtime key takes the hash-and-probe path.
+
+**tests/programs/dict_basic.lio (excerpt)**
+```text
+d: dict[int[64], int[64], 4] = {1: 10, 2: 20, 3: 30, 4: 40}
+print(d[1])
+print(d[4])
+
+k: int[64] = 2
+print(d[k])
+j: int[64] = k + 1
+print(d[j])
+```
+Output:
+```
+10
+40
+20
+30
+```
+Source: `tests/programs/dict_basic.lio`
+
+> **More entries than buckets is a duplicate-bucket problem** — dict_basic.lio stays one short of it and leans on the probe instead. dict_table.lio is the test that pins a collision down to fixed keys rather than leaving it to chance.
+
+#### Where to go next
+
+- **Pointers** — Raw addresses, addressof/valueof, and the _ naming rule.
+- **Structs** — Packed storage: fields at fixed offsets, no padding.
+- **Enums** — A tag plus a payload, read with match.
+- **Type functions** — Compile-time type constructors that expand structurally.
+- **Built-in functions** — The whole prelude, one row per name.
+
+---
+
+### Pointers
+
+*Typed pointers with a mandatory `_` prefix: explicit unsafe memory, no hidden aliasing.*
+
+URL: https://project-lithon.github.io/Lithon/docs/pointers
+
+#### The `_` rule
+
+Every pointer variable carries a mandatory leading _. This is not a naming convention the compiler happens to enforce: it is a source-level marker that raw memory is in play, greppable and impossible to miss in review.
+
+**rejected · missing underscore**
+```text
+x: int[64] = 5
+p: ptr[int[64]] = addressof(x)
+print(valueof(p))
+```
+Expected to be refused with: `named with a leading underscore`
+
+#### addressof and valueof
+
+addressof(x) produces a ptr[T] to x; valueof(_p) reads through it. Pointer equality compares addresses. Pointer arithmetic (_p + 1, _p - 1) steps by sizeof(T), not by bytes.
+
+**tests/programs/ptr_basic.lio (excerpt)**
+```text
+x: int[64] = 5
+_p: ptr[int[64]] = addressof(x)
+print(valueof(_p))
+q: int[64] = 6
+_q: ptr[int[64]] = addressof(q)
+print(valueof(_q))
+print(_p == _q)
+```
+Output:
+```
+5
+6
+False
+```
+Source: `tests/programs/ptr_basic.lio`
+
+#### What pointers cannot do
+
+*Restrictions*
+| Type changes | a pointer cannot change its pointee type |
+| --- | --- |
+| Arithmetic | only same-type offset arithmetic (_p ± n, _p1 − _p2); no arbitrary casts |
+| Deref | no *_p syntax: valueof / assignment through the pointer |
+| Null | _p == 0 is a comparison; there is no null-deref path in safe code |
+
+> **Pointers are unsafe by design** — The _ prefix marks the boundary. Inside it, the compiler's usual guarantees about definite assignment and type agreement do not extend through raw memory writes, that is the deal you take when you reach for ptr.
+
+#### Pointers to floats and bools
+
+ptr works for any scalar pointee: float[64], bool, and any int[w]. Reading through a ptr[float[64]] after the pointee changed gives you the new value, because the pointer names a location, not a snapshot:
+
+**reading through a pointer (ptr_basic.lio excerpt)**
+```text
+f: float[64] = 2.5
+_pf: ptr[float[64]] = addressof(f)
+print(valueof(_pf))
+f = 3.25
+print(valueof(_pf))
+```
+Output:
+```
+2.5
+3.25
+```
+Source: `tests/programs/ptr_basic.lio`
+
+---
+
+### Structs
+
+*A named run of typed fields packed into one byte blob: declared offsets, no padding, no struct value.*
+
+URL: https://project-lithon.github.io/Lithon/docs/structs
+
+#### A struct is storage, not a value
+
+A struct is a named run of typed fields laid out end to end in one blob of bytes. Declaring p: Point reserves and zeroes those bytes, exactly the way a list declaration reserves its element run. A struct has no value: the only operations are reading a field and writing a field, and the whole struct is never an expression you can print or assign.
+
+The spelling is Lithon's own: a struct is a class deriving from Struct, whose body is nothing but field annotations.
+
+#### Declaring a struct and writing fields
+
+Each name: type line is a field. The declaration p: Point zeroes the blob; writing a field is a partial write into that blob at a fixed offset the frontend computed, not a rebinding of the name.
+
+**tests/programs/struct_basic.lio (excerpt)**
+```text
+class Point(Struct):
+    x: int[64]
+    y: int[64]
+
+
+p: Point
+p.x = 3
+p.y = 4
+print(p.x)
+print(p.y)
+```
+Output:
+```
+3
+4
+```
+Source: `tests/programs/struct_basic.lio`
+
+A field nobody wrote reads back as the zero of its kind: 0 for an int, False for a bool, 0.0 for a float. This is the struct analogue of an unwritten list element reading zero.
+
+> **narrow fields are signed** — An int[8]/int[16]/int[32] field is signed: writing -3 into an int[16] field and reading it back yields -3, not the zero-extended 65533. bool is the exception and reads back as 0/1. This is the same rule as a list element or a pointer dereference of the same width.
+
+**unwritten fields read zero (struct_basic.lio excerpt)**
+```text
+class SockAddrIn(Struct):
+    family: int[16]
+    port: int[16]
+    addr: int[64]
+    active: bool
+
+
+s: SockAddrIn
+s.family = 2
+s.port = 80
+print(s.family)
+print(s.port)
+print(s.addr)
+print(s.active)
+```
+Source: `tests/programs/struct_basic.lio`
+
+#### Layout: packed, no padding
+
+Fields sit at exactly the offsets their sizes imply: the first field at 0, each next field immediately after the previous. No padding is inserted, so the size of a struct is the sum of its field sizes. bool is 1 byte, float[64] is 8, and int[w] is w / 8.
+
+*SockAddrIn · 13 bytes, no padding*
+| 0 | family : int[16] |
+| --- | --- |
+| 2 | port : int[16] |
+| 4 | addr : int[64] |
+| 12 | active : bool |
+
+Because the layout is a pure sum, the struct[N] size the frontend bakes into the declaration is exactly what a C offsetof / sizeof computation over a #pragma pack(1) struct would produce. tools/check_struct_layout.py compiles the same struct definitions with cc, runs the frontend, and asserts that equality field by field.
+
+> **A field is a scalar or an earlier struct** — A field type is int[w], float[64], bool, or a struct declared before this one. A field may not be a list, tuple, dict, or pointer. A nested struct field is flattened: seg.a.x resolves to a single leaf read at the summed byte offset, so there is never an intermediate struct value.
+
+#### Float fields
+
+A float[64] field always occupies the full eight bytes and goes through the double path, so an arithmetic read is exact and a negative value survives unchanged.
+
+**float fields (struct_basic.lio excerpt)**
+```text
+class Vec(Struct):
+    x: float[64]
+    y: float[64]
+
+
+v: Vec
+v.x = 1.5
+v.y = -2.25
+print(v.x)
+print(v.y)
+print(v.x + v.y)
+```
+Source: `tests/programs/struct_basic.lio`
+
+#### What structs cannot do
+
+*Restrictions*
+| Whole value | a struct is never an expression; print(p) and q = p are refused |
+| --- | --- |
+| Field kind | no list/tuple/dict/pointer fields: only scalars and earlier structs |
+| Field as value | seg.inner alone is refused; flatten to a leaf (seg.inner.x) |
+| Narrowing | a value wider than the field is refused, exactly as for a list element |
+| Parameters | structs are not passed to or returned from functions |
+
+**rejected · a container field**
+```text
+class Foo(Struct):
+    xs: list[int[64], 4]
+
+f: Foo
+print(0)
+```
+Expected to be refused with: `LITHON-E0127`
+
+**rejected · the whole struct as a value**
+```text
+class Foo(Struct):
+    x: int[64]
+
+f: Foo
+print(f)
+```
+Expected to be refused with: `LITHON-E0128`
+
+---
+
+### Enums
+
+*A tagged union: one variant active at a time, packed as a tag plus the largest payload, read back with match.*
+
+URL: https://project-lithon.github.io/Lithon/docs/enums
+
+#### An enum is storage, not a value
+
+An enum is a tagged union: a byte blob holding an int tag and room for the payload of whichever variant is active. Like a struct it has no value — the only operations are constructing a variant, reading the tag with match, and reading a payload through the arm's binding. The whole enum is never an expression you can print, assign, pass, or return.
+
+The spelling is Lithon's own: an enum is a class deriving from Enum. Each body line declares one variant, in one of three forms — a bare unit name, a name: type payload annotation, or an inline class V(Struct) struct payload.
+
+#### Declaring an enum and its variants
+
+The declaration s: Shape reserves and zeroes the blob, exactly the way a struct declaration does. The tag is written by a construction and read by a match; the variant names are never values in scope.
+
+**tests/programs/enum_basic.lio (excerpt)**
+```text
+class Shape(Enum):
+    Empty
+    Dot
+    Line: int[32]
+    Rect: int[64]
+
+
+s: Shape
+s = Shape.Dot
+match s:
+    case Shape.Empty:
+        print(0)
+    case Shape.Dot:
+        print(1)
+    case Shape.Line(n):
+        print(n)
+    case Shape.Rect(w):
+        print(w)
+```
+Output:
+```
+1
+```
+Source: `tests/programs/enum_basic.lio`
+
+The three variant forms are: a bare name (Empty, Dot) is a unit variant with no payload; Line: int[32] is a payload variant whose variant carries one scalar; and an inline class Tcp(Struct): ... is a struct payload whose fields are packed at the payload offset. Two variants may not share a name.
+
+#### Layout: a tag, then the largest payload
+
+The layout is [tag][payload] with no padding. The tag sits at offset 0. It is an int[8] while the enum has at most 128 variants (a signed byte holds 0..127) and widens to int[16] past that. The payload starts at the tag width, and the enum's size is the tag width plus the largest payload of any variant.
+
+*Shape · 9 bytes, no padding*
+| 0 | tag : int[8] (Empty=0, Dot=1, Line=2, Rect=3) |
+| --- | --- |
+| 1 | payload : largest is Rect's int[64], 8 bytes |
+
+Only the active variant's payload bytes are ever read. Overwriting a payload variant with a smaller one leaves the old bytes in place but inactive, so a later match can never observe them. The size the frontend bakes into the struct[N] declaration is exactly what a C offsetof/sizeof over a #pragma pack(1) tag-plus-union would produce; tools/check_enum_layout.py compiles that C layout, runs the frontend, and asserts the two agree at both tag-width boundaries.
+
+#### Constructing a variant
+
+A construction writes the tag and the active payload; it does not create a value. e = E.V writes a unit variant, e = E.V(x) a one-scalar payload, and e = E.V(field=x, ...) or e = E.V(x, ...) a struct payload by field name or position. A construction can appear as a bare assignment, in the declaration e: E = E.V(...), or into a struct field s.efield = E.V(...).
+
+**tests/programs/enum_struct.lio (excerpt)**
+```text
+class Endpoint(Enum):
+    Empty
+    class Tcp(Struct):
+        port: int[16]
+        addr: int[32]
+    Udp: int[32]
+
+
+class Conn(Struct):
+    proto: Endpoint
+    id: int[64]
+
+
+c: Conn
+c.proto = Endpoint.Tcp(port=8080, addr=16777343)
+c.id = 7
+```
+Source: `tests/programs/enum_struct.lio`
+
+> **stale payloads are never read** — After s = Shape.Line(7) then s = Shape.Empty, the 7 is still in the blob's payload bytes but the tag says Empty. A match reads the tag first and enters only the arm it selects, so the overwritten bytes are unreachable.
+
+#### Reading a variant with match
+
+A match on an enum reads the tag once and dispatches to the arm whose variant matches. An arm for a payload variant binds that payload (case Shape.Line(n):); an arm for a unit variant binds nothing (case Shape.Empty:). A case _: arm is the wildcard and must be last. The match must be exhaustive: every variant is covered by some arm, or there is a case _:.
+
+*match arms*
+| Unit arm | case E.V: binds nothing |
+| --- | --- |
+| Scalar arm | case E.V(n): binds the one payload scalar |
+| Struct arm | case E.V(f1=a, f2=b): binds each named field |
+| Wildcard | case _: must be the final arm |
+| Exhaustiveness | all variants covered, or a case _: present |
+
+**tests/programs/enum_struct.lio (excerpt)**
+```text
+class Endpoint(Enum):
+    Empty
+    class Tcp(Struct):
+        port: int[16]
+        addr: int[32]
+    Udp: int[32]
+
+
+class Conn(Struct):
+    proto: Endpoint
+    id: int[64]
+
+
+c: Conn
+c.proto = Endpoint.Tcp(port=8080, addr=16777343)
+c.id = 7
+match c.proto:
+    case Endpoint.Tcp(port=p, addr=a):
+        print(p)
+        print(a)
+    case Endpoint.Udp(n):
+        print(n)
+    case Endpoint.Empty:
+        print(-1)
+print(c.id)
+```
+Source: `tests/programs/enum_struct.lio`
+
+match lowers to the same tag-compare if/elif chain a hand-written dispatch would be: each arm is a fieldload of the tag, an equality test, and a branch whose body reads the payload fields it bound. There is no new instruction kind and no enum value flowing through the IR.
+
+#### What enums cannot do
+
+*Restrictions*
+| Whole value | an enum is never an expression; print(e) and e2 = e are refused |
+| --- | --- |
+| Parameters/returns | enums are not passed to or returned from functions |
+| List elements | an enum may not be a list element or a list payload |
+| Enum payloads | a variant payload is a scalar or an inline Struct; not another enum |
+| Guards | case E.V if <guard>: is not supported |
+
+**rejected · an enum definition error**
+```text
+class E(Enum):
+    A
+    A
+print(0)
+```
+Expected to be refused with: `LITHON-E0129`
+
+**rejected · an unknown variant**
+```text
+class E(Enum):
+    A
+e: E
+e = E.B
+
+```
+Expected to be refused with: `LITHON-E0130`
+
+**rejected · an enum used as a value**
+```text
+class E(Enum):
+    A
+    B: int[32]
+e: E
+match e:
+    case E.A:
+        print(0)
+```
+Expected to be refused with: `LITHON-E0131`
+
+---
+
+### Methods
+
+*A function declared in a struct or enum body, with an implicit self, inlined at each call site.*
+
+URL: https://project-lithon.github.io/Lithon/docs/methods
+
+#### A method is a function in a class body
+
+A def inside a Struct or Enum body is a method. Its first parameter is the implicit receiver self, the rest are annotated scalars, and the return type is optional. A method is called on a struct or enum place: p.f(1), where p may be a variable or a struct/enum field.
+
+A method is inlined at the call site. That is forced by the storage model — a field access names a variable, not a value, and a struct or enum cannot be passed to a function (E0124). Inlining is what lets a method read and write the receiver's fields, run loops and branches, and call other methods.
+
+#### Declaring and calling a method
+
+**tests/programs/method_basic.lio (excerpt)**
+```text
+class Counter(Struct):
+    value: int[64]
+
+    def add(self, n: int[64]) -> int[64]:
+        self.value = self.value + n
+        return self.value
+
+
+c: Counter
+print(c.add(5))
+print(c.add(7))
+```
+Output:
+```
+5
+12
+```
+Source: `tests/programs/method_basic.lio`
+
+A method's locals are private to the call: a name in the body cannot capture or clobber a caller's variable of the same spelling, because the inline renames every method local with a per-call prefix. A method that returns nothing is a statement (p.log()); one that returns a scalar is an expression you can print or combine.
+
+#### The receiver, and enum methods
+
+The receiver is a place, so it can be a struct field: o.inner resolves to the field's bytes and a method on Inner reads and writes the caller's inner. A method on an enum reads self with match self — the only way to read an enum — and returns a scalar computed from the active variant.
+
+**tests/programs/method_enum.lio (excerpt)**
+```text
+class Shape(Enum):
+    Empty
+    Line: int[32]
+
+    def code(self) -> int[64]:
+        match self:
+            case Shape.Empty:
+                return 0
+            case Shape.Line(n):
+                return n
+            case _:
+                return -1
+
+
+s: Shape
+s = Shape.Empty
+print(s.code())
+```
+Output:
+```
+0
+```
+Source: `tests/programs/method_enum.lio`
+
+#### What a method cannot do
+
+*Restrictions*
+| Receiver | the first parameter must be the unannotated name self |
+| --- | --- |
+| Signature | scalars only (int[w]/float[64]/bool); not a struct, enum, container or pointer, as parameter or return |
+| Arguments | plain positional names; no /, *, ** or defaults |
+| Names | no redeclaration or overloading; may not shadow a field or variant |
+| Recursion | inlined at each call site, so direct and mutual recursion are refused |
+
+**rejected · a method whose first parameter is not self**
+```text
+class P(Struct):
+    x: int[64]
+    def f(a: int[64]) -> int[64]:
+        return a
+p: P
+print(p.f(1))
+```
+Expected to be refused with: `LITHON-E0134`
+
+**rejected · a recursive method**
+```text
+class P(Struct):
+    x: int[64]
+    def f(self) -> int[64]:
+        return self.f()
+p: P
+print(p.f())
+```
+Expected to be refused with: `LITHON-E0135`
+
+---
+
+### Type Functions
+
+*A compile-time type constructor: `def Name(params) -> NewType: return { T }`, applied as `Name(args)` anywhere a type is allowed.*
+
+URL: https://project-lithon.github.io/Lithon/docs/type-functions
+
+#### A type function is a compile-time type constructor
+
+A type function names a type shape. You declare it with def Name(params) -> NewType: return { T }, and then wherever a type is allowed you write Name(args); at compile time the arguments are substituted into T and the result is an ordinary type. It runs entirely in the frontend: a definition carries no code, and no runtime value is ever involved.
+
+NewType is a reserved marker in the return position. The body must be exactly one return { <type> }. The parameters hold types and sizes — they are plain unannotated names standing in for whatever is spliced at the call site, not values.
+
+#### Declaring and applying a type function
+
+**tests/programs/typefunc_basic.lio (excerpt)**
+```text
+def Fixed(t, n) -> NewType:
+    return {list[t, n]}
+
+
+def Word() -> NewType:
+    return {int[32]}
+
+
+xs: Fixed(int[64], 4)
+xs[0] = 100
+xs[1] = 23
+xs[2] = -3
+print(xs[0] + xs[1] + xs[2])
+```
+Output:
+```
+120
+```
+Source: `tests/programs/typefunc_basic.lio`
+
+Fixed(int[64], 4) is list[int[64], 4] and Word() is int[32]. A zero-parameter type function must still be applied with parentheses — write Word(), not a bare Word, which would read as a sized integer and be refused.
+
+#### The result is structural
+
+Applying a type function yields a type identical to the expansion spelled out — there is no distinct typedef identity. Alias(int[64]) is the very same type as int[64], so a variable declared one way and re-declared the other is not a re-declaration with a different type.
+
+**tests/programs/typefunc_basic.lio (excerpt)**
+```text
+def Alias(t) -> NewType:
+    return {t}
+
+
+a: int[64] = 5
+a: Alias(int[64]) = 6
+print(a)
+```
+Source: `tests/programs/typefunc_basic.lio`
+
+Because the type erases completely, nothing about a type function survives into the IR. tools/check_typefunc.py proves this: it compiles a type-function program and the same program with every type spelled out, and asserts the two IR texts are byte-identical.
+
+#### Where a type function can be applied
+
+A call is resolved inside the single annotation parser every type flows through, so a type function works anywhere a type is written: nested in another type function's argument, in a function parameter and return type, as a struct field, and as a container element type.
+
+**tests/programs/typefunc_uses.lio (excerpt)**
+```text
+def Word() -> NewType:
+    return {int[32]}
+
+
+def Pair(t) -> NewType:
+    return {list[t, 2]}
+
+
+ps: Pair(Word())
+ps[0] = 11
+ps[1] = -22
+print(ps[0] + ps[1])
+```
+Output:
+```
+-11
+```
+Source: `tests/programs/typefunc_uses.lio`
+
+> **applications nest** — Pair(Word()) applies Word() first, giving list[int[32], 2]. Applications are memoized by call shape, so writing the same Pair(int[64]) twice expands the body once and returns the same type.
+
+#### What a type function cannot do
+
+*Restrictions*
+| Body | exactly one return { <type> }; {} is a dict and refused, multi-element bodies and comprehensions too |
+| --- | --- |
+| Composes | scalar, container, pointer and dict types — not a struct or an enum (those are storage) |
+| Parameters | plain unannotated positional names; no /, *, ** or defaults |
+| Names | no redeclaration, and no collision with a struct, an enum or a function |
+| Recursion | must bottom out in a concrete type; direct and mutual recursion are refused |
+
+**rejected · a body holding two types**
+```text
+def T(a) -> NewType:
+    return {a, a}
+print(0)
+```
+Expected to be refused with: `LITHON-E0132`
+
+**rejected · a recursive type function**
+```text
+def P(a) -> NewType:
+    return {P(a)}
+x: P(int[64]) = 1
+print(0)
+```
+Expected to be refused with: `LITHON-E0133`
+
+---
+
+### Syscalls
+
+*The raw syscall primitive: `syscall(number, a1..a6) -> int[64]`, one IR instruction, one host trampoline, identical in both tiers.*
+
+URL: https://project-lithon.github.io/Lithon/docs/syscalls
+
+#### One instruction, unchecked
+
+syscall(number, a1, a2, a3, a4, a5, a6) is a compiler-recognized name, not a function you import. It takes a syscall number and up to six arguments and returns the kernel's raw result as int[64]. The whole call lowers to a single Syscall IR instruction.
+
+Nothing is wrapped and nothing is checked. On Linux a failure is simply a negative number: the negated errno, exactly as the kernel reports it. There is no fallible[...] to unwrap and no use-before-check rule in this slice — a program that wants to handle failure compares the result itself.
+
+**a syscall number that does not exist**
+```text
+r: int[64] = syscall(-1)
+print(r)
+```
+Output:
+```
+-38
+```
+*-1 is not a syscall number, so the kernel returns -ENOSYS (-38). The number is stable across both tiers and across the platform fork, which is what makes it a checkable example.*
+
+#### Arguments are integers or pointers
+
+A raw syscall argument must be an int or a pointer. The type checker says so plainly: *a raw syscall argument must be an integer or a pointer (a buffer or a sockaddr); floats and aggregates are not passed by value*.
+
+> **A pointer argument is a real host address in both tiers** — This is the load-bearing fact. The interpreter does not emulate a synthetic address space: a pointer to a variable is the address of that variable, in the interpreter and in the JIT alike. So a kernel syscall that reads a buffer reads exactly the bytes the language wrote, and one that writes a sockaddr writes into the very struct you handed it. tests/net/loopback.lio is a shipped TCP round trip that depends on it.
+
+**a syscall with a pointer argument**
+```text
+x: int[64] = 65
+_ptrX: ptr[int[64]] = addressof(x)
+r: int[64] = syscall(1, _ptrX)
+print(r)
+```
+Output:
+```
+-38
+```
+*The number 1 is not a valid Linux syscall number, so the kernel returns -ENOSYS (-38) — the same answer in both tiers, which is what makes it a checkable example.*
+
+A float[64] argument is refused: the kernel ABI passes floats differently, and a syscall that takes one by value is not reachable from Lithon. A struct argument is refused for the same reason: it is not a scalar, and a struct is not passed by value.
+
+- **Networking** — A real TCP loopback, checked against a C oracle.
+- **Pointers** — Why a pointer to a struct is a real address.
+
+#### Both tiers execute the same trampoline
+
+The platform fork lives in exactly one place, src/jit/syscall_runtime.h. It consults an embedder-installed hook first, on every platform. With no hook it runs the real syscall instruction on Linux/x86-64; on a platform whose raw ABI is not stable (Windows) it returns -ENOSYS rather than guessing.
+
+Both the interpreter and the JIT call that one helper, so the two engines cannot drift about the calling convention — the argument registers, the clobbered registers, and the raw return are defined once. The JIT treats the op as a register-clobbering boundary, exactly like a call, so a value live across a syscall is spilled or placed in a callee-saved register.
+
+---
+
+### Divergences from Python
+
+*Every place Lithon deliberately behaves differently from CPython, and why: modulo, division, shifts, narrowing, truthiness, strings, exceptions.*
+
+URL: https://project-lithon.github.io/Lithon/docs/python-divergences
+
+#### The short list
+
+Lithon's source syntax is Python's. Its *semantics* are not, in eleven specific places, all of which come from the same two decisions: fixed-width values and no dynamic dispatch. This page is the list; each row links to the page that explains it in full.
+
+*the eleven differences that will bite you*
+| Modulo with a negative dividend | -7 % 3 == 2 | -7 % 3 == -1 — C-style, the sign follows the dividend |
+| --- | --- | --- |
+| Integer division | 7 / 2 == 3.5 | 7 / 2 == 3.5 — same, but // is refused outright |
+| Narrowing an integer | always allowed | refused: int[8] never becomes int[64] implicitly |
+| Float to int | int(3.7) == 3 | int(64, 3.7) == 3 — the width has to be named |
+| Truthiness | if 0: is False, if "": is False | refused: a condition must be a bool |
+| Strings | unbounded, heap-allocated, + concatenates | bounded str[N] byte runs; + is refused |
+| Exceptions | raise anything, catch by class | seven named engine traps; no raise, no exception objects |
+| Unassigned variables | NameError at run time | refused at compile time: every name needs a type and a value |
+| Recursion | bounded by the C stack | self tail calls become loops; a stack guard traps at 4096 |
+| Function arguments | positional, keyword, *args, **kwargs, defaults | positional only, fixed arity, no defaults, no keywords |
+| Comparisons | a <= b, chained a < b < c | only <, >, ==, !=; no chaining |
+
+> **The rule behind all eleven** — CPython can decide what an expression means at run time. Lithon cannot, so anything the compiler would have to guess about becomes a refusal. A refusal is a compile-time error with a precise message, not a wrong answer at run time.
+
+#### Modulo follows C, not Python
+
+Lithon's % is the C remainder: the sign of the result follows the dividend, not the divisor. Python's is a true modulo: the sign follows the divisor.
+
+*-7 % 3*
+#### Lithon
+```text
+print(-7 % 3)
+```
+Output:
+```
+-1
+```
+#### CPython
+```text
+>>> -7 % 3
+2
+```
+
+The same holds for 7 % -3: Lithon gives 1, CPython gives -2. This is not an oversight: the C-style form is the one a machine instruction actually implements, and Lithon emits exactly that instruction.
+
+> **Where to read more** — The full statement of the rule, with the machine-level reason, is on the semantics (/docs/semantics) page.
+
+#### Division is always float; `//` does not exist
+
+/ always produces a float[64], including when both operands are integers: 7 / 2 is 3.5, not 3. There is no integer division operator at all — // is refused with *operator FloorDiv not supported yet*.
+
+To get an integer quotient, write it yourself or use a shift when the divisor is a power of two: x // 2 becomes x >> 1 for non-negative x.
+
+> **Division by zero traps in both tiers** — 1 / 0 is not an IEEE infinity and not a NaN: it is a ZeroDivisionError trap, exactly like Python's, and it is catchable with try/except.
+
+#### Narrowing is never implicit
+
+CPython integers are arbitrary-precision, so every integer is every other integer. Lithon integers are fixed-width, so an int[8] value is not an int[64] value: widening happens automatically, narrowing is refused.
+
+**widening is fine**
+```text
+small: int[8] = 5
+big: int[64] = small
+print(big)
+```
+Output:
+```
+5
+```
+
+**narrowing is refused**
+```text
+wide: int[64] = 5
+narrow: int[8] = wide
+print(narrow)
+```
+Expected to be refused with: `cannot narrow`
+
+There is no cast syntax for this. If you genuinely want to truncate, you have to say so with the explicit conversion, and the conversion traps rather than truncating when the value does not fit.
+
+#### Conversions name their width
+
+*conversions*
+| int from float | int(3.7) | int(64, 3.7) |
+| --- | --- | --- |
+| float from int | float(3) | float(64, 3) |
+| out of range | int(1e30) is a big int | int(8, 300.0) traps with ValueError |
+| float from int[64] | n/a | refused: int[64] has no exact float[64] (E0106) |
+
+The width is not decoration. int(8, v) promises the value fits in a signed byte, and the engine checks that promise at run time instead of silently wrapping.
+
+#### There is no truthiness
+
+In CPython, if x: asks whether x is truthy, and almost everything has a truth value. In Lithon, a condition must be a bool. if x: where x: int[64] is a type error, not a check for non-zero.
+
+**the Lithon way**
+```text
+n: int[64] = 0
+if n != 0:
+    print("not zero")
+```
+
+> **Why** — A truthiness test on an int is a comparison the compiler could have proved away, but on a container it depends on the container's length, which is a run-time value. One rule — *conditions are bool values* — is easier to verify and faster to compile than a truthiness table.
+
+#### Strings are bounded byte runs
+
+*strings*
+| Type | str, unbounded | str[N], N bytes |
+| --- | --- | --- |
+| Length | len(s) in characters | len(s) in bytes, at run time |
+| Concatenation | a + b | refused |
+| Slicing | s[1:3] | refused |
+| Comparison | by content | by content, across different capacities |
+| Methods | dozens | three: find, count, split |
+| In a list | yes | yes, as a str[N] element |
+| As a function argument | yes | refused: a string is addressed, not passed |
+
+> **Where to read more** — The whole string model is on the strings (/docs/strings) page.
+
+#### Exceptions are a closed set of engine traps
+
+CPython lets you raise anything and catch by class. Lithon has no exception objects and no raise: the only thing you can catch is one of seven named traps that the engine itself raises.
+
+*the catchable set*
+- **ZeroDivisionError** — division or modulo by zero.
+- **OverflowError** — a dynamic int[64] overflow, or an input value that does not fit the width it was read into.
+- **ValueError** — a float-to-int conversion out of range, a shift count outside 0..63, a zero range step, or non-numeric input.
+- **IndexError** — a dynamic index outside a list's bounds.
+- **KeyError** — a dict key that is not present.
+- **EOFError** — input() hit the end of the input.
+- **Exception** — the catch-all: matches every one of the six above.
+
+A bare except: is refused, except X as e is refused (there is no exception object to bind), and raise is refused. A trap raised inside a called function is not catchable by the caller: the trap unwinds past it.
+
+> **Where to read more** — The full try/except/else/finally story is on the control flow (/docs/control-flow) page.
+
+#### Unassigned names are a compile error
+
+CPython raises NameError when you read a name you never assigned. Lithon refuses the program before it runs, and the refusal is per-name and per-path.
+
+**rejected · V1_SPEC 0.6.10**
+```text
+x: int[64]
+print(x)
+```
+Expected to be refused with: `never assigned a value`
+
+The same rule covers branches: if one arm of an if assigns a name and the other does not, the program is refused, because the verifier cannot prove which arm runs.
+
+#### Functions have a fixed shape
+
+*function signatures*
+| Parameter types | optional | mandatory |
+| --- | --- | --- |
+| Return type | optional | mandatory |
+| Default values | yes | no |
+| Keyword arguments | yes | no |
+| *args / **kwargs | yes | no |
+| Default arguments | yes | no |
+| Closures | yes | no: a function body cannot capture a caller's variable |
+| First-class functions | yes | no: a function name is not a value |
+| Recursion | yes | yes, with a stack guard at 4096 frames |
+| Overloading | yes | no |
+
+Every one of these is a place where CPython would have to build a closure, a tuple, or a dictionary at run time. Lithon has no such machinery, so the shape of a function is fixed at compile time and the machine code is a direct call.
+
+#### Comparisons are four operators, never chained
+
+Lithon has <, >, == and !=. <= and >= are refused (*comparison LtE not supported yet*), and chained comparisons (a < b < c) are refused, because a chain means two comparisons and an intermediate value that a machine register cannot hold.
+
+**the Lithon way**
+```text
+a: int[64] = 1
+b: int[64] = 2
+if a < b and b < 10:
+    print("ok")
+```
+Output:
+```
+ok
+```
+
+!= is a first-class operator with its own machine instruction, not == followed by not. On floats it follows IEEE 754: nan != nan is true.
+
+#### What is exactly the same
+
+It is worth being precise about what did not change, because the list above can read as if Lithon is a different language. These are identical:
+
+- while and for loops, break, continue — same shape, same semantics.
+- if / elif / else — same, and elif is spelled elif, not else if.
+- The conditional expression a if cond else b — same.
+- Integer literals, float literals, True / False — same spellings.
+- Operator precedence — Python's, exactly, because the frontend uses Python's own parser.
+- and / or / not — same precedence, but the operands must be bool.
+- Function calls, subscripting, attribute access — same syntax.
+- Recursion — supported, and the same shape as Python's.
+- range(start, stop, step) — the same three forms and the same values.
+
+> The source model is Python's. The type system is not, and where the type system changes the meaning, the meaning changes.
+
+#### Where to go next
+
+- **Types & widths** — The type system behind most of these differences.
+- **Semantics** — Modulo, shifts, float traps, and no truthiness, in full.
+- **Errors & diagnostics** — Every error code, and how a refusal reads.
+- **Honest limits** — The gaps that are not yet implemented at all.
+
+---
+
+### Exceptions & traps
+
+*try/except/else/finally over a closed set of seven engine traps. What each one means, when it fires, and what is deliberately not supported.*
+
+URL: https://project-lithon.github.io/Lithon/docs/exceptions
+
+#### The model: traps, not exception objects
+
+Lithon has no exception classes, no raise, and no exception objects. What it has is traps: the engine stops the program with a short message when an operation cannot produce a value. A try block names the traps it is prepared for, and the engine routes a trap to the matching arm.
+
+**catching a division by zero**
+```text
+n: int[64] = 0
+try:
+    q: int[64] = 100 % n
+    print("not reached")
+except ZeroDivisionError:
+    print("caught ZeroDivisionError")
+```
+Output:
+```
+caught ZeroDivisionError
+```
+
+> **The catchable set is closed** — Exactly seven names are catchable: ZeroDivisionError, OverflowError, ValueError, IndexError, KeyError, EOFError, and Exception (the catch-all). Any other name in an except arm is a compile-time refusal. You cannot invent a trap, and you cannot catch a segfault.
+
+#### The seven catchable traps
+
+*the closed catchable set*
+- **ZeroDivisionError** — division or modulo by zero. Both / and % trap. A float divisor of 0.0 also traps — Lithon does not produce an IEEE infinity.
+- **OverflowError** — a dynamic int[64] overflow, and an input value that does not fit the width it was read into (int(8, input(...)) with a 300).
+- **ValueError** — a float-to-int conversion whose result is out of range or not finite, a shift count outside 0..63, a range step of zero at run time, and non-numeric input.
+- **IndexError** — a dynamic index outside a list's bounds.
+- **KeyError** — a dict key that is not present.
+- **EOFError** — input() reached the end of the input before a value was read.
+- **Exception** — the catch-all: it matches every one of the six above, and nothing else. It is the only way to write a handler that is guaranteed to cover the set.
+
+**an index trap**
+```text
+xs: list[int[64], 3] = [10, 20, 30]
+k: int[64] = 9
+try:
+    v: int[64] = xs[k]
+    print("not reached")
+except IndexError:
+    print("caught IndexError")
+```
+Output:
+```
+caught IndexError
+```
+
+**several arms, tried in order**
+```text
+try:
+    y: int[64] = 5 % 0
+except IndexError:
+    print("wrong arm")
+except ZeroDivisionError:
+    print("caught ZeroDivisionError")
+```
+Output:
+```
+caught ZeroDivisionError
+```
+
+#### `else` and `finally`
+
+Both clauses are supported, and they have the same meaning they have in Python: else runs when the try block completed without a trap, and finally runs on every path out of the block.
+
+**all three clauses**
+```text
+n: int[64] = 4
+try:
+    r: int[64] = 100 % n
+except ZeroDivisionError:
+    print("zero")
+else:
+    print("else ran")
+finally:
+    print("finally ran")
+```
+Output:
+```
+else ran
+finally ran
+```
+
+**the same program with a trap**
+```text
+n: int[64] = 0
+try:
+    r: int[64] = 100 % n
+except ZeroDivisionError:
+    print("zero")
+else:
+    print("else ran")
+finally:
+    print("finally ran")
+```
+Output:
+```
+zero
+finally ran
+```
+
+> **A try with a finally but no except is refused** — try/finally without an except is rejected: without an arm there is nothing to route a trap to, so the finally would have to be a catch-all by accident.
+
+#### Nesting and the trap boundary
+
+try blocks nest, and the innermost matching arm wins. An outer except Exception will catch a trap that no inner arm claimed.
+
+**inner catches first**
+```text
+a: int[64] = 5
+try:
+    try:
+        inner: int[64] = a % 0
+    except ZeroDivisionError:
+        print("inner caught")
+except Exception:
+    print("outer caught")
+```
+Output:
+```
+inner caught
+```
+
+> **A trap inside a called function is not catchable by the caller** — The trap unwinds past the call frame. If f() divides by zero, the try around f() in the caller does not catch it: the function boundary is a trap boundary. Catch it inside f.
+
+> **This is the one place Lithon is stricter than Python** — In CPython an exception raised inside a callee propagates through the caller and can be caught there. Lithon does not: the trap is a property of the operation, and the operation is inside the callee.
+
+#### What is deliberately refused
+
+*refused exception forms*
+| A bare except: | refused: it would also catch a system-exit, and here it would suggest catching a segfault, which is not catchable. Use except Exception:. |
+| --- | --- |
+| except X as e: | refused: there is no exception object to bind. The handler learns which trap fired from which arm it is in. |
+| raise | refused: a program cannot invent a trap. Only the engine raises. |
+| except* | refused: no exception groups. |
+| A try with only a finally | refused: without an except there is nowhere to route a trap. |
+| Catching an unlisted name | refused: the catchable set is closed. |
+
+**rejected: a bare except**
+```text
+try:
+    x: int[64] = 1
+except:
+    print("no")
+```
+Expected to be refused with: `a bare `except:` is not supported`
+
+#### Where the traps live in the reference
+
+The error-code table in the reference lists every code, including the ones that are *designed* rather than shipped. The distinction matters: a trap you can catch is not the same as a static refusal.
+
+*refusal vs trap*
+| When | before the program runs | while the program runs |
+| --- | --- | --- |
+| Where | the frontend and the type checker | the engine |
+| Message | LITHON-Ennnn: ... | a short reason, e.g. error: division by zero |
+| Catchable | no — the program does not exist | yes, with try/except |
+| Example | LITHON-E0105: unsupported float width 32 | error: list index out of range |
+
+- **Errors & diagnostics** — Every code, tier by tier, with real output.
+- **Control flow** — The try statement in the context of the other flow forms.
+- **Divergences from Python** — How Lithon's error model differs from CPython's.
+
+---
+
+### match
+
+*The enum dispatch statement: arm forms, bindings, exhaustiveness, and every shape that is deliberately refused.*
+
+URL: https://project-lithon.github.io/Lithon/docs/match
+
+#### What a match does
+
+A match reads the tag of an enum once and jumps to the arm whose variant matches it. An arm for a payload variant binds that payload, so the arm body reads it as a named variable; an arm for a unit variant binds nothing.
+
+**the shape of a match**
+```text
+class Shape(Enum):
+    Empty
+    Dot
+    Line: int[32]
+    Rect: int[64]
+
+
+s: Shape
+s = Shape.Line(42)
+match s:
+    case Shape.Empty:
+        print(0)
+    case Shape.Dot:
+        print(1)
+    case Shape.Line(n):
+        print(n)
+    case Shape.Rect(w):
+        print(w)
+```
+Output:
+```
+42
+```
+
+> **A match is not a value, and it is not a switch** — It binds names in the arms, and it does not produce one. The lowered form is a chain of tag comparisons and branches — the same thing you would hand-write, which is why there is no new IR instruction for it.
+
+#### The four arm forms
+
+*every arm form*
+- **case E.V:** — a unit variant. Binds nothing. The arm body reads only the outer variables.
+- **case E.V(n):** — a scalar payload variant. Binds the one payload to n, with the variant's own declared type.
+- **case E.V(f1=a, f2=b):** — a struct payload variant. Binds each named field. The fields are named, not positional, so a reordering of the struct does not silently rebind them.
+- **case _:** — the wildcard. Matches every variant not already covered. It must be the last arm.
+
+**a struct payload, bound by field name**
+```text
+class Endpoint(Enum):
+    Empty
+    class Tcp(Struct):
+        port: int[16]
+        addr: int[32]
+    Udp: int[32]
+
+
+c: Endpoint = Endpoint.Tcp(port=8080, addr=16777343)
+match c:
+    case Endpoint.Tcp(port=p, addr=a):
+        print(p)
+        print(a)
+    case Endpoint.Udp(n):
+        print(n)
+    case Endpoint.Empty:
+        print(-1)
+```
+Output:
+```
+8080
+16777343
+```
+
+#### Exhaustiveness is checked
+
+A match must cover every variant, or end with a case _:. The checker knows the enum's variants, so it can prove the coverage statically — there is no fall-through and no runtime surprise.
+
+**rejected: not exhaustive**
+```text
+class E(Enum):
+    A
+    B
+
+e: E
+match e:
+    case E.A:
+        print(1)
+```
+Expected to be refused with: `is not exhaustive`
+
+**rejected: the wildcard is not last**
+```text
+class E(Enum):
+    A
+
+e: E
+match e:
+    case _:
+        print(1)
+    case E.A:
+        print(2)
+```
+Expected to be refused with: `must be the last arm`
+
+> **The wildcard is not a catch-all for a missing variant** — It is a catch-all for *any* variant not named by an earlier arm. That is why it has to be last: an arm after it could never run.
+
+#### The binding rules
+
+*what a binding may be*
+| A name | case E.V(n): binds n. The name must not start with _: a leading underscore in a binding is a rejection, because a binding that is never read is a mistake worth catching. |
+| --- | --- |
+| A field name | case E.V(port=p): binds p from the struct payload's port field. |
+| A type | the bound name has the variant's declared payload type: int[32] for Line: int[32], int[16] for port. |
+| A name in scope | a binding shadows an outer name of the same name inside the arm body only. |
+
+**rejected: a binding that starts with an underscore**
+```text
+class E(Enum):
+    A: int[32]
+
+e: E
+match e:
+    case E.A(_n):
+        print(1)
+    case _:
+        print(2)
+```
+Expected to be refused with: `LITHON-E0131`
+
+#### What can be matched
+
+The subject of a match must be an enum variable or an enum struct field. It cannot be a function parameter, a list element, or an expression, because match needs a place to read the tag from.
+
+**rejected: matching a non-enum**
+```text
+x: int[64] = 1
+match x:
+    case 1:
+        print(1)
+```
+Expected to be refused with: `its subject must be an enum variable or an enum struct field`
+
+Matching a struct field is the common case, because it is how you dispatch on a protocol or a state stored inside a larger record.
+
+**matching a struct field**
+```text
+class Endpoint(Enum):
+    Empty
+    class Tcp(Struct):
+        port: int[16]
+        addr: int[32]
+    Udp: int[32]
+
+
+class Conn(Struct):
+    proto: Endpoint
+    id: int[64]
+
+
+c: Conn
+c.proto = Endpoint.Udp(53)
+c.id = 7
+match c.proto:
+    case Endpoint.Tcp(port=p, addr=a):
+        print(p)
+    case Endpoint.Udp(n):
+        print(n)
+    case Endpoint.Empty:
+        print(-1)
+print(c.id)
+```
+Output:
+```
+53
+7
+```
+
+#### What match does not do
+
+*refused match shapes*
+| Guards | case E.V if <cond>: is refused: *LITHON-E0131: case ... if <guard> is not supported yet*. Put the condition in the arm body. |
+| --- | --- |
+| Literal patterns | case 1: is refused: the subject has to be an enum, so the arms are variants. |
+| Binding by position | case E.V(a, b): is refused for a struct payload. The fields are named. |
+| Multiple subjects | match a, b: is refused: one subject, one dispatch. |
+| A match as an expression | a match is a statement. It binds names; it does not produce a value. |
+| A non-exhaustive match | refused: every variant must be covered, or a case _: must be present. |
+
+**rejected: a guard**
+```text
+class E(Enum):
+    A
+
+e: E
+match e:
+    case E.A if True:
+        print(1)
+    case _:
+        print(2)
+```
+Expected to be refused with: `is not supported yet`
+
+#### What it lowers to
+
+A match lowers to the same tag-compare chain a hand-written dispatch would be: for each arm, a fieldload of the tag, an equality test, and a branch whose body reads the payload fields it bound. There is no new instruction kind and no enum value flowing through the IR.
+
+That is why a match cannot be a subject for another match, and why the arms are checked in order: the lowered code is a chain, not a table.
+
+- **Enums** — Declaring a tagged union, and its layout.
+- **Control flow** — match next to if, while and for.
+- **Source to machine** — The IR and the machine code behind a match.
+
+---
+
+### Strings
+
+*Bounded strings: str[N] is a fixed-capacity, NUL-terminated byte run. Length is a run-time value, capacity is part of the type.*
+
+URL: https://project-lithon.github.io/Lithon/docs/strings
+
+#### What a Lithon string is
+
+A Lithon string is not a Python str. It is a bounded byte run: str[N] declares N bytes of storage, the bytes are written one at a time, and the run is NUL-terminated. There is no heap, no allocator, and no growth. Capacity is part of the type, exactly like a list's.
+
+**a bounded string**
+```text
+s: str[16] = "hello"
+print(s)
+print(len(s))
+```
+Output:
+```
+hello
+5
+```
+
+> **N is bytes, and the capacity is not the length** — str[16] reserves 16 bytes, not 16 characters: a UTF-8 character can be more than one byte. And len(s) is the run-time byte count of what was written, not the 16 you declared. A str[N] you declared but never filled has length 0.
+
+The frontend lowers a string literal to one IndexStore per byte, so the storage model stays the same as every other container: a run of bytes at a fixed address.
+
+#### Declaring and writing
+
+*string rules*
+| Capacity | str[N] — N bytes of storage. The literal must be shorter than N (the terminator needs a byte). |
+| --- | --- |
+| Length | len(s) is the run-time byte count of the bytes actually written. |
+| Unwritten bytes | read back as 0; the terminator makes the run a C string as far as the OS is concerned. |
+| Indexing | s[i] reads one byte as an int[8]. The byte is signed. |
+| Writing | s[i] = v writes one byte. The right-hand side must be a single int[8]-sized value. |
+| Comparison | s == t compares the byte runs. The two runs may have different capacities. |
+| Element type | a str[N] may be a list element, a tuple element, a struct field, or a pointer pointee. |
+
+Because a string is just a byte run, it can live inside a struct, inside a list, or behind a pointer, and the same rules apply to it as to any other fixed-capacity buffer.
+
+**a string as a struct field**
+```text
+class Header(Struct):
+    kind: str[8]
+    version: int[16]
+
+h: Header
+h.kind = "HTTP"
+h.version = 11
+print(h.kind)
+print(h.version)
+```
+Output:
+```
+HTTP
+11
+```
+
+#### The three string methods
+
+There are exactly three things you can do with a str[N] beyond reading and writing it. They are the whole string API.
+
+*the string surface*
+- **s.find(sub)** — The lowest byte index where sub occurs in s, or -1 when it does not occur. An empty needle returns 0.
+- **s.count(sub)** — How many non-overlapping occurrences of sub are in s. An empty needle returns len(s) + 1.
+- **parts: list[str[K], M] = s.split(sep)** — Splits s on every occurrence of sep and writes the pieces into a declared list[str[K], M]. A piece longer than K - 1 bytes is truncated; more than M pieces is a runtime trap. The piece count becomes the list's live length.
+
+**find and count**
+```text
+s: str[32] = "hello world"
+print(s.find("world"))
+print(s.find("zzz"))
+print(s.count("l"))
+```
+Output:
+```
+6
+-1
+2
+```
+
+**split writes into a declared list**
+```text
+s: str[32] = "a,b,c"
+parts: list[str[8], 4] = s.split(",")
+print(parts[0])
+print(parts[2])
+```
+Output:
+```
+a
+c
+```
+
+> **split is an assignment, not a statement** — s.split(",") on its own line is refused: it has to be the initializer of a declared list[str[K], M], because the split writes into the destination rather than returning a value. s.split() with no argument, and s.split("") with an empty separator, are refused too.
+
+#### Printing a string
+
+print(s) writes the bytes of the run. There are no quotes around it, because a string is a byte run and not a Python object with a repr.
+
+*print a string vs print a list of strings*
+#### a bare string
+```text
+s: str[8] = "hi"
+print(s)
+```
+Output:
+```
+hi
+```
+#### a list of strings
+```text
+xs: list[str[8], 2] = ["hi", "yo"]
+print(xs)
+```
+Output:
+```
+['hi', 'yo']
+```
+
+A list of strings prints in the container repr form, with quotes, because a list is a composite value and the reader needs to see the element boundaries. A bare string does not.
+
+#### Strings and pointers
+
+A str[N] can be the pointee of a pointer, which is how you hand a buffer to a syscall that reads or writes it.
+
+**a string behind a pointer**
+```text
+s: str[16] = "ping"
+_p: ptr[str[16]] = addressof(s)
+print(valueof(_p))
+```
+Output:
+```
+ping
+```
+
+> **One restriction worth knowing** — A str field reached through a pointer is refused: valueof(_p).kind where kind is a string field is rejected with *a bounded string field is reached through its struct variable, not through a pointer into the struct*. The string can be the pointee of the pointer directly, but not a string-typed field of a struct the pointer points at.
+
+#### What strings cannot do
+
+*refusals*
+| Concatenation | c: str[16] = a + b is refused: *a str is built from a string literal, so c: ... = <expr> needs "...", not a single expression*. There is no + on strings. |
+| --- | --- |
+| Slicing | s[1:3] is refused: only a single byte index is supported. |
+| A bare str literal in a container literal | xs: list[str[8], 2] = ["a", "b"] works in the engine, but the standalone checker answers unknown type 'list': it does not know the container types yet. |
+| Whitespace splitting | s.split() is refused: the separator is mandatory. |
+| An empty separator | s.split("") is refused, exactly as Python refuses it. |
+| A str function parameter | a string cannot be passed to a function: *a str function parameter is not yet a string place*. Strings are addressed, not passed. |
+
+#### Where to go next
+
+- **Containers** — The other fixed-capacity runs: list, tuple, dict.
+- **Pointers** — Raw addresses, addressof/valueof, and the _ naming rule.
+- **Structs** — Packed storage, and how a str[N] field is laid out.
+- **Networking** — Using strings and pointers together for real socket calls.
+
+---
+
+### Networking
+
+*Real sockets from raw syscalls: a TCP loopback round trip checked against a C oracle, and the byte-order obligation that comes with it.*
+
+URL: https://project-lithon.github.io/Lithon/docs/networking
+
+#### The premise: a pointer is a real address
+
+Networking in Lithon is not a library. It is syscall with a pointer, and the reason that works is a specific design decision: a pointer argument to a syscall is a real host address in both tiers. The interpreter does not emulate a synthetic address space; it hands the kernel the actual address of the variable.
+
+> **This is the payoff of the storage model** — Because a struct is a packed blob at a known address and a pointer to it is a real address, the kernel can read and write Lithon's memory directly. A bind() that fills the port back into your struct is not a simulation of a kernel: it is the kernel.
+
+The shipped test is tests/net/loopback.lio, and tools/check_net_loopback.py compiles a C program (tests/net/loopback_oracle.c) that issues the identical syscalls, then requires the two programs to print the same lines. A C oracle rather than the interpreter, because sockets are stateful and external: both Lithon tiers could be wrong in the same way, and the C program is not.
+
+#### The syscall primitive
+
+syscall(n, a1, ..., a6) issues Linux syscall number n and returns the kernel's return value as an int[64]. It is unchecked: a negative result is the kernel's -errno, and Lithon does not turn it into a trap.
+
+*argument kinds*
+- **int[64]** — a scalar argument. The kernel sees the value itself, passed in a register.
+- **ptr[T]** — a real host address. The kernel reads and writes exactly the bytes the language does. This is what makes a sockaddr or a buffer work.
+- **float[64]** — refused: *floats and aggregates are not passed by value*. A syscall that takes a float is not reachable from Lithon.
+
+**socket(AF_INET, SOCK_STREAM, 0)**
+```text
+srv: int[64] = syscall(41, 2, 1, 0)
+print(srv > 0)
+```
+Output:
+```
+True
+```
+
+> **Six arguments, no more** — The kernel's ABI has six argument registers. syscall takes at most six arguments, and the frontend refuses a seventh rather than silently dropping it.
+
+#### The loopback round trip
+
+The shipped test does a full TCP round trip in one process: a server socket binds to 127.0.0.1 on an ephemeral port, listens, and accepts; a second socket connects back; the client sends an int[64] and the accepted connection receives it.
+
+**tests/net/loopback.lio (excerpt)**
+```text
+class SockAddrIn(Struct):
+    lo: int[64]
+    hi: int[64]
+
+
+class Buf(Struct):
+    v: int[64]
+
+
+sa: SockAddrIn
+sa.lo = 2 | (swap32(2130706433) << 32)
+sa.hi = 0
+_sa: ptr[SockAddrIn] = addressof(sa)
+
+socklen: int[64] = 16
+_psocklen: ptr[int[64]] = addressof(socklen)
+
+# socket(AF_INET=2, SOCK_STREAM=1, 0)
+srv: int[64] = syscall(41, 2, 1, 0)
+
+# bind(srv, &sa, sizeof(sockaddr_in))
+print(syscall(49, srv, _sa, 16))
+
+# listen(srv, backlog=1)
+print(syscall(50, srv, 1))
+```
+Output:
+```
+0
+0
+```
+Source: `tests/net/loopback.lio`
+
+**the round trip (excerpt)**
+```text
+class Buf(Struct):
+    v: int[64]
+
+
+out: Buf
+out.v = 123456789
+inb: Buf
+inb.v = 0
+_pout: ptr[Buf] = addressof(out)
+_pin: ptr[Buf] = addressof(inb)
+
+# sendto(cli, &out, 8, 0, NULL, 0) == 8 bytes
+print(syscall(44, cli, _pout, 8, 0, 0, 0))
+# recvfrom(conn, &in, 8, 0, NULL, NULL) -> 8, and the bytes land in inb.
+print(syscall(45, conn, _pin, 8, 0, 0, 0))
+print(inb.v)
+```
+Output:
+```
+8
+8
+123456789
+```
+Source: `tests/net/loopback.lio`
+
+The getsockname call is the proof that the address is real: the kernel writes the chosen port back into the very bytes you handed it.
+
+**getsockname writes the port back (excerpt)**
+```text
+socklen: int[64] = 16
+_psocklen: ptr[int[64]] = addressof(socklen)
+
+# getsockname(srv, &sa, &socklen): the kernel writes the real port back into the
+# very bytes we handed it, which only works because the address is real memory.
+print(syscall(51, srv, _sa, _psocklen))
+print(socklen)
+```
+Output:
+```
+0
+16
+```
+Source: `tests/net/loopback.lio`
+
+#### The byte-order obligation
+
+A sockaddr_in is network byte order. A Lithon int[64] is little-endian. The mismatch is your problem to solve, and the test solves it with a three-line swap.
+
+**the byte swap**
+```text
+def swap32(v: int[64]) -> int[64]:
+    return ((v & 255) << 24) | ((v & 65280) << 8) | ((v >> 8) & 65280) | ((v >> 24) & 255)
+```
+Source: `tests/net/loopback.lio`
+
+> **The failure is silent, and the test proves it** — The same address without the swap is still a perfectly good 32-bit number. Nothing crashes: its bytes just name 1.0.0.127 instead of 127.0.0.1, and bind fails with EADDRNOTAVAIL (-99). A happy-path connect alone would not have shown this, so loopback.lio deliberately makes the failure explicit at the end.
+
+**the explicit failure (excerpt)**
+```text
+class SockAddrIn(Struct):
+    lo: int[64]
+    hi: int[64]
+
+
+bad: SockAddrIn
+bad.lo = 2 | (2130706433 << 32)
+bad.hi = 0
+_bad: ptr[SockAddrIn] = addressof(bad)
+badfd: int[64] = syscall(41, 2, 1, 0)
+print(syscall(49, badfd, _bad, 16) < 0)
+print(syscall(3, badfd))
+```
+Output:
+```
+True
+0
+```
+Source: `tests/net/loopback.lio`
+
+#### The syscall numbers used
+
+*Linux x86-64 syscall numbers*
+- **41 — socket(domain, type, protocol)** — returns the file descriptor
+- **42 — connect(fd, addr, len)** — the client side
+- **43 — accept(fd, addr, len)** — the server side
+- **44 — sendto(fd, buf, len, flags, addr, alen)** — send
+- **45 — recvfrom(fd, buf, len, flags, addr, alen)** — receive
+- **49 — bind(fd, addr, len)** — the server side
+- **50 — listen(fd, backlog)** — the server side
+- **51 — getsockname(fd, addr, len)** — asks the kernel for the bound address
+- **3 — close(fd)** — release the descriptor
+
+> **These numbers are Linux x86-64 specific** — The syscall ABI is per-architecture. The numbers above are the x86-64 Linux ones; on another platform the same operation has a different number. Windows uses a completely different mechanism, so a Lithon program that issues Linux syscall numbers only runs on Linux.
+
+#### What is not there
+
+*no socket library, and that is deliberate*
+| A socket type | there is none. A socket is an int[64] file descriptor. |
+| --- | --- |
+| A bind/listen function | there is none. These are syscall(49, ...) and syscall(50, ...). |
+| An import | there is none. std/ is a sketch, not a module system. |
+| A DNS resolver | there is none. getaddrinfo would need a string API the language does not have. |
+| A struct for sockaddr_in | you write it yourself, packed to match the kernel's layout. |
+| Cross-platform support | none. The syscall numbers are Linux x86-64. |
+
+- **Syscalls** — The primitive itself: argument kinds, and what the two tiers agree on.
+- **Pointers** — Why a pointer to a struct is a real address.
+- **Structs** — Packed layout, so your sockaddr_in matches the kernel's.
+- **Strings** — Bounded byte runs, for the buffers you hand the kernel.
+
+---
+
+## Inside the engine
+
+Dual tiers, verification, SSA, optimization, SIMD.
+
+### Engine architecture
+
+*Four layers from .lio source to executable memory: frontend, IR, verifier, encoder.*
+
+URL: https://project-lithon.github.io/Lithon/docs/architecture
+
+#### The four layers
+
+Lithon's native tier is a stack of small, independently checkable layers. Python appears at exactly one step; everything downstream of IR is C++ that never touches CPython.
+
+- **1 · Frontend** — src/frontend/frontend.py: parses .lio, runs the extended PEP-526 checks, emits text IR. Pure Python, no engine needed.
+- **2 · IR text format** — Typed, SSA-shaped text. Parsed inside the engine, so the native tier has no Python dependency of any kind.
+- **3 · Verifier** — SSA construction, dominance, liveness, register allocation. Anything unprovable is refused before a byte is emitted.
+- **4 · Encoder** — Hand-rolled x86-64 bytes written straight into PROT_READ | PROT_EXEC memory (mmap on Linux, VirtualAlloc on Windows) and called through a function pointer.
+
+> **No LLVM, no Cranelift, no runtime package** — The entire backend is C++20 with zero third-party dependencies. GNU as appears in exactly one place: the encoder verification harness, and never in the build.
+
+#### A walk-through: arithmetic
+
+The regression corpus's smallest program, all the way down. Source on the left of your memory, machine code at the bottom:
+
+**tests/programs/arithmetic.lio**
+```text
+x: int[64] = 10
+y: int[64] = 20
+z: int[64] = x + y
+print(z)
+print(x - y)
+print(x * y)
+```
+Output:
+```
+30
+-10
+200
+```
+Source: `tests/programs/arithmetic.lio`
+
+The IR stores and reloads x/y because the frontend emits a memory-shaped IR on purpose, that is the input the SSA pass (Mem2Reg) consumes, promoting provable slots into registers. What survives to the encoder after optimization is register-shaped, not stack-shaped.
+
+#### Calling conventions
+
+*ABI support*
+| SysV (Linux/macOS) | implemented and audited on every host |
+| --- | --- |
+| Win64 | implemented behind #if defined(_WIN32): no test evidence yet |
+| Stack alignment | 16-byte at call sites, audited by check_stack_alignment.py |
+| Callee-saved | RBX, RBP, R12–R15 preserved; caller-saved reused freely |
+
+> **Win64 is implemented but unproven** — The path exists and compiles, but the 23-module ABI audit runs on SysV hosts. Treat Win64 as experimental until it has its own evidence.
+
+#### Where to go next
+
+- **Source to machine** — The four artifacts one program produces, end to end.
+- **Registers & ABI** — The register file and the calling discipline.
+- **Instruction encoding** — Why the encoder is hand-rolled, and how it is proven.
+- **Verification** — How the claims on this page get checked.
+
+---
+
+### Dual-tier execution
+
+*Tier-1 emits native x86-64 for what is proven; Tier-0 interprets the rest; --strict refuses instead of falling back.*
+
+URL: https://project-lithon.github.io/Lithon/docs/dual-tier
+
+#### Tier-1: the native lane
+
+Every IR block whose types are provably static is compiled by the backend into x86-64 and written into executable memory. There are no runtime type checks, no guards, and no boxing on this path: the verifier already did that work, once, at compile time.
+
+**forcing the native lane**
+```bash
+$ lithon tests/programs/float.lio --strict
+[tier1] native
+0.3333333333333333
+```
+*[tier1] native goes to stderr; program output goes to stdout. Under --strict, exit 0 means the native tier really ran.*
+
+#### Tier-0: the honest fallback
+
+A C++ interpreter over the same IR. It exists so that a program the native tier cannot yet prove still runs: same source, same IR, same output. It is a real implementation, not a debug printer: run_tier_diff.py requires both tiers to agree byte for byte on stdout and stderr.
+
+In automatic mode, tier_runner tries Tier-1 first and falls back to Tier-0 with a message on stderr. This keeps the demo honest: you always know which lane ran.
+
+#### --strict turns fallback into refusal
+
+With --strict, a Tier-0 fallback is a failure, not a quiet slowdown. This is the switch the entire test suite leans on: without it, "the program printed the right number" could mean the interpreter carried the whole run.
+
+**terminal**
+```bash
+$ lithon program.lio --strict        # native only, refuse to fall back
+$ ./build/tier_runner prog.ir --strict   # same thing, two-step form
+```
+
+> **The discipline in one line** — Green + --strict = the native backend compiled and executed this program. There is no other way to exit 0.
+
+#### run_tier_diff.py: the cross-check
+
+The highest-value script in the repo. It runs every regression program through both tiers and requires identical stdout, then reports which tier actually ran:
+
+**terminal**
+```bash
+$ python3 tools/run_tier_diff.py
+… every program: both tiers agree …
+```
+
+A green run cannot hide "everything silently fell back to the interpreter", because the report says which tier ran each program.
+
+---
+
+### The type checker
+
+*Static analysis over Python's AST: the unconditional gate every module passes before anything runs.*
+
+URL: https://project-lithon.github.io/Lithon/docs/typechecking
+
+#### Unconditional, on every module
+
+tools/typecheck.py is static analysis over Python's ast: no execution, no imports evaluated. It runs whether the module annotates anything or not: an unannotated program is not "unchecked", it is invalid.
+
+**terminal**
+```bash
+$ python3 tools/typecheck.py program.lio
+$ echo $?
+0
+```
+
+> **Two checkers, one frontend** — The frontend (src/frontend/frontend.py) lowers to IR; the checker (tools/typecheck.py) is the gate. CI runs the checker unconditionally on every program: check_typecheck_unconditional.py enforces that no suite is allowed to skip it.
+
+#### What it enforces
+
+*The 0.6 series*
+| 0.6.1 | every first assignment, parameter, and return carries an explicit annotation |
+| --- | --- |
+| 0.6.4 | re-assignment is checked against the already-declared type |
+| 0.6.5 | integer literal overflow, and provable-range overflow for binary ops, are compile-time errors |
+| 0.6.8 | function contracts: parameters and return type mandatory and checked; call sites checked against the signature; declared return must be provably wide enough: never auto-widened |
+| 0.6.9 | print() is a fixed built-in, not a user function |
+| 0.6.10 | definite assignment + type agreement across if/else branches (function scoping, not block scoping) |
+| 0.6.11 | conversions: widening/same-width automatic, narrowing never; int→float automatic, float→int never; no cast syntax anywhere; int literal is not a float |
+| 0.6.12 | range()'s produced values are checked against the loop variable's declared width at compile time when known |
+
+Bitwise and shift operators (<<, >>, &, |, ^) are integer-only and not part of the arithmetic promotion rule: 2.5 & 1 is a type error, because Lithon has no float bit pattern to reinterpret. Their result takes the left operand's width. A literal shift count must be 0..63: the machine word is 64 bits and x86 masks the count to 6 bits, so a count of 64 would silently execute as 0.
+
+#### Reading an RCR error
+
+**a real diagnostic, annotated**
+```text
+x = 10
+print(x)
+```
+Expected to be refused with: `without ever being declared with a type annotation`
+
+Every diagnostic carries the failing construct, the name or expression at fault, the spec section (V1_SPEC 0.6.x) that makes it an error, and: where one exists: the spelling that would have been accepted. The full code table lives in Errors (/docs/errors).
+
+---
+
+### Optimizer & SSA pipeline
+
+*Mem2Reg, dominance, phi placement, liveness, and register allocation: each pass switchable so effects are measured, not assumed.*
+
+URL: https://project-lithon.github.io/Lithon/docs/pipeline
+
+#### Every pass is switchable, and measured
+
+Register allocation and liveness are shipped and tested, and so is a set of optimizations that can each be switched off individually, so their effect is measured rather than assumed:
+
+*Measured against HEAD, one pass at a time*
+| Strength-reduced multiplies | optimize.h · nested 1.062× |
+| --- | --- |
+| Accumulator unroll (opt-in) | optimize.h · float reduction 1.58× · 95.8 → 60.5 ms |
+| Callee-saved borrowing | register_alloc.h · fib 1.063× |
+| Mem2Reg + SSA copy resolution | ssa.h · 29 loads · 20 stores removed |
+| Diamond unrolling (opt-in) | 1.10× slower, kept behind --unroll-diamonds |
+
+#### The SSA conversion, phase by phase
+
+The IR keeps mutable variables in memory: a variable is written by a Store and read by a Load, so promotion means turning those into values that live in registers. The conversion is done one switchable phase at a time:
+
+*SSA phases · all shipped*
+| 2.1 | CFG, Cooper-Harvey-Kennedy dominators, natural loops, preheaders, latches, exits · loop_info.h |
+| --- | --- |
+| 2.2 | Phi placement by iterated dominance frontier · ssa.h |
+| 2.3 | Mem2Reg: promote, place phis, rewrite the memory traffic away · ssa.h |
+| 2.4 | SSA copy propagation, dead-value elimination, then resolve_phis() · optimize.h |
+| 2.5 | Phi copies as register moves instead of a memory round-trip · register_alloc.h |
+| 2.6 | Dedicated loop-exit blocks where the exit edge is genuinely shared · loop_info.h |
+| 2.7 | CFG liveness and interference-graph allocation · liveness.h |
+| 2.8 | Register coalescing: a merge adopts its source's dead register · both halves |
+
+> **One decision in there is load-bearing** — Promotion is gated on a *must*-analysis that iterates down from "everything", converging on the greatest fixpoint. Iterating upward from nothing makes ordinary loop accumulators silently un-promotable forever. Anything the analysis cannot prove stays in memory, and vars_declined reports it.
+
+The Phase I page (/roadmap/phase-1-dual-tier) walks through all eight phases with the reasoning behind each, including why register coalescing honestly deletes five merges across the typed regression corpus and not more.
+
+#### One IR, both tiers
+
+The SSA work happens on the same IR text the interpreter consumes. Optimizations that would change observable behaviour are refused rather than approximated, that is what lets run_tier_diff.py compare the two tiers byte for byte even when Tier-1 has run the full optimizer and Tier-0 has run none of it.
+
+---
+
+### SIMD auto-vectorization
+
+*8-wide AVX2 over int[32] lists, with a CPUID gate, a scalar tail, and the untouched scalar path as fallback.*
+
+URL: https://project-lithon.github.io/Lithon/docs/simd
+
+#### What the vectorizer does
+
+The native backend can fuse a canonical elementwise or reduction loop over a fixed-capacity int[32] list into 8-wide AVX2 lanes. The compiler recognizes the range-loop shape the while/for lowering produces: a small rotatable header (i < N), a straight-line body with a single element read/write and one integer op, and an i = i + 1 latch, and replaces it with:
+
+- **CPUID gate** — A has_avx2() check, read from an int32 constant pool appended to the module.
+- **8-wide vector main loop** — vmovdqu / vpaddd | vpsubd | vpmulld over N - N%8 elements. Reductions run a vpxor + vextracti128 + vpshufd halving merge.
+- **Scalar tail** — The last N%8 elements run scalar.
+- **Scalar fallback** — The untouched scalar header remains, so on any host without AVX2 the exact scalar code path still runs.
+
+#### Why it is exact
+
+*Correctness properties*
+| Verified bytes | vector slices are byte-for-byte what the encoder emits; check_encoder_vs_as.py verifies them |
+| --- | --- |
+| 32-bit lanes only | only int[32] lists vectorize, so no wider-than-lane math can be reordered into a different overflow |
+| Reduction accumulator checked | recognized only when the accumulator really is int[32]: verified from IR width annotations |
+| vzeroupper discipline | emitted before any Call or Return in a function that used the vector path: audited by check_vex_transitions.py |
+| Escape hatches | --no-vectorize disables the pass; it also needs loop rotation, so --no-rotate disables it too |
+
+> **The vectorizer refuses rather than guesses** — A loop the recognizer cannot prove safe is left scalar. There is no "probably fine" vector path: the same refuse-over-guess rule as the rest of the engine.
+
+#### Status
+
+| SIMD vectorizer loop cases | 6 / 6 passed |
+| --- | --- |
+| SIMD vectorizer gate + fallback | verified |
+| AVX-512 | not emitted, Phase III |
+
+CPU feature detection is cross-checked against the kernel rather than trusted to CPUID, so the AVX and AVX-512 gates cannot mis-detect. No AVX-512 is emitted yet, but the gating and the VEX transition scanner are already in place underneath it.
+
+---
+
+## Reference
+
+Errors, builtins, verification gate, honest limits.
+
+### Errors & diagnostics
+
+*The LITHON-E code family: static refusals, environmental failures, and dynamic traps: with real diagnostics.*
+
+URL: https://project-lithon.github.io/Lithon/docs/errors
+
+#### The code families
+
+Every failure carries a LITHON-Ennnn code. The first digit is the tier the failure belongs to: the same numbering the runtime uses to decide refuse-vs-trap:
+
+*from docs/whitepaper.md*
+| E01xx: tier 1 · static refusal | compile-time, the program never runs |
+| --- | --- |
+| E02xx: tier 2 · environmental | the environment failed the program, not the program itself |
+| E03xx: tier 3 · dynamic arithmetic/logic trap | runtime, per-operation |
+| E04xx: tier 3 · dynamic resource trap | runtime, resource exhaustion |
+
+*the full code table*
+| E0101, 1 (static refusal) | Overflow on reassignment |
+| --- | --- |
+| E0102, 1 (static refusal) | Literal zero divisor |
+| E0103, 1 (static refusal) | Literal shift out of range |
+| E0104, 1 (static refusal) | Literal-provable capacity overflow |
+| E0105, 1 (static refusal) | Unsupported type width |
+| E0106, 1 (static refusal) | float(64, x) of int[64] refused: lossy, 53 bits cannot hold every int[64] |
+| E0107, 1 (static refusal) | range(a, b, 0) with a literal zero step |
+| E0108, 1 (static refusal) | Unsupported type-annotation form |
+| E0109, 1 (static refusal) | Unknown or badly-sized annotation type name |
+| E0110, 1 (static refusal) | Annotation missing a required field |
+| E0111, 1 (static refusal) | Bad container capacity / literal count / str[N] capacity or literal length |
+| E0112, 1 (static refusal) | Container element must be a plain scalar |
+| E0113, 1 (static refusal) | Pointer (ptr[T]) declaration rules |
+| E0114, 1 (static refusal) | Unsupported or restricted program construct -- the catch-all: an operator that does not exist, a try/except shape that is not allowed, a string literal used where a value is needed |
+| E0115, 1 (static refusal) | Unsupported builtin call form |
+| E0116, 1 (static refusal) | Builtin argument rules (valueof/addressof/wrap_*) |
+| E0117, 1 (static refusal) | Indexing / container-subscript restrictions |
+| E0118, 1 (static refusal) | else clause on a while/for loop |
+| E0119, 1 (static refusal) | for-loop form restrictions |
+| E0120, 1 (static refusal) | break/continue outside a loop |
+| E0121, 1 (static refusal) | Assignment / target restrictions |
+| E0122, 1 (static refusal) | Declaration and re-declaration rules (including the _ prefix rule for pointers) |
+| E0123, 1 (static refusal) | Tuple/dict literal shape |
+| E0124, 1 (static refusal) | Function-header restrictions |
+| E0125, 1 (static refusal) | Pointer arithmetic form |
+| E0126, 1 (static refusal) | Struct definition (must derive from Struct; fields are annotations only) |
+| E0127, 1 (static refusal) | Struct field type (int[w]/float[64]/bool or an earlier struct; no containers/pointers) |
+| E0128, 1 (static refusal) | Struct field access (unknown field, a whole struct used where a value is needed, or a str field reached through a pointer into the struct) |
+| E0129, 1 (static refusal) | Enum definition (must derive from Enum; variants are bare unit names, payload annotations, or inline class V(Struct)) |
+| E0130, 1 (static refusal) | Enum variant construction (unknown variant, wrong payload shape, unknown/missing/duplicate struct-payload field) |
+| E0131, 1 (static refusal) | match on an enum (bad subject/pattern, non-exhaustive, a guard, a wildcard that is not last, or an enum used where a value is needed) |
+| E0132, 1 (static refusal) | Type-function definition (-> NewType): bad signature, a body that is not a one-element { T }, a duplicate name, or a name colliding with a runtime function/struct/enum |
+| E0133, 1 (static refusal) | Type-function application: an unknown callee, keyword/starred arguments, an arity mismatch, or a recursive expansion |
+| E0134, 1 (static refusal) | Method definition (a def in a struct/enum body): a decorator, //*/**/defaults, a missing or annotated self, a non-scalar parameter/return, a duplicate name, or a name colliding with a field or variant |
+| E0135, 1 (static refusal) | Method application: an unknown method, a field where a method is called, a non-struct/enum receiver, an arity mismatch, a recursive inline, or a method with no result used as a value |
+| E0201, 2 (environmental) | Fallible value read before .ok check -- designed, not built: fallible[T] does not exist yet |
+| E0301, 3 (dynamic trap) | Division by zero: shipped |
+| E0302, 3 (dynamic trap) | Modulo by zero: shipped |
+| E0303, 3 (dynamic trap) | Dynamic integer overflow: shipped, wrap_* opt-out |
+| E0304, 3 (dynamic trap) | Shift amount out of range: shipped |
+| E0305, 3 (dynamic trap) | Dynamic index/capacity out of range: shipped for list, dict TBD |
+| E0306, 3 (dynamic trap) | Invalid integer literal in input |
+| E0307, 3 (dynamic trap) | Input value outside the target width |
+| E0308, 3 (dynamic trap) | End of input |
+| E0309, 3 (dynamic trap) | Float-to-int conversion out of range or not finite |
+| E0310, 3 (dynamic trap) | range(a, b, step) with step == 0, dynamic |
+| E0401, 3 (resource trap) | Stack overflow: shipped, 4096-depth shared counter, byte-identical in both tiers |
+
+> **the tier digit is the contract** — The first digit after E is not decoration: it says whether the failure was knowable before the program ran. A tier-1 code is a refusal -- the program never started. A tier-3 code is a trap -- the program started, and stopped at a specific operation. try/except can only catch tier-3 traps, because a tier-1 refusal has no program to catch it in. Every code the source uses must be listed in docs/whitepaper.md; tools/check_error_codes.py fails the build otherwise.
+
+#### Static refusal vs dynamic trap
+
+The split is the point: overflow the verifier can prove at compile time is E0101, a refusal: the program never runs. Overflow only visible at run time is E0303, a trap: checked per operation in both tiers, identically.
+
+**the same operation, two verdicts**
+```text
+x: int[64] = 9223372036854775807
+x = x + 50    # provable at compile time: a refusal, not a runtime event
+
+b: int[64] = int(64, input("n: "))   # unknown until run
+c: int[64] = b + 50                   # Tier-3 trap (E0303) iff it overflows
+```
+
+> **E0303 and E0401 are shipped** — Dynamic-overflow trapping for Add/Sub/Mul (E0303) is shipped, with wrap_add/wrap_sub/wrap_mul as the explicit opt-out, and the stack-depth guard (E0401) is shipped: both tiers bump a shared call-depth counter and trap at depth 4096 byte-identically. E0301/E0302/E0304 and list E0305 are shipped too.
+
+#### RCR diagnostics from the checker
+
+The type checker's own diagnostics (RCR error:) are a separate family: they fire before any LITHON-E code could apply. Every one names the construct, the offending binding, the spec section, and the fix:
+
+**annotation missing**
+```text
+x = 10
+print(x)
+```
+Expected to be refused with: `without ever being declared with a type annotation`
+
+**narrowing**
+```text
+wide: int[64] = 5
+narrow: int[8] = wide
+print(narrow)
+```
+Expected to be refused with: `cannot narrow`
+
+**use before assignment**
+```text
+i: int[8]
+print(i)
+```
+Expected to be refused with: `never assigned a value`
+
+#### Both tiers trap identically
+
+run_tier_diff.py compares stderr byte for byte, so a trap message that differed between Tier-0 and Tier-1 would fail the suite. The trap text is part of the contract, not a debugging courtesy.
+
+**terminal**
+```bash
+$ lithon div_zero.lio            # dynamic divisor
+error: division by zero
+```
+
+Because the message is the same in both tiers, a trap can be caught by name and handled identically either way. The try/except classifier matches on the message text, not on a code, which is why the text is part of the contract.
+
+- **Exceptions & traps** — The seven catchable traps, and the else/finally clauses.
+- **Control flow** — The try statement in the context of the other flow forms.
+
+---
+
+### Built-in functions
+
+*print, len, range, addressof, valueof, contains, enumerate, zip, and the wrap_* family: the whole prelude.*
+
+URL: https://project-lithon.github.io/Lithon/docs/builtins
+
+#### The prelude
+
+Lithon's prelude is deliberately tiny. print() is a fixed built-in, not a user function (V1_SPEC 0.6.9); everything below is checked by name by the type checker and lowered specially by the frontend:
+
+*built-ins*
+| print(x) / print(a, b, c) | write one or more values, space-separated, and a newline: the only output primitive. print() with no arguments writes a bare newline. |
+| --- | --- |
+| len(xs) | the live length of a list/tuple/dict, or the run-time byte count of a str[N]. Carried in a companion slot, so it can change at run time. |
+| range(n) / range(a, b) | loop values, checked against the loop variable's width at compile time when known (0.6.12) |
+| addressof(x) | ptr[T] to a scalar, a str[N], or a struct |
+| valueof(_p) | read the scalar at _p |
+| contains(d, k) | bool: key k present in dict d (constant and runtime keys) |
+| sum(xs) | sum of a list[int[64]|float[64], N]: unrolled over the compile-time length |
+| min(xs) / max(xs) | min/max of a list: unrolled over N, same comparison as CPython |
+| any(xs) / all(xs) | bool OR/AND over a list[bool, N] |
+| abs(v) | scalar absolute value: -v if v < 0 else v, not a list walk |
+| x in xs / x not in xs | bool: OR of x == xs[k] over the compile-time length |
+| int(w, v) | explicit conversion to int[w]: float[64] -> int[w] (E0309 trap if out of range or not finite) |
+| float(64, v) | explicit conversion to float[64] from int[8|16|32]/float[64] (E0106 refusal for a lossy int[64] source) |
+| int(w, input(prompt)) | read int[w] from stdin, optional prompt string (E0306-E0308 traps: bad literal, out of width, end of input) |
+| syscall(n, a1..a6) | raw unchecked syscall; integer or pointer arguments, returns int[64] (-errno on Linux) |
+| wrap_add(a, b) | wrapping integer add: same wrapped value in both tiers |
+| wrap_sub(a, b) | wrapping integer sub |
+| wrap_mul(a, b) | wrapping integer mul |
+
+Two more names are built in, but only in a for header: enumerate(xs) yields (index, value) and zip(xs, ys) yields pairs, stopping at the shortest input. Used anywhere else they are refused, because a general iteration protocol does not exist yet.
+
+**enumerate and zip in a for header**
+```text
+xs: list[int[64], 3]
+ys: list[int[64], 3]
+xs[0] = 10
+xs[1] = 20
+xs[2] = 30
+ys[0] = 1
+ys[1] = 2
+ys[2] = 3
+for i, x in enumerate(xs):
+    print(i)
+for a, b in zip(xs, ys):
+    print(a)
+```
+Output:
+```
+0
+1
+2
+10
+20
+30
+```
+
+Three names behave like methods rather than free functions: xs.append(v) on a list (which never grows the list -- it writes into the next live slot and can only fail with a full list), s.find(sub) / s.count(sub) on a bounded string, and parts: list[str[K], M] = s.split(sep) into a declared destination list.
+
+**print takes several values**
+```text
+a: int[64] = 1
+b: int[64] = 2
+print(a, b, "x")
+```
+Output:
+```
+1 2 x
+```
+
+> **wrap_* is the explicit opt-in** — Provable static overflow of plain +/-/* is a compile error (E0101/E0303-family) that points you at wrap_*. The wrapping result is pinned to be identical across tiers by tools/check_error_codes.py.
+
+- **Containers** — What len, sum and append actually operate on.
+- **Strings** — find, count, split, and the bounded-string model.
+- **Semantics** — Where Lithon deliberately diverges from CPython.
+- **Errors & diagnostics** — The code family, and which of them you can catch.
+
+#### wrap_* in action
+
+**tests/typed_regression/int64_wrap.lio**
+```text
+x: int[64] = 9223372036854775807
+y: int[64] = 1
+z: int[64] = wrap_add(x, y)
+print(z)
+```
+Output:
+```
+-9223372036854775808
+```
+Source: `tests/typed_regression/int64_wrap.lio`
+
+#### What is not a built-in
+
+*rejected by name*
+| len() on a scalar | type error: len is a container operation |
+| --- | --- |
+| cast() | does not exist anywhere in the language |
+| user-defined print | rejected: print is reserved as the fixed built-in |
+| bare int/float constructor call, e.g. int(x) | wrong arity: the real form takes an explicit width, int(w, x) / float(64, x) |
+
+---
+
+### Semantics
+
+*Where Lithon deliberately diverges from CPython: modulo, shifts, float traps, truthiness.*
+
+URL: https://project-lithon.github.io/Lithon/docs/semantics
+
+#### % is C's %, not Python's
+
+% truncates toward zero and takes the sign of the dividend: what C, Rust and Java do. CPython uses floor-division semantics; the two disagree on negatives:
+
+**modulo · truncating, like C**
+```text
+print(-7 % 3)
+print(7 % -3)
+```
+Output:
+```
+-1
+1
+```
+*CPython would print 2 and -2. Lithon chose the machine's behaviour.*
+
+A zero divisor traps on both engines (E0301/E0302), and a constant power-of-two divisor is strength-reduced to a mask and a sign fixup.
+
+#### Shifts are 64-bit, count checked
+
+**shifts**
+```text
+print(5 << 63)
+```
+Output:
+```
+-9223372036854775808
+```
+
+Left shifts wrap, because there is no wider type to widen into. A count outside 0..63 is refused: at compile time for a literal (RCR, V1_SPEC 0.6.11), at run time otherwise (E0304). 2.5 & 1 is a type error: there is no float bit pattern in Lithon to reinterpret.
+
+#### Float traps like Python, not like IEEE
+
+Floats are implemented end to end in SSE2, and one formatter serves both tiers, so their output agrees byte for byte. Three trap rules matter:
+
+| division by zero | traps like Python's ZeroDivisionError, not IEEE inf/nan |
+| --- | --- |
+| NaN divisor | must not trap, Python propagates NaN |
+| -0.0 divisor | must trap: it compares equal to 0.0 |
+
+> **The ZF AND !PF problem** — comisd sets ZF for both "equal" and "NaN", distinguishable only with PF. The backend handles this explicitly; the language page (/roadmap/language) has the full list.
+
+#### No truthiness, no chaining
+
+| if x: with x: int | type error: a condition must be bool |
+| --- | --- |
+| and / or on non-bool | type error |
+| chained comparison a < b < c | not supported |
+| for/else | rejected, never silently dropped |
+
+A trap raised by any of the rules above can be caught by name with try/except -- see Control flow (/docs/control-flow#try-except) for the catchable set. A static refusal cannot: it happens before the program exists to catch it.
+
+#### Where to go next
+
+- **Errors & diagnostics** — Every code, and which tier it belongs to.
+- **Built-in functions** — The whole prelude, one row per name.
+- **Control flow** — if / while / for, and try/except.
+- **Honest limits** — What does not work yet, stated plainly.
+
+---
+
+### Verification
+
+*The numbers behind the claims: 33/33 CTest, 18,379 encoder cases with 0 wrong, both tiers byte-identical.*
+
+URL: https://project-lithon.github.io/Lithon/docs/verification
+
+#### Current verification highlights
+
+*from README.md: run it yourself, don't trust it*
+| CTest | 33 / 33 passed |
+| --- | --- |
+| x86-64 encoder comparisons | 18,379 cases |
+| Incorrect encoder cases | 0 |
+| Typed differential fuzzing | 300 / 300 passed |
+| Bitwise / shift fuzzing | 200 / 200 passed |
+| Conditional-expression / SSA fuzzing | 200 / 200 per suite |
+| Direct float Phi sweep | 38 matched / 0 mismatched |
+| ABI modules audited | 34 |
+| ABI stack/callee-saved failures | 0 |
+| Typed regression suite | 46 / 46 passed |
+| General regression suite | 34 / 34 passed |
+| Type-checker unit checks | 145 ok |
+| Error-code discipline checks | 86 ok |
+| Tier differential (interp vs JIT) | 168 / 168 passed |
+| Syscall hook parity (both tiers) | 4 / 4 passed |
+| Networking loopback vs a C oracle | verified |
+| SIMD vectorizer loop cases | 6 / 6 passed |
+| SIMD vectorizer gate + fallback | verified |
+
+> **The gate concludes** — bash tools/verify_all.sh runs the whole stack and ends with ALL CHECKS PASSED or it does not pass.
+
+> **Where the corpus lives** — The general suite is tests/programs/ (34 programs), the typed suite is tests/typed_regression/ (46 programs), and the negative suite is tests/typed_programs/ (22 programs the checker must reject). Every one has a pinned expected-output file, and the tier differential runs the whole corpus through both engines and requires byte-identical stdout.
+
+#### Encoder vs GNU as
+
+The hand-written x86-64 encoder is compared against GNU as, instruction by instruction. A byte difference is not automatically an error: x86-64 often has multiple valid encodings, so the harness decodes and classifies:
+
+**tools/check_encoder_vs_as.py**
+```text
+9239 instruction cases
+7949 byte-identical
+1290 different but valid encodings
+0 incorrect encodings
+
+WRONG = 0
+```
+
+The only number that matters is WRONG = 0.
+
+> **Two numbers, two moments** — The README quotes both figures: 18,379 is the size of the case corpus, and the 9,239 / 7,949 / 1,290 block is a snapshot of one run of the classifier over the cases exercised at that time. Neither is a claim about correctness — the claim is WRONG = 0.
+
+#### Work outward, stop where you are satisfied
+
+Each layer is roughly an order of magnitude slower than the one above it, which is what makes running all of them reasonable rather than aspirational:
+
+**the full gate**
+```bash
+$ ctest --test-dir build --output-on-failure      # 33/33
+$ python3 tools/run_regression.py                # general suite
+$ python3 tools/run_typed_regression.py          # typed suite
+$ python3 tools/run_tier_diff.py                 # both tiers, byte-identical
+$ bash tools/verify_all.sh                       # ALL CHECKS PASSED
+```
+
+**layer 3 · per-shape differential fuzzing**
+```bash
+$ python3 tools/fuzz_diff.py --count 300             # general
+$ python3 tools/fuzz_diff.py --count 300 --floats    # int/float mixes
+$ python3 tools/fuzz_diff.py --count 300 --bitwise   # & | ^ << >>, RCX hazard
+$ python3 tools/fuzz_diff.py --mod-negatives --count 300
+$ python3 tools/fuzz_diff.py --phi --count 300        # merges, with and without --ssa
+```
+
+> **What a green run does not prove** — Opcode coverage is not operand coverage. All 55 IR opcodes are emitted and exercised, but that does not prove every operand shape is right: Mod is the standing example: the general fuzzer only emits finite constants, so it cannot generate 1.0 % inf, which was returning NaN natively while the interpreter was correct.
+
+#### The headline benchmark
+
+*fib(30), from benchmarks/results/latest.json*
+| CPython 3.12 | 1731.0983 ms |
+| --- | --- |
+| Lithon native | 10.3053 ms |
+| Speedup | 168.0× |
+| Result | 832040: identical on both |
+
+The file is written by the benchmark bot in CI (.github/workflows/lithon-report-mamba.yml), which also keeps one snapshot per commit under benchmarks/results/history/. The numbers above are the current latest.json; the table is regenerated rather than hand-edited.
+
+Benchmarks are the weakest form of evidence: they prove speed, not correctness. The suites above are what prove correctness; the benchmark is what the correctness buys you.
+
+---
+
+### Honest limits
+
+*The gaps as they stand: no closures, no stdlib, no float promotion on merges, Win64 unproven, x86-64 only.*
+
+URL: https://project-lithon.github.io/Lithon/docs/limits
+
+#### The gaps
+
+A green test run covers the supported subset and should not be mistaken for a finished language. These are the gaps as they stand today:
+
+| IR opcodes emitted | 55 of 55 |
+| --- | --- |
+| Phi | emitted on the incoming edges; a direct-Phi native path also exists and is tested |
+| arguments per function / call | two in registers, the rest on the stack · budget 32 |
+| float merges | never promoted · needs an XMM pool |
+| Win64 ABI | implemented, no test evidence yet |
+| AOT binary emit | none · everything runs in-process |
+| architectures | x86-64 only · ARM64 is Phase III |
+| AVX-512 | not emitted · feature gating only |
+| dict capacity trapping | list bounds trap shipped, dict's equivalent doesn't yet |
+| // floor division | refused outright: *operator FloorDiv not supported yet* |
+| ** power | refused outright: *operator Pow not supported yet* |
+| <= and >= | refused: *comparison LtE not supported yet* |
+| unsigned ints | no uint: signed at every width |
+| closures | none: a function body cannot capture a caller's variable |
+| first-class functions | none: a function name is not a value |
+| lambda | refused: *expression node Lambda not supported yet* |
+| None | refused: *expression node Constant not supported yet* |
+| diamond unrolling | opt-in via --unroll-diamonds, 1.10× slower today |
+
+> **A str cannot be passed to a function** — Strings are addressed, not passed: a str function parameter is refused with *a str function parameter is not yet a string place*. This is the same rule that makes a struct unusable as an argument: Lithon passes scalars and containers, and addresses anything with an identity.
+
+#### This is not a CPython replacement
+
+No stdlib, no import system beyond the built-ins, no closures, and no exception objects: try/except catches the engine's own traps, but there is nothing to bind. Lithon is an experiment in one narrow question: what happens to a Python-shaped language when the types are mandatory and the machine is visible, and the honest answer to "can it run my app?" is "almost certainly not, yet".
+
+- **Roadmap** — What is next, which phase each item belongs to.
+- **Divergences from Python** — The eleven places Lithon deliberately differs from CPython.
+- **Verification** — How the claims above get checked rather than taken on trust.
+
+---
+
+## Machine view
+
+For enthusiasts: IR, registers, x86-64 encodings.
+
+### Source to machine
+
+*The full walk: .lio → typed IR → verified SSA → x86-64 bytes, with the real artifacts at each step.*
+
+URL: https://project-lithon.github.io/Lithon/docs/source-to-machine
+
+#### Four artifacts, one program
+
+Every Lithon program leaves four artifacts on the way to execution. Each one is inspectable: nothing is hidden behind a debugger:
+
+- **Source (.lio)** — What you wrote. Annotations and all.
+- **Typed IR (text)** — frontend.py output: %N = add %a, %b, store x, %v : int[64], branch, call print. This is what the engine parses; there is no Python left after this point.
+- **Verified SSA** — After Mem2Reg and phi placement: loads and stores that provably stay in memory are the only ones that survive.
+- **x86-64 bytes** — Written into PROT_READ | PROT_EXEC memory and called through a function pointer. No object file, no linker, no as.
+
+**seeing it yourself**
+```bash
+$ lithon prog.lio --ir              # stop after IR
+$ python3 src/frontend/frontend.py prog.lio > prog.ir
+$ ./build/tier_runner prog.ir --strict -v
+[tier1] native
+```
+
+#### Reading the IR
+
+The IR is deliberately boring. Registers are %N virtuals, variables are named slots with widths, and control flow is explicit blocks with branch/jump. Here is a function with a comparison and two arms, exactly as the frontend emits it:
+
+**tests/typed_regression/if.lio → IR**
+```text
+x: int[64] = 5
+if x < 3:
+    print(1)
+else:
+    print(3)
+```
+Output:
+```
+3
+```
+Source: `tests/typed_regression/if.lio`
+
+The corresponding x86-64 keeps the same shape: one conditional branch, one shared join:
+
+**the same control flow, encoded**
+```asm
+    mov  eax, 5
+    mov  QWORD PTR [rbp-0x8], rax    ; x
+    mov  rax, QWORD PTR [rbp-0x8]
+    cmp  rax, 3
+    jge  .Lelse                       ; !(x < 3)
+    mov  eax, 1
+    mov  rdi, rax
+    call print
+    jmp  .Ljoin
+.Lelse:
+    mov  eax, 3
+    mov  rdi, rax
+    call print
+.Ljoin:
+```
+*Hand-assembled for reading. The instruction shapes are real encoder output patterns; the byte schedules live in src/jit/encode.h and are verified against GNU as.*
+
+#### Calls and the frame
+
+User functions get the SysV treatment: the first two arguments in rdi/rsi (XMM0/XMM1 for floats), any further arguments on the stack, the return value in rax, and a frame that check_stack_alignment.py audits for 16-byte alignment at every call site:
+
+**tests/typed_regression/function.lio → IR**
+```text
+def add(a: int[64], b: int[64]) -> int[64]:
+    return a + b
+
+x: int[64] = add(3, 4)
+print(x)
+```
+Output:
+```
+7
+```
+Source: `tests/typed_regression/function.lio`
+
+#### Recursion, end to end
+
+The fib(10) example: real IR, real output, and the benchmark that 189× speedup comes from at fib(30):
+
+**tests/typed_regression/recursion.lio**
+```text
+def fib(n: int[64]) -> int[64]:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+x: int[64] = fib(10)
+print(x)
+```
+Output:
+```
+55
+```
+Source: `tests/typed_regression/recursion.lio`
+
+#### Where to go next
+
+- **Registers & ABI** — The register file and the calling discipline the IR maps onto.
+- **Instruction encoding** — How the IR becomes bytes, and how those bytes are proven.
+- **Optimizer & SSA pipeline** — The passes that run between the IR and the encoder.
+- **Dual-tier execution** — What happens when the native tier refuses to run a program.
+
+---
+
+### Registers & ABI
+
+*The register file, the SysV convention the backend implements, and the stack discipline the auditors check.*
+
+URL: https://project-lithon.github.io/Lithon/docs/registers-abi
+
+#### The register file
+
+*x86-64 general purpose registers, and how the backend uses them*
+| RAX | accumulator / return value / scratch |
+| --- | --- |
+| RCX | scratch: note: shift counts come in CL, a known hazard the bitwise fuzzer targets |
+| RDX | scratch / div high half |
+| RBX, R12–R15 | callee-saved: the allocator's long-lived homes |
+| RSP | stack pointer, 16-byte aligned at every call |
+| RBP | frame pointer: every function keeps it, which is what makes [rbp-0x…] slots readable in a dump |
+| RDI, RSI | SysV argument 0 / argument 1 (RCX/RDX on Windows); arguments past the second are passed on the stack |
+| R8, R9 | SysV temporary pool (check_stack_alignment scrutinee); not argument registers in this ABI |
+| XMM0–XMM15 | SSE2 float; the vectorizer's vmovdqu lanes |
+
+> **The RCX hazard** — Shifts mask their count with 6 bits of CL, and the general fuzzer has a dedicated --bitwise mode for exactly the shapes where a live RCX gets clobbered. It is a real bug class this backend has already paid for.
+
+#### SysV discipline
+
+The audited convention. Every one of the 23 ABI modules is checked for the same invariants:
+
+*what check_stack_alignment.py parses out of real modules*
+| prologue | push rbp · mov rbp, rsp · sub rsp, N |
+| --- | --- |
+| alignment | RSP ≡ 0 (mod 16) at every call: the push rbp makes up the odd word |
+| callee-saved | RBX/RBP/R12–R15 restored before ret |
+| epilogue | leave (mov rsp, rbp; pop rbp) or the explicit equivalent, then ret |
+| slots | QWORD PTR [rbp-0x…] for int[64], DWORD/WORD/BYTE for narrower widths |
+
+**the canonical prologue/epilogue**
+```asm
+my_func:
+    push rbp
+    mov  rbp, rsp
+    sub  rsp, 0x20            ; 4 slots, keeps RSP 16-aligned after the push
+    ...
+    mov  QWORD PTR [rbp-0x8], rdi    ; spill arg0 if it must survive a call
+    ...
+    leave
+    ret
+```
+
+#### Win64: implemented, unproven
+
+The path exists behind #if defined(_WIN32) and compiles, but the 23-module ABI audit runs on SysV hosts only. Win64 differs where it always differs, 32-byte shadow space, different volatile set (RAX RCX RDX R8 R9 R10 R11), XMM0–XMM5 volatile, and none of that has test evidence yet.
+
+> **Treat Win64 as experimental** — The limits page (/docs/limits) lists this as an open gap. It will close with its own audit, not with a claim.
+
+#### Where the bytes live
+
+Emitted code is written straight into memory the OS marked executable and called through a function pointer: mmap with PROT_READ | PROT_EXEC on Linux, VirtualAlloc on Windows. There is no temporary file, no loader, and no as invocation anywhere in the pipeline.
+
+---
+
+### Instruction encoding
+
+*The hand-written x86-64 encoder: how bytes are chosen, and how GNU as is used to prove every one of them.*
+
+URL: https://project-lithon.github.io/Lithon/docs/instruction-encoding
+
+#### Why hand-roll an encoder
+
+No LLVM, no Cranelift, no assembler in the build. The backend emits bytes directly: every REX prefix, ModRM, SIB, and displacement chosen by code the project owns and can audit. The cost is that every byte is your responsibility; the benefit is that the whole native tier is ~a C++ codebase you can read in an afternoon.
+
+The encoder covers 26 of 27 IR opcodes (Phi is lowered, not emitted) plus the AVX2 vector forms the auto-vectorizer emits.
+
+#### Proven against GNU as
+
+tools/check_encoder_vs_as.py is the answer to "how do you know your bytes are right?". It enumerates operand shapes, asks the encoder for bytes, assembles the same instruction with GNU as, and compares: not naively, because x86-64 often has multiple valid encodings for one instruction:
+
+**the comparison, current**
+```text
+9239 instruction cases
+7949 byte-identical
+1290 different but valid encodings
+0 incorrect encodings
+
+WRONG = 0
+```
+
+The 1,290 "different" cases are where the encoder chose a different-but-equivalent form: a different REX prefix ordering, a displacement width, and the harness decodes both to confirm they mean the same instruction. The only number that matters is WRONG = 0.
+
+#### VEX and the AVX2 forms
+
+The auto-vectorizer's slices are byte-for-byte what the encoder emits, verified the same way. The register core of the vector loop, for instance:
+
+**src/jit/encoder_test.cpp · real expected bytes**
+```asm
+vmovdqu ymm0, [rbp+rcx*4]        ; C4 E1 7E 6F 44 8D 00
+vmovdqu [rbp+r8*4-64], ymm12     ; C4 21 7E 7F 64 85 C0
+```
+
+Two details worth pausing on: the [rbp+rcx*4] form is the 4-byte-scaled addressing the 32-bit lanes need, and the second form uses the R8 REX prefix: the encoder handles the full register range, not just the low eight.
+
+*the vector instruction set the encoder emits*
+| vmovdqu | unaligned 256-bit load/store: the lane mover |
+| --- | --- |
+| vpaddd / vpsubd / vpmulld | the three integer ops the recognizer fuses |
+| vpxor | reduction accumulator zeroing |
+| vextracti128 + vpshufd | the horizontal halving merge for reductions |
+| vzeroupper | emitted before every Call/Return in a VEX function: audited by check_vex_transitions.py |
+
+> **vzeroupper is not optional** — Skipping it leaves the upper halves of the YMM registers dirty, and the transition penalty into legacy SSE code is brutal. The scanner that audits its placement ships with the encoder tests.
+
+#### Reading bytes by hand
+
+A worked example: push rbp, the first byte of every prologue:
+
+*55 → push rbp*
+| 0x55 | one byte, no REX, no ModRM: push of the low half of the register file encodes as a single opcode byte |
+| --- | --- |
+| RBP is register 5 | the opcode 0x50 + reg gives 0x50 + 5 = 0x55 |
+
+That is the whole encoding. The interesting instructions: anything with a memory operand: are where REX, ModRM, SIB, and displacement interleave, and that is exactly the surface check_encoder_vs_as.py brute-forces 9,239 ways.
+
+---
+
+## Changelog
+
+### `!=` is a first-class comparison (2026-10-20)
+
+!= is now its own IR op (ne) rather than eq followed by not, so the optimizer and branch fusion see the real predicate. On floats it follows IEEE 754: nan != nan is true, 0.0 != -0.0 is false.
+
+Docs: https://project-lithon.github.io/Lithon/docs/operators#comparison-boolean
+
+### `try` / `except` over the engine's own traps (2026-10-20)
+
+A try block can now catch the engine's traps, over a closed set of seven names: ZeroDivisionError, OverflowError, ValueError, IndexError, KeyError, EOFError, and Exception. else and finally are supported. A bare except:, except X as e, and raise are refused.
+
+Docs: https://project-lithon.github.io/Lithon/docs/exceptions
+
+### Raw syscalls, iteration helpers, and real pointers (2026-10-14)
+
+syscall(n, a1..a6) is a compiler-recognized primitive that lowers to one IR op. A pointer argument is a real host address in both tiers, which is what makes the shipped TCP loopback possible. enumerate(xs) and zip(xs, ys) rewrite a counted loop in a for header.
+
+Docs: https://project-lithon.github.io/Lithon/docs/syscalls
+
+### Packed-field structs, end to end (2026-10-13)
+
+class P(Struct) with typed fields, packed with no padding, so the byte layout matches a C #pragma pack(1) struct exactly. Narrow integer fields keep their sign when read back.
+
+Docs: https://project-lithon.github.io/Lithon/docs/structs
+
+### Explicit conversions and terminal input (2026-10-12)
+
+int(w, v), float(64, v) and int(w, input(prompt)) are the only way to change a type or read a value: the width is always named, and a conversion that does not fit traps instead of truncating.
+
+Docs: https://project-lithon.github.io/Lithon/docs/types#explicit-conversions
+
+### `break` / `continue` and a three-argument `range` (2026-10-12)
+
+Loop control flow is supported, with the rotated lowering and multi-exit loop guards it needs. range(start, stop, step) takes a step, and a zero step is refused at compile time and trapped at run time.
+
+Docs: https://project-lithon.github.io/Lithon/docs/control-flow#break-continue
+
+### Uninitialized declarations (2026-10-09)
+
+A declaration with a type and no value introduces the name and the type, emits no code, and starts unassigned. Reading it before assignment is a compile-time refusal, not a run-time surprise.
+
+Docs: https://project-lithon.github.io/Lithon/docs/declarations#definite-assignment
+
+### C-style modulo (2026-10-01)
+
+% is the C remainder: the sign follows the dividend. -7 % 3 is -1 in Lithon and 2 in CPython. This is the machine's behaviour, and it is now pinned by the differential suites.
+
+Docs: https://project-lithon.github.io/Lithon/docs/semantics#modulo
+
+### Float is a real type (2026-10-01)
+
+float[64] is a first-class type with its own arithmetic, not a fallback for an untyped value. A float literal is 0.0, never 0.
+
+Docs: https://project-lithon.github.io/Lithon/docs/types
+
+### Lists, tuples, dicts and pointers (2026-10-07)
+
+The fixed-capacity container family: list[T, N], tuple[T, N], dict[K, V, B] with a power-of-two bucket count, and typed pointers with a mandatory _ prefix.
+
+Docs: https://project-lithon.github.io/Lithon/docs/containers
+
+### Dynamic `int[64]` overflow traps (2026-10-10)
+
+Plain +, - and * on int[64] now trap on signed overflow instead of silently wrapping. wrap_add, wrap_sub and wrap_mul are the explicit opt-out, and the wrapping result is pinned to be identical across tiers.
+
+Docs: https://project-lithon.github.io/Lithon/docs/operators#wrap-arith
+
+### Stack-depth guard parity (2026-10-11)
+
+The native prologue and the interpreter bump the same shared recursion-depth counter and trap at the same depth with the same message, so a runaway recursive program fails byte-identically in both tiers.
+
+Docs: https://project-lithon.github.io/Lithon/docs/errors
+
+### Self tail calls become loops (2026-09-30)
+
+A self tail call is rewritten into a loop, so tail recursion runs in O(1) stack. A call that is not in tail position stays recursive.
+
+Docs: https://project-lithon.github.io/Lithon/docs/functions#recursion
+
+### SIMD auto-vectorization (2026-10-08)
+
+The vectorizer emits AVX2 for counted loops over int[32] lists, 8 elements wide. The result is exact, not approximate: the reduction order is preserved.
+
+Docs: https://project-lithon.github.io/Lithon/docs/simd
+
+### Register coalescing (2026-10-03)
+
+A merge takes over its source's dead register, so a phi copy does not need a fresh one.
+
+Docs: https://project-lithon.github.io/Lithon/docs/pipeline
+
+### Float comparisons fuse into the branch (2026-10-12)
+
+A float comparison is fused into the branch instead of materialising a bool first, so the hot path carries no intermediate value.
+
+Docs: https://project-lithon.github.io/Lithon/docs/pipeline
+
+### `.lio` is the source extension (2026-10-20)
+
+A Lithon program is a file with the .lio extension. The frontend refuses anything else, so the extension is what marks a file as Lithon rather than as ordinary Python.
+
+Docs: https://project-lithon.github.io/Lithon/docs/installation
+
+### The `lithon` CLI (2026-10-01)
+
+lithon script.lio runs a program. --strict refuses rather than falling back to the interpreter, --ir prints the typed IR and stops, --interp forces the correctness oracle, and -v says which tier ran and why.
+
+Docs: https://project-lithon.github.io/Lithon/docs/installation#cli
+
+### The full gate, wired together (2026-09-29)
+
+tools/verify_all.sh runs the whole stack: CTest, the general regression suite, the typed regression suite, the tier differential, and the per-shape differential fuzzers. It ends with ALL CHECKS PASSED or it does not pass.
+
+Docs: https://project-lithon.github.io/Lithon/docs/verification#the-gate
+
+### The encoder against GNU as (2026-10-07)
+
+The hand-written x86-64 encoder is compared instruction by instruction against GNU as. 18,379 cases, 0 incorrect encodings. A byte difference is not automatically an error, because x86-64 often has several valid encodings.
+
+Docs: https://project-lithon.github.io/Lithon/docs/verification#encoder-vs-as
+
+### Networking checked against a C oracle (2026-10-14)
+
+A TCP loopback round trip, built entirely from raw syscalls, is compared against a C program issuing the identical syscalls. The C program is the oracle, because both Lithon tiers could be wrong in the same way.
+
+Docs: https://project-lithon.github.io/Lithon/docs/networking
+
+### The documentation platform (2026-10-10)
+
+Every example on this site is compiled by the real Lithon frontend and pinned to the repo's regression outputs, so a doc that drifts from the engine fails the build rather than misleading a reader.
+
+Docs: https://project-lithon.github.io/Lithon/docs
+
+### The site moves to TanStack Start (2026-10-10)
+
+The hand-rolled static site became a Turborepo monorepo: all ten routes migrated, RTL-first layout, and theme, sound and text-direction toggles that persist.
+
+Docs: https://project-lithon.github.io/Lithon/
+
+### Executable docs (2026-10-10)
+
+Examples carry their real IR and a step-by-step execution trace, and the machine view toggles every example over to its IR and x86-64 tab.
+
+Docs: https://project-lithon.github.io/Lithon/docs/source-to-machine
+
+### The benchmark bot (2026-10-20)
+
+Mamba measures fib(30) on every push to master, writes benchmarks/results/latest.json and a per-commit snapshot under benchmarks/results/history/, and updates the README's benchmark block.
+
+Docs: https://project-lithon.github.io/Lithon/benchmarks

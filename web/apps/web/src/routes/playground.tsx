@@ -33,6 +33,8 @@ import { Kbd } from "@workspace/ui/components/kbd"
 import { PageHero, WRAP } from "../site"
 import { metaForPath } from "../lib/seo"
 import { LithonEditor } from "../lib/lithon-editor"
+import { PLAYGROUND_EXAMPLES } from "../lib/playground-examples"
+import { PLAYGROUND_IR } from "../lib/playground-ir"
 
 export const Route = createFileRoute("/playground")({
   head: () => {
@@ -59,96 +61,22 @@ type RunResult = {
   hint: string
 }
 
-const EXAMPLES = [
-  {
-    id: "hello",
-    title: "Hello, typed",
-    note: "the smallest annotated program",
-    source: `x: int[64] = 10
-y: int[64] = 20
+const EXAMPLES = PLAYGROUND_EXAMPLES
 
-result: int[64] = x + y
+/** FNV-1a, matching `irKey()` in docs/templates.tsx. */
+function irKey(source: string) {
+  let h = 0x811c9dc5
+  for (let i = 0; i < source.length; i++) {
+    h ^= source.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(16).padStart(8, "0")
+}
 
-print(result)`,
-  },
-  {
-    id: "fib",
-    title: "Recursive fibonacci",
-    note: "recursion, tier-1 native",
-    source: `def fib(n: int[64]) -> int[64]:
-    if n < 2:
-        return n
-    return fib(n - 1) + fib(n - 2)
-
-x: int[64] = fib(10)
-print(x)`,
-  },
-  {
-    id: "range",
-    title: "Typed range loop",
-    note: "for-range with a width-checked loop variable",
-    source: `total: int[64] = 0
-i: int[64] = 0
-
-for i in range(10):
-    total = total + i
-
-print(total)`,
-  },
-  {
-    id: "while",
-    title: "While loop",
-    note: "conditionals with a loop-carried accumulator",
-    source: `i: int[64] = 0
-total: int[64] = 0
-
-while i < 10:
-    total = total + i
-    i = i + 1
-
-print(total)`,
-  },
-  {
-    id: "float",
-    title: "Float arithmetic",
-    note: "float[64], SSE2 end to end",
-    source: `a: float[64] = 3.5
-b: float[64] = 2.0
-
-print(a + b)
-print(a * b)`,
-  },
-  {
-    id: "wrap",
-    title: "Wrapping arithmetic",
-    note: "wrap_add at the int[64] boundary",
-    source: `x: int[64] = 9223372036854775807
-y: int[64] = 1
-z: int[64] = wrap_add(x, y)
-print(z)`,
-  },
-  {
-    id: "pointer",
-    title: "Typed pointers",
-    note: "explicit raw memory, `_` prefix required",
-    source: `i: int[16] = 16
-_pi: ptr[int[16]] = addressof(i)
-print(valueof(_pi))`,
-  },
-  {
-    id: "list",
-    title: "Fixed-capacity list",
-    note: "capacity lives in the type",
-    source: `xs: list[int[64], 6]
-
-xs[0] = 10
-xs[1] = 20
-xs[2] = 30
-
-print(xs[0])
-print(len(xs))`,
-  },
-] as const
+/** The pre-generated IR for a built-in example, when there is one. */
+function staticIr(source: string): string | undefined {
+  return PLAYGROUND_IR[irKey(source)]
+}
 
 function toDiagnostic(message: string, line = 1): Diagnostic {
   return {
@@ -179,26 +107,45 @@ function Playground() {
         signal: controller.signal,
       })
       if (!res.ok) {
+        // The live runner is dev-only. When it is not there, fall back to
+        // the pre-generated IR for a built-in example, and say plainly that
+        // this is the recorded output rather than a fresh run.
+        const fallback = staticIr(code)
         setResult({
-          ok: false,
-          stage: "input",
-          diagnostics: [`runner unavailable (HTTP ${res.status})`],
-          ir: null,
+          ok: fallback !== undefined,
+          stage: fallback !== undefined ? "ir" : "input",
+          diagnostics: [
+            fallback !== undefined
+              ? "the live runner is not available here, so this is the recorded IR for a built-in example"
+              : `runner unavailable (HTTP ${res.status})`,
+          ],
+          ir: fallback ?? null,
           typecheck: null,
-          hint: "The local runner is only wired up in dev (`bun run dev`).",
+          hint:
+            fallback !== undefined
+              ? "Run `bun run dev` locally to compile your own program."
+              : "The local runner is only wired up in dev (`bun run dev`).",
         })
         return
       }
       setResult((await res.json()) as RunResult)
     } catch (e) {
       if ((e as Error).name === "AbortError") return
+      const fallback = staticIr(code)
       setResult({
-        ok: false,
-        stage: "input",
-        diagnostics: [String(e)],
-        ir: null,
+        ok: fallback !== undefined,
+        stage: fallback !== undefined ? "ir" : "input",
+        diagnostics: [
+          fallback !== undefined
+            ? "the live runner is not reachable, so this is the recorded IR for a built-in example"
+            : String(e),
+        ],
+        ir: fallback ?? null,
         typecheck: null,
-        hint: "Could not reach the local Lithon runner.",
+        hint:
+          fallback !== undefined
+            ? "Run `bun run dev` locally to compile your own program."
+            : "Could not reach the local Lithon runner.",
       })
     } finally {
       setRunning(false)
@@ -232,8 +179,8 @@ function Playground() {
             See the path.
           </>
         }
-        lede="A real editor with Lithon syntax highlighting and autocomplete, wired to the actual type checker and frontend in this repo. Press Run and you get the engine's own verdict, not a simulation."
-        meta={["Real toolchain", "Live IR", "Local only"]}
+        lede="A real editor with Lithon syntax highlighting and autocomplete, wired to the actual type checker and frontend in this repo. The live compiler runs in local development; the built-in examples carry the IR the engine really emits."
+        meta={["Real toolchain", "Recorded IR", "Live in dev"]}
       />
 
       <section className={`${WRAP} py-10`}>
@@ -305,9 +252,13 @@ function Playground() {
                     size="icon-xs"
                     variant="ghost"
                     onClick={() => {
-                      navigator.clipboard.writeText(code)
-                      setCopied(true)
-                      window.setTimeout(() => setCopied(false), 1200)
+                      navigator.clipboard
+                        .writeText(code)
+                        .then(() => {
+                          setCopied(true)
+                          window.setTimeout(() => setCopied(false), 1200)
+                        })
+                        .catch(() => {})
                     }}
                     aria-label="Copy source"
                   >

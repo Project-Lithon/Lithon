@@ -1,9 +1,28 @@
 import type { ReactNode } from "react"
 import { createFileRoute } from "@tanstack/react-router"
 
+import { metaForPath, structuredData } from "../../lib/seo"
 import { DocSection, Note, PageHero, SpecTable, WRAP } from "../../site"
 
 export const Route = createFileRoute("/roadmap/phase-3-systems")({
+  head: () => {
+    const meta = metaForPath("/roadmap/phase-3-systems")
+    return {
+      meta: [
+        { title: meta.title },
+        { name: "description", content: meta.description },
+        { property: "og:title", content: meta.title },
+        { property: "og:description", content: meta.description },
+        { property: "og:type", content: "website" },
+        { property: "og:url", content: meta.canonical },
+        { name: "twitter:card", content: "summary_large_image" },
+        { name: "twitter:title", content: meta.title },
+        { name: "twitter:description", content: meta.description },
+        { tagName: "link", rel: "canonical", href: meta.canonical },
+        { "script:ld+json": JSON.stringify(structuredData("/roadmap/phase-3-systems")) },
+      ],
+    }
+  },
   component: Phase3Systems,
 })
 
@@ -62,8 +81,8 @@ const GROUNDWORK: readonly Row[] = [
   ],
   [
     "AVX emission",
-    <span key="4" className="text-destructive">
-      , · not started
+    <span key="4" className="text-accent-strong">
+      <b>shipped</b> · 8-wide ymm over int[32] lists
     </span>,
   ],
 ]
