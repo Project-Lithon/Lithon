@@ -2,4 +2,4 @@ User-agent: *
 Allow: /
 Disallow: /api/
 
-Sitemap: https://lithon-lang.pages.dev/sitemap.xml
+Sitemap: https://project-lithon.github.io/Lithon/sitemap.xml

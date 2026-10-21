@@ -1,5 +1,5 @@
 """Plain-CPython equivalent of
-test_codes_lithon/test_eulars_constant_lim_def.py.
+test_codes_lithon/Loops/test_eulars_constant_lim_def.lio.
 
 Same program: approximate e via the limit definition (1 + 1/k)**k, built up
 as an explicit nested product since Lithon has no `**` operator, keeping the

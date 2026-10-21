@@ -1,4 +1,4 @@
-"""Plain-CPython equivalent of test_codes_lithon/base_var.py.
+"""Plain-CPython equivalent of test_codes_lithon/DataTypes/base_var.lio.
 
 Same program: declare a binding with a type and no value, assign it, print.
 CPython has no annotation-only declaration, so the annotation is dropped and

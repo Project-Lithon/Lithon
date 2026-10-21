@@ -125,7 +125,7 @@ const QUICKSTART = `git clone https://github.com/Project-Lithon/Lithon.git
 cd Lithon
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
-python3 src/frontend/frontend.py tests/programs/float.py > /tmp/float.ir
+python3 src/frontend/frontend.py tests/programs/float.lio > /tmp/float.ir
 ./build/tier_runner /tmp/float.ir --strict`
 
 function SectionHead({
@@ -557,7 +557,7 @@ function Home() {
       </section>
 
       {/* Contributors */}
-      <section className={`${WRAP} py-16`}>
+      <section id="contributors" className={`${WRAP} scroll-mt-20 py-16`}>
         <SectionHead
           kicker="05 / Contributors"
           title={

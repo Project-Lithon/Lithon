@@ -10,14 +10,17 @@ import { DOCS } from "../apps/web/src/docs/registry"
 const WEB_ROOT = resolve(dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..")
 const REPO_ROOT = resolve(WEB_ROOT, "..")
 const FRONTEND = join(REPO_ROOT, "src", "frontend", "frontend.py")
-const UV = join(
-  process.env.LOCALAPPDATA ?? "",
-  "Microsoft",
-  "WinGet",
-  "Packages",
-  "astral-sh.uv_Microsoft.Winget.Source_8wekyb3d8bbwe",
-  "uv.exe",
-)
+const UV =
+  process.env.UV_PATH ??
+  join(
+    process.env.LOCALAPPDATA ?? "",
+    "Microsoft",
+    "WinGet",
+    "Packages",
+    "astral-sh.uv_Microsoft.Winget.Source_8wekyb3d8bbwe",
+    "uv.exe",
+  )
+const CACHE_DIR = join(WEB_ROOT, "node_modules", ".cache")
 
 function hash(source: string) {
   // FNV-1a, matching irKey() in apps/web/src/docs/templates.tsx
@@ -41,8 +44,8 @@ for (const page of DOCS.pages) {
       if (ex.lang && ex.lang !== "lithon") return
       if (ex.machine?.ir) return // already hand-verified against the frontend
 
-      const file = join(REPO_ROOT, `node_modules/.cache/gen-ir-${tmpIndex++}.py`)
-      mkdirSync(join(REPO_ROOT, "node_modules/.cache"), { recursive: true })
+      const file = join(CACHE_DIR, `gen-ir-${tmpIndex++}.lio`)
+      mkdirSync(CACHE_DIR, { recursive: true })
       writeFileSync(file, ex.source, "utf8")
 
       const proc = Bun.spawnSync(

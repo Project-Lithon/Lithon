@@ -10,6 +10,11 @@ import { DOC_GROUPS } from "../apps/web/src/docs/model"
  * registry the site renders.
  *
  *   bun scripts/gen-seo.ts [origin]
+ *
+ * The origin defaults to the same constant the app uses for its canonical
+ * URLs (see apps/web/src/lib/seo.ts), so the sitemap, the robots.txt and
+ * the <link rel="canonical"> tags can never drift apart. CI passes the
+ * deployed Pages URL explicitly.
  */
 
 const WEB_ROOT = resolve(
@@ -17,7 +22,9 @@ const WEB_ROOT = resolve(
   ".."
 )
 const PUBLIC = join(WEB_ROOT, "apps", "web", "public")
-const origin = (process.argv[2] ?? "https://lithon-lang.pages.dev").replace(
+
+const DEFAULT_ORIGIN = "https://project-lithon.github.io/Lithon"
+const origin = (process.argv[2] ?? process.env.SITE_ORIGIN ?? DEFAULT_ORIGIN).replace(
   /\/+$/,
   ""
 )
@@ -29,7 +36,6 @@ const STATIC_PATHS = [
   "/benchmarks",
   "/roadmap",
   "/use-cases",
-  "/contributors",
   "/roadmap/language",
   "/roadmap/phase-1-dual-tier",
   "/roadmap/phase-2-aot",
@@ -80,7 +86,7 @@ writeFileSync(join(PUBLIC, "sitemap.xml"), sitemap, "utf8")
 writeFileSync(join(PUBLIC, "robots.txt"), robots, "utf8")
 
 console.log(
-  `sitemap.xml: ${all.length} urls across ${DOC_GROUPS.length} doc groups`
+  `sitemap.xml: ${all.length} urls across ${DOC_GROUPS.length} doc groups (origin ${origin})`
 )
 console.log(`robots.txt written`)
 if (!existsSync(PUBLIC)) process.exit(1)

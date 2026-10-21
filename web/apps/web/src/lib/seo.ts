@@ -11,9 +11,28 @@ export const SITE = {
   docsBase: "/docs",
 } as const
 
-/** Canonical origin used for sitemap and canonical URLs. */
+/**
+ * The canonical origin used for sitemap and canonical URLs.
+ *
+ * The site is deployed to GitHub Pages from the repository's `master`
+ * branch, so the canonical home is the Pages URL for the `Lithon`
+ * repository. `SITE_ORIGIN` overrides it for a fork or a custom domain;
+ * `BASE_PATH` covers the sub-path a fork would be served from.
+ */
 export const SITEMAP_HOST =
   process.env.SITE_ORIGIN ?? "https://project-lithon.github.io/Lithon"
+
+/** The path the site is served from, always with a leading and trailing slash. */
+export const SITE_BASE_PATH = (() => {
+  const explicit = process.env.BASE_PATH
+  if (explicit) {
+    const trimmed = explicit.replace(/\/+$/, "")
+    return trimmed === "" ? "/" : `${trimmed}/`
+  }
+  if (process.env.CUSTOM_DOMAIN) return "/"
+  const repo = process.env.GITHUB_REPOSITORY?.split("/")[1] ?? "Lithon"
+  return `/${repo}/`
+})()
 
 export type PageMeta = {
   title: string

@@ -23,6 +23,10 @@ _FONT_CANDIDATES = [
         "C:/Windows/Fonts/JetBrainsMonoNerdFontMono-Regular.ttf",
         "C:/Windows/Fonts/JetBrainsMonoNerdFontMono-Bold.ttf",
     ),  # Nerd Font first: the UI uses its icon glyphs (checked against its cmap, see ui.py)
+    (
+        str(pathlib.Path.home() / ".local/share/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"),
+        str(pathlib.Path.home() / ".local/share/fonts/JetBrainsMonoNerdFontMono-Bold.ttf"),
+    ),  # WSL/Linux user-font install of the same Nerd Font
     ("C:/Windows/Fonts/consola.ttf", "C:/Windows/Fonts/consolab.ttf"),
     ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"),
 ]
@@ -143,7 +147,15 @@ class VideoRecorder:
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
                 str(self.out_path),
             ]
-        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        # bufsize=0 hands us the raw pipe instead of a BufferedWriter. A
+        # single frame is ~35 MB at the default size, which is far larger
+        # than any pipe buffer: a buffered writer can hand a partial chunk
+        # to the OS and ffmpeg then reads a truncated frame and aborts with
+        # "Invalid buffer size, packet size N < expected frame_size M".
+        # Writing straight to the pipe keeps every frame's bytes contiguous.
+        self._proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
+        )
         self._frame_count = 0
 
     def _rasterize(self, renderable: RenderableType) -> bytes:
@@ -182,12 +194,41 @@ class VideoRecorder:
         stdin = self._proc.stdin
         assert stdin is not None
         for _ in range(hold_frames):
-            stdin.write(data)
+            self._write_all(stdin, data)
         self._frame_count += hold_frames
+
+    @staticmethod
+    def _write_all(stdin, data: bytes) -> None:
+        """Write every byte of `data` to the pipe.
+
+        A raw pipe write is not guaranteed to transfer everything in one
+        call: it can return a short count when the pipe buffer fills up
+        while ffmpeg is busy. Writing the remainder is the only correct
+        behaviour -- a truncated frame makes ffmpeg abort the whole encode.
+        """
+        view = memoryview(data)
+        while view:
+            written = stdin.write(view)
+            if written is None or written <= 0:
+                raise BrokenPipeError("ffmpeg closed the video pipe early")
+            view = view[written:]
 
     def close(self) -> None:
         assert self._proc.stdin is not None
-        self._proc.stdin.close()
+        try:
+            self._proc.stdin.close()
+        except BrokenPipeError:
+            # ffmpeg already died; its exit code and stderr say why
+            pass
         self._proc.wait()
         if self._proc.returncode != 0:
-            raise RuntimeError(f"ffmpeg exited {self._proc.returncode} while writing {self.out_path}")
+            detail = ""
+            if self._proc.stderr is not None:
+                try:
+                    detail = self._proc.stderr.read().decode("utf-8", "replace").strip()
+                except (OSError, ValueError):
+                    detail = ""
+            raise RuntimeError(
+                f"ffmpeg exited {self._proc.returncode} while writing {self.out_path}"
+                + (f":\n{detail}" if detail else "")
+            )

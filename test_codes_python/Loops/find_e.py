@@ -1,4 +1,4 @@
-"""Plain-CPython equivalent of test_codes_lithon/find_e.py.
+"""Plain-CPython equivalent of test_codes_lithon/Loops/find_e.lio.
 
 Same program: seed e with the n=0 term (1/0! = 1), then sum 1/n! for
 n = 1..7999 and print the result.

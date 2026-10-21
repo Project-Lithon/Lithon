@@ -8,11 +8,11 @@ Config shape::
 
     [[tasks]]
     name = "CPython"
-    command = ["{python}", "bench_vid_maker/tasks/python_sum.py"]
+    command = ["{python}", "test_codes_python/Loops/test_1b_fsum.py"]
 
     [[tasks]]
     name = "Lithon"
-    command = ["{lithon}", "test_codes_lithon/test_1b_fsum.py"]
+    command = ["{lithon}", "test_codes_lithon/Loops/test_1b_fsum.lio"]
     cwd = "."                                                 # optional, relative to repo root
 
 All relative paths (command args and ``cwd``) are resolved against the repo
@@ -24,6 +24,7 @@ interpreters/executables described below; add new placeholders in
 from __future__ import annotations
 
 import dataclasses
+import os
 import pathlib
 import shutil
 import sys
@@ -44,18 +45,66 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]  # .../bench_vid_make
 REPO_ROOT = find_repo_root(PROJECT_ROOT)
 
 
+def _is_runnable(path: pathlib.Path) -> bool:
+    """True when `path` exists *and* can actually be executed on this OS.
+
+    A Windows `.venv/Scripts/lithon.exe` sitting in the repo is a real trap
+    when the tool runs inside WSL: the file exists, so a plain `exists()`
+    check picks it, and it then fails with a baffling "native runner not
+    found at C:\\...\\tier_runner.exe" -- a Windows path, resolved from a
+    Linux process. The runner is only usable if this platform can run it.
+    """
+    if not path.exists():
+        return False
+    if path.suffix.lower() == ".exe" and not sys.platform.startswith("win"):
+        return False  # a Windows binary is useless on Linux/macOS
+    if not path.suffix and sys.platform.startswith("win"):
+        return False  # a POSIX binary is useless on Windows
+    return os.access(path, os.X_OK) or path.suffix.lower() == ".exe"
+
+
 def _find_lithon() -> str:
-    for rel in (".venv/Scripts/lithon.exe", ".venv/bin/lithon"):
+    """Locate a `lithon` executable that can run *on this platform*.
+
+    Order:
+      1. the repo's own virtualenv (platform-correct subdirectory),
+      2. a sibling of the running interpreter (this is what makes
+         `~/.venvs/lithon-bench/bin/lithon` in WSL resolve correctly),
+      3. `lithon` on PATH,
+      4. the repo's `cli.py`, run through the current interpreter -- the
+         engine's own source entry point, so a repo that has been cloned
+         but not `pip install`ed still works.
+    """
+    venv_names = (
+        (".venv/Scripts/lithon.exe", ".venv/bin/lithon")
+        if sys.platform.startswith("win")
+        else (".venv/bin/lithon", ".venv/Scripts/lithon.exe")
+    )
+    for rel in venv_names:
         p = REPO_ROOT / rel
-        if p.exists():
+        if _is_runnable(p):
             return str(p)
+
+    # A venv running bench-vid-maker itself (e.g. ~/.venvs/lithon-bench in
+    # WSL) that has the repo installed: lithon sits next to our interpreter.
+    for name in ("lithon.exe", "lithon"):
+        sibling = pathlib.Path(sys.executable).parent / name
+        if _is_runnable(sibling):
+            return str(sibling)
+
     found = shutil.which("lithon")
-    if found:
+    if found and _is_runnable(pathlib.Path(found)):
         return found
+
+    # Last resort: run the engine straight from its source entry point.
+    cli = REPO_ROOT / "cli.py"
+    if cli.exists():
+        return str(cli)
+
     raise FileNotFoundError(
-        "could not find a built `lithon` executable (looked in "
-        f"{REPO_ROOT / '.venv/Scripts'} and {REPO_ROOT / '.venv/bin'}, and on PATH). "
-        "Build/install Lithon first."
+        "could not find a runnable `lithon` executable (looked in "
+        f"{REPO_ROOT / '.venv/bin'} and {REPO_ROOT / '.venv/Scripts'}, next to "
+        f"{sys.executable}, on PATH, and {cli}). Build/install Lithon first."
     )
 
 
@@ -83,6 +132,28 @@ def _expand(token: str) -> str:
     return token
 
 
+def _expand_command(command: list[str]) -> list[str]:
+    """Expand the placeholders in a whole command.
+
+    `{lithon}` may resolve to the engine's Python entry point (`cli.py`)
+    when no built executable is available -- in that case the command has
+    to be run *through* the interpreter, so the interpreter is prepended
+    and the marker is kept out of the final argv.
+    """
+    expanded: list[str] = []
+    for tok in command:
+        if tok == "{lithon}":
+            lithon = _find_lithon()
+            if lithon.endswith(".py"):
+                expanded.append(sys.executable)
+                expanded.append(lithon)
+            else:
+                expanded.append(lithon)
+        else:
+            expanded.append(_expand(tok))
+    return expanded
+
+
 def load_config(path: pathlib.Path) -> BenchConfig:
     path = pathlib.Path(path).resolve()
     data = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -95,7 +166,7 @@ def load_config(path: pathlib.Path) -> BenchConfig:
     for i, t in enumerate(raw_tasks):
         if "name" not in t or "command" not in t:
             raise ValueError(f"{path}: tasks[{i}] is missing 'name' or 'command'")
-        command = [_expand(tok) for tok in t["command"]]
+        command = _expand_command(t["command"])
         cwd = REPO_ROOT / t.get("cwd", ".")
         tasks.append(Task(name=t["name"], command=command, cwd=cwd.resolve()))
 

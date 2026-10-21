@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+﻿import { useEffect, useState } from "react"
 import {
   HeadContent,
   Link,
@@ -39,6 +39,7 @@ import {
 } from "@workspace/ui/components/tooltip"
 import appCss from "@workspace/ui/globals.css?url"
 import { initSoundFeedback, readStoredSound, toggleSound } from "../lib/sound"
+import { assetUrl } from "../lib/assets"
 import { ConsentBanner, PREFERENCE_SCRIPT } from "../lib/consent"
 import { CiStatusStrip } from "../lib/ci-status"
 import {
@@ -60,14 +61,16 @@ export const Route = createRootRoute({
         content:
           "Lithon | A zero-dependency, dual-tier execution engine built for native speed.",
       },
-      { name: "theme-color", content: "#f8fff4" },
+      { name: "theme-color", content: "#121212" },
       {
         title:
           "Lithon | Not a revolution but an evolution of the same bloodline",
       },
     ],
     links: [
-      { rel: "icon", href: "/favicon.svg", type: "image/svg+xml" },
+      { rel: "icon", href: assetUrl("/favicon.svg"), type: "image/svg+xml" },
+      { rel: "apple-touch-icon", href: assetUrl("/favicon.ico") },
+      { rel: "manifest", href: assetUrl("/manifest.json") },
       { rel: "stylesheet", href: appCss },
     ],
   }),
@@ -335,7 +338,7 @@ function SearchButton() {
     >
       <MagnifyingGlassIcon />
       <span className="text-xs">Search</span>
-      <Kbd>⌘</Kbd>
+      <Kbd>âŒ˜</Kbd>
       <Kbd>K</Kbd>
     </Button>
   )
@@ -363,7 +366,7 @@ function SiteHeader({
             </IconButton>
           </span>
           <span className="hidden sm:flex">
-            <IconButton href="https://discord.gg/qaJD8Kxys" label="Discord">
+            <IconButton href="https://discord.gg/project-lithon" label="Discord">
               <DiscordLogo />
             </IconButton>
           </span>
@@ -416,7 +419,7 @@ function SiteHeader({
                 >
                   <GithubLogo />
                 </IconButton>
-                <IconButton href="https://discord.gg/qaJD8Kxys" label="Discord">
+                <IconButton href="https://discord.gg/project-lithon" label="Discord">
                   <DiscordLogo />
                 </IconButton>
               </div>
@@ -440,7 +443,7 @@ function SiteFooter() {
           </span>
         </Link>
         <p className="text-sm text-muted-foreground sm:ms-4">
-          Not a revolution but an evolution of the same bloodline. © 2026 Lithon
+          Not a revolution but an evolution of the same bloodline. Â© 2026 Lithon
           contributors.
         </p>
         <div className="flex gap-3 text-sm sm:ms-auto">

@@ -132,7 +132,7 @@ function checkExample(
     }
   }
 
-  const tmp = join(TMP, `ex_${checked}.py`)
+  const tmp = join(TMP, `ex_${checked}.lio`)
   writeFileSync(tmp, example.source, "utf8")
   ran++
 

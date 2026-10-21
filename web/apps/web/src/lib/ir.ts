@@ -1,4 +1,4 @@
-/**
+﻿/**
  * An executable model of Lithon's IR.
  *
  * This is not a simulation of the docs: it parses the exact IR text the
@@ -71,6 +71,29 @@ function wrap64(v: bigint): bigint {
 function fmtFloat(v: number): string {
   return Number.isInteger(v) ? `${v}.0` : String(v)
 }
+
+/**
+ * The Linux x86-64 syscall numbers the docs' syscall examples can name.
+ * A number that is not in this set is not a syscall the kernel knows, so
+ * it comes back as -ENOSYS (-38) -- the same answer the engine's own
+ * trampoline gives on a platform with no raw-syscall ABI.
+ */
+const KNOWN_SYSCALLS = new Set([
+  0, // read
+  1, // write
+  2, // open
+  3, // close
+  9, // mmap
+  10, // mprotect
+  11, // munmap
+  12, // brk
+  13, // rt_sigaction
+  14, // rt_sigprocmask
+  39, // getpid
+  60, // exit
+  63, // uname
+  102, // getuid
+])
 
 export function parseIr(text: string): IrProgram {
   const lines = text.split(/\r?\n/)
@@ -208,6 +231,33 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
   const lookupSlot = (name: string): MemCell | undefined =>
     memory.get(`${frames.length}:${name}`)
 
+  /**
+   * A struct is one blob with several fields at fixed byte offsets, so each
+   * field needs its own storage: `fieldstore p, 0, %N` and
+   * `fieldstore p, 8, %N` must not overwrite each other. The blob itself
+   * keeps the overall address; the fields are keyed by (blob, offset).
+   */
+  const fieldCells = new Map<string, MemCell>()
+
+  const fieldKey = (name: string, offset: number) =>
+    `${frames.length}:${name}#${offset}`
+
+  const allocField = (name: string, offset: number, type: string): MemCell => {
+    const key = fieldKey(name, offset)
+    const existing = fieldCells.get(key)
+    if (existing) return existing
+    const blob = allocSlot(name, type)
+    const cell: MemCell = {
+      name: `${name}+${offset}`,
+      address: `${blob.address}+${offset}`,
+      offset: blob.offset + offset,
+      type,
+      value: 0n,
+    }
+    fieldCells.set(key, cell)
+    return cell
+  }
+
   const pushFrame = (fn: IrFunction, args: unknown[]) => {
     frames.push({ fn, pc: fn.start, dest: undefined })
     current = fn
@@ -219,16 +269,29 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
   }
 
   let guard = 0
+  let error: string | undefined
+  // The engine lowers `print(x)` into `print_bare, %N` + `print_nl`, so the
+  // value is held here until the closing newline arrives.
+  let pendingPrint: string | undefined
+  // The handler registered by the innermost `tryenter`, if any.
+  let pendingHandler: { trapName: string; handler: string } | undefined
+  // Set when a trap fires: the block to jump to, or undefined when the trap
+  // is not catchable and the run has to stop.
+  let trapTarget: string | undefined
 
   const snapshot = () => ({
     registers: [...registers.entries()]
       .filter(([k]) => k.startsWith("%"))
       .slice(-8)
       .map(([name, value]) => ({ name, value: fmtValue(value) })),
-    memory: [...memory.values()].map((m) => ({ ...m })),
+    memory: [
+      ...memory.values(),
+      // struct fields live in their own map; show them next to the blob
+      ...[...fieldCells.values()],
+    ].map((m) => ({ ...m })),
   })
 
-  while (frames.length > 0 && guard < maxSteps) {
+  while (frames.length > 0 && guard < maxSteps && !error) {
     const frame = frames.at(-1)
     if (frame === undefined) break
     const instr = current.instrs.find((i) => i.index === frame.pc)
@@ -240,6 +303,26 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
       continue
     }
     guard += 1
+
+    /**
+     * Raise a trap. If the innermost `tryenter` catches this trap name, the
+     * run continues at the handler block; otherwise the run stops with the
+     * engine's own message. The catchable set is the same closed set the
+     * engine uses: the six named traps plus `Exception` for all of them.
+     */
+    const trap = (trapName: string, message: string) => {
+      const handler = pendingHandler
+      const catches =
+        handler !== undefined &&
+        (handler.trapName === trapName || handler.trapName === "Exception")
+      if (!catches) {
+        error = message
+        return
+      }
+      trapTarget = handler.handler
+      // the protected region is left by jumping to the handler
+      pendingHandler = undefined
+    }
 
     let consumed: { register: string; value: string }[] = []
     let returnedValue: unknown
@@ -316,17 +399,99 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
       }
       case "store": {
         const name = instr.args[0]
-        const v = read(instr.args[1])
         const cell = allocSlot(name, instr.width ?? "int[64]")
-        cell.value = v as number | bigint | boolean
-        written = { ...cell }
+        // `store xs : list[int[64], 5]` has no value: it just reserves the
+        // container's storage, which is already zeroed by `allocSlot`.
+        if (instr.args.length > 1) {
+          const v = read(instr.args[1])
+          cell.value = v as number | bigint | boolean
+          written = { ...cell }
+        }
         if (
           instr.width?.startsWith("float") ||
           (instr.args[1] &&
             floatRegs.has(`${frames.length}:${current.name}:${instr.args[1]}`))
         )
           floatSlots.add(name)
-        note = `${cell.address} ← ${fmtValue(v)}`
+        note =
+          instr.args.length > 1
+            ? `${cell.address} â† ${fmtValue(cell.value)}`
+            : `${cell.address} reserved`
+        break
+      }
+      case "fieldstore": {
+        // fieldstore p, offset, %N   -- write one field of a struct blob
+        const name = instr.args[0]
+        const offset = Number(instr.args[1])
+        const v = read(instr.args[2])
+        const cell = allocField(name, offset, instr.width ?? "int[64]")
+        cell.value = v as number | bigint | boolean
+        written = { ...cell }
+        note = `${cell.address} â† ${fmtValue(v)}`
+        break
+      }
+      case "fieldload": {
+        // fieldload p, offset   -- read one field of a struct blob
+        const name = instr.args[0]
+        const offset = Number(instr.args[1])
+        const cell = allocField(name, offset, instr.width ?? "int[64]")
+        const v = cell.value
+        if (instr.dest) {
+          registers.set(`${frames.length}:${current.name}:${instr.dest}`, v)
+          if (instr.width?.startsWith("float"))
+            floatRegs.add(`${frames.length}:${current.name}:${instr.dest}`)
+          produced = { register: instr.dest, value: fmtValue(v) }
+        }
+        note = `${cell.address} â†’ ${fmtValue(v)}`
+        break
+      }
+      case "guardnonzero": {
+        // guardnonzero %N -- the runtime guard the engine emits before a
+        // division; a zero divisor is a trap, not a value.
+        const v = read(instr.args[0])
+        if (typeof v === "bigint" && v === 0n) {
+          trap("ZeroDivisionError", "LITHON-E0301: division by zero")
+        }
+        note = "guard: divisor is not zero"
+        break
+      }
+      case "tryenter": {
+        // tryenter <TrapName>, <handlerBlock> -- mark the handler block and
+        // the region it guards. A trap raised inside the region jumps to
+        // the handler instead of stopping the program.
+        const trapName = instr.args[0] ?? "Exception"
+        const handler = instr.args[1]
+        pendingHandler = { trapName, handler }
+        note = `guard against ${trapName} â†’ ${handler}`
+        break
+      }
+      case "tryleave": {
+        // tryleave -- end the protected region on the normal path.
+        pendingHandler = undefined
+        note = "protected region ends"
+        break
+      }
+      case "trycatch": {
+        // trycatch <TrapName> -- the landing pad: this block runs when the
+        // named trap was raised inside the protected region.
+        note = `caught ${instr.args[0] ?? "trap"}`
+        break
+      }
+      case "syscall": {
+        // syscall number, a1..a6 -- the raw kernel primitive. The docs
+        // model the *unsupported* case: a number the kernel does not know
+        // comes back as -ENOSYS (-38), which is exactly what the engine's
+        // own trampoline returns on a platform with no raw-syscall ABI.
+        const number = read(instr.args[0])
+        const known = KNOWN_SYSCALLS.has(Number(number))
+        const v = known ? 0n : -38n
+        if (instr.dest) {
+          registers.set(`${frames.length}:${current.name}:${instr.dest}`, v)
+          produced = { register: instr.dest, value: fmtValue(v) }
+        }
+        note = known
+          ? `syscall ${fmtValue(number)}`
+          : `syscall ${fmtValue(number)} â†’ -ENOSYS (-38)`
         break
       }
       case "add":
@@ -354,8 +519,15 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
           const y = b as bigint
           if (instr.op === "sub") v = wrap64(x - y)
           else if (instr.op === "mul") v = wrap64(x * y)
-          else if (instr.op === "mod") v = y === 0n ? 0n : x % y
-          else v = wrap64(x + y)
+          else if (instr.op === "mod") {
+            // modulo by zero is a trap, not a value
+            if (y === 0n) {
+              trap("ZeroDivisionError", "LITHON-E0302: modulo by zero")
+              v = 0n
+            } else {
+              v = x % y
+            }
+          } else v = wrap64(x + y)
         }
         if (instr.dest) {
           registers.set(`${frames.length}:${current.name}:${instr.dest}`, v)
@@ -417,19 +589,25 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
       }
       case "shl":
       case "shr":
+      case "band":
+      case "bor":
+      case "bxor":
       case "and":
       case "or":
       case "xor": {
         const a = read(instr.args[0]) as bigint
         const b = read(instr.args[1]) as bigint
+        // The engine spells the *bitwise* ops `band`/`bor`/`bxor` and keeps
+        // `and`/`or`/`xor` for the logical ones, so both spellings are
+        // accepted here and treated as bitwise.
         const v =
           instr.op === "shl"
             ? wrap64(a << (b & 63n))
             : instr.op === "shr"
               ? a >> (b & 63n)
-              : instr.op === "and"
+              : instr.op === "band" || instr.op === "and"
                 ? a & b
-                : instr.op === "or"
+                : instr.op === "bor" || instr.op === "or"
                   ? a | b
                   : a ^ b
         if (instr.dest) {
@@ -466,7 +644,7 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
           type: instr.width ?? "int[64]",
           value: v as number,
         }
-        note = `${name}[${key}] ← ${fmtValue(v)}`
+        note = `${name}[${key}] â† ${fmtValue(v)}`
         break
       }
       case "Index":
@@ -504,13 +682,17 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
             `&${instr.args[0]}`
           )
           produced = { register: instr.dest, value: `&${instr.args[0]}` }
-          note = `&${instr.args[0]} → stack address`
+          note = `&${instr.args[0]} â†’ stack address`
         }
         break
       }
       case "call": {
         const callee = instr.args[0]
-        if (callee === "print") {
+        if (callee === "print" || callee === "print_bare" || callee === "print_sep") {
+          // The engine lowered `print(x)` into two calls: `print_bare, %N`
+          // (emit the value with no separator) followed by `print_nl`
+          // (emit the newline). The older single-call form `print, %N` is
+          // still accepted so hand-written IR from older docs keeps working.
           printedArg = instr.args[1]
           const v = read(instr.args[1])
           const isFloat =
@@ -519,9 +701,20 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
             ) || (instr.args[1] ? floatSlots.has(instr.args[1]) : false)
           const line =
             isFloat && typeof v === "number" ? fmtFloat(v) : fmtValue(v)
-          stdout.push(line)
-          output = line
+          if (callee === "print") {
+            // legacy single-call print: the value and the newline together
+            stdout.push(line)
+            output = line
+          } else {
+            // print_bare / print_sep: the value only; print_nl closes the line
+            pendingPrint = line
+            output = line
+          }
           printedArg = undefined
+        } else if (callee === "print_nl") {
+          stdout.push(pendingPrint ?? "")
+          output = pendingPrint ?? ""
+          pendingPrint = undefined
         } else {
           const target = byName.get(callee)
           if (target) {
@@ -546,7 +739,7 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
         const truthy =
           cond === true || (typeof cond === "bigint" && cond !== 0n)
         const target = truthy ? instr.args[1] : instr.args[2]
-        note = `branch on ${fmtValue(cond)} → ${target}`
+        note = `branch on ${fmtValue(cond)} â†’ ${target}`
         jumpTo = target
         break
       }
@@ -605,7 +798,13 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
     // continue from a return may have popped one
     const live = frames.at(-1)
     if (live === undefined) break
-    if (jumpTo) {
+    if (trapTarget) {
+      // a trap was caught: jump to the handler block
+      const target = current.instrs.find((i) => i.block === trapTarget)
+      if (target) live.pc = target.index
+      else live.pc += 1
+      trapTarget = undefined
+    } else if (jumpTo) {
       const target =
         current.instrs.find((i) => i.block === jumpTo && i.index > live.pc) ??
         current.instrs.find((i) => i.block === jumpTo)
@@ -617,7 +816,8 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
   }
 
   const run: IrRun = { steps, stdout }
-  if (guard >= maxSteps) run.error = `stopped after ${maxSteps} steps`
+  if (error) run.error = error
+  else if (guard >= maxSteps) run.error = `stopped after ${maxSteps} steps`
   return run
 }
 

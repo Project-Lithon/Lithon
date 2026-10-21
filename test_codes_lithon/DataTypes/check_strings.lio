@@ -1,11 +1,11 @@
-# check_strings.py
+# check_strings.lio
 #
 # Strings are NOT supported yet: the frontend lowers a bare string literal to
 # "expression node Constant not supported yet". Kept here as the pinned
 # example of that gap -- running it fails loudly rather than silently
 # producing a wrong answer.
 #
-#   $ lithon test_codes_lithon/check_strings.py
+#   $ lithon test_codes_lithon/DataTypes/check_strings.lio
 #   NotImplementedError: expression node Constant not supported yet
 #
 # Until that lands, the closest working equivalent is `len()` on a pointer or
