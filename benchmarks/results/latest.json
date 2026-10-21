@@ -1,11 +1,11 @@
 {
   "benchmark": "fib(30)",
-  "native_ms": 5.265,
-  "reference_ms": 876.4135,
-  "speedup": 166.5,
+  "native_ms": 10.4551,
+  "reference_ms": 1721.9913,
+  "speedup": 164.7,
   "result": 832040,
   "status": "PASS",
-  "commit": "6bfe7206dce6efd871755e43a8778ebfc3967e97",
+  "commit": "764670a34f90a3a9fc0670246436abf483c2c03f",
   "branch": "master",
   "runner": "Linux"
 }
