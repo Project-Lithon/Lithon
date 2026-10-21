@@ -36,7 +36,9 @@ jobs:
         run: bun run verify:docs
 
       # The generated IR and the AI-facing surfaces are committed, so they
-      # have to match what the frontend produces today.
+      # have to match what the frontend produces today. The generators
+      # normalise line endings, so the comparison is the same on every
+      # platform.
       - name: Check the generated IR is up to date
         working-directory: web
         run: |

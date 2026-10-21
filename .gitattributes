@@ -1,0 +1,23 @@
+# The generated IR files are compared byte-for-byte in CI, so their line
+# endings have to be the same on every platform. The generators normalise
+# the frontend's output to LF; this pins the files themselves so a
+# checkout cannot rewrite them.
+web/apps/web/src/docs/generated/ir.ts text eol=lf
+web/apps/web/src/lib/playground-ir.ts text eol=lf
+
+# The plain-text surfaces are served as-is.
+web/apps/web/public/llms.txt text eol=lf
+web/apps/web/public/llms-full.txt text eol=lf
+
+# Shell scripts must keep LF: CRLF breaks them.
+*.sh text eol=lf
+
+# Binary assets.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.mp4 binary
+*.woff binary
+*.woff2 binary

@@ -26,6 +26,23 @@ export function hash(source: string) {
   return h.toString(16).padStart(8, "0")
 }
 
+/**
+ * Normalises the frontend's output to LF, with no trailing blank lines.
+ *
+ * The frontend emits its IR with the platform's line ending, so the same
+ * program produces CRLF on Windows and LF on Linux. The generated file has
+ * to be byte-identical on every platform, or the CI freshness check fails
+ * on one of them.
+ */
+export function normalise(text: string): string {
+  return text
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0)
+    .join("\n")
+}
+
 const UV = requireUv()
 
 const out: Record<string, string> = {}
@@ -45,7 +62,7 @@ for (const page of DOCS.pages) {
       writeFileSync(file, ex.source, "utf8")
 
       const res = runTool(UV, [FRONTEND, file], REPO_ROOT)
-      const text = res.out.trim()
+      const text = normalise(res.out)
       if (res.code === 0 && text) {
         out[hash(ex.source)] = text
       } else {
