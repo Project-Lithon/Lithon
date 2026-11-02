@@ -207,6 +207,65 @@ enum class Op : uint8_t {
     FieldLoad,
     FieldStore,
 
+    // 4.10.1. Class instances. An instance is a HEAP REFERENCE -- an 8-byte
+    // pointer to a block beginning [vptr:8][refcount:8] (src/runtime/object.h)
+    // followed by the attributes packed at their class-declared offsets. Unlike
+    // a struct (4.6), which is an inline byte run the frame owns, an instance is
+    // a reference value that lives in a register: it can be passed, returned,
+    // stored in other objects and lists, and aliased (b = a names the SAME
+    // object). This is the 4.10.1 object model, and it is why a class-typed
+    // value is a new type kind ("class"), not a "struct[N]".
+    //
+    // Attribute access reuses the fixed-offset idea of FieldLoad/FieldStore, but
+    // the base is a REFERENCE rather than a named frame blob, so the offset is
+    // absolute from the object start (it already includes the 16-byte header):
+    // both tiers do `[ref + int_imm]`, and neither needs to know the header size.
+    //
+    //   New        name = ClassName, args = {}          result = ref (refcount 1)
+    //   RefLoad    args = {ref}, int_imm = attr offset  result = attribute value
+    //   RefStore   args = {ref, value}, int_imm = offset no result
+    //   Retain     args = {ref}                          result = ref (inc, for an alias)
+    //   Release    args = {ref}                          no result (dec; __del__ at 0)
+    //
+    // 4.10.2 adds the two runtime questions and the polymorphic call:
+    //
+    //   IsInstance args = {value}, name = C             result = bool
+    //   CallVirtual args = {recv, ...}, name = method   result = the method's value
+    //                                       int_imm = slot index
+    //
+    // IsInstance is TWO integer compares against C's subtree range (the
+    // descriptor's `subtree_lo <= x.vptr->type_id <= subtree_hi`): with a closed
+    // single hierarchy and pre-order, subtree-contiguous ids, `isinstance(x, C)`
+    // never walks -- it is the whole reason the id scheme exists. A null
+    // reference is false.
+    //
+    // CallVirtual is a real indirect call through the receiver's vtable slot.
+    // It is emitted ONLY when the receiver's exact class is not statically
+    // known (a base-typed parameter, a base-typed attribute): a monomorphic
+    // site keeps 4.9's inlining, which is the devirtualization the project
+    // promises. `int_imm` is the slot, fixed by the base the site compiled
+    // against; every subclass's descriptor has the same method in the same slot.
+    //
+    // New allocates a zeroed instance and stamps its vptr and refcount (1). The
+    // frontend emits it, then inlines __init__ (4.9's model, kept: a method is
+    // spliced in, never a separate function) so the constructor's assignments
+    // become ordinary RefStore instructions and its reads of self become
+    // RefLoad. Retain/Release are the reference-count traffic; the optimizer
+    // elides matched pairs and the borrowed-argument cases (4.10's plan), and a
+    // Release is the ONE observable lifetime point when the class has __del__
+    // (4.10.0 rule 2), so it may not be moved or elided there.
+    //
+    // The attribute's own type rides the trailing " : T" suffix exactly as a
+    // struct field does, so a RefLoad of an int[16] sign-extends, a float is a
+    // movsd, a bool zero-extends -- the same per-kind move the field ops use.
+    New,
+    RefLoad,
+    RefStore,
+    Retain,
+    Release,
+    IsInstance,
+    CallVirtual,
+
     // Hardening item 5. Explicit numeric conversions and terminal input.
     //
     //   ToFloat   args = {value}   result = float[64]
@@ -324,6 +383,37 @@ enum class Op : uint8_t {
     TryCatch
 };
 
+// True for every op that reaches a host helper as an ordinary `call` and so
+// clobbers the caller-saved registers per the host ABI. Both the liveness pass
+// and the register allocator consult this ONE list, so a new call-like op is
+// marked in a single place rather than being silently missed by one of them --
+// which is exactly how a live value comes to be parked in a register the call
+// then destroys.
+inline bool is_register_clobbering_op(Op op) {
+    switch (op) {
+        case Op::Call:
+        case Op::Syscall:
+        case Op::PrintContainer:
+        case Op::StrLen:
+        case Op::StrEq:
+        case Op::StrNe:
+        case Op::StrFind:
+        case Op::StrCount:
+        // 4.10.1. New/Retain/Release reach the shared class runtime by address.
+        case Op::New:
+        case Op::Retain:
+        case Op::Release:
+        // 4.10.2. IsInstance (a runtime helper) and CallVirtual (an indirect
+        // call) both clobber registers, so a value that must survive one cannot
+        // live only in a caller-saved register.
+        case Op::IsInstance:
+        case Op::CallVirtual:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // 6.10. The closed set of catchable Tier-3 traps, keyed by the message the
 // throwing site already uses. Both tiers call this, so they agree on which
 // exception a trap is: a program must not catch on one tier and die on the
@@ -375,12 +465,12 @@ inline std::vector<std::string> split_marks(const std::string& s) {
 // per-Instr strings below are the legacy one-level projection; new readers
 // recurse through `elem`/`key` instead.
 struct Type {
-    std::string kind;             // int | float | str | bool | struct | ptr | list | tuple | dict
+    std::string kind;             // int | float | str | bool | struct | ptr | class | list | tuple | dict
     int width = -1;               // scalar width, or struct byte size
     int cap = -1;                 // list/tuple capacity, or dict bucket count
     std::shared_ptr<Type> elem;   // element (list/tuple), value (dict), pointee (ptr)
     std::shared_ptr<Type> key;    // dict key
-    std::string ref;              // struct/enum name, source-level only
+    std::string ref;              // struct/enum/class name, source-level only
 
     bool is_container() const {
         return kind == "list" || kind == "tuple" || kind == "dict";
@@ -389,6 +479,11 @@ struct Type {
         return kind == "int" || kind == "float" || kind == "str" ||
                kind == "bool" || kind == "struct";
     }
+    // 4.10.1. A class-typed value is an 8-byte heap reference (an object
+    // pointer), NOT a packed scalar: it has no byte-run storage of its own, so
+    // is_scalar() deliberately excludes it, exactly as it excludes ptr. It is
+    // register-sized and passed/returned/compared as a value.
+    bool is_class() const { return kind == "class"; }
 };
 
 // 4.1 (phase 3). Flat-leaf layout of a list/tuple type. Leaves are packed
@@ -416,6 +511,10 @@ struct ContainerLayout {
 
 inline int scalar_leaf_bytes(const Type& t) {
     if (t.kind == "bool") return 1;
+    // 4.10.3. A class reference is one 8-byte object pointer. It is not a
+    // scalar (it has no byte-run storage of its own), but it IS a packed leaf
+    // when it sits inside a container: the run holds the pointer value.
+    if (t.kind == "class") return 8;
     if (t.kind == "int" || t.kind == "float")
         return (t.width > 0 && t.width % 8 == 0) ? t.width / 8 : 0;
     return 0;   // str, or anything else without packed storage
@@ -439,7 +538,9 @@ inline ContainerLayout container_layout(const Type& t) {
         levels.push_back(cur);
         cur = cur->elem.get();
     }
-    if (!cur || !cur->is_scalar()) return out;
+    // 4.10.3. A class reference is a valid packed leaf even though it is not
+    // a scalar: its run entry is the 8-byte pointer, not the object.
+    if (!cur || !(cur->is_scalar() || cur->is_class())) return out;
     const int lb = scalar_leaf_bytes(*cur);
     if (lb <= 0) return out;
     int count = 1;
@@ -517,13 +618,62 @@ struct Function {
     std::vector<std::string> params;
     std::vector<std::string> param_type_kinds;   // parallel to params; "" if untyped
     std::vector<int> param_type_widths;           // parallel to params; -1 if untyped/bool
+    std::vector<std::string> param_type_refs;     // class name when kind == "class"
     std::string return_type_kind;                 // "" if untyped
     int return_type_width = -1;
+    std::string return_type_ref;                  // class name when kind == "class"
     std::vector<BasicBlock> blocks;
+};
+
+// One class's runtime shape. `attributes` is in declaration order and each
+// offset is ABSOLUTE from the object start (it already includes the 16-byte
+// [vptr][refcount] header), so a RefLoad/RefStore and this table agree without
+// either side re-adding the header.
+struct ClassAttr {
+    std::string name;
+    int offset = 0;               // absolute byte offset from the object start
+    std::string type_kind;        // "int" | "float" | "bool" | "class" | ...
+    int type_width = -1;          // bit width, or -1
+    std::string type_ref;         // class name when type_kind == "class"
+};
+
+struct ClassInfo {
+    std::string name;
+    int instance_size = 0;        // header + all attributes, packed
+    bool has_destructor = false;  // a __del__ exists (4.10.0 rule 2)
+    std::vector<ClassAttr> attributes;
+    // 4.10.2 inheritance metadata. `base_index` is the index of the base class in
+    // Module::classes, or -1 for a root class. Every subclass instance begins
+    // with a valid base instance (base attributes keep their offsets), so an
+    // upcast is free. `slot_count` is the total vtable slots (the union of the
+    // chain's methods, base order first); a subclass never REMOVES a slot, so a
+    // call compiled against a base reads a stable index for every subclass.
+    // `abstract` marks a class whose body leaves at least one method `...`; it
+    // may not be instantiated.
+    int base_index = -1;
+    int slot_count = 0;
+    bool abstract = false;
+    // The method NAME at each slot, in slot order. Emitted so a CallVirtual site
+    // can be validated against the class it compiled against, and so the JIT and
+    // interpreter agree on what a slot means without re-deriving the chain.
+    std::vector<std::string> slots;
 };
 
 struct Module {
     std::vector<Function> functions;
+
+    // 4.10.1. Class layout metadata, one entry per declared class. The
+    // per-instruction ops carry the attribute OFFSETS they use (so the common
+    // path has no lookup), but New still needs the instance SIZE to allocate,
+    // and both tiers need the descriptor that `vptr` points at (for refcount and
+    // the destructor). Emitting the whole table once, here, is what lets the
+    // interpreter and the JIT build IDENTICAL descriptors from one source of
+    // truth rather than re-deriving layout on each side.
+    //
+    // A `struct[N]`-style inline record (4.6) is NOT here: it stays a frame byte
+    // run with no descriptor. This table is only for the reference-based classes
+    // of 4.10.
+    std::vector<ClassInfo> classes;
 };
 
 } // namespace lithon::ir

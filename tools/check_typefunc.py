@@ -32,19 +32,19 @@ FRONTEND = REPO / "src" / "frontend" / "frontend.py"
 # functions, `spelled` writes the expansions. The runtime statements are
 # identical, so the IR must be identical too.
 VIA = """\
-def Fixed(t, n: int[16]) -> NewType:
+def Fixed(t, n: int[16]) -> newtype:
     return {list[t, n]}
 
 
-def Word() -> NewType:
+def Word() -> newtype:
     return {int[32]}
 
 
-def Alias(t) -> NewType:
+def Alias(t) -> newtype:
     return {t}
 
 
-def Ref(t) -> NewType:
+def Ref(t) -> newtype:
     return {ptr[t]}
 
 
@@ -88,37 +88,37 @@ print(valueof(_p))
 # (label, source) refusals the frontend must reject with the given E-code.
 REFUSALS = [
     ("definition: two return values",
-     "def T(a) -> NewType:\n    return {a, a}\nprint(0)\n", "LITHON-E0132"),
+     "def T(a) -> newtype:\n    return {a, a}\nprint(0)\n", "LITHON-E0132"),
     ("definition: empty braces are a dict",
-     "def T() -> NewType:\n    return {}\nprint(0)\n", "LITHON-E0132"),
+     "def T() -> newtype:\n    return {}\nprint(0)\n", "LITHON-E0132"),
     ("application: value parameter annotated with a container",
-     "def T(a: list[int[64], 4]) -> NewType:\n    return {int[64]}\n"
+     "def T(a: list[int[64], 4]) -> newtype:\n    return {int[64]}\n"
      "x: T(1) = 1\nprint(0)\n", "LITHON-E0132"),
     ("application: value parameter given a type",
-     "def T(n: int[16]) -> NewType:\n    return {list[int[64], n]}\n"
+     "def T(n: int[16]) -> newtype:\n    return {list[int[64], n]}\n"
      "x: T(int[64]) = 1\nprint(0)\n", "LITHON-E0132"),
     ("application: value parameter argument out of range",
-     "def T(n: int[8]) -> NewType:\n    return {list[int[64], n]}\n"
+     "def T(n: int[8]) -> newtype:\n    return {list[int[64], n]}\n"
      "x: T(300) = 1\nprint(0)\n", "LITHON-E0132"),
     ("application: bool value parameter given an int",
-     "def T(b: bool) -> NewType:\n    return {list[int[64], 1]}\n"
+     "def T(b: bool) -> newtype:\n    return {list[int[64], 1]}\n"
      "x: T(1) = 1\nprint(0)\n", "LITHON-E0132"),
     ("definition: collides with a struct",
-     "def T(a) -> NewType:\n    return {a}\nclass T(Struct):\n    x: int[64]\nprint(0)\n",
+     "def T(a) -> newtype:\n    return {a}\nclass T(struct):\n    x: int[64]\nprint(0)\n",
      "LITHON-E0132"),
     ("application: not a declared type function",
      "x: T(int[64]) = 1\nprint(0)\n", "LITHON-E0133"),
     ("application: wrong arity",
-     "def P(a, b) -> NewType:\n    return {list[a, b]}\nx: P(int[64]) = 1\nprint(0)\n",
+     "def P(a, b) -> newtype:\n    return {list[a, b]}\nx: P(int[64]) = 1\nprint(0)\n",
      "LITHON-E0133"),
     ("application: direct recursion",
-     "def P(a) -> NewType:\n    return {P(a)}\nx: P(int[64]) = 1\nprint(0)\n",
+     "def P(a) -> newtype:\n    return {P(a)}\nx: P(int[64]) = 1\nprint(0)\n",
      "LITHON-E0133"),
     ("application: mutual recursion",
-     "def P(a) -> NewType:\n    return {Q(a)}\ndef Q(a) -> NewType:\n    return {P(a)}\n"
+     "def P(a) -> newtype:\n    return {Q(a)}\ndef Q(a) -> newtype:\n    return {P(a)}\n"
      "x: P(int[64]) = 1\nprint(0)\n", "LITHON-E0133"),
     ("definition: body names a struct",
-     "class S(Struct):\n    v: int[64]\ndef P() -> NewType:\n    return {S}\ns: P()\n",
+     "class S(struct):\n    v: int[64]\ndef P() -> newtype:\n    return {S}\ns: P()\n",
      "LITHON-E0132"),
 ]
 
@@ -170,7 +170,7 @@ def main() -> int:
     # is clean after a run, and a repeated call hands back the same tuple object.
     fe = load_frontend()
     fe.build_program(ast.parse(
-        "def Pair(t) -> NewType:\n    return {list[t, 2]}\n"
+        "def Pair(t) -> newtype:\n    return {list[t, 2]}\n"
         "a: Pair(int[64])\nb: Pair(int[64])\nc: Pair(int[32])\n"))
     entries = len(fe._TYPE_FUNC_CACHE)
     active_clean = fe._TYPE_FUNC_ACTIVE == []

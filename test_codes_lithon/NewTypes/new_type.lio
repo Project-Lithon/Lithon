@@ -1,4 +1,4 @@
-def custom(a:int[16],b:int[32],c:int[64],d:int[16],e:int[16]) -> NewType:
+def custom(a:int[16],b:int[32],c:int[64],d:int[16],e:int[16]) -> newtype:
 	return {
 	dict[str[e],list[tuple[int[d],a],b],c]
 	}

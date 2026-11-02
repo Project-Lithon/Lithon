@@ -23,13 +23,13 @@ def swap32(v: int[64]) -> int[64]:
 # address is 127.0.0.1 = 0x7F000001; swap32 makes the stored bytes 7F 00 00 01,
 # which is what the kernel reads as network order. The port starts at 0 so the
 # kernel picks a free one, and getsockname fills it in below.
-class SockAddrIn(Struct):
+class SockAddrIn(struct):
     lo: int[64]
     hi: int[64]
 
 
 # An 8-byte buffer the kernel can read from and write into.
-class Buf(Struct):
+class Buf(struct):
     v: int[64]
 
 

@@ -21,6 +21,7 @@
 #include "optimize.h"
 #include "print_guard.h"
 #include "register_alloc.h"
+#include "runtime/class_runtime.h"
 #include "stack_guard.h"
 #include "syscall_runtime.h"
 #include "x86_encoder.h"
@@ -706,6 +707,16 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
     // register while the caller had correctly put the double in XMM.
     const std::vector<std::vector<Kind>> module_param_kinds = infer_param_kinds(module);
 
+    // 4.10.1. Each class's index in the module's class table. `new Point` emits
+    // this index, and the runtime's build_class_table (called with the same
+    // module.classes in the same order) turns it back into the descriptor. The
+    // index is resolved HERE, at compile time, rather than read from the runtime
+    // table -- the table is built at the entry point, after compilation.
+    std::unordered_map<std::string, int> class_index;
+    for (size_t ci = 0; ci < module.classes.size(); ++ci) {
+        class_index[module.classes[ci].name] = static_cast<int>(ci);
+    }
+
     for (size_t fn_index = 0; fn_index < module.functions.size(); ++fn_index) {
         const Function& original_fn = module.functions[fn_index];
         // A mutable copy: accumulator_unroll is the one pass that invents new
@@ -887,6 +898,16 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
             for (const auto& in : b.instrs) {
                 if (in.op == Op::Call && in.args.size() > 2) {
                     out_args = std::max(out_args, in.args.size() - 2);
+                }
+                // 4.10.2. A virtual call marshals the receiver plus the method
+                // arguments into the outgoing area, then calls the slot
+                // resolver (which clobbers the argument registers), so it also
+                // needs three extra slots past the arguments: the resolved
+                // target, plus the receiver and the first argument saved across
+                // the resolver call.
+                if (in.op == Op::CallVirtual) {
+                    const size_t argv = in.args.size() >= 2 ? in.args.size() - 2 : 0;
+                    out_args = std::max(out_args, argv + 3);
                 }
             }
         }
@@ -2876,6 +2897,19 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
             }
 
             case Op::Index: {
+                // 4.10.3. A class container is fully initialized by its
+                // literal, so a null leaf means the program read an element no
+                // constructor ever wrote. Trap with the interpreter's text
+                // instead of dereferencing null on the next attribute load or
+                // virtual call. The check is emitted only for Object results,
+                // so every existing int/float/bool/pointer Index is unchanged.
+                auto trap_if_null_object = [&](Reg dst) {
+                    if (value_kinds[instr.result] != Kind::Object) return;
+                    emit_test_reg_reg(code, dst);
+                    JumpPatch ok = emit_jcc_rel32(code, Cond::NotEqual);
+                    emit_host_error_trap("error: null class reference\n");
+                    resolve_jump_patch(code, ok, code.size());
+                };
                 // 4.1 (phase 3). A nested access is one flat-leaf index sum.
                 if (alloc.has_flat_layout(instr.name)) {
                     const auto* lay = alloc.flat_layout(instr.name);
@@ -2892,6 +2926,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                             emit_load_rbp_scaled(code, dst, kR, bdisp, lay->leaf_bytes);
                         else
                             emit_load_rbp_scaled_sext(code, dst, kR, bdisp, lay->leaf_bytes);
+                        trap_if_null_object(dst);
                         commit_result(instr.result, dst);
                     }
                     break;
@@ -2928,6 +2963,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                         emit_load_rbp_scaled(code, dst, idx, disp, stride);
                     else
                         emit_load_rbp_scaled_sext(code, dst, idx, disp, stride);
+                    trap_if_null_object(dst);
                     commit_result(instr.result, dst);
                 }
                 break;
@@ -3252,6 +3288,227 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                     // other scratch users may be holding across this case.
                     Reg src = read_in(instr.args.at(0), kR);
                     emit_store_rbp_offset(code, src, disp, bytes);
+                }
+                break;
+            }
+
+            // 4.10.1. Class instance ops. The reference is an ordinary 8-byte
+            // value in a GP register (a class-typed variable lives in a frame
+            // slot exactly as a ptr does), so an attribute load/store is a
+            // `[ref + disp]` at the frontend's absolute offset -- the same
+            // instruction the 4.4 pointer-field path emits, only the base is a
+            // reference instead of a raw ptr. Allocation and the refcount
+            // traffic go through the shared runtime helpers, so the interpreter
+            // and the JIT free to the same size class and run __del__ through
+            // the same pointer.
+            case Op::New: {
+                auto ci_it = class_index.find(instr.name);
+                if (ci_it == class_index.end()) {
+                    throw std::runtime_error("compile_module: new of unknown class '" +
+                                             instr.name + "'");
+                }
+                const int idx = ci_it->second;
+                emit_mov_reg_imm(code, abi::kArgRegs[0], static_cast<int64_t>(idx));
+                emit_mov_reg_imm(code, kR,
+                                 reinterpret_cast<int64_t>(&lithon::runtime::host_class_new));
+                emit_call_reg(code, kR);
+                Reg dst = compute_dest(instr.result);
+                if (dst != Reg::RAX) emit_mov_reg_reg(code, dst, Reg::RAX);
+                commit_result(instr.result, dst);
+                break;
+            }
+            case Op::RefLoad: {
+                Reg base = read_left(instr.args.at(0));
+                if (is_float_value(value_kinds, instr.result)) {
+                    // Float attributes go through the shared helper, which is
+                    // bit-identical to the interpreter's memcpy of the same 8
+                    // bytes. Kept off the inline path deliberately: it is rare
+                    // and it removes any chance of a different movsd form
+                    // disagreeing on byte order.
+                    emit_mov_reg_reg(code, abi::kArgRegs[0], base);
+                    emit_mov_reg_imm(code, abi::kArgRegs[1], instr.int_imm);
+                    emit_mov_reg_imm(
+                        code, kR,
+                        reinterpret_cast<int64_t>(&lithon::runtime::class_attr_load_f64));
+                    // The helper returns a double in XMM0; move it to the
+                    // result's float home.
+                    emit_call_reg(code, kR);
+                    Xmm dst = float_dest(instr.result);
+                    if (dst != Xmm::XMM0) emit_movsd_xmm_xmm(code, dst, Xmm::XMM0);
+                    commit_float_result(instr.result, dst);
+                    break;
+                }
+                const int disp = static_cast<int>(instr.int_imm);
+                const int bytes = (instr.type_kind == "bool") ? 1
+                                  : (instr.type_kind == "class") ? 8
+                                  : instr.type_width / 8;
+                Reg dst = compute_dest(instr.result);
+                if (instr.type_kind == "bool")
+                    emit_load_reg_disp(code, dst, base, disp, bytes);
+                else
+                    emit_load_reg_disp_sext(code, dst, base, disp, bytes);
+                commit_result(instr.result, dst);
+                break;
+            }
+            case Op::RefStore: {
+                Reg base = read_left(instr.args.at(0));
+                if (is_float_value(value_kinds, instr.args.at(1))) {
+                    Xmm src = read_float(instr.args.at(1));
+                    // Stage the ref and the offset, then hand the double in XMM0.
+                    emit_mov_reg_reg(code, abi::kArgRegs[0], base);
+                    emit_mov_reg_imm(code, abi::kArgRegs[1], instr.int_imm);
+                    if (src != Xmm::XMM0) emit_movsd_xmm_xmm(code, Xmm::XMM0, src);
+                    emit_mov_reg_imm(
+                        code, kR,
+                        reinterpret_cast<int64_t>(&lithon::runtime::class_attr_store_f64));
+                    emit_call_reg(code, kR);
+                    break;
+                }
+                const int disp = static_cast<int>(instr.int_imm);
+                const int bytes = (instr.type_kind == "bool") ? 1
+                                  : (instr.type_kind == "class") ? 8
+                                  : instr.type_width / 8;
+                // kR, not read_left: a refstore names no result, but the value
+                // must not land in kL, which the ref may already be holding.
+                Reg src = read_in(instr.args.at(1), kR);
+                emit_store_reg_disp(code, src, base, disp, bytes);
+                break;
+            }
+            case Op::Retain: {
+                Reg base = read_left(instr.args.at(0));
+                emit_mov_reg_reg(code, abi::kArgRegs[0], base);
+                emit_mov_reg_imm(
+                    code, kR,
+                    reinterpret_cast<int64_t>(&lithon::runtime::host_class_retain));
+                emit_call_reg(code, kR);
+                Reg dst = compute_dest(instr.result);
+                if (dst != Reg::RAX) emit_mov_reg_reg(code, dst, Reg::RAX);
+                commit_result(instr.result, dst);
+                break;
+            }
+            case Op::Release: {
+                Reg base = read_left(instr.args.at(0));
+                emit_mov_reg_reg(code, abi::kArgRegs[0], base);
+                emit_mov_reg_imm(
+                    code, kR,
+                    reinterpret_cast<int64_t>(&lithon::runtime::host_class_release));
+                emit_call_reg(code, kR);
+                break;
+            }
+            // 4.10.2. isinstance(x, C): the shared runtime helper does the two
+            // integer compares, so the JIT and the interpreter agree by
+            // construction. `int_imm` is C's table index.
+            case Op::IsInstance: {
+                materialize_into(abi::kArgRegs[0], instr.args.at(0));
+                emit_mov_reg_imm(code, abi::kArgRegs[1], instr.int_imm);
+                emit_mov_reg_imm(
+                    code, kR,
+                    reinterpret_cast<int64_t>(&lithon::runtime::host_class_is_instance));
+                emit_call_reg(code, kR);
+                Reg dst = compute_dest(instr.result);
+                if (dst != Reg::RAX) emit_mov_reg_reg(code, dst, Reg::RAX);
+                commit_result(instr.result, dst);
+                break;
+            }
+            // 4.10.2. callvirtual: read the receiver's OWN descriptor slot (so a
+            // subclass override runs) and call it. The target comes from a
+            // runtime helper, so it cannot be a rel32 patch; it is stashed in
+            // the outgoing-argument area beyond the argument slots while the
+            // register arguments are marshalled, because RAX does not survive
+            // that marshalling. The ABI is the ordinary one: the receiver is
+            // arg 0, the method parameters follow, exactly as the equivalent
+            // inlined call would pass them.
+            case Op::CallVirtual: {
+                const size_t nargs = instr.args.size();
+                if (nargs < 1) {
+                    throw std::runtime_error("compile_module: callvirtual with no receiver");
+                }
+                if (nargs - 1 > abi::kMaxParams) {
+                    throw std::runtime_error(
+                        "compile_module: callvirtual with more than " +
+                        std::to_string(abi::kMaxParams) + " arguments not supported");
+                }
+                // Layout of the outgoing area for this call:
+                //   [rsp + (i-2)*8]  arg i (i >= 2) -- the ordinary call slots
+                //   target_off       the resolved slot pointer
+                //   arg0_off         the receiver, saved across the resolver call
+                //   arg1_off         the first method parameter, likewise
+                const int32_t target_off = static_cast<int32_t>((nargs >= 2 ? nargs - 2 : 0) * 8);
+                const int32_t arg0_off = target_off + 8;
+                const int32_t arg1_off = target_off + 16;
+                // Marshal the arguments the way Op::Call does -- stack arguments
+                // first, then the register ones -- so the argument registers are
+                // set up LAST, immediately before the call.
+                for (size_t i = 2; i < nargs; ++i) {
+                    const int32_t off = static_cast<int32_t>((i - 2) * 8);
+                    if (is_float_value(value_kinds, instr.args[i])) {
+                        Xmm fv = read_float(instr.args[i]);
+                        emit_movsd_rsp_mem(code, fv, off);
+                    } else {
+                        materialize_into(kR, instr.args[i]);
+                        emit_store_rsp_offset(code, kR, off);
+                    }
+                }
+                for (size_t i = 0; i < std::min(nargs, size_t(2)); ++i) {
+                    if (is_float_value(value_kinds, instr.args[i])) {
+                        Xmm fv = read_float(instr.args[i]);
+                        if (fv != abi::kFloatArgRegs[i]) {
+                            emit_movsd_xmm_xmm(code, abi::kFloatArgRegs[i], fv);
+                        }
+                    } else {
+                        materialize_into(abi::kArgRegs[i], instr.args[i]);
+                    }
+                }
+                // The resolver call clobbers the argument registers, so save
+                // the receiver (arg 0) and, when present, the first method
+                // parameter (arg 1) to stack slots the resolver's own call does
+                // not touch. Arg 0 is always a GP reference; arg 1 may be a
+                // float, in which case its XMM is also caller-saved and must be
+                // saved the same way.
+                emit_store_rsp_offset(code, abi::kArgRegs[0], arg0_off);
+                const bool arg1_is_float = nargs > 1 && is_float_value(value_kinds, instr.args[1]);
+                if (nargs > 1) {
+                    if (arg1_is_float) {
+                        emit_movsd_rsp_mem(code, abi::kFloatArgRegs[1], arg1_off);
+                    } else {
+                        emit_store_rsp_offset(code, abi::kArgRegs[1], arg1_off);
+                    }
+                }
+                // Resolve the slot pointer: host_class_slot(receiver, slot).
+                emit_mov_reg_imm(code, abi::kArgRegs[1], instr.int_imm);
+                emit_mov_reg_imm(
+                    code, kR,
+                    reinterpret_cast<int64_t>(&lithon::runtime::host_class_slot));
+                emit_call_reg(code, kR);
+                emit_store_rsp_offset(code, Reg::RAX, target_off);
+                // Restore the two register arguments the resolver call clobbered
+                // and load the target, so the setup is again the last thing
+                // before the call.
+                emit_load_rsp_offset(code, abi::kArgRegs[0], arg0_off);
+                if (nargs > 1) {
+                    if (arg1_is_float) {
+                        emit_movsd_rsp_to_xmm(code, abi::kFloatArgRegs[1], arg1_off);
+                    } else {
+                        emit_load_rsp_offset(code, abi::kArgRegs[1], arg1_off);
+                    }
+                }
+                emit_load_rsp_offset(code, kR, target_off);
+                emit_call_reg(code, kR);
+                if (instr.result != kInvalidValue) {
+                    if (is_float_value(value_kinds, instr.result)) {
+                        Xmm d = float_dest(instr.result);
+                        if (d != abi::kFloatArgReg) {
+                            emit_movsd_xmm_xmm(code, d, abi::kFloatArgReg);
+                        }
+                        commit_float_result(instr.result, d);
+                    } else {
+                        const ValueLocation& loc = alloc.temp_location(instr.result);
+                        if (loc.in_register) {
+                            if (loc.reg != Reg::RAX) emit_mov_reg_reg(code, loc.reg, Reg::RAX);
+                        } else {
+                            emit_store_rbp_offset(code, Reg::RAX, loc.stack_slot);
+                        }
+                    }
                 }
                 break;
             }

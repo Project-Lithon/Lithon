@@ -1,0 +1,58 @@
+# 4.10.2. Single inheritance and virtual dispatch. `Square` and `Rect` extend
+# the abstract `Shape`: the base owns `sides`, each subclass adds its own
+# attributes, and each overrides `area`. `describe` is inherited and calls
+# `self.area()`, which must reach the SUBCLASS override even though the call
+# was compiled against `Shape` (a vtable slot, stable down the hierarchy).
+# Assigning a `Square`/`Rect` to a `Shape` variable is the free upcast: base
+# attributes keep their offsets, so the pointer does not move.
+#
+# The expected output is CPython's answer for the same shapes.
+
+class Shape:
+    sides: int[64]
+
+    def __init__(self, sides: int[64]):
+        self.sides = sides
+
+    def area(self) -> int[64]: ...
+
+    def describe(self) -> int[64]:
+        return self.area() * 10 + self.sides
+
+class Square(Shape):
+    side: int[64]
+
+    def __init__(self, side: int[64]):
+        super().__init__(4)
+        self.side = side
+
+    def area(self) -> int[64]:
+        return self.side * self.side
+
+class Rect(Shape):
+    w: int[64]
+    h: int[64]
+
+    def __init__(self, w: int[64], h: int[64]):
+        super().__init__(4)
+        self.w = w
+        self.h = h
+
+    def area(self) -> int[64]:
+        return self.w * self.h
+
+s: Square = Square(3)
+print(s.area())
+print(s.describe())
+r: Rect = Rect(2, 5)
+print(r.area())
+print(r.describe())
+sh: Shape = s
+print(sh is s)
+print(sh.area())
+print(sh.describe())
+sh = r
+print(sh is r)
+print(sh is s)
+print(sh.area())
+print(sh.describe())

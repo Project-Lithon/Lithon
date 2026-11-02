@@ -1,4 +1,6 @@
 #include "interpreter.h"
+#include "runtime/class_runtime.h"
+#include "runtime/heap.h"
 #include "runtime/value.h"
 #include "ir/ir.h"
 #include "jit/container_print.h"
@@ -280,6 +282,10 @@ public:
 LithonValue zero_of_kind(const std::string& elem_kind) {
     if (elem_kind == "float") return LithonValue::make_float(0.0);
     if (elem_kind == "bool")  return LithonValue::make_bool(false);
+    // 4.10.3. A class leaf's zero is a null object reference, not an int zero:
+    // the interpreter's ValueTag must match the kind the container was laid
+    // out as, and Retain/Release are null-tolerant.
+    if (elem_kind == "class") return LithonValue::make_object(nullptr);
     return LithonValue::make_int(0);
 }
 
@@ -603,6 +609,24 @@ LithonValue apply_compare(Op op, LithonValue lhs, LithonValue rhs) {
     // compare). Treating it as its integer value 0/1 keeps the two engines
     // identical: True == 1, False == 0, True > False, exactly as in Python. The
     // payload of make_bool is already 0/1, so as_int() reads it back correctly.
+    // 4.10.1. Object identity. A class reference is an address; `==`/`!=` (and
+    // `is`/`is not`, which lower to the same ops) compare the two references.
+    // `lt`/`gt` on references is meaningless and refused.
+    if (lhs.is_object() || rhs.is_object()) {
+        if (!lhs.is_object() || !rhs.is_object()) {
+            throw std::runtime_error(
+                "interpreter: comparison between an object and a non-object");
+        }
+        const uintptr_t a = reinterpret_cast<uintptr_t>(lhs.as_object());
+        const uintptr_t b = reinterpret_cast<uintptr_t>(rhs.as_object());
+        switch (op) {
+            case Op::Eq: return LithonValue::make_bool(a == b);
+            case Op::Ne: return LithonValue::make_bool(a != b);
+            default:
+                throw std::runtime_error(
+                    "interpreter: objects can only be compared for identity");
+        }
+    }
     const bool lhs_num = lhs.is_int() || lhs.is_float() || lhs.is_bool();
     const bool rhs_num = rhs.is_int() || rhs.is_float() || rhs.is_bool();
     if (!lhs_num || !rhs_num) {
@@ -700,6 +724,40 @@ LithonValue apply_bitop(Op op, LithonValue lhs, LithonValue rhs) {
 // kind does, and sharing the analysis keeps both tiers agreeing on which prints
 // are pointers. Set for the duration of run_main.
 const std::vector<std::vector<lithon::jit::Kind>>* g_value_kinds = nullptr;
+
+LithonValue execute_function(const Module& module, const Function& fn,
+                             const std::vector<LithonValue>& arg_values);
+
+// 4.10.1. The module and its emitted `__del__<Class>` functions, for the
+// duration of run_main. The runtime's release path invokes a descriptor's
+// destructor as a `void(*)(void*)`; in the interpreter that pointer is
+// `interp_destructor`, which looks the class up here and runs the function with
+// the object reference as `self`. Set beside reset_heap at the entry point.
+const Module* g_del_module = nullptr;
+std::unordered_map<std::string, const Function*>* g_del_functions = nullptr;
+
+// 4.10.2. The emitted `__virt__<Class>.<slot>` functions, keyed by
+// "<Class>.<slot>". A virtual call in the interpreter resolves the receiver's
+// runtime class and slot to one of these by name -- the same convention
+// `__del__<Class>` uses -- rather than indirect-calling a slot pointer, which
+// the JIT owns. Set beside the __del__ map at the entry point.
+std::unordered_map<std::string, const Function*>* g_virt_functions = nullptr;
+
+// The interpreter's destructor trampoline. `self` is the ObjectHeader pointer
+// the runtime passes; the emitted `__del__<Class>(self: class[Class])` receives
+// it as its one reference argument.
+void interp_destructor(void* self) {
+    if (g_del_functions == nullptr || g_del_module == nullptr) return;
+    // The class name comes from the object's own descriptor, so the trampoline
+    // needs no per-class closure: one function serves every class.
+    auto* obj = static_cast<lithon::runtime::ObjectHeader*>(self);
+    if (obj->vptr == nullptr || obj->vptr->name == nullptr) return;
+    auto it = g_del_functions->find(std::string("__del__") + obj->vptr->name);
+    if (it == g_del_functions->end()) return;
+    execute_function(*g_del_module, *it->second,
+                     {LithonValue::make_object(
+                         reinterpret_cast<lithon::ObjHeader*>(self))});
+}
 
 bool print_arg_is_ptr(const Module& module, const Function& fn, lithon::ir::ValueId id) {
     if (!g_value_kinds || module.functions.empty()) return false;
@@ -1515,6 +1573,165 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     }
                     break;
                 }
+                // 4.10.1. Class instance ops. An instance is a reference: the
+                // value in the register is an ObjectTag carrying the object's
+                // address, and the object itself is a real block on the shared
+                // runtime heap -- the SAME heap the JIT uses. Reading an
+                // attribute is a load at [obj + int_imm] with the attribute's
+                // own kind deciding the move, exactly as a struct field read
+                // does; writing is the matching store. Because the bytes live
+                // in the shared heap and the offsets are the same absolute
+                // numbers, the interpreter and the JIT read and write the very
+                // same bytes.
+                case Op::New: {
+                    const int idx = lithon::runtime::class_table().index_of(instr.name);
+                    if (idx < 0) {
+                        throw std::runtime_error(
+                            "interpreter: new of unknown class '" + instr.name + "'");
+                    }
+                    auto* obj = lithon::runtime::host_class_new(idx);
+                    if (obj == nullptr) {
+                        throw std::runtime_error("interpreter: out of memory allocating " +
+                                                 instr.name);
+                    }
+                    frame.regs[instr.result] = LithonValue::make_object(
+                        reinterpret_cast<lithon::ObjHeader*>(obj));
+                    break;
+                }
+                case Op::RefLoad: {
+                    LithonValue ref = frame.get_reg(instr.args.at(0));
+                    if (!ref.is_object()) {
+                        throw std::runtime_error("interpreter: refload of a non-object");
+                    }
+                    auto* obj = reinterpret_cast<lithon::runtime::ObjectHeader*>(
+                        ref.as_object());
+                    if (instr.type_kind == "float") {
+                        const double d = lithon::runtime::class_attr_load_f64(
+                            obj, instr.int_imm);
+                        frame.regs[instr.result] = LithonValue::make_float(d);
+                    } else if (instr.type_kind == "bool") {
+                        const uint64_t raw = lithon::runtime::class_attr_load_u64(
+                            obj, instr.int_imm, 1, false);
+                        frame.regs[instr.result] = LithonValue::make_bool(raw != 0);
+                    } else if (instr.type_kind == "class") {
+                        // A class-typed attribute is itself a reference: its
+                        // bytes ARE the object pointer.
+                        const uint64_t raw = lithon::runtime::class_attr_load_u64(
+                            obj, instr.int_imm, 8, false);
+                        lithon::runtime::ObjectHeader* inner = nullptr;
+                        std::memcpy(&inner, &raw, sizeof(inner));
+                        frame.regs[instr.result] = LithonValue::make_object(
+                            reinterpret_cast<lithon::ObjHeader*>(inner));
+                    } else {
+                        const int64_t raw = lithon::runtime::class_attr_load_u64(
+                            obj, instr.int_imm, instr.type_width / 8, true);
+                        frame.regs[instr.result] = LithonValue::make_int(raw);
+                    }
+                    break;
+                }
+                case Op::RefStore: {
+                    LithonValue ref = frame.get_reg(instr.args.at(0));
+                    if (!ref.is_object()) {
+                        throw std::runtime_error("interpreter: refstore to a non-object");
+                    }
+                    auto* obj = reinterpret_cast<lithon::runtime::ObjectHeader*>(
+                        ref.as_object());
+                    LithonValue v = frame.get_reg(instr.args.at(1));
+                    if (instr.type_kind == "float") {
+                        lithon::runtime::class_attr_store_f64(obj, instr.int_imm,
+                                                              v.as_float());
+                    } else if (instr.type_kind == "bool") {
+                        lithon::runtime::class_attr_store_u64(
+                            obj, instr.int_imm, 1, v.as_int() != 0 ? 1 : 0);
+                    } else if (instr.type_kind == "class") {
+                        lithon::runtime::ObjectHeader* inner =
+                            v.is_object()
+                                ? reinterpret_cast<lithon::runtime::ObjectHeader*>(
+                                      v.as_object())
+                                : nullptr;
+                        uint64_t raw = 0;
+                        std::memcpy(&raw, &inner, sizeof(raw));
+                        lithon::runtime::class_attr_store_u64(obj, instr.int_imm, 8, raw);
+                    } else {
+                        lithon::runtime::class_attr_store_u64(
+                            obj, instr.int_imm, instr.type_width / 8,
+                            static_cast<uint64_t>(v.as_int()));
+                    }
+                    break;
+                }
+                case Op::Retain: {
+                    LithonValue ref = frame.get_reg(instr.args.at(0));
+                    if (!ref.is_object()) {
+                        throw std::runtime_error("interpreter: retain of a non-object");
+                    }
+                    auto* obj = lithon::runtime::host_class_retain(
+                        reinterpret_cast<lithon::runtime::ObjectHeader*>(ref.as_object()));
+                    frame.regs[instr.result] =
+                        LithonValue::make_object(reinterpret_cast<lithon::ObjHeader*>(obj));
+                    break;
+                }
+                case Op::Release: {
+                    LithonValue ref = frame.get_reg(instr.args.at(0));
+                    if (!ref.is_object()) {
+                        throw std::runtime_error("interpreter: release of a non-object");
+                    }
+                    lithon::runtime::host_class_release(
+                        reinterpret_cast<lithon::runtime::ObjectHeader*>(ref.as_object()));
+                    break;
+                }
+                // 4.10.2. isinstance(x, C): two integer compares inside the
+                // shared runtime, so the interpreter and the JIT agree by
+                // construction. The class is named by its table index.
+                case Op::IsInstance: {
+                    LithonValue ref = frame.get_reg(instr.args.at(0));
+                    if (!ref.is_object()) {
+                        throw std::runtime_error("interpreter: isinstance of a non-object");
+                    }
+                    auto* obj = reinterpret_cast<lithon::runtime::ObjectHeader*>(
+                        ref.as_object());
+                    const bool yes = lithon::runtime::host_class_is_instance(
+                        obj, instr.int_imm);
+                    frame.regs[instr.result] = LithonValue::make_bool(yes);
+                    break;
+                }
+                // 4.10.2. callvirtual: pick the implementation from the
+                // receiver's OWN descriptor, so a subclass override runs, and
+                // invoke it with the receiver and the arguments. The interpreter
+                // reaches the emitted function by name (the same convention
+                // `__del__<Class>` uses) rather than through a slot pointer,
+                // which the JIT owns.
+                case Op::CallVirtual: {
+                    LithonValue ref = frame.get_reg(instr.args.at(0));
+                    if (!ref.is_object()) {
+                        throw std::runtime_error("interpreter: callvirtual on a non-object");
+                    }
+                    auto* obj = reinterpret_cast<lithon::runtime::ObjectHeader*>(
+                        ref.as_object());
+                    if (obj->vptr == nullptr || obj->vptr->name == nullptr) {
+                        throw std::runtime_error("interpreter: callvirtual on an unstamped object");
+                    }
+                    const std::string owner = obj->vptr->name;
+                    const std::string key = owner + "." + instr.name2;
+                    const Function* callee = nullptr;
+                    if (g_virt_functions != nullptr) {
+                        auto it = g_virt_functions->find(key);
+                        if (it != g_virt_functions->end()) callee = it->second;
+                    }
+                    if (callee == nullptr) {
+                        throw std::runtime_error(
+                            "interpreter: no implementation for virtual call " + key);
+                    }
+                    std::vector<LithonValue> argv;
+                    argv.push_back(ref);
+                    for (size_t a = 1; a < instr.args.size(); ++a) {
+                        argv.push_back(frame.get_reg(instr.args.at(a)));
+                    }
+                    LithonValue r = execute_function(*g_del_module, *callee, argv);
+                    if (!instr.type_kind.empty()) {
+                        frame.regs[instr.result] = r;
+                    }
+                    break;
+                }
                 // Hardening item 5. Explicit conversions and terminal input.
                 case Op::ToFloat:
                     frame.regs[instr.result] =
@@ -1597,7 +1814,15 @@ LithonValue execute_function(const Module& module, const Function& fn,
                             throw std::runtime_error("list index out of range");
                     }
                     if (instr.op == Op::Index) {
-                        frame.regs[instr.result] = elems[static_cast<size_t>(flat)];
+                        LithonValue v = elems[static_cast<size_t>(flat)];
+                        // 4.10.3. A class container is fully initialized by its
+                        // literal, so a null leaf means the program read an
+                        // element no constructor ever wrote. Trap with the same
+                        // text the native tier uses rather than handing a null
+                        // reference to an attribute load or method call.
+                        if (v.is_object() && v.as_object() == nullptr)
+                            throw std::runtime_error("null class reference");
+                        frame.regs[instr.result] = v;
                     } else {
                         elems[static_cast<size_t>(flat)] = frame.get_reg(instr.args.at(n_idx));
                     }
@@ -1771,6 +1996,43 @@ void run_main(const Module& module) {
     // E0401: a fresh program starts at depth 0; execute_function's own guard
     // bumps it to 1 for __main__.
     lithon::jit::g_call_depth = 0;
+    // 4.10.0: and a fresh program starts with a fresh object heap. Both tiers
+    // reset the SAME arena, so a class program's observable lifetime behaviour
+    // (when __del__ runs) matches regardless of which tier ran it.
+    lithon::runtime::reset_heap();
+    // 4.10.1: and a fresh class-descriptor table, built from the module's class
+    // metadata. Both tiers build it from the same ClassInfo list, so a New in
+    // either allocates the same size and a Release runs __del__ through the
+    // same descriptor. Each __del__ is resolved to the interpreter trampoline,
+    // which runs the emitted `__del__<Class>` function.
+    std::unordered_map<std::string, const Function*> del_functions;
+    for (const auto& fn : module.functions) {
+        if (fn.name.rfind("__del__", 0) == 0) del_functions[fn.name] = &fn;
+    }
+    g_del_module = &module;
+    g_del_functions = &del_functions;
+    // 4.10.2. The virtual-method functions, keyed "<Class>.<slot>" -- the
+    // `__virt__` prefix stripped. A CallVirtual resolves its receiver's runtime
+    // class and the call's method name to one of these.
+    std::unordered_map<std::string, const Function*> virt_functions;
+    for (const auto& fn : module.functions) {
+        const std::string prefix = "__virt__";
+        if (fn.name.rfind(prefix, 0) == 0)
+            virt_functions[fn.name.substr(prefix.size())] = &fn;
+    }
+    g_virt_functions = &virt_functions;
+    lithon::runtime::build_class_table(
+        module.classes,
+        [](const std::string&) -> void (*)(void*) {
+            return &interp_destructor;
+        },
+        // The interpreter never indirect-calls through a vtable slot: its
+        // CallVirtual op resolves the method name from the table's slot_names
+        // and runs the emitted function through its own dispatch, so the slot
+        // pointers stay null here.
+        [](const std::string&, int, const char*) -> void (*)(void) {
+            return nullptr;
+        });
     execute_function(module, *main_fn, {});
 }
 

@@ -432,98 +432,211 @@ FRONTEND_REFUSALS = [
      "d: dict[int[64], ptr[int[64]], 4]\nprint(0)\n", "LITHON-E0112"),
     ("range(a,b,0) literal step is E0107",
      "for i in range(5, 1, 0):\n    print(i)\n", "LITHON-E0107"),
-    ("struct without the Struct base (E0126)",
-     "class Foo:\n    x: int[64]\nprint(0)\n", "LITHON-E0126"),
+    ("a class with an unknown base (E0126)",
+     "class Foo(Bar):\n    x: int[64]\nprint(0)\n", "LITHON-E0126"),
     ("struct body with a non-annotation statement (E0126)",
-     "class Foo(Struct):\n    x = 1\nprint(0)\n", "LITHON-E0126"),
+     "class Foo(struct):\n    x = 1\nprint(0)\n", "LITHON-E0126"),
     ("container field in a struct (E0127)",
-     "class Foo(Struct):\n    xs: list[int[64], 4]\nf: Foo\nprint(0)\n",
+     "class Foo(struct):\n    xs: list[int[64], 4]\nf: Foo\nprint(0)\n",
      "LITHON-E0127"),
     ("unknown struct field type (E0127)",
-     "class Foo(Struct):\n    z: blah\nf: Foo\nprint(0)\n", "LITHON-E0127"),
+     "class Foo(struct):\n    z: blah\nf: Foo\nprint(0)\n", "LITHON-E0127"),
     ("duplicate struct field (E0127)",
-     "class Foo(Struct):\n    x: int[64]\n    x: int[32]\nf: Foo\nprint(0)\n",
+     "class Foo(struct):\n    x: int[64]\n    x: int[32]\nf: Foo\nprint(0)\n",
      "LITHON-E0127"),
     ("whole struct used as a value (E0128)",
-     "class Foo(Struct):\n    x: int[64]\nf: Foo\nprint(f)\n", "LITHON-E0128"),
+     "class Foo(struct):\n    x: int[64]\nf: Foo\nprint(f)\n", "LITHON-E0128"),
     ("unknown field access on a struct (E0128)",
-     "class Foo(Struct):\n    x: int[64]\nf: Foo\nf.y = 1\n", "LITHON-E0128"),
-    ("enum without the Enum base (E0126)",
+     "class Foo(struct):\n    x: int[64]\nf: Foo\nf.y = 1\n", "LITHON-E0128"),
+    ("a class without the `enum` base (E0126)",
      "class E(Bar):\n    A\nprint(0)\n", "LITHON-E0126"),
     ("enum member with a value (E0129)",
-     "class E(Enum):\n    A = 1\nprint(0)\n", "LITHON-E0129"),
+     "class E(enum):\n    A = 1\nprint(0)\n", "LITHON-E0129"),
     ("duplicate enum variant (E0129)",
-     "class E(Enum):\n    A\n    A\nprint(0)\n", "LITHON-E0129"),
+     "class E(enum):\n    A\n    A\nprint(0)\n", "LITHON-E0129"),
     ("unknown enum variant (E0130)",
-     "class E(Enum):\n    A\ne: E\ne = E.B\n", "LITHON-E0130"),
+     "class E(enum):\n    A\ne: E\ne = E.B\n", "LITHON-E0130"),
     ("unit variant constructed with a payload (E0130)",
-     "class E(Enum):\n    A\n    B: int[32]\ne: E\ne = E.A(1)\n", "LITHON-E0130"),
+     "class E(enum):\n    A\n    B: int[32]\ne: E\ne = E.A(1)\n", "LITHON-E0130"),
     ("enum used where a value is needed (E0131)",
-     "class E(Enum):\n    A\ne: E\nprint(e)\n", "LITHON-E0131"),
+     "class E(enum):\n    A\ne: E\nprint(e)\n", "LITHON-E0131"),
     ("non-exhaustive enum match (E0131)",
-     "class E(Enum):\n    A\n    B: int[32]\ne: E\nmatch e:\n    case E.A:\n        print(0)\n",
+     "class E(enum):\n    A\n    B: int[32]\ne: E\nmatch e:\n    case E.A:\n        print(0)\n",
      "LITHON-E0131"),
     ("enum match guard (E0131)",
-     "class E(Enum):\n    A\ne: E\nmatch e:\n    case E.A if True:\n        print(0)\n",
+     "class E(enum):\n    A\ne: E\nmatch e:\n    case E.A if True:\n        print(0)\n",
      "LITHON-E0131"),
     ("type function body with two types (E0132)",
-     "def T(a) -> NewType:\n    return {a, a}\nprint(0)\n", "LITHON-E0132"),
+     "def T(a) -> newtype:\n    return {a, a}\nprint(0)\n", "LITHON-E0132"),
     ("type function body is an empty dict (E0132)",
-     "def T() -> NewType:\n    return {}\nprint(0)\n", "LITHON-E0132"),
+     "def T() -> newtype:\n    return {}\nprint(0)\n", "LITHON-E0132"),
     ("type function value parameter given a type (E0132)",
-     "def T(n: int[16]) -> NewType:\n    return {list[int[64], n]}\nx: T(int[64]) = 1\nprint(0)\n",
+     "def T(n: int[16]) -> newtype:\n    return {list[int[64], n]}\nx: T(int[64]) = 1\nprint(0)\n",
      "LITHON-E0132"),
     ("type function name collides with a struct (E0132)",
-     "def T(a) -> NewType:\n    return {a}\nclass T(Struct):\n    x: int[64]\nprint(0)\n",
+     "def T(a) -> newtype:\n    return {a}\nclass T(struct):\n    x: int[64]\nprint(0)\n",
      "LITHON-E0132"),
     ("application of an undeclared type function (E0133)",
      "x: T(int[64]) = 1\nprint(0)\n", "LITHON-E0133"),
     ("type function arity mismatch (E0133)",
-     "def P(a, b) -> NewType:\n    return {list[a, b]}\nx: P(int[64]) = 1\nprint(0)\n",
+     "def P(a, b) -> newtype:\n    return {list[a, b]}\nx: P(int[64]) = 1\nprint(0)\n",
      "LITHON-E0133"),
     ("recursive type function (E0133)",
-     "def P(a) -> NewType:\n    return {P(a)}\nx: P(int[64]) = 1\nprint(0)\n",
+     "def P(a) -> newtype:\n    return {P(a)}\nx: P(int[64]) = 1\nprint(0)\n",
      "LITHON-E0133"),
     ("type function body names a struct (E0132)",
-     "class S(Struct):\n    v: int[64]\ndef P() -> NewType:\n    return {S}\ns: P()\n",
+     "class S(struct):\n    v: int[64]\ndef P() -> newtype:\n    return {S}\ns: P()\n",
      "LITHON-E0132"),
     ("method with a decorator (E0134)",
-     "class P(Struct):\n    x: int[64]\n    @staticmethod\n    def f(self) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    @staticmethod\n    def f(self) -> int[64]:\n"
      "        return 1\np: P\nprint(p.f())\n", "LITHON-E0134"),
     ("method whose first parameter is not `self` (E0134)",
-     "class P(Struct):\n    x: int[64]\n    def f(a: int[64]) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    def f(a: int[64]) -> int[64]:\n"
      "        return a\np: P\nprint(p.f(1))\n", "LITHON-E0134"),
     ("method with an annotated `self` (E0134)",
-     "class P(Struct):\n    x: int[64]\n    def f(self: int[64]) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    def f(self: int[64]) -> int[64]:\n"
      "        return 1\np: P\nprint(p.f())\n", "LITHON-E0134"),
     ("method with an unannotated parameter (E0134)",
-     "class P(Struct):\n    x: int[64]\n    def f(self, a) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    def f(self, a) -> int[64]:\n"
      "        return a\np: P\nprint(p.f(1))\n", "LITHON-E0134"),
     ("method with a container parameter (E0134)",
-     "class P(Struct):\n    x: int[64]\n    def f(self, a: list[int[64], 4]) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    def f(self, a: list[int[64], 4]) -> int[64]:\n"
      "        return 1\np: P\nprint(p.f(1))\n", "LITHON-E0134"),
     ("method with a default argument (E0134)",
-     "class P(Struct):\n    x: int[64]\n    def f(self, a: int[64] = 3) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    def f(self, a: int[64] = 3) -> int[64]:\n"
      "        return a\np: P\nprint(p.f())\n", "LITHON-E0134"),
     ("method name colliding with a field (E0134)",
-     "class P(Struct):\n    x: int[64]\n    def x(self) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    def x(self) -> int[64]:\n"
      "        return 1\np: P\nprint(p.x())\n", "LITHON-E0134"),
     ("call to an unknown method (E0135)",
-     "class P(Struct):\n    x: int[64]\np: P\nprint(p.h())\n", "LITHON-E0135"),
+     "class P(struct):\n    x: int[64]\np: P\nprint(p.h())\n", "LITHON-E0135"),
     ("a field called as a method (E0135)",
-     "class P(Struct):\n    x: int[64]\np: P\nprint(p.x())\n", "LITHON-E0135"),
+     "class P(struct):\n    x: int[64]\np: P\nprint(p.x())\n", "LITHON-E0135"),
     ("method call with a keyword argument (E0135)",
-     "class P(Struct):\n    x: int[64]\n    def f(self, a: int[64]) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    def f(self, a: int[64]) -> int[64]:\n"
      "        return a\np: P\nprint(p.f(a=1))\n", "LITHON-E0135"),
     ("method call arity mismatch (E0135)",
-     "class P(Struct):\n    x: int[64]\n    def f(self, a: int[64]) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    def f(self, a: int[64]) -> int[64]:\n"
      "        return a\np: P\nprint(p.f(1, 2))\n", "LITHON-E0135"),
     ("recursive method (E0135)",
-     "class P(Struct):\n    x: int[64]\n    def f(self) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    def f(self) -> int[64]:\n"
      "        return self.f()\np: P\nprint(p.f())\n", "LITHON-E0135"),
     ("method with no result used as a value (E0135)",
-     "class P(Struct):\n    x: int[64]\n    def f(self):\n        return\n"
+     "class P(struct):\n    x: int[64]\n    def f(self):\n        return\n"
      "p: P\nprint(p.f())\n", "LITHON-E0135"),
+    # 4.10.1. Classes. A bare class name is not a value, an instance has exactly
+    # its declared attributes, an uninitialized attribute is an error, and a
+    # class body may not carry a decorator (property/classmethod are keywords in
+    # 4.10.6, not decorators).
+    ("bare class name in a value position (E0140)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "print(P)\n", "LITHON-E0140"),
+    ("read of an undeclared class attribute (E0141)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "p: P = P(1)\nprint(p.y)\n", "LITHON-E0141"),
+    ("write of an undeclared class attribute (E0141)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "p: P = P(1)\np.y = 2\n", "LITHON-E0141"),
+    ("an attribute left uninitialized by __init__ (E0140)",
+     "class P:\n    x: int[64]\n    y: int[64]\n    def __init__(self, x: int[64]):\n"
+     "        self.x = x\np: P = P(1)\nprint(p.x)\n", "LITHON-E0140"),
+    ("a class method with a decorator (E0134)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    @property\n    def y(self) -> int[64]:\n        return self.x\n"
+     "p: P = P(1)\nprint(p.y)\n", "LITHON-E0134"),
+    # 4.10.2. Single inheritance. The base must be declared earlier, a subclass
+    # adds attributes rather than shadowing them, an override keeps the slot's
+    # signature, an abstract class cannot be instantiated, and super() has a
+    # base to start from and the base's own constructor arity.
+    ("a class with two bases (E0126)",
+     "class A:\n    x: int[64]\nclass C(A, A):\n    y: int[64]\nprint(0)\n",
+     "LITHON-E0126"),
+    ("a subclass declared before its base (E0126)",
+     "class B(A):\n    x: int[64]\nclass A:\n    x: int[64]\nprint(0)\n",
+     "LITHON-E0126"),
+    ("a subclass re-declaring an inherited attribute (E0127)",
+     "class A:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "class B(A):\n    x: int[64]\n    def __init__(self, x: int[64]):\n"
+     "        super().__init__(x)\n        self.x = x\nb: B = B(1)\nprint(b.x)\n",
+     "LITHON-E0127"),
+    ("an override with a different signature (E0135)",
+     "class A:\n    def f(self, x: int[64]) -> int[64]:\n        return x\n"
+     "class B(A):\n    def f(self) -> int[64]:\n        return 1\n"
+     "b: B = B()\nprint(b.f())\n", "LITHON-E0135"),
+    ("instantiating an abstract class (E0140)",
+     "class A:\n    def f(self) -> int[64]: ...\na: A = A()\nprint(a.f())\n",
+     "LITHON-E0140"),
+    ("super() in a class with no base (E0135)",
+     "class A:\n    def f(self) -> int[64]:\n        return super().f()\n"
+     "a: A = A()\nprint(a.f())\n", "LITHON-E0135"),
+    ("super() outside a method (E0135)",
+     "def f() -> int[64]:\n    return super().f()\nprint(f())\n", "LITHON-E0135"),
+    ("super().__init__ with the wrong arity (E0135)",
+     "class A:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "class B(A):\n    def __init__(self):\n        super().__init__()\n"
+     "b: B = B()\nprint(b.x)\n", "LITHON-E0135"),
+    ("assigning an unrelated class reference (E0140)",
+     "class A:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "class B:\n    y: int[64]\n    def __init__(self, y: int[64]):\n        self.y = y\n"
+     "a: A = B(1)\nprint(a.x)\n", "LITHON-E0140"),
+    ("isinstance on a value that is not a class reference (E0140)",
+     "class A:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "n: int[64] = 1\nprint(isinstance(n, A))\n", "LITHON-E0140"),
+    ("isinstance with a non-class second argument (E0135)",
+     "class A:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "a: A = A(1)\nprint(isinstance(a, 3))\n", "LITHON-E0135"),
+    ("identity compare between unrelated classes (E0140)",
+     "class A:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "class B:\n    y: int[64]\n    def __init__(self, y: int[64]):\n        self.y = y\n"
+     "a: A = A(1)\nb: B = B(2)\nprint(a is b)\n", "LITHON-E0140"),
+    # 4.10.3. Class references as list/tuple elements. Every slot must be filled
+    # by the literal (a null reference is never a value), an element slot may be
+    # overwritten only with a related class reference, append has no room, and
+    # the ownership of a NAME bound to an element across iterations is not
+    # settled, so enumerate/zip over these containers is refused too. A
+    # class-typed container is local storage, not a value that crosses a
+    # function header.
+    ("a bare class-typed list declaration (E0140)",
+     "class T:\n    v: int[64]\n    def __init__(self, v: int[64]):\n        self.v = v\n"
+     "xs: list[T, 2]\nprint(0)\n", "LITHON-E0140"),
+    ("a bare class-typed tuple declaration (E0140)",
+     "class T:\n    v: int[64]\n    def __init__(self, v: int[64]):\n        self.v = v\n"
+     "ts: tuple[T, 2]\nprint(0)\n", "LITHON-E0140"),
+    ("a class-typed list literal shorter than its capacity (E0123)",
+     "class T:\n    v: int[64]\n    def __init__(self, v: int[64]):\n        self.v = v\n"
+     "xs: list[T, 2] = [T(1)]\nprint(0)\n", "LITHON-E0123"),
+    ("list.append on a class-typed list (E0140)",
+     "class T:\n    v: int[64]\n    def __init__(self, v: int[64]):\n        self.v = v\n"
+     "xs: list[T, 2] = [T(1), T(2)]\nxs.append(T(3))\n", "LITHON-E0140"),
+    ("a non-class value searched in a class-typed list (E0140)",
+     "class T:\n    v: int[64]\n    def __init__(self, v: int[64]):\n        self.v = v\n"
+     "xs: list[T, 2] = [T(1), T(2)]\nprint(1 in xs)\n", "LITHON-E0140"),
+    ("an unrelated class searched in a class-typed list (E0140)",
+     "class A:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "class B:\n    y: int[64]\n    def __init__(self, y: int[64]):\n        self.y = y\n"
+     "xs: list[A, 2] = [A(1), A(2)]\nb: B = B(1)\nprint(b in xs)\n", "LITHON-E0140"),
+    ("enumerate over a class-typed list (E0119)",
+     "class T:\n    v: int[64]\n    def __init__(self, v: int[64]):\n        self.v = v\n"
+     "xs: list[T, 2] = [T(1), T(2)]\nfor i, x in enumerate(xs):\n    print(x.v)\n",
+     "LITHON-E0119"),
+    ("zip over a class-typed list (E0119)",
+     "class T:\n    v: int[64]\n    def __init__(self, v: int[64]):\n        self.v = v\n"
+     "xs: list[T, 2] = [T(1), T(2)]\nys: list[T, 2] = [T(3), T(4)]\n"
+     "for a, b in zip(xs, ys):\n    print(a.v + b.v)\n", "LITHON-E0119"),
+    ("a class-typed list as a parameter (E0124)",
+     "class T:\n    v: int[64]\n    def __init__(self, v: int[64]):\n        self.v = v\n"
+     "def f(xs: list[T, 2]) -> int[64]:\n    return xs[0].v\nprint(0)\n",
+     "LITHON-E0124"),
+    ("a class-typed list as a return type (E0124)",
+     "class T:\n    v: int[64]\n    def __init__(self, v: int[64]):\n        self.v = v\n"
+     "def f() -> list[T, 2]:\n    return 0\nprint(0)\n", "LITHON-E0124"),
+    ("a non-class value stored into a class-typed element (E0140)",
+     "class T:\n    v: int[64]\n    def __init__(self, v: int[64]):\n        self.v = v\n"
+     "xs: list[T, 2] = [T(1), T(2)]\nxs[0] = 1\n", "LITHON-E0140"),
+    ("an unrelated class stored into a class-typed element (E0140)",
+     "class A:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "class B:\n    y: int[64]\n    def __init__(self, y: int[64]):\n        self.y = y\n"
+     "xs: list[A, 2] = [A(1), A(2)]\nb: B = B(1)\nxs[0] = b\n", "LITHON-E0140"),
     # 6.2. Bounded strings. A str[N] is N bytes, so a literal of L bytes needs
     # L < N (the last byte is the NUL terminator), the capacity must be a
     # positive literal, and the value must be a string literal -- there is no
@@ -540,11 +653,11 @@ FRONTEND_REFUSALS = [
     # pointer into the struct has no companion name (E0128). A pointer's
     # pointee is a place, not a value, so valueof(_p) used as one is E0114.
     ("str field literal does not fit its capacity (E0111)",
-     "class C(Struct):\n    a: str[2]\n\nc: C\nc.a = \"abc\"\nprint(c.a)\n", "LITHON-E0111"),
+     "class C(struct):\n    a: str[2]\n\nc: C\nc.a = \"abc\"\nprint(c.a)\n", "LITHON-E0111"),
     ("whole str field used as a value (E0114)",
-     "class C(Struct):\n    a: str[4]\n\nc: C\nx: str[4] = c.a\nprint(x)\n", "LITHON-E0114"),
+     "class C(struct):\n    a: str[4]\n\nc: C\nx: str[4] = c.a\nprint(x)\n", "LITHON-E0114"),
     ("str field read through a pointer into the struct (E0128)",
-     "class C(Struct):\n    a: str[4]\n\np: C\n_pp: ptr[C] = addressof(p)\n"
+     "class C(struct):\n    a: str[4]\n\np: C\n_pp: ptr[C] = addressof(p)\n"
      "print(valueof(_pp).a)\n", "LITHON-E0128"),
     ("whole str pointee used as a value (E0114)",
      "s: str[4] = \"hi\"\n_p: ptr[str[4]] = addressof(s)\n"

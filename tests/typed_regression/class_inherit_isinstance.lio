@@ -1,0 +1,38 @@
+# 4.10.2. isinstance() and issubclass(). Type ids are assigned in pre-order and
+# each class's subtree is one contiguous range, so isinstance is two integer
+# compares against the receiver's descriptor and needs no walk. A `Puppy` is a
+# `Dog` and an `Animal`; a `Dog` is not a `Puppy`; a `Cat` is not a `Dog`.
+# issubclass() is decided entirely at compile time from the static hierarchy.
+# The calls at the end prove the virtual dispatch behind the same hierarchy.
+#
+# The expected output is CPython's answer for the same shapes.
+
+class Animal:
+    def kind(self) -> int[64]: ...
+
+class Dog(Animal):
+    def kind(self) -> int[64]:
+        return 1
+
+class Puppy(Dog):
+    def kind(self) -> int[64]:
+        return 2
+
+class Cat(Animal):
+    def kind(self) -> int[64]:
+        return 3
+
+d: Dog = Dog()
+p: Puppy = Puppy()
+c: Cat = Cat()
+print(isinstance(d, Dog))
+print(isinstance(p, Dog))
+print(isinstance(p, Animal))
+print(isinstance(d, Puppy))
+print(isinstance(c, Dog))
+print(issubclass(Puppy, Animal))
+print(issubclass(Dog, Puppy))
+print(issubclass(Cat, Animal))
+print(d.kind())
+print(p.kind())
+print(c.kind())

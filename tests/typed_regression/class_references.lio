@@ -1,0 +1,66 @@
+# 4.10.1. A class reference is a real value: it crosses function boundaries
+# (passed and returned), is aliased, and is stored in a class attribute. `is`
+# / `is not` and `==` / `!=` on references are object identity -- an integer
+# compare of the two addresses.
+#
+# The expected output is CPython's answer for the same shapes.
+
+
+class Leaf:
+    v: int[64]
+
+    def __init__(self, v: int[64]):
+        self.v = v
+
+    def get(self) -> int[64]:
+        return self.v
+
+
+class Holder:
+    leaf: Leaf
+    n: int[64]
+
+    def __init__(self, leaf: Leaf, n: int[64]):
+        self.leaf = leaf
+        self.n = n
+
+    def total(self) -> int[64]:
+        return self.n + self.leaf.get()
+
+
+def pick(a: Leaf, b: Leaf, which: bool) -> Leaf:
+    if which:
+        return a
+    return b
+
+
+def sum2(a: Leaf, b: Leaf) -> int[64]:
+    return a.get() + b.get()
+
+
+p: Leaf = Leaf(10)
+q: Leaf = Leaf(20)
+print(sum2(p, q))
+print(pick(p, q, True).get())
+print(pick(p, q, False).get())
+
+r: Leaf = p
+print(r.get())
+if p is r:
+    print(111)
+if p is q:
+    print(222)
+else:
+    print(333)
+
+shared: Leaf = Leaf(7)
+h1: Holder = Holder(shared, 100)
+h2: Holder = Holder(shared, 200)
+print(h1.total())
+print(h2.total())
+if h1.leaf is h2.leaf:
+    print(444)
+if h1 is h2:
+    print(555)
+else:
+    print(666)

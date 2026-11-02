@@ -1,0 +1,13 @@
+def main(buy:int[16],sell:int[16]) -> str[32]:
+	if buy > sell:
+		print((sell-buy)*100/sell)
+		return "Lossed"
+	else:
+		print((sell-buy)*100/sell)
+		return "Profited"
+
+i:str[100] = str(100,input("Enter the item name: "))
+c:int[32] = int(32,input("Enter the item id: "))
+b:int[16] = int(16,input("Enter the bought price of the item: "))
+s:int[16] = int(16,input("Enter the selling price of the item: "))
+print(main(b,s))

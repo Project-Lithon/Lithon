@@ -28,6 +28,7 @@
 #include "interpreter/interpreter.h"
 #include "jit/compile_function.h"
 #include "jit/syscall_runtime.h"
+#include "runtime/heap.h"
 #include "typecheck/typecheck.h"
 
 #include <cstdio>
@@ -139,6 +140,8 @@ void run_native(const lithon::ir::Module& m) {
     using Fn = void (*)();
     auto entry = reinterpret_cast<Fn>(static_cast<uint8_t*>(mem) + it->second);
     lithon::jit::g_call_depth = 0;
+    // 4.10.0: the JIT side of the shared object heap, reset the same way.
+    lithon::runtime::reset_heap();
     entry();
     std::fflush(stdout);
     munmap(mem, compiled.code.size());

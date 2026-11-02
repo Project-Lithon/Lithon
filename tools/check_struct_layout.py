@@ -34,19 +34,19 @@ FRONTEND = REPO / "src" / "frontend" / "frontend.py"
 # The canonical program. Every leaf field of every struct is written, so the
 # IR must name every leaf offset.
 PROGRAM = """\
-class Point(Struct):
+class Point(struct):
     x: int[64]
     y: int[64]
 
 
-class SockAddrIn(Struct):
+class SockAddrIn(struct):
     family: int[16]
     port: int[16]
     addr: int[64]
     active: bool
 
 
-class Segment(Struct):
+class Segment(struct):
     a: Point
     b: Point
     tag: int[8]

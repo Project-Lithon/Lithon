@@ -1,6 +1,6 @@
 # 4.6. Structs: a named run of typed fields in one packed byte blob.
 #
-# CPython cannot run `class Point(Struct)` -- Struct is not a Python builtin --
+# CPython cannot run `class Point(struct)` -- `struct` is not a Python builtin --
 # so this file has no CPython oracle and expected/struct_basic.out is written
 # from the documented 4.6 semantics rather than recorded from a CPython run.
 # This is the same split the dict and pointer tests use for the one construct
@@ -13,21 +13,21 @@
 # store at a fixed byte offset the frontend computed.
 
 
-class Point(Struct):
+class Point(struct):
     x: int[64]
     y: int[64]
 
 
 # A nested struct field is packed at its own offset with no padding, so `family`
 # at 0, `port` at 2, `addr` at 4 and `active` at 12 make a 13 byte struct.
-class SockAddrIn(Struct):
+class SockAddrIn(struct):
     family: int[16]
     port: int[16]
     addr: int[64]
     active: bool
 
 
-class Vec(Struct):
+class Vec(struct):
     x: float[64]
     y: float[64]
 

@@ -153,6 +153,13 @@ static std::shared_ptr<Type> parse_type_tree(const std::string& raw) {
         ty->elem->width = 8;
         return ty;
     }
+    // 4.10.1. `class[Name]`: the inner is the class NAME, not a width (unlike a
+    // scalar) and not an element type (unlike ptr). The reference itself is one
+    // 8-byte pointer; the name is what both tiers key the descriptor on.
+    if (ty->kind == "class") {
+        ty->ref = inner;
+        return ty;
+    }
     if (ty->kind != "list" && ty->kind != "tuple" && ty->kind != "ptr" &&
         ty->kind != "dict") {
         // A scalar: `int[8]` -- width is a bit width; `struct[N]` is a byte size.
@@ -246,17 +253,19 @@ struct ParamSpec {
     std::string name;
     std::string kind;
     int width = -1;
+    std::string ref;
 };
 
 ParamSpec parse_param(const std::string& raw) {
     std::string p = trim(raw);
     size_t colon = p.find(':');
     if (colon == std::string::npos) {
-        return ParamSpec{p, "", -1};
+        return ParamSpec{p, "", -1, ""};
     }
     std::string name = trim(p.substr(0, colon));
     const ParsedType pt = parse_type_string(p.substr(colon + 1));
-    return ParamSpec{name, pt.kind, pt.width};
+    std::string ref = pt.tree ? pt.tree->ref : "";
+    return ParamSpec{name, pt.kind, pt.width, ref};
 }
 
 // Hardening item 5. Decodes the hex-encoded input() prompt carried in the IR.
@@ -292,12 +301,93 @@ Module parse_ir_text(const std::string& text) {
     Function* current_fn = nullptr;
     BasicBlock* current_block = nullptr;
 
-    std::istringstream stream(text);
-    std::string raw_line;
+    // 4.10.1. Read every line up front and iterate by INDEX rather than by
+    // stream, because a `class` block consumes a run of following `attr` lines
+    // and must be able to leave the next top-level line for the main loop. With
+    // a stream that needs push-back (or fragile re-injection); with an index it
+    // is just `++i` on the lines that are not attributes.
+    std::vector<std::string> lines;
+    {
+        std::istringstream s(text);
+        std::string l;
+        while (std::getline(s, l)) lines.push_back(l);
+    }
 
-    while (std::getline(stream, raw_line)) {
-        std::string line = trim(raw_line);
+    for (size_t i = 0; i < lines.size(); ++i) {
+        std::string line = trim(lines[i]);
         if (line.empty()) continue;
+
+        if (starts_with(line, "class ")) {
+            // `class Name size=N [del]`, then following `attr <name> <off> : <T>`
+            // lines. Everything both tiers need to allocate an instance and
+            // build its descriptor.
+            std::string rest = line.substr(std::string("class ").size());
+            std::vector<std::string> toks;
+            {
+                std::istringstream ts(rest);
+                std::string t;
+                while (ts >> t) toks.push_back(t);
+            }
+            if (toks.empty()) {
+                throw std::runtime_error("malformed class header: " + line);
+            }
+            ClassInfo info;
+            info.name = toks[0];
+            for (size_t k = 1; k < toks.size(); ++k) {
+                if (starts_with(toks[k], "size=")) {
+                    info.instance_size = std::stoi(toks[k].substr(5));
+                } else if (starts_with(toks[k], "base=")) {
+                    info.base_index = std::stoi(toks[k].substr(5));
+                } else if (starts_with(toks[k], "slots=")) {
+                    info.slot_count = std::stoi(toks[k].substr(6));
+                } else if (toks[k] == "abstract") {
+                    info.abstract = true;
+                } else if (toks[k] == "del") {
+                    info.has_destructor = true;
+                }
+            }
+            module.classes.push_back(info);
+            size_t j = i + 1;
+            for (; j < lines.size(); ++j) {
+                std::string a = trim(lines[j]);
+                if (a.empty()) continue;
+                if (starts_with(a, "slot ")) {
+                    // `slot <index> <method-name>`: the vtable order. Emitted in
+                    // index order, so a plain push keeps slots[i] == the name at
+                    // slot i.
+                    std::string sr = a.substr(std::string("slot ").size());
+                    std::istringstream ss(sr);
+                    int sidx = 0;
+                    std::string sname;
+                    ss >> sidx >> sname;
+                    (void)sidx;
+                    module.classes.back().slots.push_back(sname);
+                    continue;
+                }
+                if (!starts_with(a, "attr ")) break;
+                std::string ar = a.substr(std::string("attr ").size());
+                size_t colon = ar.rfind(" : ");
+                std::string head = colon == std::string::npos ? ar : trim(ar.substr(0, colon));
+                std::string tstr = colon == std::string::npos ? std::string()
+                                                              : trim(ar.substr(colon + 3));
+                std::istringstream hs(head);
+                std::string aname;
+                int aoff = 0;
+                hs >> aname >> aoff;
+                ClassAttr attr;
+                attr.name = aname;
+                attr.offset = aoff;
+                if (!tstr.empty()) {
+                    const ParsedType pt = parse_type_string(tstr);
+                    attr.type_kind = pt.kind;
+                    attr.type_width = pt.width;
+                    if (pt.tree) attr.type_ref = pt.tree->ref;
+                }
+                module.classes.back().attributes.push_back(attr);
+            }
+            i = j - 1;  // the main loop's ++i lands on the first non-attr line
+            continue;
+        }
 
         if (starts_with(line, "function ")) {
             std::string rest = line.substr(std::string("function ").size());
@@ -306,12 +396,14 @@ Module parse_ir_text(const std::string& text) {
             // Optional " -> ReturnType" before the (now-removed) trailing ':'
             std::string return_kind;
             int return_width = -1;
+            std::string return_ref;
             size_t arrow = rest.find("->");
             if (arrow != std::string::npos) {
                 std::string ret_str = trim(rest.substr(arrow + 2));
                 const ParsedType rt = parse_type_string(ret_str);
                 return_kind = rt.kind;
                 return_width = rt.width;
+                if (rt.tree) return_ref = rt.tree->ref;
                 rest = trim(rest.substr(0, arrow));
             }
 
@@ -321,6 +413,7 @@ Module parse_ir_text(const std::string& text) {
             std::vector<std::string> params;
             std::vector<std::string> param_kinds;
             std::vector<int> param_widths;
+            std::vector<std::string> param_refs;
 
             if (paren_open != std::string::npos && paren_close != std::string::npos) {
                 std::string param_str = trim(rest.substr(paren_open + 1, paren_close - paren_open - 1));
@@ -330,6 +423,7 @@ Module parse_ir_text(const std::string& text) {
                         params.push_back(spec.name);
                         param_kinds.push_back(spec.kind);
                         param_widths.push_back(spec.width);
+                        param_refs.push_back(spec.ref);
                     }
                 }
             }
@@ -339,8 +433,10 @@ Module parse_ir_text(const std::string& text) {
             fn.params = params;
             fn.param_type_kinds = param_kinds;
             fn.param_type_widths = param_widths;
+            fn.param_type_refs = param_refs;
             fn.return_type_kind = return_kind;
             fn.return_type_width = return_width;
+            fn.return_type_ref = return_ref;
             module.functions.push_back(fn);
             current_fn = &module.functions.back();
             current_block = nullptr;
@@ -596,6 +692,62 @@ Module parse_ir_text(const std::string& text) {
             } else {
                 instr.name = oa.raw_args.at(0);
             }
+        // 4.10.1. Class instance ops. Unlike the field ops above, the base is
+        // always a REFERENCE register (never a named frame blob), so these take
+        // plain operands. `new` names its class; the attribute ops carry the
+        // absolute byte offset in int_imm and read the value type from the
+        // trailing " : T" suffix parsed above.
+        //
+        //   %r = new Point
+        //   %v = refload %r, 16 : int[16]
+        //   refstore %r, 16, %v
+        //   %b = retain %r
+        //   release %r
+        } else if (oa.op_name == "new") {
+            instr.op = Op::New;
+            instr.name = oa.raw_args.at(0);
+        } else if (oa.op_name == "refload") {
+            instr.op = Op::RefLoad;
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+            instr.int_imm = std::stoll(oa.raw_args.at(1));
+        } else if (oa.op_name == "refstore") {
+            instr.op = Op::RefStore;
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+            instr.int_imm = std::stoll(oa.raw_args.at(1));
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(2)));
+        } else if (oa.op_name == "retain") {
+            instr.op = Op::Retain;
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+        } else if (oa.op_name == "release") {
+            instr.op = Op::Release;
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+        // 4.10.2. Class hierarchy ops. Both carry the class by NAME for a
+        // diagnostic and by INDEX for the runtime range check.
+        //
+        //   %b = isinstance %r, C, 2
+        //   %v = callvirtual %r, %a0, C, method, 0 : int[64]
+        //
+        // For callvirtual the class, method and slot are the LAST three
+        // operands, so everything before them is the receiver and the arguments;
+        // the optional trailing ` : T` suffix (parsed above) types the result.
+        } else if (oa.op_name == "isinstance") {
+            instr.op = Op::IsInstance;
+            if (oa.raw_args.size() != 3)
+                throw std::runtime_error("isinstance needs a value, a class and an index");
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
+            instr.name = trim(oa.raw_args.at(1));
+            instr.int_imm = std::stoll(oa.raw_args.at(2));
+        } else if (oa.op_name == "callvirtual") {
+            instr.op = Op::CallVirtual;
+            if (oa.raw_args.size() < 4)
+                throw std::runtime_error(
+                    "callvirtual needs a receiver, arguments, a class, a method and a slot");
+            const size_t n = oa.raw_args.size();
+            instr.name = trim(oa.raw_args.at(n - 3));
+            instr.name2 = trim(oa.raw_args.at(n - 2));
+            instr.int_imm = std::stoll(trim(oa.raw_args.at(n - 1)));
+            for (size_t a = 0; a + 3 < n; ++a)
+                instr.args.push_back(parse_value_ref(oa.raw_args.at(a)));
         } else if (oa.op_name == "tofloat") {
             instr.op = Op::ToFloat;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));

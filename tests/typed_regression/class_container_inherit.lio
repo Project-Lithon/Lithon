@@ -1,0 +1,64 @@
+# 4.10.3. A container's declared element class is the STATIC type of every
+# `xs[i]` read. An element may hold the class itself or any subclass (an
+# upcast), so a call through `xs[i]` dispatches on the object's real type, and
+# `isinstance` still sees the derived class after an upcast store.
+#
+# The expected output is CPython's answer for the same program.
+
+
+class Base:
+    tag: int[64]
+
+    def __init__(self, tag: int[64]):
+        self.tag = tag
+
+    def kind(self) -> int[64]:
+        return 0
+
+
+class Left(Base):
+    def kind(self) -> int[64]:
+        return 1
+
+
+class Right(Base):
+    def kind(self) -> int[64]:
+        return 2
+
+
+def describe(x: Base) -> int[64]:
+    return x.kind() + x.tag
+
+
+items: list[Base, 3] = [Left(10), Right(20), Base(30)]
+print(items[0].kind())
+print(items[1].kind())
+print(items[2].kind())
+print(describe(items[0]))
+print(describe(items[1]))
+
+# Store a derived class into a base-typed slot. The slot's static type stays
+# Base, so the call site must dispatch at run time.
+l: Left = Left(5)
+items[1] = l
+print(items[1] is l)
+print(items[1].kind())
+print(isinstance(items[1], Left))
+print(isinstance(items[1], Base))
+
+# Membership compares references, and a base list may be searched with a
+# derived probe (or the other way around).
+print(l in items)
+print(Right(20) in items)
+print(Base(30) in items)
+
+# A derived-typed container holds only Left references; a base value would be
+# a downcast and is refused by the frontend.
+ls: list[Left, 2] = [Left(1), Left(2)]
+print(ls[0].kind())
+print(ls[1].tag)
+
+# The same dispatch rule applies to a tuple of base references.
+ts: tuple[Base, 2] = (Right(3), Left(4))
+print(ts[0].kind())
+print(ts[1].kind())

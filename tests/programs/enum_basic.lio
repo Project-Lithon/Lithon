@@ -1,7 +1,7 @@
 # 4.7. Enums: a Rust-style tagged union stored as one packed byte blob.
 #
 # An enum is storage, exactly like a struct, so CPython cannot run this file
-# (`Enum` is not a Python builtin) and expected/enum_basic.out is written from
+# (`enum` is not a Python builtin) and expected/enum_basic.out is written from
 # the documented 4.7 semantics rather than recorded from a CPython run. The
 # layout is `[tag][payload]` with no padding: the tag is an int[8] while the
 # enum has 128 variants or fewer, the payload starts at the tag width, and the
@@ -14,7 +14,7 @@
 # the same fieldload/fieldstore a struct field uses.
 
 
-class Shape(Enum):
+class Shape(enum):
     Empty
     Dot
     Line: int[32]
@@ -74,7 +74,7 @@ match s:
 
 # A narrow int[8] and a bool payload, to pin the signed narrow readback and the
 # 0/1 bool path through an enum payload.
-class Flag(Enum):
+class Flag(enum):
     Set: bool
     Code: int[8]
 
@@ -95,7 +95,7 @@ match f:
         print(c)
 
 # A float[64] payload goes through the double path, so a negative value is exact.
-class Sample(Enum):
+class Sample(enum):
     None_
     Value: float[64]
 

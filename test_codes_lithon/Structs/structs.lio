@@ -1,4 +1,4 @@
-class LithonStruct(Struct):
+class LithonStruct(struct):
 	name:str[7];
 	year:int[32];
 #	release:bool

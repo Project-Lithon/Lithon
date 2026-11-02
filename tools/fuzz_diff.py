@@ -66,6 +66,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 UNROLL_DIAMONDS = False
 ACCUM_UNROLL = False
+# --oop: see Gen.program_oop and Gen.program_oop_inherit. When set, the CPython
+# oracle is not required to agree on the ORDER of `__del__` output. Lithon pins a
+# reference's drop to the exit of the scope that owns it (a loop body releases
+# each iteration, an early return releases the path's references), whereas
+# CPython keeps a name alive until the frame or module it was bound in tears
+# down. Both engines in this codebase agree with each other exactly -- that is
+# the gate -- but they can disagree with CPython on the interleaving. This is the
+# same treatment --mod-negatives gives the floored-vs-truncated `%%` gap.
+# Alternate seeds use the flat 4.10.1 shape, the 4.10.2 inheritance shape and
+# the 4.10.3 class-references-in-containers shape, so one --oop run exercises
+# all three.
+OOP_MODE = False
 # --phi: run the JIT twice, with and without the SSA pipeline, and require both
 # to match the interpreter. The plain run is the control: it proves the pipeline
 # did not change the answer, rather than only proving the pipeline agrees with
@@ -814,6 +826,532 @@ class Gen:
         self.emit(0, f"print({acc})")
         return "\n".join(self.lines) + "\n"
 
+    def program_oop(self):
+        """A class program, exercising the 4.10.1 object model.
+
+        Each generated program declares one small class with two int attributes,
+        an `__init__`, one or two plain methods, and -- half the time -- a
+        `__del__` that prints an attribute. The body then constructs objects,
+        aliases them (`b = a`, which retains), mutates attributes through the
+        reference, calls methods, passes objects to a function and returns them,
+        compares identity (`is`/`is not`), and drops references at scope exits.
+        Half the time it also declares a second HOLDER class whose attribute is
+        a reference to the first, so a reference stored INSIDE an object -- and
+        the release of the object it names when the holder dies -- is exercised
+        too, not only references held in local names.
+
+        Why these shapes and not a free-for-all:
+          * Every printed value is an INT. A class reference is print-unsafe by
+            design (its text would be an address, which the two tiers may lay
+            out differently), so printing one is refused -- the generator must
+            print attribute values, never the object.
+          * Magnitudes stay small so int[64] overflow never fires; the point is
+            the object model, not arithmetic.
+          * The `__del__` print is the observable lifetime signal: if the two
+            tiers disagree about WHEN the last reference drops -- a scope exit,
+            a loop back edge, an early return -- the printed order differs and
+            the diff catches it.
+          * The program is also valid CPython (`int[64]` annotations are never
+            evaluated at module or local scope), so the secondary oracle is
+            meaningful.
+        """
+        r = self.r
+        cname = r.choice(["Box", "Cell", "Node", "Pair"])
+        a1, a2 = "lo", "hi"
+
+        lines = []
+        lines.append(f"class {cname}:")
+        lines.append(f"    {a1}: int[64]")
+        lines.append(f"    {a2}: int[64]")
+        lines.append("")
+        lines.append(f"    def __init__(self, {a1}: int[64], {a2}: int[64]):")
+        lines.append(f"        self.{a1} = {a1}")
+        lines.append(f"        self.{a2} = {a2}")
+        lines.append("")
+
+        # A method combining the two attributes, in one of a few shapes so that
+        # both the read path and the arithmetic around it vary.
+        body_expr = r.choice([
+            f"self.{a1} + self.{a2}",
+            f"self.{a1} - self.{a2}",
+            f"self.{a1} + self.{a2} + self.{a1}",
+        ])
+        lines.append(f"    def total(self) -> int[64]:")
+        lines.append(f"        return {body_expr}")
+        lines.append("")
+
+        has_del = r.random() < 0.5
+        if has_del:
+            which = r.choice([a1, a2])
+            lines.append("    def __del__(self):")
+            lines.append(f"        print(self.{which} + {r.randint(0, 3)})")
+            lines.append("")
+
+        # A free function that takes two objects and returns one, so references
+        # cross a call boundary and a returned reference is consumed as a
+        # receiver.
+        pick_true = r.random() < 0.5
+        lines.append(f"def pick(a: {cname}, b: {cname}) -> {cname}:")
+        if pick_true:
+            lines.append("    return a")
+        else:
+            lines.append("    return b")
+        lines.append("")
+
+        # A function that returns a sum, so a method runs on a passed-in object.
+        lines.append(f"def sum_to(a: {cname}, b: {cname}) -> int[64]:")
+        lines.append("    return a.total() + b.total()")
+        lines.append("")
+
+        # Half the time, add a HOLDER class with a CLASS-TYPED attribute. This is
+        # the nested-ownership path: the holder owns a reference to the object
+        # its attribute names, so releasing the holder must release that object,
+        # and the held object's __del__ must run at the holder's drop. Without
+        # this variant the generator never exercised a reference stored INSIDE an
+        # object (only aliases in local names), which is exactly the leak the
+        # hand-written class_lifetime test caught.
+        has_holder = r.random() < 0.5
+        hname = "Wrap"
+        holder_del = r.random() < 0.5
+        if has_holder:
+            lines.append(f"class {hname}:")
+            lines.append(f"    item: {cname}")
+            lines.append("    tag: int[64]")
+            lines.append("")
+            lines.append(f"    def __init__(self, item: {cname}, tag: int[64]):")
+            lines.append("        self.item = item")
+            lines.append("        self.tag = tag")
+            lines.append("")
+            lines.append("    def score(self) -> int[64]:")
+            lines.append("        return self.tag + self.item.total()")
+            lines.append("")
+            if holder_del:
+                lines.append("    def __del__(self):")
+                lines.append("        print(self.item.total() + 5000)")
+                lines.append("")
+            lines.append("")
+
+        v1, v2, v3 = (r.randint(0, 9) for _ in range(3))
+        lines.append(f"p: {cname} = {cname}({v1}, {v2})")
+        lines.append(f"q: {cname} = {cname}({v3}, {r.randint(0, 9)})")
+        lines.append("print(sum_to(p, q))")
+        lines.append("print(pick(p, q).total())")
+        lines.append("print(p.total())")
+
+        # Aliasing: both names own a reference, and a mutation is visible
+        # through either.
+        lines.append("alias: %s = p" % cname)
+        delta = r.randint(0, 5)
+        lines.append(f"alias.{a1} = alias.{a1} + {delta}")
+        lines.append("print(p.total())")
+
+        # Identity.
+        lines.append("if p is alias:")
+        lines.append("    print(1000)")
+        lines.append("if p is not q:")
+        lines.append("    print(2000)")
+        if r.random() < 0.5:
+            lines.append("r2: %s = q" % cname)
+            lines.append("if q is r2:")
+            lines.append("    print(3000)")
+
+        # Reassignment drops the reference the name held before, so the object it
+        # named dies at that statement (its __del__ runs there).
+        if r.random() < 0.5:
+            lines.append("alias = %s(%d, %d)" % (cname, r.randint(0, 9), r.randint(0, 9)))
+            lines.append("print(alias.total())")
+
+        # A user function that RETURNS a reference: the result is a temporary the
+        # caller owns, consumed either as another call's argument or discarded.
+        if r.random() < 0.5:
+            lines.append("print(pick(q, p).total())")
+
+        # A loop that constructs and drops a fresh object each iteration: with a
+        # __del__ this pins the per-iteration drop point.
+        if r.random() < 0.5:
+            n = r.randint(1, 4)
+            lines.append(f"i: int[64] = 0")
+            lines.append(f"acc: int[64] = 0")
+            lines.append(f"while i < {n}:")
+            lines.append(f"    t: {cname} = {cname}(i, {r.randint(0, 9)})")
+            lines.append("    acc = acc + t.total()")
+            lines.append("    i = i + 1")
+            lines.append("print(acc)")
+
+        # An early return: the references the returned path owns are dropped on
+        # that path only.
+        if r.random() < 0.5:
+            flag = r.choice(["True", "False"])
+            lines.append(f"def early(flag: bool) -> int[64]:")
+            lines.append(f"    a: {cname} = {cname}({r.randint(0, 9)}, {r.randint(0, 9)})")
+            lines.append("    if flag:")
+            lines.append("        return a.total()")
+            lines.append(f"    b: {cname} = {cname}({r.randint(0, 9)}, {r.randint(0, 9)})")
+            lines.append("    return b.total()")
+            lines.append(f"print(early({flag}))")
+
+        lines.append("print(q.total())")
+
+        # A holder built from a FRESH object: the attribute is the only surviving
+        # reference once the constructor's temporary is gone, so this pins the
+        # nested drop (the held object dies when the holder does). Guarded on the
+        # holder existing so the program stays valid when it does not.
+        if has_holder:
+            lines.append(f"w: {hname} = {hname}({cname}({r.randint(0, 9)}, {r.randint(0, 9)}), {r.randint(0, 9)})")
+            lines.append("print(w.score())")
+            lines.append("print(w.item.total())")
+            if r.random() < 0.5:
+                # A holder whose held object is ALSO still named locally: the
+                # held object must survive to the last drop of either.
+                lines.append(f"keep: {cname} = {cname}({r.randint(0, 9)}, {r.randint(0, 9)})")
+                lines.append(f"w2: {hname} = {hname}(keep, {r.randint(0, 9)})")
+                lines.append("print(w2.score() + keep.total())")
+        return "\n".join(lines) + "\n"
+
+    def program_oop_inherit(self):
+        """A class program with SINGLE INHERITANCE, exercising 4.10.2.
+
+        The base declares two int attributes, an `__init__`, and a `total`
+        method. A derived class adds one attribute, calls `super().__init__`,
+        and -- most of the time -- overrides `total` (its override itself calls
+        `super().total()`, so the base implementation is reached through the
+        chain). A sibling class extends the same base without overriding
+        `total`, so the inherited implementation and the "not a derived" branch
+        of isinstance are both exercised.
+
+        The body then:
+          * calls the override directly and through a BASE-typed reference (the
+            vtable must pick the override at run time),
+          * calls `super().total()` from a derived method that the base does not
+            have (`bonus`),
+          * checks isinstance/issubclass over true, inherited and sibling pairs,
+          * passes a derived where a base parameter is expected, and returns a
+            derived through a base return type,
+          * aliases and reassigns base-typed names (retain/drop),
+          * builds a fresh derived temporary, and constructs/drops one per loop
+            iteration,
+          * optionally gives the BASE a `__del__`, which both subclasses
+            inherit, so a drop of any hierarchy object is observable.
+
+        As in program_oop, every printed value is an INT (never a reference),
+        magnitudes stay small, and the program is valid CPython. When a
+        `__del__` is present the evaluator skips the CPython drop-ORDER
+        comparison (OOP_MODE), but the interpreter-vs-JIT comparison is always
+        enforced in full.
+        """
+        r = self.r
+        bname = r.choice(["Base", "Shape", "Animal"])
+        dname = r.choice(["Derived", "Square", "Dog"])
+        sname = r.choice(["Sibling", "Other", "Bird"])
+        a1, a2, a3 = "lo", "hi", "extra"
+
+        base_expr = r.choice([
+            f"self.{a1} + self.{a2}",
+            f"self.{a1} - self.{a2}",
+            f"self.{a1} + self.{a2} + self.{a1}",
+        ])
+        override_expr = r.choice([
+            f"super().total() + self.{a3}",
+            f"super().total() * 2 + self.{a3}",
+            f"self.{a3} - super().total()",
+        ])
+        override = r.random() < 0.7
+        has_del = r.random() < 0.5
+        del_which = r.choice([a1, a2])
+        del_k = r.randint(0, 3)
+
+        lines = []
+        lines.append(f"class {bname}:")
+        lines.append(f"    {a1}: int[64]")
+        lines.append(f"    {a2}: int[64]")
+        lines.append("")
+        lines.append(f"    def __init__(self, {a1}: int[64], {a2}: int[64]):")
+        lines.append(f"        self.{a1} = {a1}")
+        lines.append(f"        self.{a2} = {a2}")
+        lines.append("")
+        lines.append("    def total(self) -> int[64]:")
+        lines.append(f"        return {base_expr}")
+        lines.append("")
+        if has_del:
+            lines.append("    def __del__(self):")
+            lines.append(f"        print(self.{del_which} + {del_k})")
+            lines.append("")
+
+        # The derived class: adds an attribute, chains __init__, and usually
+        # overrides total. bonus always calls super().total(), so the base
+        # implementation is reached through super() even without an override.
+        lines.append(f"class {dname}({bname}):")
+        lines.append(f"    {a3}: int[64]")
+        lines.append("")
+        lines.append(f"    def __init__(self, {a1}: int[64], {a2}: int[64], {a3}: int[64]):")
+        lines.append(f"        super().__init__({a1}, {a2})")
+        lines.append(f"        self.{a3} = {a3}")
+        lines.append("")
+        if override:
+            lines.append("    def total(self) -> int[64]:")
+            lines.append(f"        return {override_expr}")
+            lines.append("")
+        lines.append("    def bonus(self) -> int[64]:")
+        lines.append(f"        return super().total() * 10 + self.{a3}")
+        lines.append("")
+
+        # A sibling: same base, no total override, one extra attribute. This
+        # gives isinstance a FALSE branch and the inherited slot a non-derived
+        # receiver.
+        lines.append(f"class {sname}({bname}):")
+        lines.append("    tag: int[64]")
+        lines.append("")
+        lines.append(f"    def __init__(self, {a1}: int[64], {a2}: int[64], tag: int[64]):")
+        lines.append(f"        super().__init__({a1}, {a2})")
+        lines.append("        self.tag = tag")
+        lines.append("")
+        lines.append("    def score(self) -> int[64]:")
+        lines.append("        return self.total() + self.tag")
+        lines.append("")
+
+        # Free functions: a base parameter accepts a derived (free upcast), and
+        # a base return type carries a derived back out (implicit upcast on
+        # return).
+        lines.append(f"def sum_two(x: {bname}, y: {bname}) -> int[64]:")
+        lines.append("    return x.total() + y.total()")
+        lines.append("")
+        lines.append(f"def upcast(x: {dname}) -> {bname}:")
+        lines.append("    return x")
+        lines.append("")
+
+        v1, v2, v3 = (r.randint(0, 9) for _ in range(3))
+        lines.append(f"d: {dname} = {dname}({v1}, {v2}, {v3})")
+        lines.append("print(d.total())")
+        lines.append("print(d.bonus())")
+
+        # A base-typed reference to a derived object: the call site is compiled
+        # against the base, so an override must be reached through the vtable.
+        lines.append(f"b: {bname} = d")
+        lines.append("print(b.total())")
+        lines.append(f"print(isinstance(d, {dname}))")
+        lines.append(f"print(isinstance(d, {bname}))")
+        lines.append(f"print(isinstance(b, {dname}))")
+        lines.append(f"print(isinstance(d, {sname}))")
+        lines.append(f"print(issubclass({dname}, {bname}))")
+        lines.append(f"print(issubclass({bname}, {dname}))")
+
+        lines.append(f"s: {sname} = {sname}({r.randint(0, 9)}, {r.randint(0, 9)}, {r.randint(0, 9)})")
+        lines.append("print(s.score())")
+        lines.append(f"print(isinstance(s, {bname}))")
+        lines.append(f"print(isinstance(s, {dname}))")
+        lines.append(f"sb: {bname} = s")
+        lines.append("print(sb.total())")
+
+        # A base parameter accepts both a derived and a sibling; the derived
+        # one dispatches to its override.
+        lines.append("print(sum_two(d, s))")
+        lines.append("print(sum_two(b, sb))")
+        lines.append("print(upcast(d).total())")
+
+        # Aliasing and reassignment: both names own a reference, and moving the
+        # base-typed name from the derived object to the sibling drops the
+        # derived reference (which d still owns).
+        lines.append(f"alias: {bname} = d")
+        lines.append("print(alias.total())")
+        lines.append("alias = s")
+        lines.append("print(alias.total())")
+        lines.append("if d is b:")
+        lines.append("    print(1000)")
+        lines.append("if b is not s:")
+        lines.append("    print(2000)")
+
+        # A fresh derived temporary, dropped at the statement that owns it.
+        lines.append(f"print({dname}({r.randint(0, 9)}, {r.randint(0, 9)}, {r.randint(0, 9)}).total())")
+
+        # One derived per iteration: with an inherited __del__ this pins the
+        # per-iteration drop point.
+        n = r.randint(1, 4)
+        lines.append("i: int[64] = 0")
+        lines.append("acc: int[64] = 0")
+        lines.append(f"while i < {n}:")
+        lines.append(f"    t: {dname} = {dname}(i, {r.randint(0, 9)}, i + 1)")
+        lines.append("    acc = acc + t.total()")
+        lines.append("    i = i + 1")
+        lines.append("print(acc)")
+
+        # Early return: only the returned path's references are dropped there.
+        lines.append("def early(flag: bool) -> int[64]:")
+        lines.append(f"    x: {dname} = {dname}({r.randint(0, 9)}, {r.randint(0, 9)}, {r.randint(0, 9)})")
+        lines.append("    if flag:")
+        lines.append("        return x.total()")
+        lines.append(f"    y: {bname} = {dname}({r.randint(0, 9)}, {r.randint(0, 9)}, {r.randint(0, 9)})")
+        lines.append("    return y.total()")
+        lines.append("print(early(True))")
+        lines.append("print(early(False))")
+
+        lines.append("print(s.total())")
+        return "\n".join(lines) + "\n"
+
+    def program_oop_containers(self):
+        """A class program whose OBJECTS live in lists and tuples -- 4.10.3.
+
+        The shape is one base class plus a derived override, so a container
+        declared with the BASE element type can hold either class. That makes
+        every read `xs[i]` a reference whose static class is the base but whose
+        real class may be the derived one, which is exactly the case virtual
+        dispatch and isinstance must get right through a container.
+
+        The body exercises:
+          * a list literal with a derived, a base and a derived element,
+          * reads through `xs[i]` (attributes, methods, virtual dispatch),
+          * overwriting a slot with a fresh object and with another slot,
+          * a class-typed name aliased from an element (retain),
+          * identity and membership over references,
+          * isinstance over base/derived elements,
+          * a nested list and a class-typed tuple,
+          * an explicit `while` index loop (the supported iteration form),
+          * passing an element to a free function and returning a reference,
+          * an early return from a function that owns a container,
+          * optionally a base `__del__`, inherited by the derived class, so the
+            per-slot drop at an overwrite or a scope exit is observable.
+
+        Every printed value is an INT (a reference is print-unsafe), magnitudes
+        stay small, and the program is valid CPython. When a `__del__` is
+        present the CPython oracle skips only the drop ORDER, as in the other
+        OOP shapes; the interpreter-vs-JIT comparison is always exact.
+        """
+        r = self.r
+        bname = r.choice(["Base", "Shape", "Animal"])
+        dname = r.choice(["Derived", "Square", "Dog"])
+        a1, a2, a3 = "lo", "hi", "extra"
+
+        base_expr = r.choice([
+            f"self.{a1} + self.{a2}",
+            f"self.{a1} - self.{a2}",
+            f"self.{a1} + self.{a2} + self.{a1}",
+        ])
+        override = r.random() < 0.7
+        override_expr = r.choice([
+            f"super().total() + self.{a3}",
+            f"super().total() * 2 + self.{a3}",
+            f"self.{a3} - super().total()",
+        ])
+        has_del = r.random() < 0.5
+        del_which = r.choice([a1, a2])
+        del_k = r.randint(0, 3)
+
+        lines = []
+        lines.append(f"class {bname}:")
+        lines.append(f"    {a1}: int[64]")
+        lines.append(f"    {a2}: int[64]")
+        lines.append("")
+        lines.append(f"    def __init__(self, {a1}: int[64], {a2}: int[64]):")
+        lines.append(f"        self.{a1} = {a1}")
+        lines.append(f"        self.{a2} = {a2}")
+        lines.append("")
+        lines.append("    def total(self) -> int[64]:")
+        lines.append(f"        return {base_expr}")
+        lines.append("")
+        if has_del:
+            lines.append("    def __del__(self):")
+            lines.append(f"        print(self.{del_which} + {del_k})")
+            lines.append("")
+
+        lines.append(f"class {dname}({bname}):")
+        lines.append(f"    {a3}: int[64]")
+        lines.append("")
+        lines.append(f"    def __init__(self, {a1}: int[64], {a2}: int[64], {a3}: int[64]):")
+        lines.append(f"        super().__init__({a1}, {a2})")
+        lines.append(f"        self.{a3} = {a3}")
+        lines.append("")
+        if override:
+            lines.append("    def total(self) -> int[64]:")
+            lines.append(f"        return {override_expr}")
+            lines.append("")
+        lines.append("    def bonus(self) -> int[64]:")
+        lines.append(f"        return super().total() * 10 + self.{a3}")
+        lines.append("")
+
+        # Free functions: an element read is a BORROW, so passing it must not
+        # claim the container's reference. A returned reference is a fresh one
+        # the caller owns.
+        lines.append(f"def sum_pair(x: {bname}, y: {bname}) -> int[64]:")
+        lines.append("    return x.total() + y.total()")
+        lines.append("")
+        lines.append(f"def lift(x: {bname}) -> {bname}:")
+        lines.append("    return x")
+        lines.append("")
+
+        v = [r.randint(0, 9) for _ in range(9)]
+        lines.append(f"xs: list[{bname}, 3] = [{dname}({v[0]}, {v[1]}, {v[2]}), "
+                     f"{bname}({v[3]}, {v[4]}), {dname}({v[5]}, {v[6]}, {v[7]})]")
+        lines.append("print(xs[0].total())")
+        lines.append("print(xs[1].total())")
+        lines.append("print(xs[2].total())")
+        lines.append("print(len(xs))")
+
+        # A base-typed name aliased from an element owns a second reference.
+        lines.append(f"p: {bname} = xs[1]")
+        lines.append("print(p.total())")
+        lines.append("print(p is xs[1])")
+        lines.append("print(xs[1] is xs[2])")
+        lines.append("print(p in xs)")
+        lines.append("print(xs[0] in xs)")
+        lines.append(f"print({dname}({r.randint(0, 9)}, {r.randint(0, 9)}, "
+                     f"{r.randint(0, 9)}) in xs)")
+
+        lines.append(f"print(isinstance(xs[0], {dname}))")
+        lines.append(f"print(isinstance(xs[1], {dname}))")
+        lines.append(f"print(isinstance(p, {bname}))")
+        lines.append("print(sum_pair(xs[0], xs[1]))")
+        lines.append("print(lift(xs[2]).total())")
+
+        # Overwrite with a fresh object, then with another slot. The old slot
+        # reference drops where the store happens.
+        lines.append(f"xs[0] = {dname}({r.randint(0, 9)}, {r.randint(0, 9)}, "
+                     f"{r.randint(0, 9)})")
+        lines.append("print(xs[0].total())")
+        lines.append("xs[2] = xs[0]")
+        lines.append("print(xs[2] is xs[0])")
+        lines.append("print(xs[2].total())")
+
+        # A nested list: the flat run is filled by the literal and each leaf is
+        # an independent reference.
+        lines.append(f"grid: list[list[{bname}, 2], 2] = "
+                     f"[[{bname}({r.randint(0, 9)}, {r.randint(0, 9)}), "
+                     f"{dname}({r.randint(0, 9)}, {r.randint(0, 9)}, {r.randint(0, 9)})], "
+                     f"[{dname}({r.randint(0, 9)}, {r.randint(0, 9)}, {r.randint(0, 9)}), "
+                     f"{bname}({r.randint(0, 9)}, {r.randint(0, 9)})]]")
+        lines.append("print(grid[0][1].total())")
+        lines.append("print(grid[1][0].total())")
+        lines.append(f"grid[0][0] = {bname}({r.randint(0, 9)}, {r.randint(0, 9)})")
+        lines.append("print(grid[0][0].total())")
+
+        # A class-typed tuple is filled once by its literal and read only.
+        lines.append(f"ts: tuple[{bname}, 2] = ({dname}({r.randint(0, 9)}, {r.randint(0, 9)}, "
+                     f"{r.randint(0, 9)}), {bname}({r.randint(0, 9)}, {r.randint(0, 9)}))")
+        lines.append("print(ts[0].total())")
+        lines.append("print(ts[1].total())")
+
+        # The explicit index loop is the supported iteration form.
+        n = r.randint(1, 3)
+        lines.append("ci: int[64] = 0")
+        lines.append("acc: int[64] = 0")
+        lines.append(f"while ci < {n}:")
+        lines.append("    acc = acc + xs[ci].total()")
+        lines.append("    ci = ci + 1")
+        lines.append("print(acc)")
+
+        # An early return from a function that owns a container: the returned
+        # path releases the container's slots when it returns, the other path
+        # releases them on its own return.
+        lines.append("def early(flag: bool) -> int[64]:")
+        lines.append(f"    ys: list[{bname}, 2] = [{bname}({r.randint(0, 9)}, {r.randint(0, 9)}), "
+                     f"{dname}({r.randint(0, 9)}, {r.randint(0, 9)}, {r.randint(0, 9)})]")
+        lines.append("    if flag:")
+        lines.append("        return ys[0].total()")
+        lines.append("    return ys[1].total()")
+        lines.append("print(early(True))")
+        lines.append("print(early(False))")
+
+        lines.append("print(p.total())")
+        return "\n".join(lines) + "\n"
+
     def program(self):
         call_expr = self.emit_recursive_helper() if self.r.random() < 0.5 else None
         for v in VARS[:3]:
@@ -951,7 +1489,13 @@ def evaluate(py_path: Path, tmp_ir: Path):
     # single generated trap as a "language gap" and bury the real findings.
     # The primary JIT-vs-interpreter agreement above, including that both
     # engines trap with the same operator, is still enforced in full.
-    if cpy.returncode == 0 and not (is_shift_trap and interp_trapped == jit_trapped):
+    # The primary gate above already holds -- both engines agree. The CPython
+    # oracle is a secondary semantics check; in --oop mode a program with a
+    # __del__ is exempt from matching CPython's drop ORDER (see OOP_MODE), so
+    # only its presence is worth comparing, not the interleaving.
+    oop_del_exempt = OOP_MODE and "__del__" in py_path.read_text()
+    if cpy.returncode == 0 and not (is_shift_trap and interp_trapped == jit_trapped) \
+            and not oop_del_exempt:
         if interp.returncode == TIMEOUT_RC:
             return Result(False, *seen, reason="hang_vs_cpython")   # Lithon never finishes; CPython does
         if cpy.stdout != interp.stdout:
@@ -1035,13 +1579,17 @@ def main():
     ap.add_argument("--phi", action="store_true",
                     help="use the merge-focused generator (see Gen.program_phi) and compare the JIT "
                          "with and without the SSA pipeline against the interpreter")
+    ap.add_argument("--oop", action="store_true",
+                    help="use the class-focused generator (see Gen.program_oop): construction, "
+                         "attributes, methods, aliasing, __del__ lifetime, identity")
     args = ap.parse_args()
     TIMEOUT = args.timeout
-    global UNROLL_DIAMONDS, SSA_MODE, ACCUM_UNROLL, DIRECT_PHI_MODE
+    global UNROLL_DIAMONDS, SSA_MODE, ACCUM_UNROLL, DIRECT_PHI_MODE, OOP_MODE
     UNROLL_DIAMONDS = args.diamond and not args.no_diamond_unroll
     ACCUM_UNROLL = args.accum
     SSA_MODE = args.phi
     DIRECT_PHI_MODE = args.break_mode
+    OOP_MODE = args.oop
 
     for exe, name in ((HELLO, "hello"), (TIER_RUNNER, "tier_runner")):
         if not exe.exists():
@@ -1057,7 +1605,19 @@ def main():
     for seed in range(args.seed, args.seed + args.count):
         gen = Gen(seed, args.shared_loop_vars, floats=args.floats,
                   mod_negatives=args.mod_negatives)
-        if args.phi:
+        if args.oop:
+            # Alternate seeds across the three OOP shapes: the flat 4.10.1
+            # object model, the 4.10.2 single-inheritance shape, and the 4.10.3
+            # class-references-in-containers shape. All three are pinned by the
+            # same interpreter-vs-JIT gate; the extra shapes add vtable
+            # dispatch, super(), isinstance, upcasts, and per-slot ownership.
+            if seed % 3 == 0:
+                src = gen.program_oop()
+            elif seed % 3 == 1:
+                src = gen.program_oop_inherit()
+            else:
+                src = gen.program_oop_containers()
+        elif args.phi:
             src = gen.program_phi()
         elif args.floats:
             src = gen.float_program()

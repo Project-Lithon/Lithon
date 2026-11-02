@@ -8,15 +8,15 @@
 # the documented 4.8 semantics.
 
 
-def Word() -> NewType:
+def Word() -> newtype:
     return {int[32]}
 
 
-def Pair(t) -> NewType:
+def Pair(t) -> newtype:
     return {list[t, 2]}
 
 
-def Wide() -> NewType:
+def Wide() -> newtype:
     return {int[64]}
 
 
@@ -37,7 +37,7 @@ print(addtwo(700, -1000))
 
 
 # As a struct field type.
-class Rec(Struct):
+class Rec(struct):
     code: Word()
     flag: bool
 

@@ -43,7 +43,7 @@
 
 namespace lithon::jit {
 
-enum class Kind : uint8_t { Unseen, Int, Bool, Float, Ptr, Unknown };
+enum class Kind : uint8_t { Unseen, Int, Bool, Float, Ptr, Object, Unknown };
 
 inline Kind join(Kind a, Kind b) {
     if (a == b) return a;
@@ -60,6 +60,10 @@ inline Kind join(Kind a, Kind b) {
 inline Kind kind_of_elem(const std::string& elem_kind) {
     if (elem_kind == "float") return Kind::Float;
     if (elem_kind == "bool") return Kind::Bool;
+    // 4.10.3. A class element is an object reference, not an int. Without this
+    // an Index from a list[Point, N] inferred Int, so `xs[0].field` looked like
+    // an int receiver and `print(xs)` was not rejected as an object aggregate.
+    if (elem_kind == "class") return Kind::Object;
     return Kind::Int;
 }
 
@@ -84,6 +88,7 @@ inline const char* kind_name(Kind k) {
         case Kind::Bool:    return "bool";
         case Kind::Float:   return "float";
         case Kind::Ptr:     return "a pointer";
+        case Kind::Object:  return "an object reference";
         case Kind::Unknown: return "not provably int";
         case Kind::Unseen:  return "unresolved";
     }
@@ -103,6 +108,9 @@ inline Kind declared_kind(const std::string& type_kind) {
     if (type_kind == "bool")  return Kind::Bool;
     if (type_kind == "float") return Kind::Float;
     if (type_kind == "ptr")   return Kind::Ptr;
+    // 4.10.1. A class-typed value (an instance reference, or a class-typed
+    // attribute read back by RefLoad) is print-unsafe like a pointer.
+    if (type_kind == "class") return Kind::Object;
     return Kind::Unknown;                          // str, anything else
 }
 
@@ -375,6 +383,42 @@ struct Analysis {
                     // load above reads the kind back from the field's suffix, so
                     // there is no running kind to update here.
                     case Op::FieldStore:
+                        break;
+
+                    // 4.10.1. Class instance ops. A class reference is a heap
+                    // pointer whose default text is an address, so it is
+                    // print-UNSAFE exactly as Ptr is: `New`, `Retain` and a
+                    // class-typed value all carry Kind::Object, and printing one
+                    // is what the print guard refuses (an object prints only
+                    // through __str__/__repr__, 4.10.5, not yet implemented).
+                    // A RefLoad's kind is its declared attribute type, like a
+                    // FieldLoad's; a RefStore/Release has no result.
+                    case Op::New:
+                        raise(st.vals[in.result], Kind::Object);
+                        break;
+                    // 4.10.2. isinstance yields a bool; a virtual call's result
+                    // is its declared suffix type (a class reference is Object,
+                    // exactly as an inlined call's class result is).
+                    case Op::IsInstance:
+                        raise(st.vals[in.result], Kind::Bool);
+                        break;
+                    case Op::CallVirtual:
+                        if (in.type_kind == "class") {
+                            raise(st.vals[in.result], Kind::Object);
+                        } else if (!in.type_kind.empty()) {
+                            raise(st.vals[in.result], declared_kind(in.type_kind));
+                        }
+                        break;
+                    case Op::Retain:
+                        raise(st.vals[in.result], st.vals[in.args.at(0)]);
+                        break;
+                    case Op::RefLoad: {
+                        const Kind attr = declared_kind(in.type_kind);
+                        raise(st.vals[in.result], attr);
+                        break;
+                    }
+                    case Op::RefStore:
+                    case Op::Release:
                         break;
 
                     // Hardening item 5. Conversions are exact in the kind

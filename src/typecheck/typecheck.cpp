@@ -76,12 +76,18 @@ struct LType {
     // valueless struct store down the same "binds storage" path a container
     // takes rather than the type-only scalar path.
     bool is_scalar() const {
-        return !has_elem() && !has_key() && kind != "struct";
+        return !has_elem() && !has_key() && kind != "struct" && kind != "class";
     }
     bool is_list() const { return kind == "list"; }
     bool is_dict() const { return kind == "dict"; }
     bool is_ptr() const { return kind == "ptr"; }
     bool is_struct() const { return kind == "struct"; }
+    // 4.10.1. A class-typed value is a heap reference (one 8-byte pointer), not
+    // a packed scalar and not a container. `elem_kind` carries the class NAME,
+    // which is empty for every scalar, so it is the natural home for the
+    // one payload a class type has.
+    bool is_class() const { return kind == "class"; }
+    const std::string& class_name() const { return elem_kind; }
 
     // 4.4. The element stride a pointer offset is scaled by, in BYTES. The
     // frontend lowers `_p + 1` to `add _p, sizeof(T)`, so an offset is a byte
@@ -133,8 +139,14 @@ LType from_ir_type(const Type& t) {
         return out;
     }
     out.width = t.is_container() ? t.cap : t.width;
-    if (t.elem && (t.is_container() || t.kind == "ptr")) {
-        out.elem_tree = std::make_shared<LType>(from_ir_type(*t.elem));
+    // 4.10.1. A class reference carries its class name in `elem_kind` (a scalar
+    // leaves that empty, so it is free). `class_name()` is what the checker uses
+    // to enforce that a class-typed value's declared class is the one its
+    // attributes are read through.
+    if (t.kind == "class") {
+        out.elem_kind = t.ref;
+    }
+    if (t.elem && (t.is_container() || t.kind == "ptr")) {        out.elem_tree = std::make_shared<LType>(from_ir_type(*t.elem));
         out.elem_kind = t.elem->kind;
         out.elem_width = t.elem->kind == "str"
                              ? t.elem->cap
@@ -238,7 +250,11 @@ public:
     void run() {
         bool has_return_type = !fn_.return_type_kind.empty();
         if (has_return_type) {
-            return_type_ = LType{fn_.return_type_kind, fn_.return_type_width};
+            LType rt{fn_.return_type_kind, fn_.return_type_width};
+            if (fn_.return_type_kind == "class" && !fn_.return_type_ref.empty()) {
+                rt.elem_kind = fn_.return_type_ref;
+            }
+            return_type_ = rt;
             check_scalar_width(fn_.return_type_kind, fn_.return_type_width);
         }
         has_return_type_ = has_return_type;
@@ -252,12 +268,26 @@ public:
                 header_invalid = true;
                 continue;
             }
-            entry_scope[fn_.params[i]] = LType{fn_.param_type_kinds[i], fn_.param_type_widths[i]};
+            LType pt{fn_.param_type_kinds[i], fn_.param_type_widths[i]};
+            if (fn_.param_type_kinds[i] == "class" && i < fn_.param_type_refs.size() &&
+                !fn_.param_type_refs[i].empty()) {
+                pt.elem_kind = fn_.param_type_refs[i];
+            }
+            entry_scope[fn_.params[i]] = pt;
             check_scalar_width(fn_.param_type_kinds[i], fn_.param_type_widths[i]);
         }
         // Entry points are exempt from the return-annotation rule: the frontend's
         // implicit top-level function is __main__, and hand-written IR may use main.
-        if (fn_.name != "main" && fn_.name != "__main__" && !has_return_type) {
+        // 4.10.1. A compiler-generated `__del__<Class>` is exempt too: it is a
+        // destructor, invoked by the runtime as `void(*)(void*)`, so it has no
+        // value to return and no annotation the frontend could have written.
+        // 4.10.2. A compiler-generated `__virt__<Class>.<slot>` is exempt for the
+        // same reason: a virtual method that returns nothing has no annotation to
+        // write, and the function exists only as a vtable target.
+        const bool is_generated_destructor = fn_.name.rfind("__del__", 0) == 0;
+        const bool is_generated_virtual = fn_.name.rfind("__virt__", 0) == 0;
+        if (fn_.name != "main" && fn_.name != "__main__" && !is_generated_destructor &&
+            !is_generated_virtual && !has_return_type) {
             error("function '" + fn_.name + "' has no return type annotation (V1_SPEC 0.6.8)");
             header_invalid = true;
         }
@@ -321,6 +351,10 @@ private:
             else
                 error(code + "unsupported float width " + std::to_string(width) +
                       " -- float must be 64");
+        } else if (kind == "class" || kind == "bool" || kind == "str" ||
+                   kind == "struct" || kind == "ptr" || kind == "list" ||
+                   kind == "tuple" || kind == "dict") {
+            return;
         }
     }
 
@@ -735,6 +769,14 @@ private:
                 }
                 return;
             }
+            // 4.10.3. Class-to-class flow is deliberately accepted here. Both
+            // sides have width -1, and the checker has no class table: the
+            // frontend is the only layer that knows the hierarchy, and it
+            // admits exactly a same-class or subclass (upcast) reference.
+            // This branch is therefore the hand-written-IR backstop for
+            // class-to-class only; a class flowing into a non-class, or the
+            // reverse, still falls through to the mismatch error below.
+            if (source.kind == "class" && target.kind == "class") return;
             if (source.width < 0 && target.width < 0) return;
             if (source.width >= 0 && target.width >= 0) {
                 if (target.width >= source.width) return;
@@ -1350,6 +1392,129 @@ private:
                     check_value_into_target(instr.args.at(0), field,
                                             "store into field of '" + instr.name + "'");
                 }
+                return;
+            }
+            // 4.10.1. Class instance ops. A class-typed value is a heap
+            // reference; the ops mirror the field ops but the base is a
+            // reference register, not a named blob.
+            case Op::New: {
+                // `new Point`: the class name must be one the IR knows, carried
+                // in `name`. The result is a class-typed reference. (The checker
+                // cannot see the class registry, so it trusts the frontend's
+                // stamped name -- but a hand-written `new Bogus` with no type is
+                // caught by the result never being usable.)
+                if (instr.name.empty()) {
+                    error("New needs a class name (4.10.1)");
+                    return;
+                }
+                LType ref;
+                ref.kind = "class";
+                ref.elem_kind = instr.name;
+                reg_types_[instr.result] = ref;
+                return;
+            }
+            case Op::RefLoad: {
+                LType base;
+                if (!reg_type(instr.args.at(0), base)) {
+                    error("refload needs a resolved class reference (4.10.1)");
+                    return;
+                }
+                if (!base.is_class() && !base.is_ptr()) {
+                    error("refload base is " + type_str(base) +
+                          ", not a class reference (4.10.1)");
+                    return;
+                }
+                if (instr.int_imm < 0) {
+                    error("refload offset must be non-negative (4.10.1)");
+                    return;
+                }
+                const LType attr{instr.type_kind, instr.type_width, "", -1, "", -1};
+                if (attr.kind.empty()) {
+                    error("refload needs the attribute's type in its suffix (4.10.1)");
+                    return;
+                }
+                reg_types_[instr.result] = attr;
+                return;
+            }
+            case Op::RefStore: {
+                LType base;
+                if (!reg_type(instr.args.at(0), base)) {
+                    error("refstore needs a resolved class reference (4.10.1)");
+                    return;
+                }
+                if (!base.is_class() && !base.is_ptr()) {
+                    error("refstore base is " + type_str(base) +
+                          ", not a class reference (4.10.1)");
+                    return;
+                }
+                if (instr.int_imm < 0) {
+                    error("refstore offset must be non-negative (4.10.1)");
+                    return;
+                }
+                const LType attr{instr.type_kind, instr.type_width, "", -1, "", -1};
+                check_value_into_target(instr.args.at(1), attr,
+                                        "store into attribute (4.10.1)");
+                return;
+            }
+            case Op::Retain: {
+                LType base;
+                if (!reg_type(instr.args.at(0), base) || !base.is_class()) {
+                    error("retain needs a class reference (4.10.1)");
+                    return;
+                }
+                reg_types_[instr.result] = base;
+                return;
+            }
+            case Op::Release: {
+                LType base;
+                if (!reg_type(instr.args.at(0), base) || !base.is_class()) {
+                    error("release needs a class reference (4.10.1)");
+                    return;
+                }
+                return;
+            }
+            // 4.10.2. IsInstance: the operand is a class reference; the result is
+            // a bool. The class is named in `name` and indexed in `int_imm`.
+            case Op::IsInstance: {
+                LType base;
+                if (!reg_type(instr.args.at(0), base) || !base.is_class()) {
+                    error("isinstance needs a class reference (4.10.2)");
+                    return;
+                }
+                LType b;
+                b.kind = "bool";
+                reg_types_[instr.result] = b;
+                return;
+            }
+            // 4.10.2. CallVirtual: an indirect call through the receiver's
+            // descriptor slot. The receiver is a class reference; the trailing
+            // suffix carries the method's result type (absent for a void method),
+            // exactly as an inlined call's result would be typed.
+            case Op::CallVirtual: {
+                LType recv;
+                if (instr.args.empty() || !reg_type(instr.args.at(0), recv) ||
+                    !recv.is_class()) {
+                    error("callvirtual needs a class receiver (4.10.2)");
+                    return;
+                }
+                if (instr.name.empty() || instr.name2.empty()) {
+                    error("callvirtual needs a class and a method name (4.10.2)");
+                    return;
+                }
+                if (instr.type_kind.empty()) return;   // a void method: no result
+                if (instr.type_kind == "class") {
+                    if (!instr.decl_type || instr.decl_type->ref.empty()) {
+                        error("callvirtual class result needs a class name (4.10.2)");
+                        return;
+                    }
+                    LType cls;
+                    cls.kind = "class";
+                    cls.elem_kind = instr.decl_type->ref;
+                    reg_types_[instr.result] = cls;
+                    return;
+                }
+                const LType ret{instr.type_kind, instr.type_width, "", -1, "", -1};
+                reg_types_[instr.result] = ret;
                 return;
             }
             // Hardening item 5. Explicit numeric conversions (V1_SPEC 0.6.11).
@@ -2510,11 +2675,20 @@ std::vector<RCRError> check_module(const Module& module) {
     for (const auto& fn : module.functions) {
         FnMeta meta;
         for (size_t i = 0; i < fn.params.size(); ++i) {
-            meta.param_types.push_back(LType{fn.param_type_kinds[i], fn.param_type_widths[i]});
+            LType pt{fn.param_type_kinds[i], fn.param_type_widths[i]};
+            if (fn.param_type_kinds[i] == "class" && i < fn.param_type_refs.size() &&
+                !fn.param_type_refs[i].empty()) {
+                pt.elem_kind = fn.param_type_refs[i];
+            }
+            meta.param_types.push_back(pt);
         }
         meta.has_return_type = !fn.return_type_kind.empty();
         if (meta.has_return_type) {
-            meta.return_type = LType{fn.return_type_kind, fn.return_type_width};
+            LType rt{fn.return_type_kind, fn.return_type_width};
+            if (fn.return_type_kind == "class" && !fn.return_type_ref.empty()) {
+                rt.elem_kind = fn.return_type_ref;
+            }
+            meta.return_type = rt;
         }
         all_fns[fn.name] = meta;
     }

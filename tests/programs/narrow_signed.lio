@@ -6,12 +6,12 @@
 # printed -5 under the interpreter and 65531 natively (the JIT zero-extended),
 # while a struct int[16] field printed 65531 in BOTH tiers (the interpreter
 # zero-extended too). Both tiers now sign-extend a narrow int load, and bool
-# keeps its 0/1 zero-extension. CPython cannot run this file (Struct and the
+# keeps its 0/1 zero-extension. CPython cannot run this file (`struct` and the
 # int[w] spellings are Lithon's own), so expected/narrow_signed.out is written
 # from the documented signed semantics rather than recorded from CPython.
 
 
-class Packed(Struct):
+class Packed(struct):
     a: int[8]
     b: int[16]
     c: int[32]

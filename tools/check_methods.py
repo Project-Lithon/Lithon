@@ -31,7 +31,7 @@ TIER_RUNNER = REPO / "build" / "tier_runner"
 
 
 METHOD_STRUCT = """\
-class Counter(Struct):
+class Counter(struct):
     value: int[64]
 
     def add(self, n: int[64]) -> int[64]:
@@ -54,7 +54,7 @@ print(c.total(4))
 """
 
 MANUAL_STRUCT = """\
-class Counter(Struct):
+class Counter(struct):
     value: int[64]
 
 
@@ -72,7 +72,7 @@ print(t)
 """
 
 METHOD_NESTED = """\
-class Inner(Struct):
+class Inner(struct):
     x: int[64]
 
     def bump(self, by: int[64]):
@@ -83,7 +83,7 @@ class Inner(Struct):
         return self.x
 
 
-class Outer(Struct):
+class Outer(struct):
     inner: Inner
 
 
@@ -95,11 +95,11 @@ print(o.inner.x)
 """
 
 MANUAL_NESTED = """\
-class Inner(Struct):
+class Inner(struct):
     x: int[64]
 
 
-class Outer(Struct):
+class Outer(struct):
     inner: Inner
 
 
@@ -112,7 +112,7 @@ print(o.inner.x)
 """
 
 METHOD_ENUM = """\
-class Shape(Enum):
+class Shape(enum):
     Empty
     Line: int[32]
 
@@ -134,7 +134,7 @@ print(s.code())
 """
 
 MANUAL_ENUM = """\
-class Shape(Enum):
+class Shape(enum):
     Empty
     Line: int[32]
 
@@ -167,29 +167,29 @@ CASES = [
 
 REFUSALS = [
     ("definition: decorator",
-     "class P(Struct):\n    x: int[64]\n    @staticmethod\n    def f(self) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    @staticmethod\n    def f(self) -> int[64]:\n"
      "        return 1\np: P\nprint(p.f())\n", "LITHON-E0134"),
     ("definition: first parameter is not self",
-     "class P(Struct):\n    x: int[64]\n    def f(a: int[64]) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    def f(a: int[64]) -> int[64]:\n"
      "        return a\np: P\nprint(p.f(1))\n", "LITHON-E0134"),
     ("definition: annotated self",
-     "class P(Struct):\n    x: int[64]\n    def f(self: int[64]) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    def f(self: int[64]) -> int[64]:\n"
      "        return 1\np: P\nprint(p.f())\n", "LITHON-E0134"),
     ("definition: unannotated parameter",
-     "class P(Struct):\n    x: int[64]\n    def f(self, a) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    def f(self, a) -> int[64]:\n"
      "        return a\np: P\nprint(p.f(1))\n", "LITHON-E0134"),
     ("definition: name collides with a field",
-     "class P(Struct):\n    x: int[64]\n    def x(self) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    def x(self) -> int[64]:\n"
      "        return 1\np: P\nprint(p.x())\n", "LITHON-E0134"),
     ("call: unknown method",
-     "class P(Struct):\n    x: int[64]\np: P\nprint(p.h())\n", "LITHON-E0135"),
+     "class P(struct):\n    x: int[64]\np: P\nprint(p.h())\n", "LITHON-E0135"),
     ("call: field used as a method",
-     "class P(Struct):\n    x: int[64]\np: P\nprint(p.x())\n", "LITHON-E0135"),
+     "class P(struct):\n    x: int[64]\np: P\nprint(p.x())\n", "LITHON-E0135"),
     ("call: recursive method",
-     "class P(Struct):\n    x: int[64]\n    def f(self) -> int[64]:\n"
+     "class P(struct):\n    x: int[64]\n    def f(self) -> int[64]:\n"
      "        return self.f()\np: P\nprint(p.f())\n", "LITHON-E0135"),
     ("call: void method used as a value",
-     "class P(Struct):\n    x: int[64]\n    def f(self):\n        return\n"
+     "class P(struct):\n    x: int[64]\n    def f(self):\n        return\n"
      "p: P\nprint(p.f())\n", "LITHON-E0135"),
 ]
 

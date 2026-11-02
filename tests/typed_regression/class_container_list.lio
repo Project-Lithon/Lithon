@@ -1,0 +1,69 @@
+# 4.10.3. Class references as list and tuple elements. A container holds one
+# 8-byte reference per slot, every slot is written by the literal, and reading
+# `xs[i]` yields the same class reference the slot owns. Lists are mutable, so
+# an element may be overwritten; a tuple is filled once by its literal and read
+# only.
+#
+# The expected output is CPython's answer for the same program.
+
+
+class Animal:
+    tag: int[64]
+
+    def __init__(self, tag: int[64]):
+        self.tag = tag
+
+    def sound(self) -> int[64]:
+        return 0
+
+
+class Cat(Animal):
+    def sound(self) -> int[64]:
+        return 1
+
+
+a: Animal = Cat(7)
+xs: list[Animal, 3] = [Cat(1), Animal(2), a]
+
+print(xs[0].sound())
+print(xs[1].sound())
+print(xs[2].sound())
+print(xs[2] is a)
+print(a in xs)
+print(Cat(3) in xs)
+print(Animal(2) in xs)
+print(isinstance(xs[0], Cat))
+print(isinstance(xs[1], Cat))
+print(len(xs))
+
+# Overwrite an element with a fresh object and with another element. The old
+# reference is dropped; the new one is retained before the old one is released,
+# so `xs[1] = xs[0]` can never free the value it is about to store.
+xs[0] = Cat(9)
+print(xs[0].sound())
+print(xs[0].tag)
+xs[1] = xs[0]
+print(xs[1] is xs[0])
+print(xs[1].tag)
+
+# An element read is a borrow; binding it to a class variable retains it, so
+# it survives the container's own scope exit.
+keep: Animal = xs[2]
+print(keep.tag)
+
+# Nested containers are one flat run of reference leaves.
+nested: list[list[Animal, 2], 2] = [[Animal(10), Animal(11)],
+                                    [Animal(12), Animal(13)]]
+print(nested[1][0].tag)
+print(nested[0][1].sound())
+nested[0][0] = Cat(14)
+print(nested[0][0].sound())
+
+# A tuple of class references is filled by its literal and read-only after.
+ts: tuple[Animal, 2] = (Cat(20), Animal(21))
+print(ts[0].sound())
+print(ts[1].tag)
+
+# An explicit index loop is the supported iteration form.
+for i in range(3):
+    print(xs[i].tag)

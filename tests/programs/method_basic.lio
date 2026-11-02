@@ -5,7 +5,7 @@
 # storage model -- a field op names a variable (not a register), and a struct
 # cannot be passed to a function (E0124) -- and it is what lets a method read
 # AND write the receiver's fields, run loops and branches, and call other
-# methods. `struct`/`Struct` is not a Python builtin, so this file has no
+# methods. `struct` is not a Python builtin, so this file has no
 # CPython oracle; expected/method_basic.out is written from the documented 4.9
 # semantics and confirmed by both tiers agreeing byte for byte.
 #
@@ -15,7 +15,7 @@
 # (directly or indirectly); that is refused at the call site.
 
 
-class Counter(Struct):
+class Counter(struct):
     value: int[64]
 
     # A value-returning method reads the receiver and takes a scalar parameter.
@@ -70,7 +70,7 @@ print(i)
 
 # A receiver can be a struct field: `o.inner` resolves to the field's bytes, so
 # a method on Inner reads and writes the caller's `inner`.
-class Inner(Struct):
+class Inner(struct):
     x: int[64]
 
     def bump(self, by: int[64]):
@@ -80,7 +80,7 @@ class Inner(Struct):
         return self.x
 
 
-class Outer(Struct):
+class Outer(struct):
     inner: Inner
     tag: int[64]
 

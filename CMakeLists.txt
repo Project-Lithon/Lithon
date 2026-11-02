@@ -78,6 +78,15 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|X86_64)$")
     target_include_directories(dict_str_probe_test PUBLIC src src/jit)
     add_test(NAME dict_str_probe_test COMMAND dict_str_probe_test)
 
+    # object_runtime_test: 4.10.0's allocator, object header layout, reference
+    # counting, and the ONE observable lifetime moment (when __del__ runs).
+    # object.h and heap.h are header-only and shared by both tiers, so this pins
+    # the foundation once; run_tier_diff.py then proves the tiers agree at the
+    # program level. Header only, so src on the include path is all it needs.
+    add_executable(object_runtime_test src/runtime/object_runtime_test.cpp)
+    target_include_directories(object_runtime_test PUBLIC src)
+    add_test(NAME object_runtime_test COMMAND object_runtime_test)
+
     # These go through compile_module(), which is ABI-aware
     # (System V / Microsoft x64), so they run on every platform.
     set(LITHON_JIT_TESTS

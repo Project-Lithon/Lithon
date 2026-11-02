@@ -64,6 +64,120 @@ drop-in Python replacement.
 
 ### Recently added
 
+- **Class references in containers (4.10.3)** — a `list[P, N]` or
+  `tuple[P, N]` may now hold class references. Each element is one 8-byte
+  reference leaf in the container's flat run, so a nested
+  `list[list[P, 2], 2]` is still one contiguous run and `xs[i][j]` is the same
+  multi-index access scalars use. The declared element class is the **static**
+  type of every read: an element may name that class or any subclass (an
+  upcast), so `xs[i].method()` dispatches on the object's real class, and
+  `isinstance(xs[i], D)` still sees a stored `D`. A read is a **borrow**; the
+  slot owns one reference. A class-typed literal must fill every slot (a bare
+  declaration would be a run of null references), so a shorter literal, a bare
+  `list[P, N]`/`tuple[P, N]`, and `append` are refused. Overwriting a slot
+  retains the new reference *before* releasing the old one, so
+  `xs[0] = xs[0]` and `xs[1] = xs[0]` cannot free the value being stored;
+  scope exit walks the flat leaf chains in reverse and drops one reference per
+  slot, which is what makes per-element `__del__` observable and tier-identical.
+  Tuples build their elements first and then declare/fill the run in one block,
+  because an element's inlined constructor splits the IR. `in`, `is`/`is not`
+  and `==`/`!=` compare references (with the same related-class rule as
+  identity); `len` reports the literal's slot count. Deliberately deferred:
+  `enumerate`/`zip` over a class-typed container (the loop target outlives an
+  iteration, so its ownership rule is not settled — use
+  `for i in range(N):` and read `xs[i]`), class-typed containers as function
+  parameters or return values (local storage, not a value), and dict
+  keys/values of class type. `tests/typed_regression/class_container_list.lio`,
+  `class_container_inherit.lio` and `class_container_lifetime.lio` guard the
+  reads, dispatch/upcasts and per-slot lifetime, and `fuzz_diff.py --oop`
+  alternates a container shape with the 4.10.1/4.10.2 shapes.
+- **Single inheritance (4.10.2)** — `class Dog(Animal):` extends an earlier
+  class. A subclass instance begins with a valid base instance (base attributes
+  keep their offsets), so upcasting a `Dog` reference to `Animal` is free and an
+  inherited attribute or method is reached without a copy. Method slots are
+  **stable down the chain**: a call site compiled against the base reads the
+  same slot for every subclass, and an override replaces that slot's
+  implementation. A call whose receiver's exact class is statically known (and
+  whose hierarchy has no override) is still inlined; when the receiver is only
+  known as a base, the frontend emits `CallVirtual`, which reads the receiver's
+  own descriptor and runs the override at run time. `super()` starts lookup at
+  the enclosing class's base and inlines that implementation;
+  `super().__init__(...)` runs the base constructor on the same object while
+  registering the base's attributes with the derived definite-init check.
+  `isinstance(x, C)` is two integer compares against C's subtree range (type ids
+  are assigned pre-order, so every subtree is one contiguous interval);
+  `issubclass(A, B)` folds to a constant at compile time. A method whose body is
+  `...` is abstract: the class is flagged and cannot be instantiated until a
+  subclass implements it. An override must match the inherited signature, and a
+  subclass adds attributes rather than shadowing inherited ones. Multiple
+  inheritance is 4.10.4. `tests/typed_regression/class_inherit.lio`,
+  `class_inherit_super.lio`, `class_inherit_isinstance.lio` and
+  `class_inherit_params.lio` are tier-identical guards, and `fuzz_diff.py --oop`
+  now alternates flat class programs, inheritance programs and class-reference-
+  in-container programs (vtable dispatch, `super()`, `isinstance`, upcasts,
+  per-slot ownership).
+- **Classes (4.10.1)** — the first user-visible slice of Python's object model.
+  A `class Name:` with no base declares a real class: attributes with types, an
+  `__init__`, plain methods, and an optional `__del__`. An instance is a heap
+  **reference** (8 bytes) — distinct from a `struct`'s inline byte run — so it is
+  a value that can be passed, returned, aliased and stored, and every method is
+  inlined at its call site with `self` as the receiver reference (the 4.9
+  model). Attribute access lowers to `refload`/`refstore` at absolute offsets
+  baked in from the class layout, which the frontend emits once as module
+  metadata both tiers read, so the two engines cannot disagree about a layout.
+  Lifetime is the reference-counting model made observable: `p: Point = Point(...)`
+  owns one reference, dropped at the exit of the block that owns it (a function
+  or module body, a loop body, a `return` path, a `break`/`continue`); `b = a`
+  and storing a reference in an attribute emit a retain so both owners count.
+  Releasing an object also drops the references its own class-typed attributes
+  hold, so an object kept alive *only* by a holder still dies, and its `__del__`
+  runs, when the holder does. A function that returns a reference retains it, so
+  a call result is always one owned reference the caller drops at its own scope
+  exit — the same contract whether the callee returned a fresh construction, an
+  owned local or a borrowed parameter, which removes the borrow ambiguity instead
+  of inferring it.
+  `__del__` is **not** inlined — it is emitted as a real `__del__<Class>`
+  function and pointed at from the descriptor, so it runs at the exact last drop
+  and in the same order in both tiers. `is`/`is not` and (until 4.10.5 adds
+  `__eq__`) `==`/`!=` on two references are object identity: one integer compare
+  of the addresses. Definite initialization is enforced structurally — every
+  declared attribute must be assigned on every path reaching the end of
+  `__init__` (E0140), and uninitialized scalar attributes are zeroed at `new`.
+  An attribute is `int[w]`, `float[64]`, `bool` or a reference to another class
+  — the declaration makes exactly those usable, so a `str`, `struct` or `enum`
+  attribute (which would be stored inline but has no *variable* for the ops that
+  reach a bounded string, a struct field or an enum payload) is refused at
+  declaration (E0127) rather than accepted and then unreadable. Refused by
+  design: a bare class name in a value position ("did you mean `Name(...)`?"),
+  an undeclared attribute (E0141), and any decorator (4.10) — `property` and
+  `classmethod` arrive as keywords in 4.10.6. Class-typed variables are non-null
+  by default; `Optional`/`None` is a later sub-step. Class references may now
+  be list/tuple elements (4.10.3); a dict, struct attribute or class attribute
+  holding one remains a later sub-step.
+  `tests/typed_regression/class_basic.lio`, `class_lifetime.lio`,
+  `class_references.lio` and `class_returns.lio` are tier-identical guards, and
+  `tools/fuzz_diff.py --oop` generates class programs and compares the two
+  engines (and CPython) over construction, aliasing, lifetime and identity.
+- **Object runtime (4.10.0)** — the foundation for real classes: a small
+  `mmap`-backed heap with intrusive size-class free lists and no libc, the
+  `[vptr:8][refcount:8]` instance header, a read-only `ClassDescriptor` carrying
+  the type id, its subtree range and the vtable, and shared `IncRef`/`DecRef`
+  helpers. **Reference counting** is the decided lifetime model: deterministic,
+  pause-free, and the `__del__` moment is pinned to exactly the program point
+  where the last reference drops — the one observable lifetime event, so the
+  optimizer may not move or elide it, and the two tiers therefore agree. An
+  object whose class has no `__del__` is a plain, freely-rewritable free;
+  class descriptors and (later) stack-allocated objects carry an immortal
+  sentinel so no increment is ever emitted for them. The runtime is shared by
+  both tiers (`src/runtime/object.h`, `src/runtime/heap.h`) and reset at each
+  entry point exactly like the stack-depth guard, so allocation and destructor
+  order cannot drift between the interpreter and the JIT. This stage adds **no
+  user-visible language change**; `src/runtime/object_runtime_test.cpp` pins the
+  layout, the allocator, reference counting, the destructor timing/order, the
+  immortal no-ops and the two-compare `isinstance` range. Documented narrowings:
+  allocation addresses are never observable (a reference is print-unsafe, like
+  `Ptr`), cycles leak, and references held between a trap and a `try` handler
+  are leaked on the exceptional path (never a safety problem).
 - **`try`/`except` (6.10)** — the Python EAFP rhyme works: a `try` body whose
   `int(8, input("..."))` meets a typo lands in `except ValueError:`, and the
   program continues. It catches the closed set of built-in Tier-3 traps
@@ -135,6 +249,13 @@ Lithon is built around several principles:
 * **Interpreter fallback** — unsupported native cases can still execute through
   Tier-0 when using automatic mode.
 * **Explicit unsafe memory access** — pointer variables require an `_` prefix.
+* **Managed objects, but no hidden pauses** — class instances live on a
+  reference-counted heap (4.10.0), so aliasing (`b = a`) and objects outliving
+  their creator work as in Python; there is no tracing collector and therefore
+  no pauses. Dynamic dispatch exists only through declared class hierarchies,
+  costs one indirect call, and is removed wherever the compiler can prove the
+  type; objects live on the heap unless escape analysis proves they do not
+  escape.
 * **JIT/Compiler refusal over silent miscompilation** — when Lithon cannot prove
   something, the native tier refuses it.
 
@@ -534,20 +655,22 @@ The verification suite checks several independent layers.
 
 | Area                                 |         Current result        |
 | :----------------------------------- | :---------------------------: |
-| CTest                                |       **33 / 33 passed**      |
+| CTest                                |       **35 / 35 passed**      |
 | x86-64 encoder comparisons           |       **18,379 cases**        |
 | Incorrect encoder cases              |             **0**             |
 | Typed differential fuzzing           |      **300 / 300 passed**     |
 | Bitwise / shift fuzzing              |      **200 / 200 passed**     |
 | Conditional-expression / SSA fuzzing |    **200 / 200 per suite**    |
-| Direct float Phi sweep               | **38 matched / 0 mismatched** |
+| Direct float Phi sweep               | **88 matched / 0 mismatched** |
 | ABI modules audited                  |             **34**            |
 | ABI stack/callee-saved failures      |             **0**             |
-| Typed regression suite               |       **28 / 28 passed**      |
+| Typed regression suite               |       **54 / 54 passed**      |
 | General regression suite             |       **34 / 34 passed**      |
 | Type-checker unit checks             |          **145 ok**          |
-| Error-code discipline checks         |          **86 ok**           |
-| Tier differential (interp vs JIT)    |      **168 / 168 passed**     |
+| Error-code discipline checks         |         **139 ok**           |
+| Tier differential (interp vs JIT)    |      **221 / 221 passed**     |
+| Object runtime (4.10.0–4.10.2, ctest) | **68 ok**       |
+| Class (OOP) fuzzing                  |      **200 / 200 passed**     |
 | Syscall hook parity (both tiers)     |        **4 / 4 passed**      |
 | Networking loopback vs a C oracle    |          **verified**        |
 | SIMD vectorizer loop cases           |        **6 / 6 passed**      |
@@ -870,7 +993,7 @@ words: list[str[8], 3] = ["one", "two", ""]
 print(words[1][2])        # 111  ('o' of "two")
 words[1][2] = 88          # -> "twX"
 
-class Named(Struct):
+class Named(struct):
     name: str[8]
     n: int[8]
 
@@ -962,11 +1085,11 @@ miscompiled.
 ## 🧱 Structs
 
 A struct is a named run of typed fields packed into one blob of bytes. It is
-spelled as a class deriving from `Struct`, whose body is nothing but field
+spelled as a class deriving from `struct`, whose body is nothing but field
 annotations:
 
 ```python
-class Point(Struct):
+class Point(struct):
     x: int[64]
     y: int[64]
 
@@ -987,7 +1110,7 @@ the layout is a pure sum of field sizes and matches a C `#pragma pack(1)`
 struct byte for byte.
 
 ```python
-class SockAddrIn(Struct):
+class SockAddrIn(struct):
     family: int[16]   # offset 0
     port: int[16]     # offset 2
     addr: int[64]     # offset 4
@@ -1017,10 +1140,10 @@ An enum is a tagged union: a byte blob holding an `int` tag plus room for the
 payload of whichever variant is active. Like a struct it **has no value** —
 the only operations are constructing a variant, reading the tag with `match`,
 and reading a payload through the arm's binding. It is spelled as a class
-deriving from `Enum`:
+deriving from `enum`:
 
 ```python
-class Shape(Enum):
+class Shape(enum):
     Empty
     Dot
     Line: int[32]
@@ -1040,7 +1163,7 @@ match s:
 ```
 
 A variant is a bare unit name (`Empty`), a `name: type` scalar payload
-(`Line: int[32]`), or an inline `class V(Struct)` struct payload. The layout is
+(`Line: int[32]`), or an inline `class V(struct)` struct payload. The layout is
 `[tag][payload]` with **no padding**: the tag is an `int[8]` while the enum has
 at most 128 variants and widens to `int[16]` past that, the payload starts at
 the tag width, and the size is the tag width plus the largest payload. Only the
@@ -1066,7 +1189,7 @@ implicit receiver `self`; the rest are annotated scalars, and the return type is
 optional. A method is called as `recv.name(args)`.
 
 ```python
-class Counter(Struct):
+class Counter(struct):
     value: int[64]
 
     def add(self, n: int[64]) -> int[64]:
@@ -1105,7 +1228,7 @@ inheritance or overloading, a method name may not shadow a field or a variant,
 and the signature accepts no `/`, `*`, `**` or defaults (E0134).
 
 ```python
-class Shape(Enum):
+class Shape(enum):
     Empty
     Line: int[32]
 
@@ -1129,17 +1252,17 @@ and checks the E0134/E0135 refusals.
 ## 🧩 Type Functions
 
 A type function is a **compile-time type constructor**: `def Name(params) ->
-NewType` returns `{ T }`, and writing `Name(args)` anywhere a type is allowed
+newtype` returns `{ T }`, and writing `Name(args)` anywhere a type is allowed
 substitutes the arguments into `T` and yields an ordinary type.
 
 ```python
-def Fixed(t, n) -> NewType:
+def Fixed(t, n) -> newtype:
     return {list[t, n]}
 
-def Word() -> NewType:
+def Word() -> newtype:
     return {int[32]}
 
-def Ref(t) -> NewType:
+def Ref(t) -> newtype:
     return {ptr[t]}
 
 xs: Fixed(int[64], 4)      # == list[int[64], 4]
@@ -1508,6 +1631,21 @@ Deliberate narrowings, collected next to `%` and `v == n`:
 | `try`/`except` (6.10) | catches any exception, from anywhere, and `finally` always runs | catches the closed set of built-in Tier-3 traps (`ZeroDivisionError`, `OverflowError`, `ValueError`, `IndexError`, `KeyError`, `EOFError`, or `Exception` for all of them) **raised in the same function as the `try`**; a trap raised inside a called function ends the program, and an *uncaught* trap does not run a `finally` | a trap is routed statically, so a caught trap is a plain jump within one function; crossing a call boundary would need a real unwind, and re-running `finally` on a propagating trap would need `raise` |
 | a bare `except:` | catches everything | refused (`E0114`) | it would claim to catch a segfault, which no tier can catch; `except Exception:` is the spelled-out catch-all |
 | `except X as e` / `raise` / `except*` (6.10) | binds an exception object, re-raises, groups | refused (`E0114`) | there is no exception object -- a caught trap is a jump to a block, so there is nothing to bind or re-raise |
+| object lifetime (4.10.0) | reference counting **plus** a cycle collector, so cycles are reclaimed | reference counting only: a reference **cycle** leaks | there is no tracing collector (it would add pauses and a large runtime); cycles are rare in the straight-line / ownership style Lithon targets, and a weakref + cycle collector is a later addition |
+| allocation addresses (4.10.0) | `id(x)` / a default `repr` shows a real address | addresses are never observable: a reference is print-unsafe (like `Ptr`), and an object prints only through `__str__`/`__repr__` | the two tiers may lay the heap out differently, so an address cannot be byte-comparable across them; making it unobservable is what lets them agree |
+| references held across a trap (4.10.0) | a caught exception's frame objects are dropped when the handler runs | the references held between a trap and its `try` handler are **leaked** on the exceptional path; their `__del__` does not run | the caught trap is a plain jump, so there is no unwind step to release the abandoned frames; releasing them needs per-frame cleanup tables. Never a safety problem -- a leak, not a dangling reference |
+| `__del__` timing (4.10.0) | runs when the garbage collector notices (or at interpreter exit for some cycles) | runs at the exact program point where the last reference drops, and the optimizer may not move or elide that drop | it is the one observable lifetime event, so it must be identical in both tiers; making it a fixed drop point is what guarantees that |
+| object drop points (4.10.1) | a name is kept alive until the frame or module that bound it tears down, so a loop variable from the last iteration survives to the end of the function | a reference is dropped at the exit of the **scope that owns it**: a loop body releases what each iteration created on the back edge, and a `return`/`break`/`continue` releases the references that path owns | it keeps the reference count equal to the number of *lexically live* owners, so a per-iteration object is freed each pass instead of accumulating, and the observable `__del__` order follows the program's block structure rather than CPython's frame teardown. `fuzz_diff.py --oop` exempts this from the CPython oracle for `__del__` programs; the two tiers always agree with each other |
+| classes (4.10.1/4.10.2) | classes, instances, multiple inheritance, decorators, `__dict__`, metaclasses, dynamic attribute addition | a baseless `class Name:` or a single base declared earlier (multiple inheritance is 4.10.4); no decorators (4.10.6 adds `property`/`classmethod` keywords); an attribute is `int[w]`/`float[64]`/`bool`/a class reference, and an instance has exactly its declared attributes; a class-typed variable is non-null; a list/tuple element may be a class reference only in a fully initialized literal (4.10.3) | a class is a layout the compiler knows, so an attribute is a fixed offset and a method is inlined or reached through a fixed slot; dynamic attributes would need a runtime shape and a hash map, nullability needs `Optional`, and a reference leaf in a container needs the per-slot ownership of 4.10.3, all later additions |
+| class references in a container (4.10.3) | a list/tuple holds object references and can grow, shrink, be iterated and be passed freely | a list/tuple of class references is a fixed-capacity run of one 8-byte reference per slot; the literal must fill every slot (no bare declaration, shorter literal or `append`); overwriting a slot retains the new reference before releasing the old one; scope exit drops one reference per slot in reverse flat order; reads are borrows; `in`/identity compare references; `enumerate`/`zip` and class-typed container parameters/returns are refused; dict class keys/values are deferred | one owner per slot is what keeps the reference count exactly equal to the live owners, so per-element `__del__` is deterministic in both tiers; a loop target bound to an element outlives the iteration, so its ownership rule is deliberately left for a later sub-stage, and a container has no value form to cross a function header |
+| method resolution (4.10.2) | a full MRO, with multiple inheritance, cooperative `super()` and `__mro__` | one base per class, and `super()` starts at the enclosing class's **single** base; a method is found by walking the base chain | with exactly one base there is one lookup path, so an MRO is machinery for a shape the language does not yet have; 4.10.4 adds multiple inheritance and the MRO with it |
+| virtual dispatch (4.10.2) | each call does a fresh class/instance-dict lookup | a method name gets one vtable slot, stable down the chain; a statically exact receiver is inlined (and devirtualized when the hierarchy proves no override), otherwise `CallVirtual` reads the receiver's own descriptor | fixed slots are what let a base-compiled call site stay valid for every subclass, and keeping the monomorphic inline path means inheritance costs nothing on the calls the compiler can already see through |
+| `isinstance` / `issubclass` (4.10.2) | `isinstance` walks `__mro__` and accepts a tuple of classes; `issubclass` accepts arbitrary class objects | `isinstance(x, C)` is a class-reference check lowered to two integer compares against C's subtree range; `issubclass(A, B)` takes two class **names** and folds at compile time | the hierarchy is closed and single, so type ids can be assigned pre-order and each subtree is one contiguous interval; tuples and runtime class objects would need the reflection surface this slice omits |
+| abstract methods (4.10.2) | the `abc` module, `@abstractmethod`, and runtime enforcement | a method body of `...` marks the slot abstract; the class is flagged and refused at construction (E0140) until a subclass implements it | `...` is already the spelling a stub uses, and a static flag plus the construction check enforces the rule with no `abc` import or metaclass |
+| identity between two unrelated class references (4.10.2) | `a is b` is valid for any two objects and is usually `False` | same-or-related classes compare by address; two **unrelated** class references are refused (E0140) | the comparison can never be true for unrelated classes, so refusing it at compile time turns a meaningless question into a diagnostic; `isinstance` is the way to ask about type |
+| a reference returned from a function (4.10.1) | the return transfers whatever the object's reference count implies: a fresh object is new, a returned parameter is a borrow the caller must not free | the callee **retains** what it returns, so every class-typed call result is one owned reference the caller drops at its own scope exit | it makes a fresh construction, an owned local and a borrowed parameter one uniform contract; without the retain, `return param` would hand the caller a reference the callee never owned (a use-after-free), so the borrow ambiguity is resolved by construction rather than by inference |
+| `==`/`!=` on two objects (4.10.1) | calls `__eq__` (default is identity) | identity -- one integer compare of the two references (`is`/`is not` are the same compare) | `__eq__` arrives with the other special methods in 4.10.5; until then "same object" is the only meaning, and it is spelled out rather than silently defaulting |
+| a bare class name in a value position (4.10.1) | the class object is a first-class value | refused (`E0140`), pointing at `Name(...)` | a class is a layout, not a value; making it a value would mean a class object and the reflection surface (metaclasses, `type(name, bases, ns)`) this slice deliberately omits |
 
 ---
 
@@ -1635,6 +1773,61 @@ Deliberate narrowings, collected next to `%` and `v == n`:
   catchable; `except X as e`, `raise`, `except*` and a bare `except:` are
   refused. The EAFP rhyme works: `int(8, input("..."))` on a typo lands in
   `except ValueError:`.
+* [x] Object runtime (4.10.0) — the reference-counted heap foundation for real
+  classes: an `mmap` allocator with size-class free lists (no libc), the
+  `[vptr:8][refcount:8]` instance header, a read-only `ClassDescriptor` (type id,
+  subtree range, vtable, `__del__`), and shared `IncRef`/`DecRef`. The `__del__`
+  moment is pinned to the last drop and the optimizer may not move it, so both
+  tiers agree; an object with no `__del__` frees freely, and descriptors/stack
+  objects are immortal (no increment emitted). **No user-visible language change
+  yet.** Cycles leak, addresses are unobservable, and references held across a
+  trap are leaked on the exceptional path — all documented. Pinned by the
+  `object_runtime_test` ctest.
+* [x] Classes (4.10.1) — baseless `class Name:` declarations: typed attributes,
+  an `__init__`, plain methods and an optional `__del__`. An instance is a heap
+  reference (a value), distinct from a `struct`'s inline storage; methods are
+  inlined at the call site with `self` as the receiver reference (4.9 model), and
+  attribute access lowers to `refload`/`refstore` at layout-baked offsets emitted
+  once as module metadata both tiers read. Lifetime is reference counting made
+  observable: a declaration owns a reference dropped at its block's exit, a loop
+  body drops each iteration, a `return`/`break`/`continue` drops the path's
+  references, an alias or an attribute store retains, releasing an object drops
+  the references its own class-typed attributes hold, and a callee retains what
+  it returns so every call result is one owned reference. `__del__` is emitted as
+  a real `__del__<Class>` function reached from the descriptor, so it runs at the
+  exact last drop, in the same order in both tiers. `is`/`is not` and (pre-4.10.5
+  `__eq__`) `==`/`!=` on references are identity — one integer compare. Definite
+  init is enforced structurally (E0140); an undeclared attribute (E0141) or a
+  bare class name are refused, and 4.10 has no decorators. `Optional`/`None` is a
+  later sub-step, so a class-typed variable is non-null. Guards:
+  `class_basic.lio`, `class_lifetime.lio`, `class_references.lio`,
+  `class_returns.lio`, and `fuzz_diff.py --oop`.
+* [x] Single inheritance (4.10.2) — `class Dog(Animal):` with the base declared
+  earlier, base-first layout (a subclass instance starts with a valid base
+  instance, so the upcast is free), stable vtable slots, monomorphic inlining
+  with a `CallVirtual` fallback, `super()` (including `super().__init__`)
+  resolving at the enclosing class's base, `isinstance` as a subtree-range
+  check, compile-time `issubclass`, abstract methods spelled `...` (the class is
+  flagged and cannot be instantiated), and implicit upcasts in class-typed
+  assignments, parameters and returns. Guards: `class_inherit.lio`,
+  `class_inherit_super.lio`, `class_inherit_isinstance.lio`,
+  `class_inherit_params.lio`, and the inheritance shapes in
+  `fuzz_diff.py --oop`. Multiple inheritance is 4.10.4.
+* [x] Class references in containers (4.10.3) — `list[P, N]` and `tuple[P, N]`
+  hold one 8-byte reference leaf per slot, including nested
+  `list[list[P, 2], 2]` as one flat run. The declared element class is the
+  static type of every `xs[i]` read, so virtual dispatch and `isinstance`
+  follow the object's real class through a base-typed container. A read is a
+  borrow; the slot owns one reference. A full literal retains/claims every
+  element, an overwrite retains the new reference before releasing the old, and
+  scope exit drops one per slot in reverse flat order (so `__del__` timing is
+  tier-identical). A bare declaration, a shorter literal and `append` are
+  refused (a slot is never a null reference); `in`, identity and default `==`
+  compare references; `enumerate`/`zip` over a class-typed container, class-typed
+  container parameters/returns, and dict class keys/values are deferred with
+  coded refusals. Guards: `class_container_list.lio`,
+  `class_container_inherit.lio`, `class_container_lifetime.lio`, and the
+  container shape in `fuzz_diff.py --oop`.
 
 ---
 

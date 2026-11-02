@@ -1,0 +1,31 @@
+# 4.10.1. A baseless class: a heap instance reached through a reference, with
+# declared attributes, an __init__ and an inlined method. `Point(3, 4)` emits
+# `new Point` and splices __init__; `p.total()` inlines the method on the
+# reference. The reference is released at the statement that ends its scope.
+#
+# The expected output is CPython's answer for the same shapes.
+
+
+class Point:
+    x: int[64]
+    y: int[64]
+
+    def __init__(self, x: int[64], y: int[64]):
+        self.x = x
+        self.y = y
+
+    def total(self) -> int[64]:
+        return self.x + self.y
+
+    def scaled(self, k: int[64]) -> int[64]:
+        return self.total() * k
+
+
+p: Point = Point(3, 4)
+print(p.total())
+print(p.scaled(10))
+print(p.x)
+p.x = 100
+print(p.total())
+q: Point = Point(1, 1)
+print(p.total() + q.total())

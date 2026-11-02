@@ -118,6 +118,9 @@ python3 tools/check_tco_noopt.py
 step "differential fuzzing: interpreter vs JIT on random typed programs"
 python3 tools/fuzz_diff.py --count 300
 
+step "differential fuzzing: object model, flat and single-inheritance shapes (--oop)"
+python3 tools/fuzz_diff.py --count 200 --oop
+
 step "differential fuzzing: bitwise/shift programs (both encodings, count bounds, RCX destination)"
 python3 tools/fuzz_diff.py --count 200 --bitwise
 

@@ -93,10 +93,10 @@ def model(variants):
 
 def program() -> str:
     lines = []
-    lines.append("class Packet(Enum):")
+    lines.append("class Packet(enum):")
     lines.append("    Empty")
     lines.append("    Ack: int[32]")
-    lines.append("    class Data(Struct):")
+    lines.append("    class Data(struct):")
     lines.append("        seq: int[16]")
     lines.append("        len: int[32]")
     lines.append("    Flag: bool")
@@ -118,7 +118,7 @@ def program() -> str:
     lines.append(match.rstrip("\n"))
     lines.append("")
     # A 129-variant enum: the tag must widen to int[16].
-    lines.append("class Big(Enum):")
+    lines.append("class Big(enum):")
     for i in range(BIG_N):
         lines.append(f"    V{i}")
     lines.append("")

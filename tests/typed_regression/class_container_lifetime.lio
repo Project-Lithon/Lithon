@@ -1,0 +1,74 @@
+# 4.10.3. A list or tuple of class references owns ONE reference per slot.
+# The reference is taken when the literal stores the element (a fresh
+# construction transfers its reference; a borrow is retained) and dropped when
+# the slot is overwritten or when the container's scope exits. The drop is
+# observable through __del__, so this file pins the ownership model itself, not
+# just that the values can be read back.
+#
+# The expected output is CPython's answer for the same program.
+
+
+class T:
+    v: int[64]
+
+    def __init__(self, v: int[64]):
+        self.v = v
+
+    def __del__(self):
+        print(self.v)
+
+
+# Scope exit drops every slot. The walk is most-recent first, so the second
+# element's __del__ runs before the first's -- the same order CPython uses for
+# a list teardown.
+def scope() -> int[64]:
+    xs: list[T, 2] = [T(1), T(2)]
+    print(xs[0].v)
+    return 0
+
+
+print(scope())
+
+
+# Overwriting a slot releases the old reference exactly there. Storing another
+# element retains it first, so the source object survives the overwrite.
+def overwrite() -> int[64]:
+    xs: list[T, 2] = [T(10), T(11)]
+    xs[0] = T(12)
+    xs[1] = xs[0]
+    print(xs[0].v)
+    return 0
+
+
+print(overwrite())
+
+
+# A name bound from an element is a second owner: the element can be dropped
+# with the container and the object still lives until the name is dropped.
+def alias() -> int[64]:
+    xs: list[T, 2] = [T(20), T(21)]
+    a: T = xs[1]
+    print(a.v)
+    return 0
+
+
+print(alias())
+
+
+# A tuple is the same ownership rule, filled once and released at scope exit.
+def tup() -> int[64]:
+    ts: tuple[T, 2] = (T(30), T(31))
+    print(ts[1].v)
+    return 0
+
+
+print(tup())
+
+
+# A container declared inside a loop is released at each iteration's back
+# edge, so a fresh pair dies per pass rather than accumulating.
+i: int[64] = 0
+while i < 2:
+    ys: list[T, 2] = [T(40 + i), T(50 + i)]
+    print(ys[0].v)
+    i = i + 1

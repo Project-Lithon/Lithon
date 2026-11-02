@@ -2,11 +2,11 @@
 # `valueof(_p).field`. The frontend lowers it to a fieldload/fieldstore whose
 # subject is the pointer register rather than a struct variable name, so both
 # tiers address the same bytes the named form does. CPython cannot run this
-# (Struct is not a Python builtin), so expected/ptr_field.out is written from
+# (`struct` is not a Python builtin), so expected/ptr_field.out is written from
 # the documented 4.4/4.6 semantics.
 
 
-class Point(Struct):
+class Point(struct):
     x: int[64]
     y: int[64]
 
@@ -31,7 +31,7 @@ print(valueof(_pp).y)
 
 # Narrow fields, so the pointer path's sign-extension is exercised at every
 # width the scalar path supports.
-class Narrow(Struct):
+class Narrow(struct):
     a: int[8]
     b: int[16]
     c: int[32]

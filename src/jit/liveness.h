@@ -388,7 +388,8 @@ private:
                 // 6.4's StrFind/StrCount reach a helper the same way.
                 if (op != Op::Call && op != Op::Syscall && op != Op::PrintContainer &&
                     op != Op::StrLen && op != Op::StrEq && op != Op::StrNe &&
-                    op != Op::StrFind && op != Op::StrCount)
+                    op != Op::StrFind && op != Op::StrCount &&
+                    !lithon::ir::is_register_clobbering_op(op))
                     continue;
                 const int call_pos = static_cast<int>(pos);
                 for (auto& kv : ranges_) {

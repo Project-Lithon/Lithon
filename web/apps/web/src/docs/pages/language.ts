@@ -1591,7 +1591,7 @@ const structs: DocPage = {
         },
         {
           kind: "p",
-          text: "The spelling is Lithon's own: a struct is a class deriving from `Struct`, whose body is nothing but field annotations.",
+          text: "The spelling is Lithon's own: a struct is a class deriving from `struct`, whose body is nothing but field annotations.",
         },
       ],
     },
@@ -1610,7 +1610,7 @@ const structs: DocPage = {
             sourceRef: "tests/programs/struct_basic.lio",
             expectedRef: "tests/programs/expected/struct_basic.out",
             typecheck: false,
-            source: `class Point(Struct):
+            source: `class Point(struct):
     x: int[64]
     y: int[64]
 
@@ -1639,7 +1639,7 @@ print(p.y)`,
             title: "unwritten fields read zero (struct_basic.lio excerpt)",
             sourceRef: "tests/programs/struct_basic.lio",
             typecheck: false,
-            source: `class SockAddrIn(Struct):
+            source: `class SockAddrIn(struct):
     family: int[16]
     port: int[16]
     addr: int[64]
@@ -1701,7 +1701,7 @@ print(s.active)`,
             title: "float fields (struct_basic.lio excerpt)",
             sourceRef: "tests/programs/struct_basic.lio",
             typecheck: false,
-            source: `class Vec(Struct):
+            source: `class Vec(struct):
     x: float[64]
     y: float[64]
 
@@ -1739,7 +1739,7 @@ print(v.x + v.y)`,
             tool: "frontend",
             typecheck: false,
             errorMatch: "LITHON-E0127",
-            source: `class Foo(Struct):
+            source: `class Foo(struct):
     xs: list[int[64], 4]
 
 f: Foo
@@ -1754,7 +1754,7 @@ print(0)`,
             tool: "frontend",
             typecheck: false,
             errorMatch: "LITHON-E0128",
-            source: `class Foo(Struct):
+            source: `class Foo(struct):
     x: int[64]
 
 f: Foo
@@ -1793,7 +1793,7 @@ const enums: DocPage = {
         },
         {
           kind: "p",
-          text: "The spelling is Lithon's own: an enum is a class deriving from `Enum`. Each body line declares one variant, in one of three forms — a bare unit name, a `name: type` payload annotation, or an inline `class V(Struct)` struct payload.",
+          text: "The spelling is Lithon's own: an enum is a class deriving from `enum`. Each body line declares one variant, in one of three forms — a bare unit name, a `name: type` payload annotation, or an inline `class V(struct)` struct payload.",
         },
       ],
     },
@@ -1812,7 +1812,7 @@ const enums: DocPage = {
             sourceRef: "tests/programs/enum_basic.lio",
             expectedRef: "tests/programs/expected/enum_basic.out",
             typecheck: false,
-            source: `class Shape(Enum):
+            source: `class Shape(enum):
     Empty
     Dot
     Line: int[32]
@@ -1835,7 +1835,7 @@ match s:
         },
         {
           kind: "p",
-          text: "The three variant forms are: a bare name (`Empty`, `Dot`) is a unit variant with no payload; `Line: int[32]` is a payload variant whose variant carries one scalar; and an inline `class Tcp(Struct): ...` is a struct payload whose fields are packed at the payload offset. Two variants may not share a name.",
+          text: "The three variant forms are: a bare name (`Empty`, `Dot`) is a unit variant with no payload; `Line: int[32]` is a payload variant whose variant carries one scalar; and an inline `class Tcp(struct): ...` is a struct payload whose fields are packed at the payload offset. Two variants may not share a name.",
         },
       ],
     },
@@ -1875,15 +1875,15 @@ match s:
             title: "tests/programs/enum_struct.lio (excerpt)",
             sourceRef: "tests/programs/enum_struct.lio",
             typecheck: false,
-            source: `class Endpoint(Enum):
+            source: `class Endpoint(enum):
     Empty
-    class Tcp(Struct):
+    class Tcp(struct):
         port: int[16]
         addr: int[32]
     Udp: int[32]
 
 
-class Conn(Struct):
+class Conn(struct):
     proto: Endpoint
     id: int[64]
 
@@ -1926,15 +1926,15 @@ c.id = 7`,
             title: "tests/programs/enum_struct.lio (excerpt)",
             sourceRef: "tests/programs/enum_struct.lio",
             typecheck: false,
-            source: `class Endpoint(Enum):
+            source: `class Endpoint(enum):
     Empty
-    class Tcp(Struct):
+    class Tcp(struct):
         port: int[16]
         addr: int[32]
     Udp: int[32]
 
 
-class Conn(Struct):
+class Conn(struct):
     proto: Endpoint
     id: int[64]
 
@@ -1970,7 +1970,7 @@ print(c.id)`,
             ["Whole value", "an enum is never an expression; `print(e)` and `e2 = e` are refused"],
             ["Parameters/returns", "enums are not passed to or returned from functions"],
             ["List elements", "an enum may not be a list element or a list payload"],
-            ["Enum payloads", "a variant payload is a scalar or an inline `Struct`; not another enum"],
+            ["Enum payloads", "a variant payload is a scalar or an inline `struct`; not another enum"],
             ["Guards", "`case E.V if <guard>:` is not supported"],
           ],
         },
@@ -1982,7 +1982,7 @@ print(c.id)`,
             tool: "frontend",
             typecheck: false,
             errorMatch: "LITHON-E0129",
-            source: `class E(Enum):
+            source: `class E(enum):
     A
     A
 print(0)`,
@@ -1996,7 +1996,7 @@ print(0)`,
             tool: "frontend",
             typecheck: false,
             errorMatch: "LITHON-E0130",
-            source: `class E(Enum):
+            source: `class E(enum):
     A
 e: E
 e = E.B
@@ -2011,7 +2011,7 @@ e = E.B
             tool: "frontend",
             typecheck: false,
             errorMatch: "LITHON-E0131",
-            source: `class E(Enum):
+            source: `class E(enum):
     A
     B: int[32]
 e: E
@@ -2029,12 +2029,12 @@ const typeFunctions: DocPage = {
   slug: "type-functions",
   title: "Type Functions",
   description:
-    "A compile-time type constructor: `def Name(params) -> NewType: return { T }`, applied as `Name(args)` anywhere a type is allowed.",
+    "A compile-time type constructor: `def Name(params) -> newtype: return { T }`, applied as `Name(args)` anywhere a type is allowed.",
   group: "language",
   tags: [
     "type functions",
     "type function",
-    "NewType",
+    "newtype",
     "type alias",
     "typedef",
     "generics",
@@ -2048,11 +2048,11 @@ const typeFunctions: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "A type function names a type shape. You declare it with `def Name(params) -> NewType: return { T }`, and then wherever a type is allowed you write `Name(args)`; at compile time the arguments are substituted into `T` and the result is an ordinary type. It runs entirely in the frontend: a definition carries no code, and no runtime value is ever involved.",
+          text: "A type function names a type shape. You declare it with `def Name(params) -> newtype: return { T }`, and then wherever a type is allowed you write `Name(args)`; at compile time the arguments are substituted into `T` and the result is an ordinary type. It runs entirely in the frontend: a definition carries no code, and no runtime value is ever involved.",
         },
         {
           kind: "p",
-          text: "`NewType` is a reserved marker in the return position. The body must be exactly one `return { <type> }`. The parameters hold **types and sizes** — they are plain unannotated names standing in for whatever is spliced at the call site, not values.",
+          text: "`newtype` is a reserved marker in the return position. The body must be exactly one `return { <type> }`. The parameters hold **types and sizes** — they are plain unannotated names standing in for whatever is spliced at the call site, not values.",
         },
       ],
     },
@@ -2067,11 +2067,11 @@ const typeFunctions: DocPage = {
             sourceRef: "tests/programs/typefunc_basic.lio",
             expectedRef: "tests/programs/expected/typefunc_basic.out",
             typecheck: false,
-            source: `def Fixed(t, n) -> NewType:
+            source: `def Fixed(t, n) -> newtype:
     return {list[t, n]}
 
 
-def Word() -> NewType:
+def Word() -> newtype:
     return {int[32]}
 
 
@@ -2103,7 +2103,7 @@ print(xs[0] + xs[1] + xs[2])`,
             title: "tests/programs/typefunc_basic.lio (excerpt)",
             sourceRef: "tests/programs/typefunc_basic.lio",
             typecheck: false,
-            source: `def Alias(t) -> NewType:
+            source: `def Alias(t) -> newtype:
     return {t}
 
 
@@ -2133,11 +2133,11 @@ print(a)`,
             sourceRef: "tests/programs/typefunc_uses.lio",
             expectedRef: "tests/programs/expected/typefunc_uses.out",
             typecheck: false,
-            source: `def Word() -> NewType:
+            source: `def Word() -> newtype:
     return {int[32]}
 
 
-def Pair(t) -> NewType:
+def Pair(t) -> newtype:
     return {list[t, 2]}
 
 
@@ -2179,7 +2179,7 @@ print(ps[0] + ps[1])`,
             tool: "frontend",
             typecheck: false,
             errorMatch: "LITHON-E0132",
-            source: `def T(a) -> NewType:
+            source: `def T(a) -> newtype:
     return {a, a}
 print(0)`,
           },
@@ -2192,7 +2192,7 @@ print(0)`,
             tool: "frontend",
             typecheck: false,
             errorMatch: "LITHON-E0133",
-            source: `def P(a) -> NewType:
+            source: `def P(a) -> newtype:
     return {P(a)}
 x: P(int[64]) = 1
 print(0)`,
@@ -2225,7 +2225,7 @@ const methods: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "A `def` inside a `Struct` or `Enum` body is a **method**. Its first parameter is the implicit receiver `self`, the rest are annotated scalars, and the return type is optional. A method is called on a struct or enum place: `p.f(1)`, where `p` may be a variable or a struct/enum field.",
+          text: "A `def` inside a `struct` or `enum` body is a **method**. Its first parameter is the implicit receiver `self`, the rest are annotated scalars, and the return type is optional. A method is called on a struct or enum place: `p.f(1)`, where `p` may be a variable or a struct/enum field.",
         },
         {
           kind: "p",
@@ -2244,7 +2244,7 @@ const methods: DocPage = {
             sourceRef: "tests/programs/method_basic.lio",
             expectedRef: "tests/programs/expected/method_basic.out",
             typecheck: false,
-            source: `class Counter(Struct):
+            source: `class Counter(struct):
     value: int[64]
 
     def add(self, n: int[64]) -> int[64]:
@@ -2279,7 +2279,7 @@ print(c.add(7))`,
             sourceRef: "tests/programs/method_enum.lio",
             expectedRef: "tests/programs/expected/method_enum.out",
             typecheck: false,
-            source: `class Shape(Enum):
+            source: `class Shape(enum):
     Empty
     Line: int[32]
 
@@ -2324,7 +2324,7 @@ print(s.code())`,
             tool: "frontend",
             typecheck: false,
             errorMatch: "LITHON-E0134",
-            source: `class P(Struct):
+            source: `class P(struct):
     x: int[64]
     def f(a: int[64]) -> int[64]:
         return a
@@ -2340,7 +2340,7 @@ print(p.f(1))`,
             tool: "frontend",
             typecheck: false,
             errorMatch: "LITHON-E0135",
-            source: `class P(Struct):
+            source: `class P(struct):
     x: int[64]
     def f(self) -> int[64]:
         return self.f()

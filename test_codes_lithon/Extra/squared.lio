@@ -1,0 +1,16 @@
+# uses the progression way for a given positive N's squared
+# formulae: sigma r=1 -> N of (2r-1) = N^2
+
+def find_square(N:int[64]) -> float[64]:
+	total:float[64] = 0.0
+	i:int[64] = 0
+	for i in range(1,N+1):
+		total += 2*i - 1
+	return total
+
+
+v:int[64] = int(64,input("Enter the value to find the square: "))
+if (v < 0):
+	v = -v
+out:float[64] = find_square(v)
+print(out)

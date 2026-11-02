@@ -5,10 +5,10 @@
 # correct if that holds: the named form and the pointer form interleave in a
 # loop and across an inlined method (4.9), and both tiers must agree at every
 # optimization level. expected/ptr_alias.out is written from 4.4/4.6/4.9
-# semantics (Struct is not a Python builtin, so there is no CPython oracle).
+# semantics (`struct` is not a Python builtin, so there is no CPython oracle).
 
 
-class Pair(Struct):
+class Pair(struct):
     a: int[64]
     b: int[64]
 

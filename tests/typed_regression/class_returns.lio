@@ -1,0 +1,42 @@
+# 4.10.1. Reference ownership across function boundaries.
+#
+# A function that returns a class reference hands the caller a FRESH owned
+# reference (the callee retains what it returns), so the caller's binding owns
+# one reference and drops it at its scope exit. This is the SAME contract for all
+# three return shapes below -- a fresh construction, an owned local, and a
+# borrowed parameter. Each object is created and dropped inside its own function,
+# so the observable __del__ order is fixed by the program's block structure and
+# matches CPython exactly.
+
+class P:
+    v: int[64]
+
+    def __init__(self, v: int[64]):
+        self.v = v
+
+    def __del__(self):
+        print(500 + self.v)
+
+    def get(self) -> int[64]:
+        return self.v
+
+
+def fresh(v: int[64]) -> int[64]:
+    a: P = P(v)
+    return a.get()
+
+
+def named(v: int[64]) -> int[64]:
+    p: P = P(v)
+    return p.get()
+
+
+def borrowed(p: P) -> int[64]:
+    q: P = p
+    return q.get()
+
+
+print(fresh(1))
+print(named(2))
+outer: P = P(3)
+print(borrowed(outer))

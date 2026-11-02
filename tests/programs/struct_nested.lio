@@ -9,16 +9,16 @@
 # point: no padding is inserted, so the layout is exactly the sum of the field
 # sizes and the C comparison in the prove-it test can compute the same numbers.
 #
-# CPython cannot run `class Point(Struct)`, so expected/struct_nested.out is
+# CPython cannot run `class Point(struct)`, so expected/struct_nested.out is
 # written from these documented semantics rather than recorded from a run.
 
 
-class Point(Struct):
+class Point(struct):
     x: int[64]
     y: int[64]
 
 
-class Segment(Struct):
+class Segment(struct):
     a: Point
     b: Point
     tag: int[8]

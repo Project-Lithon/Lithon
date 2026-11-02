@@ -1,6 +1,6 @@
 # 4.7. Enum struct-payload variants and an enum used as a struct field.
 #
-# A variant whose payload is declared inline with `class V(Struct)` is a struct
+# A variant whose payload is declared inline with `class V(struct)` is a struct
 # payload: the struct is registered as a type of its own (equivalent to
 # declaring it beforehand) and packed at the payload offset, so its fields are
 # bound by name in a `match`. An enum can also be a struct field, in which case
@@ -15,15 +15,15 @@
 # documented 4.7 semantics rather than recorded from a CPython run.
 
 
-class Endpoint(Enum):
+class Endpoint(enum):
     Empty
-    class Tcp(Struct):
+    class Tcp(struct):
         port: int[16]
         addr: int[32]
     Udp: int[32]
 
 
-class Conn(Struct):
+class Conn(struct):
     proto: Endpoint
     id: int[64]
 

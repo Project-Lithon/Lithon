@@ -7,7 +7,7 @@
 # Python. The expected output below is CPython's answer for the same values.
 
 
-class Flag(Struct):
+class Flag(struct):
     on: bool
     off: bool
 
@@ -31,7 +31,7 @@ print(f.on == 1.0)
 
 
 # A bool payload variant: construct, match, bind, compare.
-class E(Enum):
+class E(enum):
     U
     B: bool
 
@@ -47,12 +47,12 @@ match e:
 
 
 # A bool field inside an enum's struct payload.
-class Pay(Struct):
+class Pay(struct):
     flag: bool
     n: int[32]
 
 
-class E2(Enum):
+class E2(enum):
     U
     P: Pay
 

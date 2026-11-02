@@ -40,7 +40,7 @@ print(s.find("z") < 0)         # True
 print(s.count("l") == 3)       # True
 
 
-class Box(Struct):
+class Box(struct):
     name: str[8]
 
 

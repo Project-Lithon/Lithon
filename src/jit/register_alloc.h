@@ -187,6 +187,10 @@ inline bool float_stride_supported(int width) { return width == 64; }
 // than laid out against a size that does not exist.
 inline int container_element_stride(const std::string& kind, int width) {
     if (kind == "bool") return 1;
+    // 4.10.3. A class element is one object pointer, exactly 8 bytes. It has
+    // no width subscript, so the flat `type_elem_width` is -1 and must not be
+    // fed to the shift below.
+    if (kind == "class") return 8;
     if (kind == "int" || kind == "float")
         return (width > 0 && width % 8 == 0) ? width / 8 : 0;
     return 0;   // str, or anything else without storage
@@ -1044,7 +1048,8 @@ private:
                 bool store_seen = false;
                 for (const auto& in : fn_.blocks[pb].instrs) {
                     if (in.op == Op::Store && in.name == var) { store_seen = true; continue; }
-                    if (store_seen && (in.op == Op::Call || in.op == Op::Syscall)) {
+                    if (store_seen && (in.op == Op::Call || in.op == Op::Syscall ||
+                                       lithon::ir::is_register_clobbering_op(in.op))) {
                         spans_call = true;
                         break;
                     }
@@ -1054,7 +1059,11 @@ private:
             if (!spans_call) {
                 for (int i = 0; i < load_pos; ++i) {
                     const Op op = fn_.blocks[join].instrs[i].op;
-                    if (op == Op::Call || op == Op::Syscall) { spans_call = true; break; }
+                    if (op == Op::Call || op == Op::Syscall ||
+                        lithon::ir::is_register_clobbering_op(op)) {
+                        spans_call = true;
+                        break;
+                    }
                 }
             }
 

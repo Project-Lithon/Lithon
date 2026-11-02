@@ -1,4 +1,4 @@
-# 4.8. Type functions: a structural typedef -- `def Name(p, ...) -> NewType:
+# 4.8. Type functions: a structural typedef -- `def Name(p, ...) -> newtype:
 # return { T }`. Applying `Name(args)` substitutes the arguments into T and
 # yields an ordinary type, indistinguishable from the expansion spelled out.
 # The definitions emit no code and nothing about them survives into the IR.
@@ -6,23 +6,23 @@
 # `typefunc_basic` pins the four shapes a type function is most useful for: a
 # container (`list[t, n]`), a scalar alias, a pointer, and a pure identity
 # alias whose whole point is that the expansion IS the spelling. CPython cannot
-# run this file (`NewType` is not a value), so expected/typefunc_basic.out is
+# run this file (`newtype` is not a value), so expected/typefunc_basic.out is
 # written from the documented 4.8 semantics.
 
 
-def Fixed(t, n) -> NewType:
+def Fixed(t, n) -> newtype:
     return {list[t, n]}
 
 
-def Word() -> NewType:
+def Word() -> newtype:
     return {int[32]}
 
 
-def Alias(t) -> NewType:
+def Alias(t) -> newtype:
     return {t}
 
 
-def Ref(t) -> NewType:
+def Ref(t) -> newtype:
     return {ptr[t]}
 
 

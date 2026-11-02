@@ -1,0 +1,100 @@
+# 4.10.1. Lifetime is the observable proof of the reference-counting model:
+# __del__ runs at the exact point the last reference drops. A per-iteration
+# object dies each pass; an early return drops the references that path owns;
+# a reference held in a class attribute keeps its object alive until the holder
+# is dropped.
+#
+# The expected output is CPython's answer for the same program.
+
+
+class T:
+    v: int[64]
+
+    def __init__(self, v: int[64]):
+        self.v = v
+
+    def __del__(self):
+        print(self.v)
+
+
+def loop(n: int[64]) -> int[64]:
+    i: int[64] = 0
+    total: int[64] = 0
+    while i < n:
+        o: T = T(i)
+        total = total + o.v
+        i = i + 1
+    return total
+
+
+def early(flag: bool) -> int[64]:
+    a: T = T(50)
+    if flag:
+        return 1
+    b: T = T(51)
+    return 2
+
+
+def shared() -> int[64]:
+    a: T = T(70)
+    b: T = a
+    return a.v
+
+
+# An object held ONLY by a class attribute must still die -- and run its __del__
+# -- when its holder's last reference drops. `Holder` is constructed from a
+# `Leaf`; the attribute is the only surviving reference once the constructor's
+# own reference is gone, so the drop at the end of `nested` must release it and
+# the Leaf's __del__ must run.
+class Leaf:
+    v: int[64]
+
+    def __init__(self, v: int[64]):
+        self.v = v
+
+    def __del__(self):
+        print(self.v)
+
+
+class Holder:
+    leaf: Leaf
+
+    def __init__(self, leaf: Leaf):
+        self.leaf = leaf
+
+    def __del__(self):
+        print(self.leaf.v + 1000)
+
+
+def nested() -> int[64]:
+    h: Holder = Holder(Leaf(81))
+    return h.leaf.v
+
+
+# A construction whose result is never bound to a name is a TEMPORARY: its one
+# reference must be released at the end of the statement, so the object dies
+# right there. CPython drops an unreferenced temporary the same way.
+def temporary() -> int[64]:
+    T(90)
+    return 1
+
+
+# A holder built per iteration, left by `break`: the loop scope's exit must
+# release the holder, which then releases the Leaf its attribute names.
+def loop_holder(n: int[64]) -> int[64]:
+    i: int[64] = 0
+    while True:
+        h: Holder = Holder(Leaf(200 + i))
+        if i == n:
+            break
+        i = i + 1
+    return i
+
+
+print(loop(3))
+print(early(True))
+print(early(False))
+print(shared())
+print(nested())
+print(temporary())
+print(loop_holder(2))

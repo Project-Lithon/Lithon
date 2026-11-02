@@ -1,0 +1,39 @@
+# 4.10.2. Class references across function boundaries. A parameter or return
+# annotated with a class is an 8-byte reference, so an object crosses a call
+# without copying: `value_of(d)` passes a `Derived` where a `Base` is expected
+# (the free upcast) and dispatches `get` on it. `twice` builds a new `Base` and
+# returns it; `identity` returns its parameter, an implicit upcast of the
+# argument, with the return-ownership rule (the callee retains, the caller
+# drops) keeping the object alive.
+#
+# The expected output is CPython's answer for the same shapes.
+
+class Base:
+    n: int[64]
+
+    def __init__(self, n: int[64]):
+        self.n = n
+
+    def get(self) -> int[64]:
+        return self.n
+
+class Derived(Base):
+    def __init__(self, n: int[64]):
+        super().__init__(n * 2)
+
+def twice(obj: Base) -> Base:
+    return Base(obj.get() + 1)
+
+def identity(obj: Base) -> Base:
+    return obj
+
+def value_of(obj: Base) -> int[64]:
+    return obj.get()
+
+d: Derived = Derived(5)
+print(value_of(d))
+b: Base = twice(d)
+print(b.get())
+print(value_of(twice(d)))
+print(identity(d).get())
+print(twice(d).get())

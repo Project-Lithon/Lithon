@@ -1,0 +1,45 @@
+# 4.10.2. super() over a three-level chain. `C.__init__` calls
+# `super().__init__`, which runs `B.__init__`, which calls the same form again
+# to run `A.__init__`; every level's attributes end up initialized on the one
+# object (and the derived definite-init check sees them). `value` is overridden
+# at each level and each override calls `super().value()`, so the chain adds
+# x + y + z. A `B`/`A` reference to the same `C` dispatches to C's override
+# through the vtable.
+#
+# The expected output is CPython's answer for the same shapes.
+
+class A:
+    x: int[64]
+
+    def __init__(self, x: int[64]):
+        self.x = x
+
+    def value(self) -> int[64]:
+        return self.x
+
+class B(A):
+    y: int[64]
+
+    def __init__(self, x: int[64], y: int[64]):
+        super().__init__(x)
+        self.y = y
+
+    def value(self) -> int[64]:
+        return super().value() + self.y
+
+class C(B):
+    z: int[64]
+
+    def __init__(self, x: int[64], y: int[64], z: int[64]):
+        super().__init__(x, y)
+        self.z = z
+
+    def value(self) -> int[64]:
+        return super().value() + self.z
+
+c: C = C(1, 2, 3)
+print(c.value())
+b: B = c
+print(b.value())
+a: A = c
+print(a.value())

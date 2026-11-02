@@ -16,6 +16,8 @@
 
 #include "ir/ir.h"
 #include "ir/text_parser.h"
+#include "runtime/heap.h"
+#include "runtime/class_runtime.h"
 #include "typecheck/typecheck.h"
 #include "jit/compile_function.h"
 #include "jit/cpu_features.h"
@@ -269,6 +271,27 @@ int main(int argc, char** argv) {
         // E0401: a fresh run starts recursion at depth 0; __main__'s own
         // prologue bumps it to 1.
         lithon::jit::g_call_depth = 0;
+        // 4.10.0: and a fresh run starts with a fresh heap.
+        lithon::runtime::reset_heap();
+        // 4.10.1: and a fresh class-descriptor table.
+        {
+            uint8_t* base = static_cast<uint8_t*>(exec.data());
+            lithon::runtime::build_class_table(
+                module.classes,
+                [&](const std::string& cls) -> void (*)(void*) {
+                    auto d = compiled.function_offset.find("__del__" + cls);
+                    if (d == compiled.function_offset.end()) return nullptr;
+                    return reinterpret_cast<void (*)(void*)>(base + d->second);
+                },
+                [&](const std::string& cls, int slot, const char* slot_name) -> void (*)(void) {
+                    const std::string key = "__virt__" + cls + "." +
+                                            (slot_name != nullptr ? slot_name
+                                                                  : std::to_string(slot));
+                    auto it = compiled.function_offset.find(key);
+                    if (it == compiled.function_offset.end()) return nullptr;
+                    return reinterpret_cast<void (*)(void)>(base + it->second);
+                });
+        }
         main_fn();
         std::fflush(stdout);
         auto t3 = std::chrono::steady_clock::now();

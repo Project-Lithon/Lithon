@@ -1,14 +1,14 @@
 # 6.2. A bounded string nested through a STRUCT field: `o.inner.tag`. The
 # field's companion run is named by the whole dotted path, so a string two
 # struct levels deep is read, indexed and written exactly like a top-level one.
-# CPython cannot run this (Struct is not a Python builtin); the expected output
+# CPython cannot run this (`struct` is not a Python builtin); the expected output
 # is written from the documented 6.2 semantics.
-class Inner(Struct):
+class Inner(struct):
     tag: str[8]
     score: int[8]
 
 
-class Outer(Struct):
+class Outer(struct):
     inner: Inner
     label: str[6]
 
