@@ -50,15 +50,35 @@ struct DescBuf {
     uint32_t slot_count;
     uint32_t instance_size;
     uint32_t flags;
+    uint32_t table_index;
+    uint32_t ancestor_word_count;
+    const uint64_t* ancestor_bits;
+    uint32_t own_slot_word_count;
+    const uint64_t* own_slot_bits;
+    uint32_t mro_count;
+    const ClassDescriptor* const* mro;
     uint32_t ref_attr_count;
     const uint32_t* ref_attr_offsets;
     const char* name;
     void (*destructor)(void*);
+    const char* destructor_owner;
     void (*slots[4])(void);
 };
 
 // Guard the mirror: DescBuf must stay field-for-field compatible with the real
 // ClassDescriptor, or a test's descriptor would be read at the wrong offsets.
+static_assert(offsetof(ClassDescriptor, table_index) ==
+                  offsetof(DescBuf, table_index),
+              "DescBuf must mirror ClassDescriptor (table_index)");
+static_assert(offsetof(ClassDescriptor, ancestor_bits) ==
+                  offsetof(DescBuf, ancestor_bits),
+              "DescBuf must mirror ClassDescriptor (ancestor_bits)");
+static_assert(offsetof(ClassDescriptor, own_slot_bits) ==
+                  offsetof(DescBuf, own_slot_bits),
+              "DescBuf must mirror ClassDescriptor (own_slot_bits)");
+static_assert(offsetof(ClassDescriptor, mro) ==
+                  offsetof(DescBuf, mro),
+              "DescBuf must mirror ClassDescriptor (mro)");
 static_assert(offsetof(ClassDescriptor, ref_attr_count) ==
                   offsetof(DescBuf, ref_attr_count),
               "DescBuf must mirror ClassDescriptor (ref_attr_count)");
@@ -69,6 +89,9 @@ static_assert(offsetof(ClassDescriptor, name) == offsetof(DescBuf, name),
               "DescBuf must mirror ClassDescriptor (name)");
 static_assert(offsetof(ClassDescriptor, destructor) == offsetof(DescBuf, destructor),
               "DescBuf must mirror ClassDescriptor (destructor)");
+static_assert(offsetof(ClassDescriptor, destructor_owner) ==
+                  offsetof(DescBuf, destructor_owner),
+              "DescBuf must mirror ClassDescriptor (destructor_owner)");
 
 ClassDescriptor* make_desc(DescBuf& b) {
     return reinterpret_cast<ClassDescriptor*>(&b);
@@ -94,6 +117,13 @@ void animal_speak() {}
 void dog_speak() {}
 void puppy_speak() {}
 void bird_speak() {}
+
+// Distinct slot targets for the multiple-inheritance table: the test only
+// compares their addresses, but a wrong owner or C3 position must be visible.
+void mi_a() {}
+void mi_b() {}
+void mi_c() {}
+void mi_d() {}
 
 // Build an instance of `desc`: allocate, stamp the vptr, set refcount 1 (the
 // live handle the creator holds), exactly as a constructor does.
@@ -324,6 +354,8 @@ void test_class_table_hierarchy() {
         // 0 on a Puppy and reaches Puppy's override.
         ci.slot_count = 1;
         ci.slots.push_back("speak");
+        ci.slot_owners.push_back(name);
+        ci.own_slots.push_back(0);
         return ci;
     };
     std::vector<lithon::ir::ClassInfo> classes;
@@ -362,18 +394,20 @@ void test_class_table_hierarchy() {
               resolved[2] == "Puppy.speak" && resolved[3] == "Bird.speak",
           "the resolver is called once per class with that class's own name and slot name");
 
-    // Pre-order, subtree-contiguous ids: Animal [1,4], Dog [2,3], Puppy [3,3],
-    // Bird [4,4]. Every subtree is one interval, which is what makes isinstance
-    // two integer compares and no walk.
-    const uint32_t want_id[4] = {1, 2, 3, 4};
-    const uint32_t want_lo[4] = {1, 2, 3, 4};
-    const uint32_t want_hi[4] = {4, 3, 3, 4};
+    // 4.10.4. Ids are assigned in IR order; the ancestor bitset, not a subtree
+    // range, answers isinstance. A diamond's descendants are not contiguous.
     for (size_t i = 0; i < 4; ++i) {
         const ClassDescriptor* d = t.descriptors[i];
-        check(d->type_id == want_id[i] && d->subtree_lo == want_lo[i] &&
-                  d->subtree_hi == want_hi[i],
-              "pre-order subtree range is contiguous and covers only the subtree");
+        check(d->type_id == i + 1 && d->ancestor_bits != nullptr &&
+                  d->ancestor_word_count >= 1,
+              "each descriptor has a stable id and an ancestor bitset");
+        check(d->mro_count == (i == 0 ? 1u : i == 1 ? 2u : i == 2 ? 3u : 2u),
+              "the descriptor exposes its chain");
     }
+    check(t.descriptors[2]->mro[0] == t.descriptors[2] &&
+              t.descriptors[2]->mro[1] == t.descriptors[1] &&
+              t.descriptors[2]->mro[2] == t.descriptors[0],
+          "Puppy's MRO is Puppy, Dog, Animal");
     check((t.descriptors[0]->flags & kClassFlagAbstract) != 0,
           "the class with an abstract method carries the abstract flag");
     check((t.descriptors[1]->flags & kClassFlagAbstract) == 0 &&
@@ -417,6 +451,146 @@ void test_class_table_hierarchy() {
     host_class_release(puppy);
     host_class_release(bird);
     check(g_heap.live_objects == 0, "the hierarchy test releases everything it allocated");
+}
+
+// 4.10.4. A diamond is the shape the old pre-order/subtree model could not
+// answer: D(B, C) has A as a shared ancestor at two paths, and its descendants
+// are not contiguous. The descriptor stores the C3 MRO and an ancestor BIT, so
+// isinstance remains one probe. The same MRO drives dynamic super(): starting
+// at B on a D receiver must find C, not B's own slot, and an inherited slot
+// names its original owner instead of a per-subclass function that never exists.
+//
+// Destructor ownership is pinned here too: D inherits A's `__del__` through
+// both bases, but only A emits a function. Every descriptor points at A's
+// destructor and records A as the owner, so the drop runs it once.
+void test_multiple_inheritance_table() {
+    std::printf("multiple inheritance table\n");
+    reset_heap();
+    g_log.clear();
+
+    auto make_class = [](const char* name, std::vector<int> bases,
+                         std::vector<int> mro, const char* slot_owner,
+                         bool owns_slot) {
+        lithon::ir::ClassInfo ci;
+        ci.name = name;
+        ci.bases = std::move(bases);
+        ci.mro = std::move(mro);
+        ci.instance_size = static_cast<int>(sizeof(ObjectHeader)) + 8;
+        ci.slot_count = 1;
+        ci.slots.push_back("who");
+        ci.slot_owners.push_back(slot_owner);
+        if (owns_slot) ci.own_slots.push_back(0);
+        ci.has_destructor = true;
+        ci.destructor_owner = 0;   // every class inherits A's __del__
+        return ci;
+    };
+
+    // A is the shared root. B and C each override `who`; D overrides it again;
+    // E inherits B's implementation through the B-first C3 order.
+    std::vector<lithon::ir::ClassInfo> classes;
+    classes.push_back(make_class("A", {}, {0}, "A", true));
+    classes.push_back(make_class("B", {0}, {1, 0}, "B", true));
+    classes.push_back(make_class("C", {0}, {2, 0}, "C", true));
+    classes.push_back(make_class("D", {1, 2}, {3, 1, 2, 0}, "D", true));
+    classes.push_back(make_class("E", {1, 2}, {4, 1, 2, 0}, "B", false));
+
+    std::vector<std::string> resolved_slots;
+    std::vector<std::string> resolved_dtors;
+    auto resolve_dtor = [&resolved_dtors](const std::string& cls) -> void (*)(void*) {
+        resolved_dtors.push_back(cls);
+        return cls == "A" ? del_a : nullptr;
+    };
+    auto resolve_slot = [&resolved_slots](const std::string& cls, int slot,
+                                          const char* name) -> void (*)(void) {
+        resolved_slots.push_back(cls + "." + (name != nullptr ? name : "?"));
+        if (slot != 0) return nullptr;
+        if (cls == "A") return mi_a;
+        if (cls == "B") return mi_b;
+        if (cls == "C") return mi_c;
+        if (cls == "D") return mi_d;
+        return nullptr;
+    };
+    build_class_table(classes, resolve_dtor, resolve_slot);
+
+    const ClassTable& t = class_table();
+    check(t.names.size() == 5, "the diamond table has all five classes");
+    check(resolved_slots.size() == 5 &&
+              resolved_slots[0] == "A.who" && resolved_slots[1] == "B.who" &&
+              resolved_slots[2] == "C.who" && resolved_slots[3] == "D.who" &&
+              resolved_slots[4] == "B.who",
+          "each slot resolves to its DECLARING owner (E inherits B.who)");
+    check(resolved_dtors.size() == 5 &&
+              std::all_of(resolved_dtors.begin(), resolved_dtors.end(),
+                          [](const std::string& s) { return s == "A"; }),
+          "every class in the diamond resolves the one inherited destructor");
+
+    const ClassDescriptor* a = t.descriptors[0];
+    const ClassDescriptor* b = t.descriptors[1];
+    const ClassDescriptor* c = t.descriptors[2];
+    const ClassDescriptor* d = t.descriptors[3];
+    const ClassDescriptor* e = t.descriptors[4];
+    check(d->mro_count == 4 && d->mro[0] == d && d->mro[1] == b &&
+              d->mro[2] == c && d->mro[3] == a,
+          "D(B, C)'s MRO is D, B, C, A");
+    check(e->mro_count == 4 && e->mro[0] == e && e->mro[1] == b &&
+              e->mro[2] == c && e->mro[3] == a,
+          "E(B, C) uses the same B-before-C order");
+    check(t.slot_owners[3][0] == "D" && t.slot_owners[4][0] == "B",
+          "an inherited slot keeps its original owner");
+    check((d->own_slot_bits[0] & 1u) != 0 && (e->own_slot_bits[0] & 1u) == 0,
+          "only D owns its slot; E inherits B's implementation");
+    check(d->slots[0] == mi_d && e->slots[0] == mi_b,
+          "the descriptor points at each class's resolved implementation");
+    check(d->destructor == del_a && d->destructor_owner != nullptr &&
+              std::strcmp(d->destructor_owner, "A") == 0,
+          "D inherits A's destructor and records A as its owner");
+
+    ObjectHeader* dobj = host_class_new(3);
+    check(dobj != nullptr && dobj->vptr == d,
+          "host_class_new stamps the diamond object with D's descriptor");
+    check(host_class_is_instance(dobj, 0) && host_class_is_instance(dobj, 1) &&
+              host_class_is_instance(dobj, 2) && host_class_is_instance(dobj, 3),
+          "a D is an A, a B, a C, and a D");
+    check(!host_class_is_instance(dobj, 4), "a D is not an E");
+    check(host_class_slot(dobj, 0) == reinterpret_cast<void*>(mi_d),
+          "a virtual call on D reads D's own slot");
+
+    // The encoded argument is (defining class index << 32) | slot. B is index
+    // 1, C index 2, A index 0; D is index 3. Starting from B on a D must find
+    // C, then A, while starting from D finds B.
+    auto super_arg = [](int defining) {
+        return (static_cast<int64_t>(defining) << 32) | int64_t{0};
+    };
+    check(host_class_super_owner(dobj, super_arg(1)) == 2,
+          "B's super() on a D receiver finds C");
+    check(host_class_super_owner(dobj, super_arg(2)) == 0,
+          "C's super() then finds A");
+    check(host_class_super_owner(dobj, super_arg(0)) == -1,
+          "A's super() has no later implementation");
+    check(host_class_super_owner(dobj, super_arg(3)) == 1,
+          "D's super() starts at B");
+    check(host_class_super_slot(dobj, super_arg(1)) ==
+              reinterpret_cast<void*>(mi_c),
+          "B's super() slot resolves C's implementation");
+
+    host_class_release(dobj);
+    check(g_log.size() == 1 && g_log[0] == "A",
+          "releasing a D runs the inherited destructor exactly once");
+    check(g_heap.live_objects == 0, "the diamond object is freed");
+
+    // E has no own slot: its vtable entry is B's, and super() from B still
+    // reaches C in E's actual MRO.
+    ObjectHeader* eobj = host_class_new(4);
+    check(host_class_slot(eobj, 0) == reinterpret_cast<void*>(mi_b),
+          "E's inherited slot points at B's implementation");
+    check(host_class_super_owner(eobj, super_arg(1)) == 2,
+          "B's super() on an E receiver also finds C");
+    check(host_class_is_instance(eobj, 4) && !host_class_is_instance(eobj, 3),
+          "an E is an E but not a D");
+    host_class_release(eobj);
+    check(g_log.size() == 2 && g_log[1] == "A",
+          "E's inherited destructor also runs exactly once");
+    check(g_heap.live_objects == 0, "the E instance is freed");
 }
 
 void test_aliasing_counter_zero_once() {
@@ -586,7 +760,7 @@ void test_class_container_layout() {
 }  // namespace
 
 int main() {
-    std::printf("4.10.0 object runtime + 4.10.1-4.10.3 class tables\n");
+    std::printf("4.10.0 object runtime + 4.10.1-4.10.4 class tables\n");
     test_layout();
     test_alloc_free_reuse();
     test_size_class_reservation();
@@ -597,6 +771,7 @@ int main() {
     test_no_del_is_plain_free();
     test_isinstance_range();
     test_class_table_hierarchy();
+    test_multiple_inheritance_table();
     test_class_container_layout();
     test_aliasing_counter_zero_once();
     test_nested_attribute_release();

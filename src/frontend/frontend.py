@@ -161,37 +161,49 @@ def render_class_meta(layout, class_index):
          class Point size=32 del
            attr x 16 : int[64]
            attr y 24 : int[64]
-         class Point3 size=40 base=0 slots=2
+         class Point3 size=40 bases=0 mro=1,0 slots=2
            attr z 32 : int[64]
-           slot 0 total
-           slot 1 scale
+           slot 0 total Point3
+           slot 1 scale Point3
+           ownslot 0 total
+           ownslot 1 scale
+         class Diamond size=32 bases=1,2 mro=3,1,2,0 slots=3
+           slot 2 area Diamond
+           ownslot 2 area
 
     The offsets are ABSOLUTE from the object start (header included), which is
     exactly what a RefLoad/RefStore carries, so neither tier re-adds the header.
     `del` is present only when the class has a __del__, which is the flag the
     runtime consults to decide whether a drop is observable.
 
-    4.10.2. `base=<i>` is the index of the base class in the emitted class list
-    (its ClassInfo index), or absent for a root. The runtime uses it to assign
-    pre-order, subtree-contiguous type ids -- the invariant isinstance rests on.
-    `slots=<n>` is the vtable length and each `slot <k> <name>` line names the
-    method at slot k (inherited slots keep their index down the chain, which is
-    what makes a base-compiled call site valid for every subclass). `abstract`
-    marks a class with at least one unimplemented method.
+    4.10.2/4.10.4. `bases=` lists the direct base indices in declaration order
+    and `mro=` is the C3 linearization (self first) as class indices. Both tiers
+    build one descriptor table from these, so `isinstance` and `super()` agree by
+    construction. `slots=<n>` is the per-class vtable length; each
+    `slot <k> <name> <owner>` line names the resolved method at global slot k
+    and the class whose own implementation supplies it. `ownslot <k> <name>`
+    marks a slot this class implements itself -- the only entries emitted as
+    `__virt__<Class>.<name>` functions and the only entries a dynamic `super()`
+    can find when it scans the MRO. `abstract` marks a class with at least one
+    unimplemented method.
     """
-    head = f"class {layout.name} size={layout.instance_size}"
-    if layout.base is not None:
-        head += f" base={class_index[layout.base]}"
-    head += f" slots={len(layout.slots)}"
+    slot_count = max(layout.slots.values(), default=-1) + 1
+    bases = ",".join(str(class_index[b]) for b in layout.bases)
+    mro = ",".join(str(class_index[m]) for m in layout.mro)
+    head = (f"class {layout.name} size={layout.instance_size} bases={bases} "
+            f"mro={mro} slots={slot_count}")
     if layout.del_fn is not None:
-        head += " del"
+        head += f" del={class_index[layout.del_owner]}"
     if layout.abstract:
         head += " abstract"
     lines = [head]
     for aname, attr in layout.attrs.items():
         lines.append(f"  attr {aname} {attr['offset']}{render_type_suffix(_attr_ir_type(attr))}")
     for sname, sidx in sorted(layout.slots.items(), key=lambda kv: kv[1]):
-        lines.append(f"  slot {sidx} {sname}")
+        owner = layout.method_owners.get(sname, layout.name)
+        lines.append(f"  slot {sidx} {sname} {owner}")
+        if sname in layout.own_methods:
+            lines.append(f"  ownslot {sidx} {sname}")
     return "\n".join(lines)
 
 
@@ -271,12 +283,9 @@ def _emit_class_method_function(builder_cls, fn_rename, structs, enums, classes,
     if has_result:
         reg = db.new_reg()
         db.emit(f"{reg} = load {result_temp}")
-        if isinstance(method.returns, ast.Name) and method.returns.id in classes:
-            # A virtual result is an owned reference: retain it so the caller's
-            # single drop is enough, matching the inlined path's contract.
-            retained = db.new_reg()
-            db.emit(f"{retained} = retain {reg}")
-            reg = retained
+        # The return statement already retained a class reference and stored
+        # that owned reference in the temp, so the load TRANSFERS it to the
+        # caller. Retaining again here would leak one reference per call.
         db.emit(f"return {reg}")
     else:
         db.emit("return")
@@ -925,20 +934,25 @@ class ClassLayout:
     `class Name:` (no base) is a class; a `class Name(struct)`/`(enum)` is still
     the 4.6/4.7 record type and never lands here.
 
-    4.10.2. A class may name ONE base class: `class Dog(Animal):`. The base's
-    attributes come FIRST and keep their absolute offsets (`base` and
-    `base_layout` record the link; `attrs` is the FULL flattened set, base then
-    own), so an upcast is free -- a Dog pointer is already a valid Animal. The
-    base's methods are inherited; a same-named `def` overrides it and must have
-    the same signature. `slots` maps every method name (inherited or not) to its
-    vtable index -- a subclass's slot k is the same method its base named at
-    slot k. `abstract` lists the method names still unimplemented (`...`); a
-    class with any is abstract and cannot be instantiated.
+    4.10.2/4.10.4. A class may name one or more base classes:
+    `class Dog(Animal):` or `class Duck(Flyer, Swimmer):`. Every base's
+    attributes keep their absolute offsets (`bases` and `mro` record the links;
+    `attrs` is the FULL flattened set), so an upcast is free -- a Dog pointer is
+    already a valid Animal. Multiple bases must agree wherever their attribute
+    blocks overlap; otherwise the layouts cannot remain prefix-compatible and
+    the declaration is refused. The C3 linearization in `mro` decides method
+    lookup, exactly as Python's does. `slots` maps every method name (inherited
+    or not) to a GLOBAL vtable index -- every class uses the same index for a
+    given method name, so a call site compiled against any base stays valid
+    under multiple inheritance. `abstract` lists the method names still
+    unimplemented (`...`); a class with any is abstract and cannot be
+    instantiated.
     """
 
     __slots__ = ("name", "attrs", "instance_size", "methods", "init", "del_fn",
-                 "class_attrs", "base", "base_layout", "slots", "abstract",
-                 "own_attrs", "own_methods")
+                 "class_attrs", "bases", "mro", "init_owner", "del_owner",
+                 "slots", "method_owners", "abstract", "own_attrs",
+                 "own_methods")
 
     def __init__(self, name):
         self.name = name
@@ -948,10 +962,13 @@ class ClassLayout:
         self.init = None         # the __init__ FunctionDef, or None
         self.del_fn = None       # the __del__ FunctionDef, or None
         self.class_attrs = {}    # class-level attributes assigned only via the class name
-        # 4.10.2 inheritance.
-        self.base = None         # the base class's name, or None
-        self.base_layout = None  # the base's ClassLayout, or None
-        self.slots = {}          # method name -> vtable slot index (inherited included)
+        # 4.10.2/4.10.4 inheritance.
+        self.bases = []          # direct base class names, in declaration order
+        self.mro = []            # C3 MRO, self first
+        self.init_owner = None   # the class whose own __init__ is selected
+        self.del_owner = None    # the class whose own __del__ is selected
+        self.slots = {}          # method name -> global vtable slot index
+        self.method_owners = {}  # method name -> class that supplies the implementation
         self.abstract = set()    # method names still unimplemented (`...`)
         self.own_attrs = set()   # attribute names THIS class declares (not inherited)
         self.own_methods = {}    # method name -> FunctionDef, only those declared here
@@ -1209,24 +1226,33 @@ def _class_attr_type(owner_name, attr_name, ann, classes, structs, enums):
 
 
 def _is_subclass_of(child, ancestor, classes):
-    """True when `child` is `ancestor` or a (transitive) subclass of it -- 4.10.2.
+    """True when `child` is `ancestor` or a (transitive) subclass of it -- 4.10.2/4.10.4.
 
-    The hierarchy is single and declared base-first, so this is a walk up the
-    `base` links. It is the compile-time half of `isinstance`: an upcast (a Dog
-    where an Animal is expected) is legal exactly when this holds, and it is
-    free at run time because a subclass instance starts with a valid base
-    instance.
+    The hierarchy is declared base-first and closed, and every class records its
+    C3 linearization, so membership is a direct lookup in that MRO. It is the
+    compile-time half of `isinstance`: an upcast (a Dog where an Animal is
+    expected) is legal exactly when this holds, and it is free at run time
+    because a subclass instance starts with a valid base instance.
     """
-    seen = 0
-    cur = child
-    while cur is not None and seen <= len(classes):
-        if cur == ancestor:
+    if child == ancestor:
+        return True
+    layout = classes.get(child)
+    return layout is not None and ancestor in layout.mro
+
+
+def _possible_common_subclass(a, b, classes):
+    """True when some declared class is a subclass of both `a` and `b`.
+
+    Single inheritance made two unrelated classes permanently disjoint, so
+    `isinstance(x, C)` could fold to false and identity comparisons between
+    unrelated references could be refused. Multiple inheritance removes that
+    shortcut: a declared D(B, C) means a B-typed reference may name a D, and
+    that same object is a C. This predicate decides whether the runtime can
+    ever answer `yes`; when it is false the compile-time fold/refusal is sound.
+    """
+    for name, layout in classes.items():
+        if _is_subclass_of(name, a, classes) and _is_subclass_of(name, b, classes):
             return True
-        layout = classes.get(cur)
-        if layout is None:
-            return False
-        cur = layout.base
-        seen += 1
     return False
 
 
@@ -1235,23 +1261,57 @@ def _layout_is_abstract(layout):
     return bool(layout.abstract)
 
 
+def _c3_linearize(class_name, base_names, classes):
+    """Python's C3 linearization for a class and its direct bases -- 4.10.4.
+
+    Every base is declared earlier, so its own `mro` is already known. The
+    merge picks the head of the first sequence that does not appear in the tail
+    of any sequence; if no such head exists the hierarchy is inconsistent (the
+    classic `class X(A, B)` / `class Y(B, A)` diamond) and is refused rather
+    than silently producing an order that changes a method's meaning.
+    """
+    if not base_names:
+        return [class_name]
+    seqs = [list(classes[b].mro) for b in base_names]
+    seqs.append(list(base_names))
+    result = []
+    while any(seqs):
+        head = None
+        for seq in seqs:
+            if not seq:
+                continue
+            candidate = seq[0]
+            if all(candidate not in other[1:] for other in seqs):
+                head = candidate
+                break
+        if head is None:
+            raise NotImplementedError(
+                f"LITHON-E0126: class '{class_name}' has an inconsistent MRO -- "
+                f"the bases {', '.join(base_names)} impose contradictory C3 "
+                f"linearizations (4.10.4)")
+        result.append(head)
+        for seq in seqs:
+            if seq and seq[0] == head:
+                del seq[0]
+    return [class_name] + result
+
+
 def _resolve_method_in(classes, class_name, method_name):
     """The (defining_class, FunctionDef) for `method_name` on `class_name`.
 
-    With single inheritance the implementation is the nearest one walking up the
-    `base` chain -- Python's lookup for one base, without MRO machinery. Returns
-    None when no class in the chain declares it.
+    The lookup is the class's C3 linearization, self first -- exactly Python's
+    attribute lookup for methods. Returns None when no class in the MRO declares
+    it.
     """
-    cur = class_name
-    guard = 0
-    while cur is not None and guard <= len(classes):
-        layout = classes.get(cur)
-        if layout is None:
-            return None
-        if method_name in layout.own_methods:
-            return cur, layout.own_methods[method_name]
-        cur = layout.base
-        guard += 1
+    layout = classes.get(class_name)
+    if layout is None:
+        return None
+    for owner in layout.mro:
+        owner_layout = classes.get(owner)
+        if owner_layout is None:
+            continue
+        if method_name in owner_layout.own_methods:
+            return owner, owner_layout.own_methods[method_name]
     return None
 
 
@@ -1289,7 +1349,8 @@ def _method_signature(method):
     return (params, ret)
 
 
-def _validate_class_method(stmt, owner_name, layout, classes, structs, enums):
+def _validate_class_method(stmt, owner_name, layout, classes, structs, enums,
+                           method_slots):
     """Validates one `def` in a class body and stores it on the layout.
 
     `__init__` and `__del__` are the two reserved names. `__init__` returns
@@ -1340,6 +1401,7 @@ def _validate_class_method(stmt, owner_name, layout, classes, structs, enums):
                 f"LITHON-E0134: __init__ of class '{owner_name}' is declared more than once "
                 f"(4.10.1)")
         layout.init = stmt
+        layout.init_owner = owner_name
         layout.own_methods[method_name] = stmt
         return
     if method_name == "__del__":
@@ -1355,6 +1417,7 @@ def _validate_class_method(stmt, owner_name, layout, classes, structs, enums):
                 f"LITHON-E0134: __del__ of class '{owner_name}' is declared more than once "
                 f"(4.10.1)")
         layout.del_fn = stmt
+        layout.del_owner = owner_name
         layout.own_methods[method_name] = stmt
         return
     if method_name.startswith("__") and method_name.endswith("__"):
@@ -1382,9 +1445,15 @@ def _validate_class_method(stmt, owner_name, layout, classes, structs, enums):
                 f"inherited signature; an override takes the same parameters and returns the "
                 f"same type (4.10.2)")
     else:
-        # A NEW method: append a slot after every inherited one.
-        layout.slots[method_name] = len(layout.slots)
+        # A NEW method: take the next GLOBAL slot. Slots are keyed by method
+        # name, not by the class that first declared it, so every class in a
+        # multiple-inheritance hierarchy agrees on the index even when the
+        # method is inherited along different branches.
+        if method_name not in method_slots:
+            method_slots[method_name] = len(method_slots)
+        layout.slots[method_name] = method_slots[method_name]
     layout.methods[method_name] = stmt
+    layout.method_owners[method_name] = owner_name
     layout.own_methods[method_name] = stmt
     if is_abstract:
         layout.abstract.add(method_name)
@@ -1425,8 +1494,8 @@ def _class_method_value_type(ann, owner_name, method_name, what, classes, struct
             f"reference (4.10.1)")
 
 
-def _build_class_layout(stmt, classes, structs, enums):
-    """Validates one `class Name:` (optionally `(Base)`) body and inserts its
+def _build_class_layout(stmt, classes, structs, enums, method_slots):
+    """Validates one `class Name:` / `class Name(B, C):` body and inserts its
     ClassLayout.
 
     A class is a heap object reached through a reference: its attributes are
@@ -1434,47 +1503,104 @@ def _build_class_layout(stmt, classes, structs, enums):
     (including `__init__`/`__del__`) are validated and stored for inlining; a
     method name may not collide with an attribute.
 
-    4.10.2. With a base, the base's attributes are copied first -- at their
-    ORIGINAL absolute offsets, which is the whole point of base-first layout: an
-    upcast is a no-op, and a name declared on the base never shifts. The
-    derived class's own attributes are packed after the base's block. A derived
-    attribute may not reuse an inherited name (it would need a second offset for
-    one name); a derived method may override an inherited one but must take the
-    same parameters and return the same type (the vtable slot holds one
-    signature). `super().__init__` is NOT implicit -- a derived `__init__` that
-    exists must initialize the inherited attributes itself unless it calls the
-    base explicitly.
+    4.10.2/4.10.4. With bases, every inherited attribute keeps its ORIGINAL
+    absolute offset, which is the whole point of prefix-compatible layout: an
+    upcast to any base is a no-op, and a name declared on a base never shifts.
+    A class's own attributes are packed after the largest base block. Two bases
+    whose attribute blocks disagree at the same offset cannot both be prefixes
+    of one object, so that declaration is refused with E0127 rather than
+    producing a layout on which one base's methods would read the wrong bytes.
+    A derived attribute may not reuse an inherited name. A derived method may
+    override an inherited one but must take the same parameters and return the
+    same type. `super().__init__` is NOT implicit -- the selected `__init__`
+    must initialize the inherited attributes itself unless it calls the next
+    one in the construction MRO.
     """
     if stmt.name in classes or stmt.name in structs or stmt.name in enums:
         raise NotImplementedError(
             f"LITHON-E0126: type '{stmt.name}' is declared more than once (4.10.1)")
     layout = ClassLayout(stmt.name)
-    base_name = getattr(stmt, "_lithon_base", None)
-    offset = CLASS_HEADER_BYTES
-    if base_name is not None:
-        base_layout = classes[base_name]
-        layout.base = base_name
-        layout.base_layout = base_layout
-        # Inherit the base's attributes at their original offsets, its method
-        # slots, and its method table (a later same-named `def` overrides).
-        layout.attrs = dict(base_layout.attrs)
-        layout.methods = dict(base_layout.methods)
-        layout.slots = dict(base_layout.slots)
-        layout.own_methods = {}
-        layout.abstract = set(base_layout.abstract)
-        # The next free offset is the base's total size: its attributes already
-        # fill [CLASS_HEADER_BYTES, base.instance_size).
-        offset = base_layout.instance_size
-        # A base's __init__/__del__ are NOT inherited silently: a derived class
-        # that declares neither inherits the base's behaviour only if the base
-        # has them -- Python inherits them, so we do too, but a derived __init__
-        # must re-initialize the inherited attributes (checked below), and a
-        # derived __del__ must be explicit.
-        layout.init = base_layout.init
-        layout.del_fn = base_layout.del_fn
+    base_names = list(getattr(stmt, "_lithon_bases", []))
+    layout.bases = base_names
+    layout.mro = _c3_linearize(stmt.name, base_names, classes)
+
+    # Prefix-compatible attribute union. Every class starts its own attributes
+    # at CLASS_HEADER_BYTES, so two unrelated stateful bases collide at the
+    # first such offset; that collision is exactly what makes one object unable
+    # to be a valid instance of both. Identical inherited fields (a diamond's
+    # shared base) agree and are kept once.
+    inherited_attrs = {}
+    used_offsets = {}
+    for owner in layout.mro[1:]:
+        owner_layout = classes[owner]
+        for aname, field in owner_layout.attrs.items():
+            prev = inherited_attrs.get(aname)
+            if prev is not None:
+                if prev != field:
+                    raise NotImplementedError(
+                        f"LITHON-E0127: class '{stmt.name}' inherits attribute '{aname}' "
+                        f"with conflicting layouts from its bases; multiple bases must "
+                        f"agree at every shared offset (4.10.4)")
+                continue
+            other = used_offsets.get(field["offset"])
+            if other is not None and other[0] != aname:
+                raise NotImplementedError(
+                    f"LITHON-E0127: class '{stmt.name}' cannot inherit both '{other[0]}' "
+                    f"(base '{other[1]}') and '{aname}' (base '{owner}') at offset "
+                    f"{field['offset']}; multiple bases must have prefix-compatible "
+                    f"attribute layouts (4.10.4)")
+            inherited_attrs[aname] = dict(field)
+            used_offsets[field["offset"]] = (aname, owner)
+    layout.attrs = inherited_attrs
+    offset = max([CLASS_HEADER_BYTES] +
+                 [classes[b].instance_size for b in layout.mro[1:]])
+
+    # C3 lookup: the first class in MRO order that declares each method owns
+    # it. Slots are GLOBAL, so an inherited method keeps the same index in every
+    # class that can reach it.
+    layout.methods = {}
+    layout.slots = {}
+    layout.method_owners = {}
+    layout.abstract = set()
+    for owner in layout.mro[1:]:
+        owner_layout = classes[owner]
+        for mname, method in owner_layout.own_methods.items():
+            if mname in ("__init__", "__del__") or mname in layout.methods:
+                continue
+            # A virtual call site compiled against ANY base passes that base's
+            # signature, but the receiver's MRO may resolve the same global slot
+            # to another class's def. Every definition reachable from this new
+            # class must therefore agree, even when C3 hides one behind another.
+            for other in layout.mro:
+                if other == stmt.name:
+                    continue
+                cand = classes[other].own_methods.get(mname)
+                if cand is not None and _method_signature(cand) != _method_signature(method):
+                    raise NotImplementedError(
+                        f"LITHON-E0135: class '{stmt.name}' inherits incompatible "
+                        f"signatures for method '{mname}' from '{owner}' and '{other}'; "
+                        f"one vtable slot must have one signature (4.10.4)")
+            layout.methods[mname] = method
+            layout.slots[mname] = owner_layout.slots[mname]
+            layout.method_owners[mname] = owner
+            if _method_is_abstract(method):
+                layout.abstract.add(mname)
+
+    # __init__ and __del__ are MRO-selected too, but they are not vtable slots:
+    # construction and the last drop call the selected definition directly.
+    for owner in layout.mro[1:]:
+        owner_layout = classes[owner]
+        if layout.init is None and "__init__" in owner_layout.own_methods:
+            layout.init = owner_layout.own_methods["__init__"]
+            layout.init_owner = owner
+        if layout.del_fn is None and "__del__" in owner_layout.own_methods:
+            layout.del_fn = owner_layout.own_methods["__del__"]
+            layout.del_owner = owner
+
     for member in stmt.body:
         if isinstance(member, ast.FunctionDef):
-            _validate_class_method(member, stmt.name, layout, classes, structs, enums)
+            _validate_class_method(member, stmt.name, layout, classes, structs, enums,
+                                   method_slots)
             continue
         if not isinstance(member, ast.AnnAssign):
             raise NotImplementedError(
@@ -1486,11 +1612,12 @@ def _build_class_layout(stmt, classes, structs, enums):
                 f"a subscript or attribute (4.10.1)")
         attr_name = member.target.id
         if attr_name in layout.attrs:
-            if base_name is not None and attr_name in layout.base_layout.attrs:
+            if attr_name not in layout.own_attrs:
+                owners = [b for b in layout.mro[1:] if attr_name in classes[b].attrs]
                 raise NotImplementedError(
                     f"LITHON-E0127: class '{stmt.name}' re-declares inherited attribute "
-                    f"'{attr_name}' from '{base_name}'; a subclass adds attributes, it does "
-                    f"not shadow them (4.10.2)")
+                    f"'{attr_name}' from {', '.join(repr(o) for o in owners)}; a subclass "
+                    f"adds attributes, it does not shadow them (4.10.4)")
             raise NotImplementedError(
                 f"LITHON-E0127: class '{stmt.name}' declares attribute '{attr_name}' more "
                 f"than once (4.10.1)")
@@ -1786,37 +1913,51 @@ def build_type_registry(tree):
     structs = {}
     enums = {}
     classes = {}
+    method_slots = {}   # method name -> GLOBAL vtable index (4.10.4)
     for stmt in tree.body:
         if not isinstance(stmt, ast.ClassDef):
             continue
         bases = stmt.bases
         if not bases:
-            stmt._lithon_base = None
-            _build_class_layout(stmt, classes, structs, enums)
+            stmt._lithon_bases = []
+            _build_class_layout(stmt, classes, structs, enums, method_slots)
             continue
-        base = bases[0].id if (len(bases) == 1 and isinstance(bases[0], ast.Name)) else None
-        if base == STRUCT_BASE:
-            _build_struct_layout(stmt, structs, enums)
-        elif base == ENUM_BASE:
-            _build_enum_layout(stmt, structs, enums)
-        elif base is not None and base in classes:
-            # 4.10.2. Single inheritance from a class declared EARLIER. Requiring
-            # earlier declaration is the same rule a nested struct field follows:
-            # it makes the base's full layout (attributes and their sizes, method
-            # slots) known before the derived one is laid out, and it makes a
-            # cycle impossible.
-            if len(stmt.bases) != 1:
+        base_names = []
+        for b in bases:
+            if not isinstance(b, ast.Name):
                 raise NotImplementedError(
-                    f"LITHON-E0126: class '{stmt.name}' has more than one base; 4.10.2 "
-                    f"supports single inheritance (multiple inheritance arrives in 4.10.4)")
-            stmt._lithon_base = base
-            _build_class_layout(stmt, classes, structs, enums)
-        else:
+                    f"LITHON-E0126: every base of class '{stmt.name}' must be a plain class "
+                    f"name declared earlier (4.10.4)")
+            base_names.append(b.id)
+        if len(base_names) == 1 and base_names[0] == STRUCT_BASE:
+            stmt._lithon_bases = []
+            _build_struct_layout(stmt, structs, enums)
+            continue
+        if len(base_names) == 1 and base_names[0] == ENUM_BASE:
+            stmt._lithon_bases = []
+            _build_enum_layout(stmt, structs, enums)
+            continue
+        if len(set(base_names)) != len(base_names):
             raise NotImplementedError(
-                f"LITHON-E0126: class '{stmt.name}' has an unsupported base -- a baseless "
-                f"`class {stmt.name}:` is a class, `class {stmt.name}(struct):` a struct, "
-                f"`class {stmt.name}(enum):` an enum, and `class {stmt.name}(Base):` a subclass "
-                f"of an earlier class (4.10.2)")
+                f"LITHON-E0126: class '{stmt.name}' names the same base more than once; "
+                f"a base appears once in the MRO (4.10.4)")
+        for b in base_names:
+            if b in (STRUCT_BASE, ENUM_BASE):
+                raise NotImplementedError(
+                    f"LITHON-E0126: class '{stmt.name}' mixes a class base with the "
+                    f"'{b}' record base; struct and enum are storage kinds, not "
+                    f"classes, and cannot participate in multiple inheritance (4.10.4)")
+            if b not in classes:
+                raise NotImplementedError(
+                    f"LITHON-E0126: class '{stmt.name}' has an unsupported base '{b}' -- a "
+                    f"class base must be an earlier `class {b}:` or `class {b}(Base):` "
+                    f"declaration; baseless classes, structs and enums cannot be mixed "
+                    f"(4.10.4)")
+        # 4.10.2/4.10.4. Every base is declared EARLIER, which makes its full
+        # layout, slots and MRO known before this class is laid out -- and makes
+        # a cycle impossible.
+        stmt._lithon_bases = base_names
+        _build_class_layout(stmt, classes, structs, enums, method_slots)
     return structs, enums, classes
 
 
@@ -2133,9 +2274,7 @@ class IRBuilder:
                     f"LITHON-E0140: `in` over a list of {elem_t.ref} needs a class "
                     f"reference on the left, e.g. `x in {container_node.id}` where "
                     f"x is a {elem_t.ref} (4.10.3)")
-            related = (value_class == elem_t.ref
-                       or _is_subclass_of(value_class, elem_t.ref, self.classes)
-                       or _is_subclass_of(elem_t.ref, value_class, self.classes))
+            related = _possible_common_subclass(value_class, elem_t.ref, self.classes)
             if not related:
                 raise NotImplementedError(
                     f"LITHON-E0140: cannot search a list of {elem_t.ref} for a "
@@ -2372,9 +2511,8 @@ class IRBuilder:
                 left_class = self._peek_receiver_class(node.left)
                 right_class = self._peek_receiver_class(node.comparators[0])
                 if left_class is not None or right_class is not None:
-                    related = (left_class == right_class
-                               or _is_subclass_of(left_class, right_class, self.classes)
-                               or _is_subclass_of(right_class, left_class, self.classes))
+                    related = _possible_common_subclass(left_class, right_class,
+                                                        self.classes)
                     if not related:
                         raise NotImplementedError(
                             f"LITHON-E0140: cannot compare a {left_class} with a {right_class} "
@@ -3645,14 +3783,22 @@ class IRBuilder:
         suffix = render_type_suffix(decl) if decl[0] in ("int", "float", "bool", "ptr") else ""
         self.emit(f"store {name}, {value_reg}{suffix}")
 
-    def _inline_class_init(self, layout, obj_reg, args):
-        """Inline `__init__` for a freshly allocated object.
+    def _inline_class_init(self, layout, obj_reg, args, construction=None,
+                           defining=None):
+        """Inline the selected `__init__` for a freshly allocated object.
 
-        The receiver reference is copied into a fresh local so the inlined body's
-        `self` is an ordinary class variable; the body is then built exactly as a
-        method body. Every declared attribute must be assigned on every path
-        that reaches the end of `__init__` (checked by the caller after this).
+        `layout` is the class whose definite-init set is checked (the class being
+        constructed, or the next class reached from a `super().__init__`).
+        `defining` is the class that actually declares this `__init__`; it types
+        `self` and is the class `super()` starts after. `construction` is the
+        exact class being built, whose MRO decides the cooperative chain -- a
+        subclass may inherit a base's `__init__`, but the chain must continue
+        along the SUBCLASS's MRO, not the base's own.
         """
+        if construction is None:
+            construction = layout.name
+        if defining is None:
+            defining = layout.init_owner or layout.name
         method = layout.init
         params = method.args.args[1:]
         if len(args) != len(params):
@@ -3671,10 +3817,13 @@ class IRBuilder:
         body = _SelfRename(rename).visit(
             copy.deepcopy(ast.Module(body=method.body, type_ignores=[]))).body
 
-        # Bind the receiver local: a class variable holding the reference.
-        self.declared[self_name] = Type("class", ref=layout.name)
-        self.class_vars[self_name] = layout.name
-        self.emit(f"store {self_name}, {obj_reg}{render_type_suffix(Type('class', ref=layout.name))}")
+        # Bind the receiver local: a class variable holding the reference. The
+        # body's `self` is typed as its DECLARING class, whose attribute offsets
+        # are a prefix of the constructed class; `super()` still uses the
+        # construction class's MRO.
+        self.declared[self_name] = Type("class", ref=defining)
+        self.class_vars[self_name] = defining
+        self.emit(f"store {self_name}, {obj_reg}{render_type_suffix(Type('class', ref=defining))}")
 
         ret_label = self.reserve_label()
         saved_loop = self.loop_stack
@@ -3682,7 +3831,7 @@ class IRBuilder:
         self.method_return_stack.append((None, ret_label))
         self.inline_own_depth[len(self.method_return_stack)] = len(
             getattr(self, "own_scopes", []))
-        self.inline_active.append((layout.name, "__init__"))
+        self.inline_active.append((defining, "__init__"))
         # Track which attributes this __init__ assigns, for the definite-init
         # check.
         init_assigned = set()
@@ -3694,8 +3843,10 @@ class IRBuilder:
         # `_inline_class_method_call`.
         self_name_init = rename["self"] if rename else self_name
         old_self = getattr(self, "_cur_self_name", None)
+        old_construction = getattr(self, "_construction_class", None)
         self._cur_self_name = self_name_init
-        self.enclosing_class_stack.append(layout.name)
+        self._construction_class = construction
+        self.enclosing_class_stack.append(defining)
         try:
             for p, arg in zip(params, args):
                 self._bind_inline_param(rename[p.arg], p.annotation, arg)
@@ -3711,6 +3862,7 @@ class IRBuilder:
             self.inline_active.pop()
             self.loop_stack = saved_loop
             self._cur_self_name = old_self
+            self._construction_class = old_construction
 
         missing = [a for a in layout.attrs if a not in init_assigned]
         if missing:
@@ -3742,10 +3894,12 @@ class IRBuilder:
     def _build_isinstance(self, call):
         """`isinstance(x, C)` -> a runtime range check -- 4.10.2.
 
-        The check is TWO integer compares at run time: the object's type id
-        against C's subtree range (`subtree_lo <= id <= subtree_hi`). That is
-        correct for an object whose exact class is not statically known. When the
-        static class of `x` is unrelated to C the answer is constant and folds.
+        The check is a bitset probe at run time: the object's descriptor carries
+        the bitset of its ancestors, and C's bit is set exactly when the object
+        is a C. That is correct under multiple inheritance, where no contiguous
+        type-id range can describe a class's descendants. When NO declared class
+        can be both the static class of `x` and a C -- `_possible_common_subclass`
+        is false -- the answer is constant and folds to false.
         """
         if len(call.args) != 2:
             raise NotImplementedError(
@@ -3757,8 +3911,7 @@ class IRBuilder:
             raise NotImplementedError(
                 "LITHON-E0140: isinstance() is only defined for a class reference (4.10.2)")
         reg = self.build_expr(call.args[0])
-        if not _is_subclass_of(static, cname, self.classes) and \
-                not _is_subclass_of(cname, static, self.classes):
+        if not _possible_common_subclass(static, cname, self.classes):
             r = self.new_reg()
             # A bool, not an int: isinstance() is a predicate, so printing it
             # must render True/False exactly as the runtime check does.
@@ -3851,12 +4004,11 @@ class IRBuilder:
                       f"{slot}{suffix}")
             if ret_t.kind == "class":
                 self.reg_class[r] = ret_t.ref
+                # The callee transferred an owned class reference to us; if the
+                # caller does not bind it, the statement-end drain drops it.
+                self.stmt_temps[-1].append((r, ret_t.ref))
         else:
             self.emit(f"{r} = callvirtual {operands}, {class_name}, {method_name}, {slot}")
-        if has_result:
-            ret_t = parse_type_annotation(method.returns)
-            if ret_t.kind == "class":
-                self.reg_class[r] = ret_t.ref
         return r
 
     def _render_decl_type(self, ann):
@@ -3879,81 +4031,178 @@ class IRBuilder:
                     f"{annotation.id} reference (4.10.2)")
 
     def _build_super_call(self, call):
-        """`super().method(args)` -- call the BASE's implementation directly.
+        """`super().method(args)` -- continue at the next MRO implementation.
 
-        The receiver is the current method's `self`, typed as the enclosing
-        class; the method is resolved starting at the ENCLOSING CLASS's base, so
-        it finds the base's implementation even when the enclosing class
-        overrides it. This is single inheritance, so there is exactly one base to
-        start from. The call is inlined against a statically known
-        implementation, so no vtable is consulted -- `super()` is the explicit
-        "do not dispatch" form.
+        Ordinary methods use a dynamic `CallSuper`: the receiver's ACTUAL class
+        decides which class follows the declaring class in its C3 MRO, so the
+        same base method works correctly in a diamond (`D(B, C)` makes B's
+        `super().f()` reach C's, not B's own base A's). `__init__` is special:
+        construction always knows the exact class being built, so its cooperative
+        chain is resolved statically along that class's MRO and inlined with the
+        same definite-init bookkeeping as before.
         """
         if not getattr(self, "enclosing_class_stack", None):
             raise NotImplementedError(
-                "LITHON-E0135: super() is only valid inside a method of a class with a base "
-                "(4.10.2)")
+                "LITHON-E0135: super() is only valid inside a class method (4.10.2)")
         enclosing = self.enclosing_class_stack[-1]
         if enclosing is None:
             raise NotImplementedError(
                 "LITHON-E0135: super() is only valid inside a class method, not a free "
                 "function (4.10.2)")
         layout = self.classes[enclosing]
-        if layout.base is None:
-            raise NotImplementedError(
-                f"LITHON-E0135: class '{enclosing}' has no base, so super() has nothing to "
-                f"call (4.10.2)")
         if call.func.value.args or call.func.value.keywords:
             raise NotImplementedError(
                 "LITHON-E0135: super() takes no arguments here (4.10.2)")
-        base = layout.base
         method_name = call.func.attr
         # The receiver is the current method's `self` LOCAL. Inside an inlined
         # method/__init__ that local is renamed (`m0_self`, ...), so the name has
-        # to come from the inliner rather than the literal source spelling: a
-        # hard-coded `load self` would name a variable that does not exist in the
-        # enclosing function and fail definite assignment.
+        # to come from the inliner rather than the literal source spelling.
         self_name = self._current_self_name()
         if self_name is None:
             raise NotImplementedError(
                 "LITHON-E0135: super() requires a `self` binding in scope (4.10.2)")
-        # `super().__init__(...)`: run the BASE's constructor on the SAME object,
-        # and register every attribute it initializes in the DERIVED __init__'s
-        # definite-init set (the outer one), so the derived check sees the base's
-        # attributes as initialized.
+
+        # `super().__init__(...)`: run the next constructor in the CONSTRUCTION
+        # class's MRO on the SAME object. Every class in the chain must be
+        # visited explicitly by a cooperative super call; the definite-init set
+        # of the class being built accumulates the attributes each step assigns.
         if method_name == "__init__":
-            base_layout = self.classes[base]
-            if base_layout.init is None:
+            construction = getattr(self, "_construction_class", None) or enclosing
+            construction_layout = self.classes[construction]
+            try:
+                pos = construction_layout.mro.index(enclosing)
+            except ValueError:
+                raise NotImplementedError(
+                    f"LITHON-E0135: class '{enclosing}' is not in the MRO of the object "
+                    f"being constructed as '{construction}' (4.10.4)")
+            next_class = None
+            for anc in construction_layout.mro[pos + 1:]:
+                if "__init__" in self.classes[anc].own_methods:
+                    next_class = anc
+                    break
+            if next_class is None:
                 if call.args:
                     raise NotImplementedError(
-                        f"LITHON-E0135: base '{base}' has no __init__, so super().__init__ "
-                        f"takes no arguments (4.10.2)")
+                        f"LITHON-E0135: super().__init__() from '{enclosing}' reaches the "
+                        f"end of {construction}'s MRO, which has no further __init__, so it "
+                        f"takes no arguments (4.10.4)")
                 return None
-            params = base_layout.init.args.args[1:]
+            next_layout = self.classes[next_class]
+            next_method = next_layout.own_methods["__init__"]
+            params = next_method.args.args[1:]
             if len(call.args) != len(params):
                 raise NotImplementedError(
-                    f"LITHON-E0135: super().__init__ takes {len(params)} argument(s), got "
-                    f"{len(call.args)} (4.10.2)")
+                    f"LITHON-E0135: super().__init__() from '{enclosing}' next runs "
+                    f"'{next_class}.__init__', which takes {len(params)} argument(s), got "
+                    f"{len(call.args)} (4.10.4)")
             obj_reg = self.new_reg()
             self.emit(f"{obj_reg} = load {self_name}")
             outer_assigned = getattr(self, "_class_init_assigned", None)
-            self._inline_class_init(base_layout, obj_reg, call.args)
+            self._inline_class_init(next_layout, obj_reg, call.args,
+                                    construction=construction, defining=next_class)
             if outer_assigned is not None:
-                for a in base_layout.attrs:
+                for a in next_layout.attrs:
                     outer_assigned.add(a)
             return None
-        if self._resolve_method(base, method_name) is None:
+        if method_name == "__del__":
             raise NotImplementedError(
-                f"LITHON-E0135: base '{base}' of '{enclosing}' has no method '{method_name}' "
-                f"(4.10.2)")
-        # Bind the base method on the current `self`. The receiver expression is
-        # the current `self` local (possibly renamed by the enclosing inliner);
-        # `self_name` above is the live one, typed as the base for dispatch.
-        super_call = ast.Call(
-            func=ast.Attribute(value=ast.Name(id=self_name, ctx=ast.Load()),
-                               attr=method_name, ctx=ast.Load()),
-            args=call.args, keywords=[])
-        return self._inline_class_method_call(super_call, base)
+                "LITHON-E0135: super().__del__() is not supported; a destructor runs once "
+                "at the last drop (4.10.4)")
+
+        method = layout.own_methods.get(method_name)
+        if method is None:
+            raise NotImplementedError(
+                f"LITHON-E0135: super().{method_name}() is not a method declared by "
+                f"'{enclosing}' (4.10.4)")
+        params = method.args.args[1:]
+        if call.keywords or any(isinstance(a, ast.Starred) for a in call.args):
+            raise NotImplementedError(
+                f"LITHON-E0135: super().{method_name}() takes positional arguments only "
+                f"(4.10.4)")
+        if len(call.args) != len(params):
+            raise NotImplementedError(
+                f"LITHON-E0135: super().{method_name}() takes {len(params)} argument(s), got "
+                f"{len(call.args)} (4.10.4)")
+        slot = layout.slots.get(method_name)
+        if slot is None:
+            raise NotImplementedError(
+                f"LITHON-E0135: method '{enclosing}.{method_name}' has no vtable slot (4.10.4)")
+
+        # Dynamic super can reach any class after `enclosing` in the MRO of any
+        # concrete subclass. Require every such definition to share this
+        # method's signature, and require every concrete subclass to have at
+        # least one concrete definition after `enclosing` -- otherwise a call
+        # that looks fine on D(B, C) would miss at run time on a plain E(B).
+        candidates = {}
+        for cname, clayout in self.classes.items():
+            if not _is_subclass_of(cname, enclosing, self.classes):
+                continue
+            try:
+                pos = clayout.mro.index(enclosing)
+            except ValueError:
+                continue
+            for anc in clayout.mro[pos + 1:]:
+                anc_layout = self.classes[anc]
+                cand = anc_layout.own_methods.get(method_name)
+                if cand is not None:
+                    candidates[anc] = cand
+        if not candidates:
+            raise NotImplementedError(
+                f"LITHON-E0135: super().{method_name}() in '{enclosing}' has no implementation "
+                f"later in any subclass MRO (4.10.4)")
+        for owner, cand in candidates.items():
+            if _method_signature(cand) != _method_signature(method):
+                raise NotImplementedError(
+                    f"LITHON-E0135: super().{method_name}() in '{enclosing}' can reach "
+                    f"'{owner}.{method_name}', whose signature differs; every implementation "
+                    f"a super call can reach must share the declaring method's signature "
+                    f"(4.10.4)")
+        for cname, clayout in self.classes.items():
+            if _layout_is_abstract(clayout):
+                continue
+            if not _is_subclass_of(cname, enclosing, self.classes):
+                continue
+            try:
+                pos = clayout.mro.index(enclosing)
+            except ValueError:
+                continue
+            has_concrete = False
+            for anc in clayout.mro[pos + 1:]:
+                cand = self.classes[anc].own_methods.get(method_name)
+                if cand is not None and not _method_is_abstract(cand):
+                    has_concrete = True
+                    break
+            if not has_concrete:
+                raise NotImplementedError(
+                    f"LITHON-E0135: class '{cname}' inherits '{enclosing}.{method_name}' but "
+                    f"has no later implementation for its super() to call; override the "
+                    f"method or add a concrete base after '{enclosing}' (4.10.4)")
+
+        recv_reg = self.new_reg()
+        self.emit(f"{recv_reg} = load {self_name}")
+        self.reg_class[recv_reg] = enclosing
+        arg_regs = [self.build_expr(a) for a in call.args]
+        for p, areg in zip(params, arg_regs):
+            self._require_param_value(areg, p.annotation, method_name)
+        has_result = method.returns is not None
+        r = self.new_reg()
+        operands = ", ".join([recv_reg] + arg_regs)
+        defining_index = self._class_index_of(enclosing)
+        if has_result:
+            ret_t = parse_type_annotation(method.returns)
+            suffix = f" : {self._render_decl_type(method.returns)}"
+            self.emit(f"{r} = callsuper {operands}, {enclosing}, {method_name}, "
+                      f"{slot}, {defining_index}{suffix}")
+            if ret_t.kind == "class":
+                self.reg_class[r] = ret_t.ref
+                # A super call returns the same owned-reference contract as any
+                # other call; mark it so a binding claims it or a statement
+                # drops it.
+                self.stmt_temps[-1].append((r, ret_t.ref))
+        else:
+            self.emit(f"{r} = callsuper {operands}, {enclosing}, {method_name}, "
+                      f"{slot}, {defining_index}")
+        return r
 
     def _build_class_call_discard(self, call, class_name):
         """A class method call used as a STATEMENT -- 4.10.2.
@@ -4070,10 +4319,13 @@ class IRBuilder:
             return None
         r = self.new_reg()
         self.emit(f"{r} = load {result_temp}")
-        # A method that returns a class reference tags its result register.
+        # A method that returns a class reference tags its result register. The
+        # inline return stored an OWNED reference in the temp, so the load
+        # transfers it to the caller exactly like a real call result.
         ret_t = parse_type_annotation(method.returns)
         if ret_t.kind == "class":
             self.reg_class[r] = ret_t.ref
+            self.stmt_temps[-1].append((r, ret_t.ref))
         return r
 
     def _subclasses_of(self, class_name):
@@ -6017,7 +6269,7 @@ class IRBuilder:
         decl = self.declared.get(name)
         if decl is None:
             return ""
-        if decl[0] not in ("int", "float", "bool", "ptr"):
+        if decl[0] not in ("int", "float", "bool", "ptr", "class"):
             return ""
         return render_type_suffix(decl)
 
@@ -6712,7 +6964,7 @@ def build_program(tree):
     # by convention. The body is the method's, with `self` bound to the
     # parameter.
     for cname, clayout in classes.items():
-        if clayout.del_fn is None:
+        if "__del__" not in clayout.own_methods:
             continue
         db = IRBuilder(fn_rename, structs, enums, classes, fn_returns)
         db.start_block(db.reserve_label())
@@ -6728,7 +6980,7 @@ def build_program(tree):
         db.inline_active.append((cname, "__del__"))
         db.enclosing_class_stack.append(cname)
         try:
-            for stmt in clayout.del_fn.body:
+            for stmt in clayout.own_methods["__del__"].body:
                 db.build_stmt(stmt)
             if not db.terminated and db.block_is_reachable(db.current.label):
                 db.emit(f"jump {ret_label}")
@@ -6742,25 +6994,22 @@ def build_program(tree):
         module_parts.append(
             db.render(f"function __del__{cname}(self:class[{cname}]):"))
 
-    # 4.10.2. A VIRTUAL method is NOT inlined at the polymorphic site: the
-    # runtime picks the implementation from the receiver's descriptor, so every
-    # (class, slot) a virtual call can reach must exist as a real function the
-    # tiers can point a vtable entry at, named `__virt__<Class>.<slot>`. A slot
-    # whose body is abstract (`...`) is left null -- an abstract class cannot be
-    # instantiated, so no object ever carries it.
+    # 4.10.2/4.10.4. A VIRTUAL method is NOT inlined at the polymorphic site:
+    # the runtime picks the implementation from the receiver's descriptor, so
+    # every class that DECLARES a concrete method needs one real function for
+    # its own slot entry. It is named `__virt__<Class>.<method>`; an inherited
+    # slot points at the defining class's function, so the same base-compiled
+    # call site stays valid under multiple inheritance. A slot whose body is
+    # abstract (`...`) is left null -- an abstract class cannot be instantiated,
+    # so no object ever carries it.
     for cname, clayout in classes.items():
-        if not clayout.slots:
-            continue
-        for sname, sidx in sorted(clayout.slots.items(), key=lambda kv: kv[1]):
-            resolved = _resolve_method_in(classes, cname, sname)
-            if resolved is None:
-                continue
-            defining, method = resolved
-            if _method_is_abstract(method):
+        for sname, method in sorted(clayout.own_methods.items(),
+                                    key=lambda kv: clayout.slots.get(kv[0], 0)):
+            if sname in ("__init__", "__del__") or _method_is_abstract(method):
                 continue
             _emit_class_method_function(
                 IRBuilder, fn_rename, structs, enums, classes, fn_returns,
-                cname, defining, sname, method, class_index, module_parts)
+                cname, cname, sname, method, class_index, module_parts)
 
     for stmt in tree.body:
         if isinstance(stmt, ast.ClassDef):

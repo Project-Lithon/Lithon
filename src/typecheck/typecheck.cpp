@@ -1490,21 +1490,24 @@ private:
             // descriptor slot. The receiver is a class reference; the trailing
             // suffix carries the method's result type (absent for a void method),
             // exactly as an inlined call's result would be typed.
-            case Op::CallVirtual: {
+            case Op::CallVirtual:
+            case Op::CallSuper: {
+                const bool is_super = instr.op == Op::CallSuper;
+                const char* opname = is_super ? "callsuper" : "callvirtual";
                 LType recv;
                 if (instr.args.empty() || !reg_type(instr.args.at(0), recv) ||
                     !recv.is_class()) {
-                    error("callvirtual needs a class receiver (4.10.2)");
+                    error(std::string(opname) + " needs a class receiver (4.10.2)");
                     return;
                 }
                 if (instr.name.empty() || instr.name2.empty()) {
-                    error("callvirtual needs a class and a method name (4.10.2)");
+                    error(std::string(opname) + " needs a class and a method name (4.10.2)");
                     return;
                 }
                 if (instr.type_kind.empty()) return;   // a void method: no result
                 if (instr.type_kind == "class") {
                     if (!instr.decl_type || instr.decl_type->ref.empty()) {
-                        error("callvirtual class result needs a class name (4.10.2)");
+                        error(std::string(opname) + " class result needs a class name (4.10.2)");
                         return;
                     }
                     LType cls;

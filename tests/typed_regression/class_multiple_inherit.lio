@@ -1,0 +1,119 @@
+# 4.10.4. Multiple inheritance. The method order is C3, so D(B, C) looks in
+# D, B, C, A -- not in declaration order alone. Each `super().who()` continues
+# after the DEFINING class in the receiver's actual MRO, which is what makes the
+# cooperative diamond call chain visit B, then C, then A exactly once.
+#
+# The expected output is CPython's answer for the same program.
+
+
+class A:
+    x: int[64]
+
+    def __init__(self, x: int[64]):
+        self.x = x
+
+    def who(self) -> int[64]:
+        return 1
+
+    def add(self, a: int[64], b: int[64]) -> int[64]:
+        return self.x + a + b
+
+    def me(self) -> A:
+        return self
+
+
+class B(A):
+    def __init__(self, x: int[64]):
+        super().__init__(x)
+
+    def who(self) -> int[64]:
+        return super().who() * 2 + 3
+
+    def add(self, a: int[64], b: int[64]) -> int[64]:
+        return super().add(a, b) * 2
+
+    def me(self) -> A:
+        return super().me()
+
+
+class C(A):
+    def __init__(self, x: int[64]):
+        super().__init__(x)
+
+    def who(self) -> int[64]:
+        return super().who() * 5 + 7
+
+    def add(self, a: int[64], b: int[64]) -> int[64]:
+        return super().add(a, b) * 3
+
+    def me(self) -> A:
+        return super().me()
+
+
+class D(B, C):
+    def __init__(self, x: int[64]):
+        super().__init__(x)
+
+    def who(self) -> int[64]:
+        return super().who() * 10 + 11
+
+    def add(self, a: int[64], b: int[64]) -> int[64]:
+        return super().add(a, b) + 100
+
+    def me(self) -> A:
+        return super().me()
+
+
+# Two classes with the SAME two bases in opposite orders. Neither overrides
+# `who`, so the answer is whichever base C3 places first.
+class L(B, C):
+    def tag(self) -> int[64]:
+        return 27
+
+
+class R(C, B):
+    def tag(self) -> int[64]:
+        return 32
+
+
+def main():
+    d: D = D(5)
+    print(d.x)
+    print(d.who())
+    print(d.add(2, 3))
+
+    a: A = d
+    b: B = d
+    c: C = d
+    print(a.who())
+    print(b.who())
+    print(c.who())
+    print(a.add(1, 1))
+
+    print(isinstance(d, A))
+    print(isinstance(d, B))
+    print(isinstance(d, C))
+    print(isinstance(d, D))
+    print(isinstance(a, B))
+    print(isinstance(b, C))
+    print(isinstance(c, B))
+    print(issubclass(D, A))
+    print(issubclass(D, B))
+    print(issubclass(D, C))
+    print(issubclass(B, C))
+    print(issubclass(L, B))
+    print(issubclass(R, C))
+
+    l: L = L(4)
+    r: R = R(6)
+    print(l.who())
+    print(r.who())
+    print(l.tag())
+    print(r.tag())
+
+    x: A = a.me()
+    print(x.x)
+    print(x is d)
+    y: A = b.me()
+    print(y is d)
+main()

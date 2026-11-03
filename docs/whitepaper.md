@@ -45,7 +45,7 @@ kind of failure is this" readable from the code alone.
 | `E0133` | 1 (static refusal) | Type-function application: an unknown or non-call name, keyword/starred arguments, an arity mismatch, or a recursive (direct or mutual) expansion |
 | `E0134` | 1 (static refusal) | Method definition (a `def` in a struct/enum body): a decorator, `/`/`*`/`**`/defaults, a missing or annotated `self`, an unannotated or non-scalar parameter/return, a duplicate name, or a name colliding with a field or variant |
 | `E0135` | 1 (static refusal) | Method application: an unknown method, a field where a method is called, a non-struct/enum receiver, keyword/starred arguments, an arity mismatch, a recursive inline, or a method with no result used as a value |
-| `E0140` | 1 (static refusal) | Class instance semantics (4.10.1/4.10.2/4.10.3): a bare class name used where a value is needed, a class-typed variable initialized with a non-class value, an identity compare between two unrelated classes, an attempt to instantiate an abstract class, an attribute left uninitialized on some path through `__init__`, a bare declaration or `append` on a class-typed container, a shorter class-typed literal, storing a non-class or unrelated class reference into a class-typed container element, or membership of a non-class or unrelated class in a class-typed container |
+| `E0140` | 1 (static refusal) | Class instance semantics (4.10.1/4.10.2/4.10.3): a bare class name used where a value is needed, a class-typed variable initialized with a non-class value, an identity compare between two unrelated classes, an attempt to instantiate an abstract class, an attribute left uninitialized on some path through `__init__`, a bare declaration or `append` on a class-typed container, storing a non-class or unrelated class reference into a class-typed container element, or membership of a non-class or unrelated class in a class-typed container |
 | `E0141` | 1 (static refusal) | Class attribute access (4.10.1): a read or write of an attribute the class does not declare (an instance has exactly its declared attributes) |
 | `E0201` | 2 (environmental) | Fallible value read before `.ok` check |
 | `E0301` | 3 (dynamic runtime trap) | Division by zero |
@@ -59,3 +59,46 @@ kind of failure is this" readable from the code alone.
 | `E0309` | 3 (dynamic runtime trap) | float-to-int conversion out of range or not finite |
 | `E0310` | 3 (dynamic runtime trap) | `range(a,b,step)` where `step == 0` (dynamic) |
 | `E0401` | 3 (dynamic runtime trap, resource) | Stack overflow |
+
+## 4.10.3 — class references in containers
+
+A `list[P, N]` or `tuple[P, N]` may hold class references. The container keeps
+its existing flat-leaf representation: one 8-byte object pointer per leaf,
+packed in row-major order, so a nested `list[list[P, 2], 2]` is still one
+contiguous run and `xs[i][j]` is the same multi-index access a scalar container
+uses. `scalar_leaf_bytes` therefore reports 8 for a class leaf, and
+`container_layout` accepts a class leaf even though a class value is not a
+scalar with byte-run storage of its own. Both tiers size and address the run
+from that one layout.
+
+The declared element class is the static type of every `xs[i]` read. An element
+may name that class or a subclass (an upcast), so a method call through a
+base-typed element dispatches on the object's real class and `isinstance` still
+sees the derived class. A read is a borrow; the slot owns exactly one
+reference.
+
+A class-typed literal must fill every slot: a bare `list[P, N]` or
+`tuple[P, N]` would be a run of null references and is refused, as is a shorter
+literal and `append`. When an element is stored, the new reference is retained
+before the old one is released, so `xs[0] = xs[0]` and `xs[1] = xs[0]` are
+safe. At scope exit the flat leaf chains are walked in reverse and one
+reference is dropped per slot, which makes per-element `__del__` timing
+deterministic and tier-identical. A tuple builds its elements first, then
+declares and fills the run in one block, because an element's inlined
+`__init__` splits the IR and the type checker tracks a tuple literal per block.
+
+`in`, `is`/`is not` and the default `==`/`!=` compare references, with the same
+related-class rule as class identity (`E0140` for unrelated classes).
+`enumerate`/`zip` over a class-typed container are refused (`E0119`): the loop
+target outlives one iteration, so its ownership is not settled; an explicit
+`for i in range(N):` reading `xs[i]` is supported. A class-typed container is
+local storage, not a value, so it may not be a function parameter or return
+type (`E0124`). Dict class keys/values remain deferred.
+
+Verification for this stage: typed regression 57/57 (including
+`class_container_list`, `class_container_inherit` and
+`class_container_lifetime`), general regression 34/34, tier differential
+227/227 (native 130, interpreter fallback 0), direct-Phi 91 matched / 0
+mismatched, error-code checks 151, object-runtime ctest 77 ok (including the
+class-container layout case), and `fuzz_diff.py --count 200 --oop` 200 passed /
+0 skipped / 0 mismatches across the 4.10.1, 4.10.2 and 4.10.3 shapes.

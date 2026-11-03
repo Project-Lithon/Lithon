@@ -548,7 +548,7 @@ FRONTEND_REFUSALS = [
     # adds attributes rather than shadowing them, an override keeps the slot's
     # signature, an abstract class cannot be instantiated, and super() has a
     # base to start from and the base's own constructor arity.
-    ("a class with two bases (E0126)",
+    ("a duplicate base (E0126)",
      "class A:\n    x: int[64]\nclass C(A, A):\n    y: int[64]\nprint(0)\n",
      "LITHON-E0126"),
     ("a subclass declared before its base (E0126)",
@@ -589,6 +589,47 @@ FRONTEND_REFUSALS = [
      "class A:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
      "class B:\n    y: int[64]\n    def __init__(self, y: int[64]):\n        self.y = y\n"
      "a: A = A(1)\nb: B = B(2)\nprint(a is b)\n", "LITHON-E0140"),
+    # 4.10.4. Multiple inheritance. C3 must produce one consistent order, every
+    # base must be a real class with a prefix-compatible attribute layout, and a
+    # slot inherited from two bases must have ONE signature. A dynamic super()
+    # may only run when every concrete subclass has a later implementation.
+    ("multiple bases with an inconsistent C3 linearization (E0126)",
+     "class A:\n    def f(self) -> int[64]:\n        return 1\n"
+     "class B(A):\n    def b(self) -> int[64]:\n        return 2\n"
+     "class C(A):\n    def c(self) -> int[64]:\n        return 3\n"
+     "class X(B, C):\n    def x(self) -> int[64]:\n        return 4\n"
+     "class Y(C, B):\n    def y(self) -> int[64]:\n        return 5\n"
+     "class Z(X, Y):\n    def z(self) -> int[64]:\n        return 6\nprint(0)\n",
+     "LITHON-E0126"),
+    ("a struct used as a class base (E0126)",
+     "class S(struct):\n    x: int[64]\n"
+     "class A:\n    def f(self) -> int[64]:\n        return 1\n"
+     "class D(A, S):\n    def g(self) -> int[64]:\n        return 2\nprint(0)\n",
+     "LITHON-E0126"),
+    ("an enum used as a class base (E0126)",
+     "class E(enum):\n    A\n"
+     "class A:\n    def f(self) -> int[64]:\n        return 1\n"
+     "class D(A, E):\n    def g(self) -> int[64]:\n        return 2\nprint(0)\n",
+     "LITHON-E0126"),
+    ("multiple bases with conflicting attribute layouts (E0127)",
+     "class A:\n    x: int[64]\n"
+     "    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    def f(self) -> int[64]:\n        return 1\n"
+     "class B:\n    y: int[64]\n"
+     "    def __init__(self, y: int[64]):\n        self.y = y\n"
+     "    def f(self) -> int[64]:\n        return 2\n"
+     "class D(A, B):\n    def g(self) -> int[64]:\n        return 3\nprint(0)\n",
+     "LITHON-E0127"),
+    ("multiple bases with incompatible inherited signatures (E0135)",
+     "class A:\n    def f(self, x: int[64]) -> int[64]:\n        return x\n"
+     "class B:\n    def f(self) -> int[64]:\n        return 1\n"
+     "class D(A, B):\n    def g(self) -> int[64]:\n        return 2\nprint(0)\n",
+     "LITHON-E0135"),
+    ("dynamic super() with no later implementation for every concrete subclass (E0135)",
+     "class B:\n    def f(self) -> int[64]:\n        return super().f() + 1\n"
+     "class C:\n    def f(self) -> int[64]:\n        return 2\n"
+     "class D(B, C):\n    def g(self) -> int[64]:\n        return 3\nprint(0)\n",
+     "LITHON-E0135"),
     # 4.10.3. Class references as list/tuple elements. Every slot must be filled
     # by the literal (a null reference is never a value), an element slot may be
     # overwritten only with a related class reference, append has no room, and

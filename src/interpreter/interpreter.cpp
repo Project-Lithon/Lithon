@@ -751,8 +751,14 @@ void interp_destructor(void* self) {
     // The class name comes from the object's own descriptor, so the trampoline
     // needs no per-class closure: one function serves every class.
     auto* obj = static_cast<lithon::runtime::ObjectHeader*>(self);
-    if (obj->vptr == nullptr || obj->vptr->name == nullptr) return;
-    auto it = g_del_functions->find(std::string("__del__") + obj->vptr->name);
+    if (obj->vptr == nullptr) return;
+    // The descriptor names the class that DECLARED __del__; an inheriting
+    // subclass has no emitted function of its own.
+    const char* owner = obj->vptr->destructor_owner != nullptr
+                            ? obj->vptr->destructor_owner
+                            : obj->vptr->name;
+    if (owner == nullptr) return;
+    auto it = g_del_functions->find(std::string("__del__") + owner);
     if (it == g_del_functions->end()) return;
     execute_function(*g_del_module, *it->second,
                      {LithonValue::make_object(
@@ -1710,7 +1716,19 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     if (obj->vptr == nullptr || obj->vptr->name == nullptr) {
                         throw std::runtime_error("interpreter: callvirtual on an unstamped object");
                     }
-                    const std::string owner = obj->vptr->name;
+                    // Slots are GLOBAL, but an inheriting class has no function
+                    // of its own. The class table names the DECLARING class for
+                    // each slot, so resolve `__virt__<Owner>.<method>`.
+                    const lithon::runtime::ClassTable& table =
+                        lithon::runtime::class_table();
+                    const uint32_t ti = obj->vptr->table_index;
+                    const size_t si = static_cast<size_t>(instr.int_imm);
+                    std::string owner = obj->vptr->name;
+                    if (ti < table.slot_owners.size() &&
+                        si < table.slot_owners[ti].size() &&
+                        !table.slot_owners[ti][si].empty()) {
+                        owner = table.slot_owners[ti][si];
+                    }
                     const std::string key = owner + "." + instr.name2;
                     const Function* callee = nullptr;
                     if (g_virt_functions != nullptr) {
@@ -1720,6 +1738,53 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     if (callee == nullptr) {
                         throw std::runtime_error(
                             "interpreter: no implementation for virtual call " + key);
+                    }
+                    std::vector<LithonValue> argv;
+                    argv.push_back(ref);
+                    for (size_t a = 1; a < instr.args.size(); ++a) {
+                        argv.push_back(frame.get_reg(instr.args.at(a)));
+                    }
+                    LithonValue r = execute_function(*g_del_module, *callee, argv);
+                    if (!instr.type_kind.empty()) {
+                        frame.regs[instr.result] = r;
+                    }
+                    break;
+                }
+                // 4.10.4. Dynamic super(): the receiver's actual MRO decides
+                // which class follows the DECLARING class. `host_class_super_owner`
+                // performs the same scan the JIT's slot resolver does; then the
+                // interpreter runs `__virt__<Owner>.<method>` by name.
+                case Op::CallSuper: {
+                    LithonValue ref = frame.get_reg(instr.args.at(0));
+                    if (!ref.is_object()) {
+                        throw std::runtime_error("interpreter: callsuper on a non-object");
+                    }
+                    auto* obj = reinterpret_cast<lithon::runtime::ObjectHeader*>(
+                        ref.as_object());
+                    if (obj->vptr == nullptr || obj->vptr->name == nullptr) {
+                        throw std::runtime_error("interpreter: callsuper on an unstamped object");
+                    }
+                    const int64_t packed =
+                        (instr.int_imm2 << 32) | (instr.int_imm & 0xffffffffLL);
+                    const int64_t owner_idx =
+                        lithon::runtime::host_class_super_owner(obj, packed);
+                    const lithon::runtime::ClassTable& table =
+                        lithon::runtime::class_table();
+                    std::string key;
+                    if (owner_idx >= 0 &&
+                        static_cast<size_t>(owner_idx) < table.names.size()) {
+                        key = table.names[static_cast<size_t>(owner_idx)] + "." + instr.name2;
+                    } else {
+                        key = instr.name + "." + instr.name2;
+                    }
+                    const Function* callee = nullptr;
+                    if (g_virt_functions != nullptr) {
+                        auto it = g_virt_functions->find(key);
+                        if (it != g_virt_functions->end()) callee = it->second;
+                    }
+                    if (callee == nullptr) {
+                        throw std::runtime_error(
+                            "interpreter: no implementation for super call " + key);
                     }
                     std::vector<LithonValue> argv;
                     argv.push_back(ref);

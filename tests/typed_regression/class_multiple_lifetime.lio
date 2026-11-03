@@ -1,0 +1,52 @@
+# 4.10.4. References and destructors under multiple inheritance. D inherits
+# `__del__` from A through both B and C, but the destructor still runs exactly
+# once at the last drop. `me()` returns a class reference through a dynamic
+# super chain, so each returned reference is an owner and must be released at
+# the function's scope exit -- a leak would keep the object alive and suppress
+# the 107 below.
+#
+# The expected output is CPython's answer for the same program.
+
+
+class A:
+    x: int[64]
+
+    def __init__(self, x: int[64]):
+        self.x = x
+
+    def me(self) -> A:
+        return self
+
+    def __del__(self):
+        print(self.x + 100)
+
+
+class B(A):
+    def me(self) -> A:
+        return super().me()
+
+
+class C(A):
+    def me(self) -> A:
+        return super().me()
+
+
+class D(B, C):
+    def me(self) -> A:
+        return super().me()
+
+
+def demo() -> int[64]:
+    d: D = D(7)
+    a: A = d
+    b: B = d
+    x: A = a.me()
+    y: A = b.me()
+    print(x.x)
+    print(y.x)
+    print(x is d)
+    print(y is d)
+    return 0
+
+
+print(demo())

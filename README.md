@@ -664,12 +664,12 @@ The verification suite checks several independent layers.
 | Direct float Phi sweep               | **88 matched / 0 mismatched** |
 | ABI modules audited                  |             **34**            |
 | ABI stack/callee-saved failures      |             **0**             |
-| Typed regression suite               |       **54 / 54 passed**      |
+| Typed regression suite               |       **57 / 57 passed**      |
 | General regression suite             |       **34 / 34 passed**      |
 | Type-checker unit checks             |          **145 ok**          |
-| Error-code discipline checks         |         **139 ok**           |
-| Tier differential (interp vs JIT)    |      **221 / 221 passed**     |
-| Object runtime (4.10.0–4.10.2, ctest) | **68 ok**       |
+| Error-code discipline checks         |         **151 ok**           |
+| Tier differential (interp vs JIT)    |      **227 / 227 passed**     |
+| Object runtime (4.10.0–4.10.3, ctest) | **77 ok**       |
 | Class (OOP) fuzzing                  |      **200 / 200 passed**     |
 | Syscall hook parity (both tiers)     |        **4 / 4 passed**      |
 | Networking loopback vs a C oracle    |          **verified**        |

@@ -232,12 +232,13 @@ enum class Op : uint8_t {
     //   IsInstance args = {value}, name = C             result = bool
     //   CallVirtual args = {recv, ...}, name = method   result = the method's value
     //                                       int_imm = slot index
+    //   CallSuper   args = {recv, ...}, name = defining class, name2 = method
+    //                                       int_imm = slot, int_imm2 = defining index
     //
-    // IsInstance is TWO integer compares against C's subtree range (the
-    // descriptor's `subtree_lo <= x.vptr->type_id <= subtree_hi`): with a closed
-    // single hierarchy and pre-order, subtree-contiguous ids, `isinstance(x, C)`
-    // never walks -- it is the whole reason the id scheme exists. A null
-    // reference is false.
+    // IsInstance is one bitset probe against C's ancestor bit: each descriptor
+    // carries the bitset of the classes it is an instance of, so multiple
+    // inheritance needs no hierarchy walk and no contiguous type-id range. A
+    // null reference is false.
     //
     // CallVirtual is a real indirect call through the receiver's vtable slot.
     // It is emitted ONLY when the receiver's exact class is not statically
@@ -245,6 +246,13 @@ enum class Op : uint8_t {
     // site keeps 4.9's inlining, which is the devirtualization the project
     // promises. `int_imm` is the slot, fixed by the base the site compiled
     // against; every subclass's descriptor has the same method in the same slot.
+    //
+    // CallSuper is the dynamic half of `super().method()`: it starts at the
+    // DEFINING class after the receiver's actual class and picks the next MRO
+    // class that implements the method itself. That is what makes a cooperative
+    // diamond call chain correct (`D(B, C)` runs B.f then C.f, not A.f twice).
+    // `int_imm2` is the defining class's IR index -- the interpreter does not
+    // need it but the JIT packs it with the slot into one resolver argument.
     //
     // New allocates a zeroed instance and stamps its vptr and refcount (1). The
     // frontend emits it, then inlines __init__ (4.9's model, kept: a method is
@@ -265,6 +273,7 @@ enum class Op : uint8_t {
     Release,
     IsInstance,
     CallVirtual,
+    CallSuper,
 
     // Hardening item 5. Explicit numeric conversions and terminal input.
     //
@@ -408,6 +417,7 @@ inline bool is_register_clobbering_op(Op op) {
         // live only in a caller-saved register.
         case Op::IsInstance:
         case Op::CallVirtual:
+        case Op::CallSuper:
             return true;
         default:
             return false;
@@ -567,6 +577,9 @@ struct Instr {
     std::vector<ValueId> args;
 
     int64_t int_imm = 0;
+    // A second integer immediate for CallSuper: the defining class's IR index.
+    // Every other op leaves it zero.
+    int64_t int_imm2 = 0;
     double float_imm = 0.0;
     std::string name;
     // 6.2. A second variable name, for the one op that names two variables:
@@ -642,21 +655,35 @@ struct ClassInfo {
     int instance_size = 0;        // header + all attributes, packed
     bool has_destructor = false;  // a __del__ exists (4.10.0 rule 2)
     std::vector<ClassAttr> attributes;
-    // 4.10.2 inheritance metadata. `base_index` is the index of the base class in
-    // Module::classes, or -1 for a root class. Every subclass instance begins
-    // with a valid base instance (base attributes keep their offsets), so an
-    // upcast is free. `slot_count` is the total vtable slots (the union of the
-    // chain's methods, base order first); a subclass never REMOVES a slot, so a
-    // call compiled against a base reads a stable index for every subclass.
-    // `abstract` marks a class whose body leaves at least one method `...`; it
-    // may not be instantiated.
+    // 4.10.2/4.10.4 inheritance metadata. `bases` are the direct base class
+    // indices in declaration order (empty for a root), and `mro` is the C3
+    // linearization, self first. Every subclass instance begins with a valid
+    // base instance (base attributes keep their offsets), so an upcast is free.
+    // `slot_count` is this class's vtable length; slots are GLOBAL by method
+    // name, so a call compiled against any base reads the same index in every
+    // class that can reach it. `abstract` marks a class whose body leaves at
+    // least one method `...`; it may not be instantiated.
+    std::vector<int> bases;
+    std::vector<int> mro;
+    // Legacy single-inheritance base index (also accepted from hand-written
+    // `base=N`); new frontends emit `bases=`/`mro=`.
     int base_index = -1;
     int slot_count = 0;
     bool abstract = false;
-    // The method NAME at each slot, in slot order. Emitted so a CallVirtual site
-    // can be validated against the class it compiled against, and so the JIT and
-    // interpreter agree on what a slot means without re-deriving the chain.
+    // The classes that DECLARE the method at each NON-EMPTY global slot, and the
+    // method names at those slots. Parallel arrays, indexed by slot. A slot an
+    // inherited class receives from a base still names the base as its owner,
+    // so a virtual call resolves `__virt__<owner>.<method>` rather than looking
+    // for a per-subclass function that does not exist.
     std::vector<std::string> slots;
+    std::vector<std::string> slot_owners;
+    // Slots this class implements ITSELF (concrete `def`s, excluding abstract
+    // stubs and `__init__`/`__del__`). A dynamic `super()` scans the receiver's
+    // MRO after the defining class and takes the first owner entry here.
+    std::vector<int> own_slots;
+    // The class whose own `__del__` the drop runs, or -1 when none exists.
+    // Subclasses inherit the behavior but do not get a second emitted function.
+    int destructor_owner = -1;
 };
 
 struct Module {

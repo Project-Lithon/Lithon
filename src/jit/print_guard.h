@@ -403,6 +403,7 @@ struct Analysis {
                         raise(st.vals[in.result], Kind::Bool);
                         break;
                     case Op::CallVirtual:
+                    case Op::CallSuper:
                         if (in.type_kind == "class") {
                             raise(st.vals[in.result], Kind::Object);
                         } else if (!in.type_kind.empty()) {

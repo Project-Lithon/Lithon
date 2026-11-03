@@ -333,35 +333,75 @@ Module parse_ir_text(const std::string& text) {
             }
             ClassInfo info;
             info.name = toks[0];
+            auto parse_indices = [](const std::string& text) {
+                std::vector<int> out;
+                std::string cur;
+                std::istringstream ss(text);
+                while (std::getline(ss, cur, ',')) {
+                    if (!cur.empty()) out.push_back(std::stoi(cur));
+                }
+                return out;
+            };
             for (size_t k = 1; k < toks.size(); ++k) {
                 if (starts_with(toks[k], "size=")) {
                     info.instance_size = std::stoi(toks[k].substr(5));
+                } else if (starts_with(toks[k], "bases=")) {
+                    info.bases = parse_indices(toks[k].substr(6));
+                    if (!info.bases.empty()) info.base_index = info.bases[0];
                 } else if (starts_with(toks[k], "base=")) {
                     info.base_index = std::stoi(toks[k].substr(5));
+                } else if (starts_with(toks[k], "mro=")) {
+                    info.mro = parse_indices(toks[k].substr(4));
                 } else if (starts_with(toks[k], "slots=")) {
                     info.slot_count = std::stoi(toks[k].substr(6));
+                } else if (starts_with(toks[k], "del=")) {
+                    info.has_destructor = true;
+                    info.destructor_owner = std::stoi(toks[k].substr(4));
                 } else if (toks[k] == "abstract") {
                     info.abstract = true;
                 } else if (toks[k] == "del") {
+                    // Backward-compatible hand-written form: the class itself
+                    // owns the destructor.
                     info.has_destructor = true;
                 }
             }
+            info.slots.resize(static_cast<size_t>(std::max(info.slot_count, 0)));
+            info.slot_owners.resize(static_cast<size_t>(std::max(info.slot_count, 0)));
             module.classes.push_back(info);
             size_t j = i + 1;
             for (; j < lines.size(); ++j) {
                 std::string a = trim(lines[j]);
                 if (a.empty()) continue;
                 if (starts_with(a, "slot ")) {
-                    // `slot <index> <method-name>`: the vtable order. Emitted in
-                    // index order, so a plain push keeps slots[i] == the name at
-                    // slot i.
+                    // `slot <index> <method-name> <owner>`: global slot index,
+                    // method name, and the class whose own def supplies it.
                     std::string sr = a.substr(std::string("slot ").size());
                     std::istringstream ss(sr);
                     int sidx = 0;
                     std::string sname;
+                    std::string sowner;
+                    ss >> sidx >> sname >> sowner;
+                    if (sidx < 0) throw std::runtime_error("negative class slot index");
+                    auto& ci = module.classes.back();
+                    if (static_cast<size_t>(sidx) >= ci.slots.size()) {
+                        ci.slots.resize(static_cast<size_t>(sidx) + 1);
+                        ci.slot_owners.resize(static_cast<size_t>(sidx) + 1);
+                    }
+                    ci.slots[static_cast<size_t>(sidx)] = sname;
+                    ci.slot_owners[static_cast<size_t>(sidx)] = sowner;
+                    ci.slot_count = std::max(ci.slot_count, sidx + 1);
+                    continue;
+                }
+                if (starts_with(a, "ownslot ")) {
+                    // `ownslot <index> <method-name>`: a concrete method this
+                    // class declares itself, reachable by a dynamic super().
+                    std::string sr = a.substr(std::string("ownslot ").size());
+                    std::istringstream ss(sr);
+                    int sidx = 0;
+                    std::string sname;
                     ss >> sidx >> sname;
-                    (void)sidx;
-                    module.classes.back().slots.push_back(sname);
+                    (void)sname;
+                    if (sidx >= 0) module.classes.back().own_slots.push_back(sidx);
                     continue;
                 }
                 if (!starts_with(a, "attr ")) break;
@@ -747,6 +787,20 @@ Module parse_ir_text(const std::string& text) {
             instr.name2 = trim(oa.raw_args.at(n - 2));
             instr.int_imm = std::stoll(trim(oa.raw_args.at(n - 1)));
             for (size_t a = 0; a + 3 < n; ++a)
+                instr.args.push_back(parse_value_ref(oa.raw_args.at(a)));
+        } else if (oa.op_name == "callsuper") {
+            // `%r = callsuper %recv, %a0, Defining, method, slot, defining_idx`
+            instr.op = Op::CallSuper;
+            if (oa.raw_args.size() < 5)
+                throw std::runtime_error(
+                    "callsuper needs a receiver, arguments, a defining class, a method, "
+                    "a slot and a class index");
+            const size_t n = oa.raw_args.size();
+            instr.name = trim(oa.raw_args.at(n - 4));
+            instr.name2 = trim(oa.raw_args.at(n - 3));
+            instr.int_imm = std::stoll(trim(oa.raw_args.at(n - 2)));
+            instr.int_imm2 = std::stoll(trim(oa.raw_args.at(n - 1)));
+            for (size_t a = 0; a + 4 < n; ++a)
                 instr.args.push_back(parse_value_ref(oa.raw_args.at(a)));
         } else if (oa.op_name == "tofloat") {
             instr.op = Op::ToFloat;

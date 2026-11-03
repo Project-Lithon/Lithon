@@ -74,9 +74,9 @@ ACCUM_UNROLL = False
 # down. Both engines in this codebase agree with each other exactly -- that is
 # the gate -- but they can disagree with CPython on the interleaving. This is the
 # same treatment --mod-negatives gives the floored-vs-truncated `%%` gap.
-# Alternate seeds use the flat 4.10.1 shape, the 4.10.2 inheritance shape and
-# the 4.10.3 class-references-in-containers shape, so one --oop run exercises
-# all three.
+# Alternate seeds use the flat 4.10.1 shape, the 4.10.2 single-inheritance
+# shape, the 4.10.3 class-references-in-containers shape, and the 4.10.4
+# multiple-inheritance diamond shape, so one --oop run exercises all four.
 OOP_MODE = False
 # --phi: run the JIT twice, with and without the SSA pipeline, and require both
 # to match the interpreter. The plain run is the control: it proves the pipeline
@@ -1187,6 +1187,236 @@ class Gen:
         lines.append("print(s.total())")
         return "\n".join(lines) + "\n"
 
+    def program_oop_multiple(self):
+        """A DIAMOND class program, exercising multiple inheritance -- 4.10.4.
+
+        One root class owns the state, two bases add only methods, and a diamond
+        class inherits both. The C3 order is Root, Left, Right because the
+        diamond declares `(Left, Right)`; the arithmetic in each `total`
+        override is deliberately asymmetric, so a wrong MRO order changes the
+        printed answer rather than merely reordering a commutative sum.
+
+        The body exercises:
+          * cooperative `super().__init__` through Left and Right to Root,
+          * dynamic `super().total()` on Left, Right and the diamond itself,
+          * virtual dispatch through Root-, Left- and Right-typed references,
+          * a second diamond, Inherited(Left, Right), that inherits Left's
+            `total` and reaches Right through its ACTUAL receiver MRO,
+          * a class-returning `me()` implemented by every base and reached
+            through the whole super chain (the reference-ownership path),
+          * isinstance/issubclass over the diamond, including false branches,
+          * upcasts, free-function parameters/returns, aliases and reassignment,
+          * a fresh temporary and one diamond per loop iteration,
+          * an early return that drops only its path's references,
+          * optionally a Root `__del__`, inherited once by every class.
+
+        Every printed value is an INT or BOOL, magnitudes stay small, and the
+        program is valid CPython. As in the other OOP shapes, a `__del__`
+        exempts only CPython's drop ORDER; interpreter-vs-JIT is always exact.
+        """
+        r = self.r
+        aname = r.choice(["Root", "Base", "Shape"])
+        bname = r.choice(["Left", "North", "West"])
+        cname = r.choice(["Right", "South", "East"])
+        dname = r.choice(["Diamond", "Cross", "Both"])
+        ename = r.choice(["Inherited", "Fork", "Leaf"])
+        a1, a2 = "lo", "hi"
+
+        base_expr = r.choice([
+            f"self.{a1} + self.{a2}",
+            f"self.{a1} - self.{a2}",
+            f"self.{a1} * 2 + self.{a2}",
+        ])
+        left_expr = r.choice([
+            f"super().total() * 2 + 3",
+            f"super().total() + 10",
+        ])
+        right_expr = r.choice([
+            f"super().total() * 5 + 7",
+            f"super().total() + 20",
+        ])
+        diamond_expr = r.choice([
+            "super().total() + 100",
+            "super().total() * 3 + 1",
+        ])
+        has_del = r.random() < 0.5
+        del_which = r.choice([a1, a2])
+        del_k = r.randint(0, 3)
+
+        lines = []
+        lines.append(f"class {aname}:")
+        lines.append(f"    {a1}: int[64]")
+        lines.append(f"    {a2}: int[64]")
+        lines.append("")
+        lines.append(f"    def __init__(self, {a1}: int[64], {a2}: int[64]):")
+        lines.append(f"        self.{a1} = {a1}")
+        lines.append(f"        self.{a2} = {a2}")
+        lines.append("")
+        lines.append("    def total(self) -> int[64]:")
+        lines.append(f"        return {base_expr}")
+        lines.append("")
+        lines.append(f"    def me(self) -> {aname}:")
+        lines.append("        return self")
+        lines.append("")
+        if has_del:
+            lines.append("    def __del__(self):")
+            lines.append(f"        print(self.{del_which} + {del_k})")
+            lines.append("")
+
+        # Both bases have the SAME (root-only) state, so the diamond's prefix
+        # layout is compatible; all the variation is in the method order.
+        lines.append(f"class {bname}({aname}):")
+        lines.append(f"    def __init__(self, {a1}: int[64], {a2}: int[64]):")
+        lines.append(f"        super().__init__({a1}, {a2})")
+        lines.append("")
+        lines.append("    def total(self) -> int[64]:")
+        lines.append(f"        return {left_expr}")
+        lines.append("")
+        lines.append(f"    def me(self) -> {aname}:")
+        lines.append("        return super().me()")
+        lines.append("")
+        lines.append("    def bonus(self) -> int[64]:")
+        lines.append("        return super().total() * 10 + 1")
+        lines.append("")
+
+        lines.append(f"class {cname}({aname}):")
+        lines.append(f"    def __init__(self, {a1}: int[64], {a2}: int[64]):")
+        lines.append(f"        super().__init__({a1}, {a2})")
+        lines.append("")
+        lines.append("    def total(self) -> int[64]:")
+        lines.append(f"        return {right_expr}")
+        lines.append("")
+        lines.append(f"    def me(self) -> {aname}:")
+        lines.append("        return super().me()")
+        lines.append("")
+        lines.append("    def mark(self) -> int[64]:")
+        lines.append("        return 9")
+        lines.append("")
+
+        # The diamond declares no state and no __init__: construction starts at
+        # Left.__init__, and its super() continues Right -> Root.
+        lines.append(f"class {dname}({bname}, {cname}):")
+        lines.append("    def total(self) -> int[64]:")
+        lines.append(f"        return {diamond_expr}")
+        lines.append("")
+        lines.append(f"    def me(self) -> {aname}:")
+        lines.append("        return super().me()")
+        lines.append("")
+        lines.append("    def badge(self) -> int[64]:")
+        lines.append("        return 11")
+        lines.append("")
+
+        # Inherited has the same two bases but no total override. Its slot must
+        # resolve to Left.total, whose super() then reaches Right on THIS
+        # receiver rather than on the declaration-order base of Left.
+        lines.append(f"class {ename}({bname}, {cname}):")
+        lines.append("    def mark(self) -> int[64]:")
+        lines.append("        return 13")
+        lines.append("")
+
+        lines.append(f"def sum_pair(x: {aname}, y: {aname}) -> int[64]:")
+        lines.append("    return x.total() + y.total()")
+        lines.append("")
+        lines.append(f"def identity(x: {aname}) -> {aname}:")
+        lines.append("    return x")
+        lines.append("")
+
+        v = [r.randint(0, 9) for _ in range(9)]
+        lines.append(f"d: {dname} = {dname}({v[0]}, {v[1]})")
+        lines.append("print(d.total())")
+        lines.append("print(d.bonus())")
+        lines.append("print(d.mark())")
+        lines.append("print(d.badge())")
+
+        # Calls through every base type dispatch to the diamond's override;
+        # `bonus` starts at Left but its super() must continue at Right.
+        lines.append(f"a: {aname} = d")
+        lines.append(f"b: {bname} = d")
+        lines.append(f"c: {cname} = d")
+        lines.append("print(a.total())")
+        lines.append("print(b.total())")
+        lines.append("print(c.total())")
+        lines.append("print(b.bonus())")
+
+        # The second diamond inherits Left.total; the super() inside it must
+        # find Right in Inherited's MRO, not in Left's declaration.
+        lines.append(f"e: {ename} = {ename}({v[2]}, {v[3]})")
+        lines.append("print(e.total())")
+        lines.append("print(e.bonus())")
+        lines.append("print(e.mark())")
+        lines.append(f"eb: {bname} = e")
+        lines.append(f"ec: {cname} = e")
+        lines.append("print(eb.total())")
+        lines.append("print(ec.total())")
+
+        lines.append(f"print(isinstance(d, {aname}))")
+        lines.append(f"print(isinstance(d, {bname}))")
+        lines.append(f"print(isinstance(d, {cname}))")
+        lines.append(f"print(isinstance(d, {dname}))")
+        lines.append(f"print(isinstance(d, {ename}))")
+        lines.append(f"print(isinstance(e, {aname}))")
+        lines.append(f"print(isinstance(e, {bname}))")
+        lines.append(f"print(isinstance(e, {cname}))")
+        lines.append(f"print(isinstance(e, {ename}))")
+        lines.append(f"print(isinstance(e, {dname}))")
+        lines.append(f"print(issubclass({dname}, {aname}))")
+        lines.append(f"print(issubclass({dname}, {bname}))")
+        lines.append(f"print(issubclass({dname}, {cname}))")
+        lines.append(f"print(issubclass({ename}, {bname}))")
+        lines.append(f"print(issubclass({ename}, {cname}))")
+        lines.append(f"print(issubclass({bname}, {cname}))")
+        lines.append(f"print(issubclass({dname}, {ename}))")
+
+        lines.append("print(sum_pair(d, e))")
+        lines.append("print(identity(d).total())")
+
+        # Class-returning methods exercise the owned-reference path through a
+        # virtual call and the cooperative super chain.
+        lines.append(f"x: {aname} = a.me()")
+        lines.append(f"print(x.{a1})")
+        lines.append("print(x is d)")
+        lines.append(f"y: {aname} = b.me()")
+        lines.append("print(y is d)")
+        lines.append(f"z: {aname} = eb.me()")
+        lines.append("print(z is e)")
+
+        # Aliasing and reassignment of an owning reference.
+        lines.append(f"alias: {aname} = d")
+        lines.append("print(alias.total())")
+        lines.append("alias = e")
+        lines.append("print(alias.total())")
+        lines.append("if b is c:")
+        lines.append("    print(1000)")
+        lines.append("if a is not e:")
+        lines.append("    print(2000)")
+
+        # A fresh diamond temporary, owned and dropped by its statement.
+        lines.append(f"print({dname}({v[4]}, {v[5]}).total())")
+
+        # One diamond per iteration; with the inherited __del__ this pins the
+        # per-iteration drop point.
+        n = r.randint(1, 4)
+        lines.append("i: int[64] = 0")
+        lines.append("acc: int[64] = 0")
+        lines.append(f"while i < {n}:")
+        lines.append(f"    t: {dname} = {dname}(i, {v[6]})")
+        lines.append("    acc = acc + t.total()")
+        lines.append("    i = i + 1")
+        lines.append("print(acc)")
+
+        # Early return: only the returned path's references drop there.
+        lines.append("def early(flag: bool) -> int[64]:")
+        lines.append(f"    p: {dname} = {dname}({v[7]}, {v[8]})")
+        lines.append("    if flag:")
+        lines.append("        return p.total()")
+        lines.append(f"    q: {aname} = {ename}({v[8]}, {v[7]})")
+        lines.append("    return q.total()")
+        lines.append("print(early(True))")
+        lines.append("print(early(False))")
+
+        lines.append("print(identity(e).total())")
+        return "\n".join(lines) + "\n"
+
     def program_oop_containers(self):
         """A class program whose OBJECTS live in lists and tuples -- 4.10.3.
 
@@ -1606,17 +1836,20 @@ def main():
         gen = Gen(seed, args.shared_loop_vars, floats=args.floats,
                   mod_negatives=args.mod_negatives)
         if args.oop:
-            # Alternate seeds across the three OOP shapes: the flat 4.10.1
-            # object model, the 4.10.2 single-inheritance shape, and the 4.10.3
-            # class-references-in-containers shape. All three are pinned by the
-            # same interpreter-vs-JIT gate; the extra shapes add vtable
-            # dispatch, super(), isinstance, upcasts, and per-slot ownership.
-            if seed % 3 == 0:
+            # Alternate seeds across the four OOP shapes: the flat 4.10.1
+            # object model, the 4.10.2 single-inheritance shape, the 4.10.3
+            # class-references-in-containers shape, and the 4.10.4 diamond
+            # shape. All four are pinned by the same interpreter-vs-JIT gate;
+            # the extra shapes add vtable dispatch, super(), C3 MRO,
+            # isinstance, upcasts, and per-slot ownership.
+            if seed % 4 == 0:
                 src = gen.program_oop()
-            elif seed % 3 == 1:
+            elif seed % 4 == 1:
                 src = gen.program_oop_inherit()
-            else:
+            elif seed % 4 == 2:
                 src = gen.program_oop_containers()
+            else:
+                src = gen.program_oop_multiple()
         elif args.phi:
             src = gen.program_phi()
         elif args.floats:

@@ -905,7 +905,7 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
                 // needs three extra slots past the arguments: the resolved
                 // target, plus the receiver and the first argument saved across
                 // the resolver call.
-                if (in.op == Op::CallVirtual) {
+                if (in.op == Op::CallVirtual || in.op == Op::CallSuper) {
                     const size_t argv = in.args.size() >= 2 ? in.args.size() - 2 : 0;
                     out_args = std::max(out_args, argv + 3);
                 }
@@ -3484,6 +3484,88 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 // Restore the two register arguments the resolver call clobbered
                 // and load the target, so the setup is again the last thing
                 // before the call.
+                emit_load_rsp_offset(code, abi::kArgRegs[0], arg0_off);
+                if (nargs > 1) {
+                    if (arg1_is_float) {
+                        emit_movsd_rsp_to_xmm(code, abi::kFloatArgRegs[1], arg1_off);
+                    } else {
+                        emit_load_rsp_offset(code, abi::kArgRegs[1], arg1_off);
+                    }
+                }
+                emit_load_rsp_offset(code, kR, target_off);
+                emit_call_reg(code, kR);
+                if (instr.result != kInvalidValue) {
+                    if (is_float_value(value_kinds, instr.result)) {
+                        Xmm d = float_dest(instr.result);
+                        if (d != abi::kFloatArgReg) {
+                            emit_movsd_xmm_xmm(code, d, abi::kFloatArgReg);
+                        }
+                        commit_float_result(instr.result, d);
+                    } else {
+                        const ValueLocation& loc = alloc.temp_location(instr.result);
+                        if (loc.in_register) {
+                            if (loc.reg != Reg::RAX) emit_mov_reg_reg(code, loc.reg, Reg::RAX);
+                        } else {
+                            emit_store_rbp_offset(code, Reg::RAX, loc.stack_slot);
+                        }
+                    }
+                }
+                break;
+            }
+
+            case Op::CallSuper: {
+                const size_t nargs = instr.args.size();
+                if (nargs < 1) {
+                    throw std::runtime_error("compile_module: callsuper with no receiver");
+                }
+                if (nargs - 1 > abi::kMaxParams) {
+                    throw std::runtime_error(
+                        "compile_module: callsuper with more than " +
+                        std::to_string(abi::kMaxParams) + " arguments not supported");
+                }
+                // Same outgoing-area layout as CallVirtual. The resolver gets
+                // (receiver, (defining_index << 32) | slot) because the JIT ABI
+                // has only two GP argument registers.
+                const int32_t target_off = static_cast<int32_t>((nargs >= 2 ? nargs - 2 : 0) * 8);
+                const int32_t arg0_off = target_off + 8;
+                const int32_t arg1_off = target_off + 16;
+                for (size_t i = 2; i < nargs; ++i) {
+                    const int32_t off = static_cast<int32_t>((i - 2) * 8);
+                    if (is_float_value(value_kinds, instr.args[i])) {
+                        Xmm fv = read_float(instr.args[i]);
+                        emit_movsd_rsp_mem(code, fv, off);
+                    } else {
+                        materialize_into(kR, instr.args[i]);
+                        emit_store_rsp_offset(code, kR, off);
+                    }
+                }
+                for (size_t i = 0; i < std::min(nargs, size_t(2)); ++i) {
+                    if (is_float_value(value_kinds, instr.args[i])) {
+                        Xmm fv = read_float(instr.args[i]);
+                        if (fv != abi::kFloatArgRegs[i]) {
+                            emit_movsd_xmm_xmm(code, abi::kFloatArgRegs[i], fv);
+                        }
+                    } else {
+                        materialize_into(abi::kArgRegs[i], instr.args[i]);
+                    }
+                }
+                emit_store_rsp_offset(code, abi::kArgRegs[0], arg0_off);
+                const bool arg1_is_float = nargs > 1 && is_float_value(value_kinds, instr.args[1]);
+                if (nargs > 1) {
+                    if (arg1_is_float) {
+                        emit_movsd_rsp_mem(code, abi::kFloatArgRegs[1], arg1_off);
+                    } else {
+                        emit_store_rsp_offset(code, abi::kArgRegs[1], arg1_off);
+                    }
+                }
+                const int64_t packed =
+                    (instr.int_imm2 << 32) | (instr.int_imm & 0xffffffffLL);
+                emit_mov_reg_imm(code, abi::kArgRegs[1], packed);
+                emit_mov_reg_imm(
+                    code, kR,
+                    reinterpret_cast<int64_t>(&lithon::runtime::host_class_super_slot));
+                emit_call_reg(code, kR);
+                emit_store_rsp_offset(code, Reg::RAX, target_off);
                 emit_load_rsp_offset(code, abi::kArgRegs[0], arg0_off);
                 if (nargs > 1) {
                     if (arg1_is_float) {

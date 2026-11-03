@@ -47,26 +47,33 @@ static_assert(sizeof(ObjectHeader) == 16,
 // carrying everything the two tiers need to answer "is this object a C?" and
 // "which method is slot k?" without a walk.
 //
-// `subtree_lo`/`subtree_hi` are the inclusive range of type ids in C's
-// inheritance subtree. isinstance(x, C) is therefore TWO integer compares
-// (`lo <= x.vptr->type_id <= hi`) with no hierarchy walk -- 4.10.2's promise,
-// made possible because the hierarchy is closed and single (for 4.10.2) and
-// because ids are assigned in a pre-order that keeps every subtree contiguous
-// (see assign_type_ids).
+// `ancestor_bits` is the descriptor's own bitset of type ids it is an instance
+// of: itself plus every class in its C3 MRO. isinstance(x, C) is one word load,
+// one shift and one bit test, with no hierarchy walk. Bitsets replace the
+// single-inheritance subtree range because a diamond's descendants are not a
+// contiguous id interval.
 //
-// Slot indices are STABLE DOWN THE HIERARCHY: a subclass's slot k is the same
+// Slot indices are GLOBAL by method name: a subclass's slot k is the same
 // method the base named at slot k (it either inherits it or overrides it), so a
 // virtual call site compiled against the base reads the same offset for every
 // subclass. `slots` holds function pointers; a slot may be null when the method
 // is abstract and this class does not implement it (such a class cannot be
-// instantiated -- 4.10.3).
+// instantiated -- 4.10.3). `own_slot_bits` marks the slots THIS class declares,
+// which is what dynamic `super()` scans along `mro`.
 struct ClassDescriptor {
-    uint32_t type_id;      // unique, assigned pre-order (subtree-contiguous)
-    uint32_t subtree_lo;   // inclusive low end of the id range this class covers
-    uint32_t subtree_hi;   // inclusive high end
+    uint32_t type_id;      // unique id, assigned in IR order
+    uint32_t subtree_lo;   // legacy single-inheritance range (kept for old tests)
+    uint32_t subtree_hi;   // legacy single-inheritance range
     uint32_t slot_count;   // number of vtable slots
     uint32_t instance_size;  // total bytes of a fully constructed instance
     uint32_t flags;        // kClassFlagAbstract when the class has an abstract method; 0 otherwise
+    uint32_t table_index;  // index in ClassTable; the interpreter keys owners on it
+    uint32_t ancestor_word_count;
+    const uint64_t* ancestor_bits;   // type id bitset, including self
+    uint32_t own_slot_word_count;
+    const uint64_t* own_slot_bits;   // slots implemented by this class itself
+    uint32_t mro_count;
+    const ClassDescriptor* const* mro;   // self first
     // The class-typed attributes: `ref_attr_count` 8-byte slots, at the absolute
     // offsets in `ref_attr_offsets`. Releasing an instance must drop one
     // reference to each object an attribute names BEFORE the instance's own
@@ -80,6 +87,10 @@ struct ClassDescriptor {
     // class has none. A null destructor is what lets the optimizer elide drops:
     // "no __del__" means "releasing this object is unobservable" (4.10.0).
     void (*destructor)(void* self);
+    // The class that DECLARED the destructor (may be an ancestor), so the
+    // interpreter trampoline can find `__del__<Owner>` even though no function
+    // is emitted for an inheriting subclass.
+    const char* destructor_owner;
     // The vtable. Declared last; the frontend/heap allocate a descriptor large
     // enough for `slot_count` entries, or use a buffer in a unit test.
     void (*slots[1])(void);
@@ -110,13 +121,21 @@ inline bool is_immortal(const ObjectHeader* obj) {
     return obj->refcount == kImmortalRefcount;
 }
 
-// isinstance: is this object a C (or a subclass of C)? Two integer compares,
-// exactly as 4.10.2 specifies. The caller passes C's descriptor; both ends are
-// inclusive, and ids are subtree-contiguous, so no walk is needed.
+// isinstance: is this object a C (or a subclass of C)? The OBJECT's descriptor
+// carries the bitset of every class it is an instance of, so the probe asks
+// whether C's type id is in that set. The fallback to the legacy subtree range
+// keeps hand-built descriptors (unit tests and old hand-written IR) meaningful
+// without a bitset.
 inline bool is_instance_of(const ObjectHeader* obj, const ClassDescriptor* cls) {
-    if (obj == nullptr) return false;
-    const uint32_t id = obj->vptr->type_id;
-    return id >= cls->subtree_lo && id <= cls->subtree_hi;
+    if (obj == nullptr || obj->vptr == nullptr || cls == nullptr) return false;
+    const ClassDescriptor* self = obj->vptr;
+    if (self->ancestor_bits != nullptr) {
+        const uint32_t id = cls->type_id;
+        const uint32_t word = id >> 6;
+        if (word >= self->ancestor_word_count) return false;
+        return ((self->ancestor_bits[word] >> (id & 63)) & 1u) != 0;
+    }
+    return self->type_id >= cls->subtree_lo && self->type_id <= cls->subtree_hi;
 }
 
 }  // namespace lithon::runtime
