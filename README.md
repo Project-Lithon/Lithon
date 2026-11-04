@@ -64,6 +64,29 @@ drop-in Python replacement.
 
 ### Recently added
 
+- **Multiple inheritance (4.10.4)** — `class D(B, C):` may combine bases that
+  were declared earlier. Method lookup uses Python's **C3 linearization**, so
+  `D(B, C)` searches `D, B, C, A` and `D(C, B)` searches `D, C, B, A`; the
+  arithmetic in each override makes a wrong order visible. A `super()` call
+  starts after the class that **defined** the running method in the receiver's
+  actual MRO, which is what makes a cooperative diamond visit each class once
+  and also lets a method call `super().foo()` for a `foo` it does not override.
+  Slots remain global by method name, and each descriptor records the
+  **declaring owner**, so an inherited slot points at the owner's emitted
+  `__virt__` function rather than a per-subclass copy. Every base must agree at
+  identical attribute offsets: a diamond reuses one copy of the shared root
+  state, while two stateful bases with different fields are refused (`E0127`)
+  because one object cannot be a valid prefix of both. `super().__init__` is
+  resolved statically along the construction class's MRO, `isinstance` probes
+  an ancestor bitset (a diamond's descendants are no longer contiguous), and a
+  destructor is selected once by MRO with only its owner emitting code
+  (`super().__del__` is refused). A class-typed result returned through
+  `super()` or a virtual call is one owned reference: a binding claims it and a
+  discarded result is released at the statement that produced it.
+  `tests/typed_regression/class_multiple_inherit.lio` and
+  `class_multiple_lifetime.lio` pin C3 lookup, cooperative `super()`, class
+  returns and inherited-drop lifetime, and `fuzz_diff.py --oop` now includes a
+  fourth diamond shape.
 - **Class references in containers (4.10.3)** — a `list[P, N]` or
   `tuple[P, N]` may now hold class references. Each element is one 8-byte
   reference leaf in the container's flat run, so a nested
@@ -90,7 +113,8 @@ drop-in Python replacement.
   keys/values of class type. `tests/typed_regression/class_container_list.lio`,
   `class_container_inherit.lio` and `class_container_lifetime.lio` guard the
   reads, dispatch/upcasts and per-slot lifetime, and `fuzz_diff.py --oop`
-  alternates a container shape with the 4.10.1/4.10.2 shapes.
+  alternates this shape with the flat, inheritance and multiple-inheritance
+  shapes.
 - **Single inheritance (4.10.2)** — `class Dog(Animal):` extends an earlier
   class. A subclass instance begins with a valid base instance (base attributes
   keep their offsets), so upcasting a `Dog` reference to `Animal` is free and an
@@ -100,22 +124,23 @@ drop-in Python replacement.
   implementation. A call whose receiver's exact class is statically known (and
   whose hierarchy has no override) is still inlined; when the receiver is only
   known as a base, the frontend emits `CallVirtual`, which reads the receiver's
-  own descriptor and runs the override at run time. `super()` starts lookup at
-  the enclosing class's base and inlines that implementation;
-  `super().__init__(...)` runs the base constructor on the same object while
+  own descriptor and runs the override at run time. `super()` starts after the
+  class that defines the running method in the receiver's actual MRO;
+  `super().__init__(...)` runs the next constructor on the same object while
   registering the base's attributes with the derived definite-init check.
-  `isinstance(x, C)` is two integer compares against C's subtree range (type ids
-  are assigned pre-order, so every subtree is one contiguous interval);
-  `issubclass(A, B)` folds to a constant at compile time. A method whose body is
-  `...` is abstract: the class is flagged and cannot be instantiated until a
-  subclass implements it. An override must match the inherited signature, and a
-  subclass adds attributes rather than shadowing inherited ones. Multiple
-  inheritance is 4.10.4. `tests/typed_regression/class_inherit.lio`,
+  This stage used a single contiguous subtree range for `isinstance(x, C)`; the
+  4.10.4 multiple-inheritance work replaces it with an ancestor bitset so a
+  diamond's descendants need not be contiguous. `issubclass(A, B)` folds to a
+  constant at compile time. A method whose body is `...` is abstract: the class
+  is flagged and cannot be instantiated until a subclass implements it. An
+  override must match the inherited signature, and a subclass adds attributes
+  rather than shadowing inherited ones. `tests/typed_regression/class_inherit.lio`,
   `class_inherit_super.lio`, `class_inherit_isinstance.lio` and
   `class_inherit_params.lio` are tier-identical guards, and `fuzz_diff.py --oop`
-  now alternates flat class programs, inheritance programs and class-reference-
-  in-container programs (vtable dispatch, `super()`, `isinstance`, upcasts,
-  per-slot ownership).
+  alternates flat class programs, inheritance programs, class-reference-in-
+  container programs and a multiple-inheritance diamond (vtable dispatch,
+  `super()`, `isinstance`, upcasts, per-slot ownership and cooperative
+  constructors).
 - **Classes (4.10.1)** — the first user-visible slice of Python's object model.
   A `class Name:` with no base declares a real class: attributes with types, an
   `__init__`, plain methods, and an optional `__del__`. An instance is a heap
@@ -161,8 +186,9 @@ drop-in Python replacement.
 - **Object runtime (4.10.0)** — the foundation for real classes: a small
   `mmap`-backed heap with intrusive size-class free lists and no libc, the
   `[vptr:8][refcount:8]` instance header, a read-only `ClassDescriptor` carrying
-  the type id, its subtree range and the vtable, and shared `IncRef`/`DecRef`
-  helpers. **Reference counting** is the decided lifetime model: deterministic,
+  the type id, the ancestor bitset (the legacy subtree range remains for old
+  descriptors) and the vtable, and shared `IncRef`/`DecRef` helpers.
+  **Reference counting** is the decided lifetime model: deterministic,
   pause-free, and the `__del__` moment is pinned to exactly the program point
   where the last reference drops — the one observable lifetime event, so the
   optimizer may not move or elide it, and the two tiers therefore agree. An
@@ -174,7 +200,7 @@ drop-in Python replacement.
   order cannot drift between the interpreter and the JIT. This stage adds **no
   user-visible language change**; `src/runtime/object_runtime_test.cpp` pins the
   layout, the allocator, reference counting, the destructor timing/order, the
-  immortal no-ops and the two-compare `isinstance` range. Documented narrowings:
+  immortal no-ops and the ancestor-bitset `isinstance` probe. Documented narrowings:
   allocation addresses are never observable (a reference is print-unsafe, like
   `Ptr`), cycles leak, and references held between a trap and a `try` handler
   are leaked on the exceptional path (never a safety problem).
@@ -661,15 +687,15 @@ The verification suite checks several independent layers.
 | Typed differential fuzzing           |      **300 / 300 passed**     |
 | Bitwise / shift fuzzing              |      **200 / 200 passed**     |
 | Conditional-expression / SSA fuzzing |    **200 / 200 per suite**    |
-| Direct float Phi sweep               | **88 matched / 0 mismatched** |
+| Direct float Phi sweep               | **93 matched / 0 mismatched** |
 | ABI modules audited                  |             **34**            |
 | ABI stack/callee-saved failures      |             **0**             |
-| Typed regression suite               |       **57 / 57 passed**      |
+| Typed regression suite               |       **59 / 59 passed**      |
 | General regression suite             |       **34 / 34 passed**      |
 | Type-checker unit checks             |          **145 ok**          |
-| Error-code discipline checks         |         **151 ok**           |
-| Tier differential (interp vs JIT)    |      **227 / 227 passed**     |
-| Object runtime (4.10.0–4.10.3, ctest) | **77 ok**       |
+| Error-code discipline checks         |         **157 ok**           |
+| Tier differential (interp vs JIT)    |      **231 / 231 passed**     |
+| Object runtime (4.10.0–4.10.4, ctest) | **107 ok**       |
 | Class (OOP) fuzzing                  |      **200 / 200 passed**     |
 | Syscall hook parity (both tiers)     |        **4 / 4 passed**      |
 | Networking loopback vs a C oracle    |          **verified**        |
@@ -1636,13 +1662,14 @@ Deliberate narrowings, collected next to `%` and `v == n`:
 | references held across a trap (4.10.0) | a caught exception's frame objects are dropped when the handler runs | the references held between a trap and its `try` handler are **leaked** on the exceptional path; their `__del__` does not run | the caught trap is a plain jump, so there is no unwind step to release the abandoned frames; releasing them needs per-frame cleanup tables. Never a safety problem -- a leak, not a dangling reference |
 | `__del__` timing (4.10.0) | runs when the garbage collector notices (or at interpreter exit for some cycles) | runs at the exact program point where the last reference drops, and the optimizer may not move or elide that drop | it is the one observable lifetime event, so it must be identical in both tiers; making it a fixed drop point is what guarantees that |
 | object drop points (4.10.1) | a name is kept alive until the frame or module that bound it tears down, so a loop variable from the last iteration survives to the end of the function | a reference is dropped at the exit of the **scope that owns it**: a loop body releases what each iteration created on the back edge, and a `return`/`break`/`continue` releases the references that path owns | it keeps the reference count equal to the number of *lexically live* owners, so a per-iteration object is freed each pass instead of accumulating, and the observable `__del__` order follows the program's block structure rather than CPython's frame teardown. `fuzz_diff.py --oop` exempts this from the CPython oracle for `__del__` programs; the two tiers always agree with each other |
-| classes (4.10.1/4.10.2) | classes, instances, multiple inheritance, decorators, `__dict__`, metaclasses, dynamic attribute addition | a baseless `class Name:` or a single base declared earlier (multiple inheritance is 4.10.4); no decorators (4.10.6 adds `property`/`classmethod` keywords); an attribute is `int[w]`/`float[64]`/`bool`/a class reference, and an instance has exactly its declared attributes; a class-typed variable is non-null; a list/tuple element may be a class reference only in a fully initialized literal (4.10.3) | a class is a layout the compiler knows, so an attribute is a fixed offset and a method is inlined or reached through a fixed slot; dynamic attributes would need a runtime shape and a hash map, nullability needs `Optional`, and a reference leaf in a container needs the per-slot ownership of 4.10.3, all later additions |
+| classes (4.10.1–4.10.4) | classes, instances, multiple inheritance, decorators, `__dict__`, metaclasses, dynamic attribute addition | a baseless `class Name:` or one or more bases declared earlier, combined by C3; no decorators (4.10.6 adds `property`/`classmethod` keywords); an attribute is `int[w]`/`float[64]`/`bool`/a class reference, and an instance has exactly its declared attributes; a class-typed variable is non-null; a list/tuple element may be a class reference only in a fully initialized literal (4.10.3) | a class is a layout the compiler knows, so an attribute is a fixed offset and a method is inlined or reached through a fixed slot; dynamic attributes would need a runtime shape and a hash map, nullability needs `Optional`, and a reference leaf in a container needs the per-slot ownership of 4.10.3, all later additions |
+| multiple bases' attribute state (4.10.4) | each base keeps its own independent state; a class may inherit disjoint or conflicting layouts from several bases | every base must be prefix-compatible at identical offsets; shared diamond state is stored once, and conflicting or disjoint stateful bases are refused (`E0127`) | one instance has one header and one fixed set of offsets; composing independent base states would need two headers or per-base indirection, which would make the zero-cost upcast and fixed-offset access impossible |
 | class references in a container (4.10.3) | a list/tuple holds object references and can grow, shrink, be iterated and be passed freely | a list/tuple of class references is a fixed-capacity run of one 8-byte reference per slot; the literal must fill every slot (no bare declaration, shorter literal or `append`); overwriting a slot retains the new reference before releasing the old one; scope exit drops one reference per slot in reverse flat order; reads are borrows; `in`/identity compare references; `enumerate`/`zip` and class-typed container parameters/returns are refused; dict class keys/values are deferred | one owner per slot is what keeps the reference count exactly equal to the live owners, so per-element `__del__` is deterministic in both tiers; a loop target bound to an element outlives the iteration, so its ownership rule is deliberately left for a later sub-stage, and a container has no value form to cross a function header |
-| method resolution (4.10.2) | a full MRO, with multiple inheritance, cooperative `super()` and `__mro__` | one base per class, and `super()` starts at the enclosing class's **single** base; a method is found by walking the base chain | with exactly one base there is one lookup path, so an MRO is machinery for a shape the language does not yet have; 4.10.4 adds multiple inheritance and the MRO with it |
-| virtual dispatch (4.10.2) | each call does a fresh class/instance-dict lookup | a method name gets one vtable slot, stable down the chain; a statically exact receiver is inlined (and devirtualized when the hierarchy proves no override), otherwise `CallVirtual` reads the receiver's own descriptor | fixed slots are what let a base-compiled call site stay valid for every subclass, and keeping the monomorphic inline path means inheritance costs nothing on the calls the compiler can already see through |
-| `isinstance` / `issubclass` (4.10.2) | `isinstance` walks `__mro__` and accepts a tuple of classes; `issubclass` accepts arbitrary class objects | `isinstance(x, C)` is a class-reference check lowered to two integer compares against C's subtree range; `issubclass(A, B)` takes two class **names** and folds at compile time | the hierarchy is closed and single, so type ids can be assigned pre-order and each subtree is one contiguous interval; tuples and runtime class objects would need the reflection surface this slice omits |
+| method resolution and `super()` (4.10.2/4.10.4) | a full MRO, with multiple inheritance, cooperative `super()` and `__mro__` | Python's C3 linearization; `super()` starts after the class that **defined** the running method in the receiver's actual MRO; a dynamic `super()` requires every concrete subclass to have a later concrete implementation and every reachable definition to share the signature; `super().__init__` is resolved statically along the construction class's MRO; `__del__` is selected once by MRO and `super().__del__` is refused | a closed hierarchy can compile every lookup and keep one global slot per method; an unsupported dynamic super would leave a call site with no target on some concrete class, and construction is the one point where the exact object class is known, so its cooperative chain can be inlined with definite-init bookkeeping |
+| virtual dispatch (4.10.2/4.10.4) | each call does a fresh class/instance-dict lookup | a method name gets one global vtable slot, stable down the hierarchy; a statically exact receiver is inlined (and devirtualized when the hierarchy proves no override), otherwise `CallVirtual` reads the receiver's own descriptor; the descriptor records the **declaring owner**, so an inherited slot runs the owner's function rather than a per-subclass copy | fixed slots are what let a base-compiled call site stay valid for every subclass, and keeping the monomorphic inline path means inheritance costs nothing on the calls the compiler can already see through |
+| `isinstance` / `issubclass` (4.10.2/4.10.4) | `isinstance` walks `__mro__` and accepts a tuple of classes; `issubclass` accepts arbitrary class objects | `isinstance(x, C)` probes C's type id in the object descriptor's ancestor bitset; `issubclass(A, B)` takes two class **names** and folds along C3 at compile time | the hierarchy is closed, so every ancestor set is known at compile time; a bitset replaces the subtree range because a diamond's descendants are not one contiguous id interval, and tuples/runtime class objects would need the reflection surface this slice omits |
 | abstract methods (4.10.2) | the `abc` module, `@abstractmethod`, and runtime enforcement | a method body of `...` marks the slot abstract; the class is flagged and refused at construction (E0140) until a subclass implements it | `...` is already the spelling a stub uses, and a static flag plus the construction check enforces the rule with no `abc` import or metaclass |
-| identity between two unrelated class references (4.10.2) | `a is b` is valid for any two objects and is usually `False` | same-or-related classes compare by address; two **unrelated** class references are refused (E0140) | the comparison can never be true for unrelated classes, so refusing it at compile time turns a meaningless question into a diagnostic; `isinstance` is the way to ask about type |
+| identity between two class references (4.10.2/4.10.4) | `a is b` is valid for any two objects and is usually `False` | same-or-related classes compare by address; two classes with **no possible common declared subclass** are refused (E0140) | the comparison can never be true when no declared class is a subclass of both; under multiple inheritance a `B`-typed and a `C`-typed reference may name the same `D`, so the relation is possible-common-subclass rather than plain disjointness, and `isinstance` is the way to ask about type |
 | a reference returned from a function (4.10.1) | the return transfers whatever the object's reference count implies: a fresh object is new, a returned parameter is a borrow the caller must not free | the callee **retains** what it returns, so every class-typed call result is one owned reference the caller drops at its own scope exit | it makes a fresh construction, an owned local and a borrowed parameter one uniform contract; without the retain, `return param` would hand the caller a reference the callee never owned (a use-after-free), so the borrow ambiguity is resolved by construction rather than by inference |
 | `==`/`!=` on two objects (4.10.1) | calls `__eq__` (default is identity) | identity -- one integer compare of the two references (`is`/`is not` are the same compare) | `__eq__` arrives with the other special methods in 4.10.5; until then "same object" is the only meaning, and it is spelled out rather than silently defaulting |
 | a bare class name in a value position (4.10.1) | the class object is a first-class value | refused (`E0140`), pointing at `Name(...)` | a class is a layout, not a value; making it a value would mean a class object and the reflection surface (metaclasses, `type(name, bases, ns)`) this slice deliberately omits |
@@ -1776,7 +1803,7 @@ Deliberate narrowings, collected next to `%` and `v == n`:
 * [x] Object runtime (4.10.0) — the reference-counted heap foundation for real
   classes: an `mmap` allocator with size-class free lists (no libc), the
   `[vptr:8][refcount:8]` instance header, a read-only `ClassDescriptor` (type id,
-  subtree range, vtable, `__del__`), and shared `IncRef`/`DecRef`. The `__del__`
+  ancestor bitset, vtable, `__del__`), and shared `IncRef`/`DecRef`. The `__del__`
   moment is pinned to the last drop and the optimizer may not move it, so both
   tiers agree; an object with no `__del__` frees freely, and descriptors/stack
   objects are immortal (no increment emitted). **No user-visible language change
@@ -1806,13 +1833,15 @@ Deliberate narrowings, collected next to `%` and `v == n`:
   earlier, base-first layout (a subclass instance starts with a valid base
   instance, so the upcast is free), stable vtable slots, monomorphic inlining
   with a `CallVirtual` fallback, `super()` (including `super().__init__`)
-  resolving at the enclosing class's base, `isinstance` as a subtree-range
-  check, compile-time `issubclass`, abstract methods spelled `...` (the class is
+  resolving in the MRO after the defining class, `isinstance` via the ancestor
+  bitset (this stage originally used a subtree range), compile-time `issubclass`,
+  abstract methods spelled `...` (the class is
   flagged and cannot be instantiated), and implicit upcasts in class-typed
   assignments, parameters and returns. Guards: `class_inherit.lio`,
   `class_inherit_super.lio`, `class_inherit_isinstance.lio`,
   `class_inherit_params.lio`, and the inheritance shapes in
-  `fuzz_diff.py --oop`. Multiple inheritance is 4.10.4.
+  `fuzz_diff.py --oop`. The 4.10.4 stage below extends this with multiple bases
+  and C3.
 * [x] Class references in containers (4.10.3) — `list[P, N]` and `tuple[P, N]`
   hold one 8-byte reference leaf per slot, including nested
   `list[list[P, 2], 2]` as one flat run. The declared element class is the
@@ -1828,6 +1857,25 @@ Deliberate narrowings, collected next to `%` and `v == n`:
   coded refusals. Guards: `class_container_list.lio`,
   `class_container_inherit.lio`, `class_container_lifetime.lio`, and the
   container shape in `fuzz_diff.py --oop`.
+* [x] Multiple inheritance (4.10.4) — `class D(B, C):` combines earlier bases
+  with Python's C3 linearization, including the diamond `D(B, C)`/`D(C, B)`
+  ordering distinction. Slots stay global by method name and each descriptor
+  records the declaring owner, so an inherited slot reaches the owner's emitted
+  `__virt__` function. Every base is prefix-compatible at identical attribute
+  offsets: a diamond stores its shared root state once, while conflicting or
+  disjoint stateful bases are refused (`E0127`). A cooperative `super()` is
+  dynamic: it starts after the class that defined the running method in the
+  receiver's actual MRO, and can call a method the enclosing class does not
+  override; every reachable definition must share the signature and every
+  concrete subclass must have a later concrete implementation (`E0135`).
+  `super().__init__` is resolved statically along the construction class's MRO,
+  a destructor is selected once by MRO with only its owner emitting code, and
+  `super().__del__` is refused. `isinstance` uses an ancestor bitset (a
+  diamond's descendants are no longer contiguous) and identity compares are
+  allowed whenever a common declared subclass is possible. Class-typed results
+  returned through `super()`/virtual calls are one owned reference. Guards:
+  `class_multiple_inherit.lio`, `class_multiple_lifetime.lio`,
+  `object_runtime_test`, and the fourth diamond shape in `fuzz_diff.py --oop`.
 
 ---
 
@@ -1943,7 +1991,7 @@ python3 tools/run_tier_diff.py
 
 Every program runs twice — once through the interpreter (the oracle) and once
 through the native tier — and the two stdout streams must be byte-identical.
-Currently **159 / 159** cases pass, 93 of them on the native tier.
+Currently **231 / 231** cases pass, 132 of them on the native tier.
 
 Two classes of case are deliberately outside this comparison:
 

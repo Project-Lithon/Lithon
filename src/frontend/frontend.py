@@ -1168,6 +1168,104 @@ def _build_struct_layout(stmt, structs, enums):
 # lets RefLoad/RefStore carry an absolute offset.
 CLASS_HEADER_BYTES = 16
 
+# 4.10.5. Operator overloading is deliberately a small, typed surface. Equality
+# and ordering dunders are ordinary methods with one class-reference parameter
+# and a bool result, so they use the same vtable slot machinery as any other
+# method. `__str__`/`__repr__` are different: their result is a bounded string,
+# which has no register form in this ABI. They are therefore TEXT methods, not
+# callable values and not vtable slots -- they are inlined only where print()
+# needs their text. Keeping these sets here makes every "is this name special?"
+# decision read from one place.
+COMPARISON_SPECIAL_METHODS = ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__")
+TEXT_SPECIAL_METHODS = ("__str__", "__repr__")
+
+# The source-level comparison operator -> (method name, negate the result).
+# `!=` is included because Python lets a class define `__ne__`; when it does not,
+# the lowering falls back to `not __eq__`.
+COMPARISON_METHOD_FOR_OP = {
+    "Eq": "__eq__",
+    "NotEq": "__ne__",
+    "Lt": "__lt__",
+    "LtE": "__le__",
+    "Gt": "__gt__",
+    "GtE": "__ge__",
+}
+
+
+def _method_return_only_expr(method):
+    """The expression of a method body that is exactly one `return expr`.
+
+    4.10.5. A `__str__`/`__repr__` result is not a value this slice can
+    return through the ordinary ABI. Restricting the supported shape to one
+    return statement makes the method's text a source expression that print()
+    can inline directly: no result run, no string-carrying call. A docstring is
+    ignored. Returns None for any other shape (including an abstract `...`).
+    """
+    body = [s for s in method.body
+            if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)
+                    and isinstance(s.value.value, str))]
+    if len(body) != 1:
+        return None
+    only = body[0]
+    if not isinstance(only, ast.Return) or only.value is None:
+        return None
+    return only.value
+
+
+def _validate_text_method_body(stmt, owner_name, layout):
+    """Validate the one expression a `__str__`/`__repr__` may return.
+
+    4.10.5. The text must be either a plain string literal or an f-string
+    whose `{...}` fields are direct scalar attributes of `self`. That is exactly
+    the subset object printing supports without a string return value: fields
+    are loaded and printed with the existing scalar print path, and the parts
+    have no side effects, so printing the object's text at its position inside
+    an f-string is still CPython's order.
+    """
+    method_name = stmt.name
+    if _method_is_abstract(stmt):
+        return
+    expr = _method_return_only_expr(stmt)
+    if expr is None:
+        raise NotImplementedError(
+            f"LITHON-E0134: {method_name} of class '{owner_name}' must be exactly one "
+            f"`return` of a string literal or f-string in 4.10.5; a bounded string has no "
+            f"value form, so object text is inlined at print() rather than returned")
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return
+    if not isinstance(expr, ast.JoinedStr):
+        raise NotImplementedError(
+            f"LITHON-E0134: {method_name} of class '{owner_name}' must return a string "
+            f"literal or f-string in 4.10.5 (4.10.5)")
+    for part in expr.values:
+        if isinstance(part, ast.Constant) and isinstance(part.value, str):
+            continue
+        if not isinstance(part, ast.FormattedValue):
+            raise NotImplementedError(
+                f"LITHON-E0134: {method_name} of class '{owner_name}' has an unsupported "
+                f"f-string part {type(part).__name__} (4.10.5)")
+        if part.format_spec is not None or part.conversion != -1:
+            raise NotImplementedError(
+                f"LITHON-E0134: {method_name} of class '{owner_name}' cannot use an f-string "
+                f"format spec or conversion; print the field directly, e.g. "
+                f"f\"{{self.x}}\" (4.10.5)")
+        value = part.value
+        if not (isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name)
+                and value.value.id == "self"):
+            raise NotImplementedError(
+                f"LITHON-E0134: an f-string field in {method_name} of class '{owner_name}' "
+                f"must be a direct scalar attribute of self, e.g. {{self.x}} (4.10.5)")
+        attr = layout.attrs.get(value.attr)
+        if attr is None:
+            raise NotImplementedError(
+                f"LITHON-E0134: {method_name} of class '{owner_name}' names unknown attribute "
+                f"'{value.attr}' (4.10.5)")
+        if attr["kind"] not in ("int", "float", "bool"):
+            raise NotImplementedError(
+                f"LITHON-E0134: an f-string field in {method_name} of class '{owner_name}' "
+                f"must be an int, float or bool attribute; '{value.attr}' is a "
+                f"{attr['kind']} (4.10.5)")
+
 
 def _class_attr_type(owner_name, attr_name, ann, classes, structs, enums):
     """Resolves a class attribute annotation to (kind, width, ref_name, byte_size).
@@ -1420,11 +1518,44 @@ def _validate_class_method(stmt, owner_name, layout, classes, structs, enums,
         layout.del_owner = owner_name
         layout.own_methods[method_name] = stmt
         return
-    if method_name.startswith("__") and method_name.endswith("__"):
+    is_text = method_name in TEXT_SPECIAL_METHODS
+    is_comparison = method_name in COMPARISON_SPECIAL_METHODS
+    if (method_name.startswith("__") and method_name.endswith("__")
+            and not (is_text or is_comparison)):
         raise NotImplementedError(
-            f"LITHON-E0134: special method '{owner_name}.{method_name}' is not supported yet; "
-            f"operator overloading arrives in 4.10.5 (4.10.1)")
-    if stmt.returns is not None:
+            f"LITHON-E0134: special method '{owner_name}.{method_name}' is not supported in "
+            f"4.10.5; the supported special methods are {', '.join(COMPARISON_SPECIAL_METHODS)} "
+            f"and {', '.join(TEXT_SPECIAL_METHODS)} (4.10.5)")
+    if is_comparison:
+        if len(a.args[1:]) != 1:
+            raise NotImplementedError(
+                f"LITHON-E0134: {method_name} of class '{owner_name}' takes exactly one "
+                f"argument besides self, the other operand (4.10.5)")
+        other_ann = a.args[1].annotation
+        other_t = parse_type_annotation(other_ann)
+        if other_t.kind != "class":
+            raise NotImplementedError(
+                f"LITHON-E0134: the argument of {method_name} of class '{owner_name}' must "
+                f"be a class reference, e.g. other: {owner_name} (4.10.5)")
+        if not (isinstance(stmt.returns, ast.Name) and stmt.returns.id == "bool"):
+            raise NotImplementedError(
+                f"LITHON-E0134: {method_name} of class '{owner_name}' must declare `-> bool`; "
+                f"a comparison returns a bool (4.10.5)")
+    elif is_text:
+        if a.args[1:]:
+            raise NotImplementedError(
+                f"LITHON-E0134: {method_name} of class '{owner_name}' takes only `self` "
+                f"(4.10.5)")
+        if stmt.returns is None:
+            raise NotImplementedError(
+                f"LITHON-E0134: {method_name} of class '{owner_name}' must declare a bounded "
+                f"string return, e.g. -> str[32] (4.10.5)")
+        ret_t = parse_type_annotation(stmt.returns)
+        if ret_t.kind != "str" or ret_t.cap is None:
+            raise NotImplementedError(
+                f"LITHON-E0134: {method_name} of class '{owner_name}' must return a bounded "
+                f"string, e.g. -> str[32]; a bounded string is a run, not a scalar (4.10.5)")
+    elif stmt.returns is not None:
         _class_method_value_type(stmt.returns, owner_name, method_name, "return type",
                                  classes, structs, enums)
     if method_name in layout.attrs:
@@ -1444,11 +1575,16 @@ def _validate_class_method(stmt, owner_name, layout, classes, structs, enums,
                 f"LITHON-E0135: override '{owner_name}.{method_name}' does not match the "
                 f"inherited signature; an override takes the same parameters and returns the "
                 f"same type (4.10.2)")
-    else:
+    elif not is_text:
         # A NEW method: take the next GLOBAL slot. Slots are keyed by method
         # name, not by the class that first declared it, so every class in a
         # multiple-inheritance hierarchy agrees on the index even when the
         # method is inherited along different branches.
+        #
+        # 4.10.5. __str__/__repr__ are deliberately NOT slots: their bounded
+        # string result has no register form, so they cannot be called through
+        # the virtual-call ABI. print() resolves them statically per concrete
+        # class and inlines their one text expression.
         if method_name not in method_slots:
             method_slots[method_name] = len(method_slots)
         layout.slots[method_name] = method_slots[method_name]
@@ -1581,6 +1717,14 @@ def _build_class_layout(stmt, classes, structs, enums, method_slots):
                         f"signatures for method '{mname}' from '{owner}' and '{other}'; "
                         f"one vtable slot must have one signature (4.10.4)")
             layout.methods[mname] = method
+            if mname in TEXT_SPECIAL_METHODS:
+                # 4.10.5. Object text is resolved per concrete class at print
+                # time, not through a vtable slot (a bounded string has no
+                # register return form).
+                layout.method_owners[mname] = owner
+                if _method_is_abstract(method):
+                    layout.abstract.add(mname)
+                continue
             layout.slots[mname] = owner_layout.slots[mname]
             layout.method_owners[mname] = owner
             if _method_is_abstract(method):
@@ -1633,6 +1777,12 @@ def _build_class_layout(stmt, classes, structs, enums, method_slots):
         }
         layout.own_attrs.add(attr_name)
         offset += byte_size
+    # 4.10.5. The text-method shape check needs every attribute, including
+    # ones declared after the method in the class body.
+    for method_name in TEXT_SPECIAL_METHODS:
+        method = layout.own_methods.get(method_name)
+        if method is not None:
+            _validate_text_method_body(method, stmt.name, layout)
     layout.instance_size = offset
     classes[stmt.name] = layout
     return layout
@@ -2224,6 +2374,62 @@ class IRBuilder:
             "LITHON-E0115: input() takes an optional string literal prompt, e.g. "
             'input("Enter x: ")')
 
+    # ---- 4.10.5. Comparison special methods -------------------------------
+    #
+    # A class reference is a pointer, so without a special method `==`/`!=` is
+    # identity. Once a class declares `__eq__` (or `__ne__`), the corresponding
+    # operator is a method call; `is`/`is not` never dispatch. Ordering has no
+    # identity fallback: a class either declares the matching method or the
+    # comparison is refused. The call is built as an ordinary method call, so
+    # inlining, devirtualization and dynamic dispatch are exactly the machinery
+    # 4.10.2/4.10.4 already provide.
+
+    def _build_class_comparison(self, node, op_type):
+        """Build a comparison on class references, or None to use the scalar /
+        identity path.
+
+        `op_type` is the ast operator class (`ast.Eq`, ...). A missing `__ne__`
+        falls back to `not __eq__`, matching Python; a missing `__eq__` keeps
+        identity for `==` in this slice. Returns None when the receiver is not a
+        class reference or when equality should use identity.
+        """
+        left_class = self._peek_receiver_class(node.left)
+        right_class = self._peek_receiver_class(node.comparators[0])
+        op_name = op_type.__name__
+        if left_class is None:
+            if right_class is not None and op_name in ("Lt", "LtE", "Gt", "GtE"):
+                raise NotImplementedError(
+                    f"LITHON-E0135: ordering compares two class references with the left "
+                    f"operand's {COMPARISON_METHOD_FOR_OP[op_name]}(); the left operand here "
+                    f"is not a class reference (4.10.5)")
+            return None
+        method_name = COMPARISON_METHOD_FOR_OP[op_name]
+        negate = False
+        resolved = self._resolve_method(left_class, method_name)
+        if resolved is None and op_name == "NotEq":
+            # Python's `!=` uses `__ne__` when present and otherwise negates
+            # `__eq__`; it does not fall back to identity when `__eq__` exists.
+            method_name = "__eq__"
+            resolved = self._resolve_method(left_class, method_name)
+            negate = True
+        if resolved is None:
+            if op_name in ("Eq", "NotEq"):
+                # No equality special method: object identity is the default,
+                # and the existing identity block below handles the operands.
+                return None
+            raise NotImplementedError(
+                f"LITHON-E0135: class '{left_class}' has no {method_name}() for this ordering "
+                f"comparison; define it or compare identity with is/is not (4.10.5)")
+        call = ast.Call(
+            func=ast.Attribute(value=node.left, attr=method_name, ctx=ast.Load()),
+            args=[node.comparators[0]], keywords=[])
+        r = self.build_expr(call)
+        if negate:
+            out = self.new_reg()
+            self.emit(f"{out} = not {r}")
+            return out
+        return r
+
     def _build_membership(self, positive, value_node, container_node):
         """`x in xs` (or `not in`) over a fixed-capacity list.
 
@@ -2482,6 +2688,13 @@ class IRBuilder:
                     op_type is ast.In,
                     node.left,
                     node.comparators[0])
+            # 4.10.5. A class reference with an equality/ordering special
+            # method dispatches to that method. `is`/`is not` are deliberately
+            # absent from this set: they stay pointer identity.
+            if op_type in (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE):
+                special = self._build_class_comparison(node, op_type)
+                if special is not None:
+                    return special
             # 6.2. `s == t` between two bounded strings is a run comparison, not
             # a scalar `eq`: a string is N bytes and never a register value, so
             # it lowers to StrEq naming both places rather than loading either.
@@ -2530,6 +2743,17 @@ class IRBuilder:
             left = self.build_expr(node.left)
             right = self.build_expr(node.comparators[0])
             op_map = {ast.Lt: "lt", ast.Gt: "gt", ast.Eq: "eq", ast.NotEq: "ne"}
+            # 4.10.5. There is no `le`/`ge` opcode, and none is needed:
+            # `a <= b` is `not (b < a)` and `a >= b` is `not (b > a)`. This is
+            # also what lets a typed `__le__`/`__ge__` body compare scalars
+            # with the natural operator.
+            if op_type in (ast.LtE, ast.GtE):
+                base = "lt" if op_type is ast.LtE else "gt"
+                inner = self.new_reg()
+                self.emit(f"{inner} = {base} {right}, {left}")
+                r = self.new_reg()
+                self.emit(f"{r} = not {inner}")
+                return r
             if op_type not in op_map:
                 raise NotImplementedError(f"LITHON-E0114: comparison {op_type.__name__} not supported yet")
             r = self.new_reg()
@@ -3956,6 +4180,10 @@ class IRBuilder:
         implementation agree on the argument registers and the result type.
         """
         method_name = call.func.attr
+        if method_name in TEXT_SPECIAL_METHODS:
+            raise NotImplementedError(
+                f"LITHON-E0135: {method_name}() cannot be called as a value; a bounded string "
+                f"has no value form in 4.10.5 -- print the object instead (4.10.5)")
         resolved = self._resolve_method(class_name, method_name)
         if resolved is None:
             layout = self.classes[class_name]
@@ -4109,11 +4337,22 @@ class IRBuilder:
                 "LITHON-E0135: super().__del__() is not supported; a destructor runs once "
                 "at the last drop (4.10.4)")
 
+        # `super()` starts AFTER the enclosing class, so the call is legal even
+        # when the enclosing class does not override this method itself: e.g.
+        # `Derived.bonus` may call `super().total()` and reach the base's
+        # implementation. Resolve the next definition in the STATIC MRO for the
+        # signature; the receiver's actual MRO is what the runtime scans.
         method = layout.own_methods.get(method_name)
         if method is None:
+            for anc in layout.mro[1:]:
+                cand = self.classes[anc].own_methods.get(method_name)
+                if cand is not None:
+                    method = cand
+                    break
+        if method is None:
             raise NotImplementedError(
-                f"LITHON-E0135: super().{method_name}() is not a method declared by "
-                f"'{enclosing}' (4.10.4)")
+                f"LITHON-E0135: super().{method_name}() has no implementation after "
+                f"'{enclosing}' in its MRO (4.10.4)")
         params = method.args.args[1:]
         if call.keywords or any(isinstance(a, ast.Starred) for a in call.args):
             raise NotImplementedError(
@@ -4233,6 +4472,10 @@ class IRBuilder:
         """
         layout = self.classes[class_name]
         method_name = call.func.attr
+        if method_name in TEXT_SPECIAL_METHODS:
+            raise NotImplementedError(
+                f"LITHON-E0135: {method_name}() cannot be called as a value; a bounded string "
+                f"has no value form in 4.10.5 -- print the object instead (4.10.5)")
         if method_name in layout.attrs:
             raise NotImplementedError(
                 f"LITHON-E0135: '{method_name}' in class '{class_name}' is an attribute, not a "
@@ -5003,6 +5246,126 @@ class IRBuilder:
     # bytes a `str[N]` literal construction writes. No format string carrying
     # user text is ever handed to printf, so a `%` in a literal is just a byte.
 
+    def _concrete_classes_of(self, class_name):
+        """The class itself plus every non-abstract subclass, derived first.
+
+        Printing a class reference must choose the `__str__`/`__repr__` of the
+        receiver's ACTUAL class, while the expression only fixes a static class.
+        The hierarchy is closed, so the concrete candidates are known; ordering
+        derived-first makes a sequence of `isinstance` checks select exactly the
+        actual class (a checked class cannot be a strict ancestor of a later,
+        more-derived candidate).
+        """
+        out = []
+        for cname, layout in self.classes.items():
+            if _layout_is_abstract(layout):
+                continue
+            if _is_subclass_of(cname, class_name, self.classes):
+                out.append(cname)
+        out.sort(key=lambda c: (-len(self.classes[c].mro), c))
+        return out
+
+    def _resolve_text_method(self, class_name):
+        """The (owner, method) that supplies an object's printed text.
+
+        Python's `str(obj)` uses `__str__`; when a class has no `__str__` it
+        falls back to `__repr__`. If neither exists, printing is refused here
+        rather than inventing an address-bearing default, which the runtime's
+        tier-parity rules make unobservable.
+        """
+        resolved = self._resolve_method(class_name, "__str__")
+        if resolved is not None:
+            return resolved
+        return self._resolve_method(class_name, "__repr__")
+
+    def _emit_special_text(self, owner_name, method, recv_reg, class_name):
+        """Inline one restricted `__str__`/`__repr__` body and print its text.
+
+        4.10.5. The method body is one return of a literal or a scalar-only
+        f-string (enforced when the class is declared). Binding `self` to the
+        receiver lets the existing scalar print path render every field; the
+        declared `str[N]` capacity is checked for a literal so an over-long
+        result cannot silently exceed the method's contract.
+        """
+        expr = _method_return_only_expr(method)
+        if expr is None:
+            raise NotImplementedError(
+                f"LITHON-E0134: {method.name} of class '{owner_name}' has no printable text "
+                f"in 4.10.5 (4.10.5)")
+        ret_t = parse_type_annotation(method.returns)
+        prefix = self._fresh_method_prefix()
+        self_name = prefix + "self"
+        rename = {"self": self_name}
+        old_self = getattr(self, "_cur_self_name", None)
+        self._cur_self_name = self_name
+        try:
+            self.declared[self_name] = Type("class", ref=class_name)
+            self.class_vars[self_name] = class_name
+            self.emit(f"store {self_name}, {recv_reg}"
+                      f"{render_type_suffix(Type('class', ref=class_name))}")
+            expr = _SelfRename(rename).visit(copy.deepcopy(expr))
+            if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+                if len(expr.value.encode("utf-8")) + 1 > ret_t.cap:
+                    raise NotImplementedError(
+                        f"LITHON-E0111: {method.name} of class '{owner_name}' returns a "
+                        f"literal longer than its str[{ret_t.cap}] result; it holds at most "
+                        f"{ret_t.cap - 1} bytes plus a NUL (4.10.5)")
+                self._emit_print_literal(expr.value)
+            else:
+                self._emit_print_fstring(expr)
+        finally:
+            self._cur_self_name = old_self
+
+    def _emit_print_object(self, recv_reg, class_name):
+        """Print an object through its actual class's `__str__`/`__repr__`.
+
+        If every concrete candidate resolves to the same method, this is one
+        inlined text expression. Otherwise emit one `isinstance` branch per
+        concrete candidate, derived first, and inline that candidate's selected
+        method in each branch. No string ever crosses a call boundary, and the
+        emitted pieces are only the existing literal/scalar print operations.
+        """
+        candidates = self._concrete_classes_of(class_name)
+        if not candidates:
+            raise NotImplementedError(
+                f"LITHON-E0135: cannot print a {class_name}; the class and all its subclasses "
+                f"are abstract (4.10.5)")
+        entries = []
+        for cname in candidates:
+            resolved = self._resolve_text_method(cname)
+            if resolved is None:
+                raise NotImplementedError(
+                    f"LITHON-E0135: cannot print a {class_name}: a {cname} has neither "
+                    f"__str__ nor __repr__ (4.10.5)")
+            owner, method = resolved
+            entries.append((cname, owner, method))
+        identities = {(owner, method.name) for _c, owner, method in entries}
+        if len(identities) == 1:
+            cname, owner, method = entries[0]
+            self._emit_special_text(owner, method, recv_reg, cname)
+            return
+        done = self.reserve_label()
+        for i, (cname, owner, method) in enumerate(entries):
+            if i == len(entries) - 1:
+                # Every other concrete class has been excluded by the earlier
+                # isinstance checks, so the last candidate is the fallback.
+                # Jump explicitly to the merge: a block does not fall through
+                # in the IR, even when the next block is emitted textually next.
+                self._emit_special_text(owner, method, recv_reg, cname)
+                self.emit(f"jump {done}")
+                break
+            then_label = self.reserve_label()
+            next_label = self.reserve_label()
+            cond = self.new_reg()
+            idx = self._class_index_of(cname)
+            self.emit(f"{cond} = isinstance {recv_reg}, {cname}, {idx}")
+            self.emit(f"branch {cond}, {then_label}, {next_label}")
+            self.start_block(then_label)
+            self._emit_special_text(owner, method, recv_reg, cname)
+            self.emit(f"jump {done}")
+            self.start_block(next_label)
+        self.start_block(done)
+
     def _emit_print_arg(self, arg):
         """One top-level print() argument, expanded in place.
 
@@ -5041,6 +5404,15 @@ class IRBuilder:
         evaluate several operands in Python's argument order and print them
         afterwards -- which is exactly what an f-string's `{...}` parts need.
         """
+        # 4.10.5. A class reference prints through its actual class's
+        # __str__/__repr__. The receiver is evaluated here, as an ordinary
+        # print operand; the text itself is emitted later by _print_place, so
+        # an f-string still evaluates every operand before printing any piece.
+        class_name = self._peek_receiver_class(arg)
+        if class_name is not None:
+            arg_reg = self.build_expr(arg)
+            actual = self.reg_class.get(arg_reg, class_name)
+            return ("object", arg_reg, actual)
         cp = self._container_print_arg(arg)
         if cp is not None:
             return ("container", cp[0], cp[1])
@@ -5056,6 +5428,9 @@ class IRBuilder:
     def _print_place(self, place):
         """Emits the runtime print for a place _eval_print_place produced."""
         kind, value, *rest = place
+        if kind == "object":
+            self._emit_print_object(value, rest[0])
+            return
         if kind == "container":
             decl = rest[0]
             # Phase 6.7. A list prints its LIVE length, so the companion length
@@ -7005,7 +7380,8 @@ def build_program(tree):
     for cname, clayout in classes.items():
         for sname, method in sorted(clayout.own_methods.items(),
                                     key=lambda kv: clayout.slots.get(kv[0], 0)):
-            if sname in ("__init__", "__del__") or _method_is_abstract(method):
+            if (sname in ("__init__", "__del__") or sname in TEXT_SPECIAL_METHODS
+                    or _method_is_abstract(method)):
                 continue
             _emit_class_method_function(
                 IRBuilder, fn_rename, structs, enums, classes, fn_returns,

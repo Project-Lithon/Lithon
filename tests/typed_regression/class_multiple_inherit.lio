@@ -70,6 +70,10 @@ class L(B, C):
     def tag(self) -> int[64]:
         return 27
 
+    def bonus(self) -> int[64]:
+        # L does not override `who`; super() still starts after L and finds B.
+        return super().who() + 5
+
 
 class R(C, B):
     def tag(self) -> int[64]:
@@ -107,6 +111,7 @@ def main():
     l: L = L(4)
     r: R = R(6)
     print(l.who())
+    print(l.bonus())
     print(r.who())
     print(l.tag())
     print(r.tag())

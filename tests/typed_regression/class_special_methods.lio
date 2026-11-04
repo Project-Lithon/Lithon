@@ -1,0 +1,97 @@
+class Point:
+    x: int[64]
+    y: int[64]
+
+    def __init__(self, x: int[64], y: int[64]):
+        self.x = x
+        self.y = y
+
+    def __eq__(self, other: Point) -> bool:
+        return self.x == other.x and self.y == other.y
+
+    def __lt__(self, other: Point) -> bool:
+        return self.x < other.x
+
+    def __le__(self, other: Point) -> bool:
+        return self.x <= other.x
+
+    def __gt__(self, other: Point) -> bool:
+        return self.x > other.x
+
+    def __ge__(self, other: Point) -> bool:
+        return self.x >= other.x
+
+    def __str__(self) -> str[64]:
+        return f"Point({self.x}, {self.y})"
+
+
+class Animal:
+    name: int[64]
+
+    def __init__(self, name: int[64]):
+        self.name = name
+
+    def __str__(self) -> str[64]:
+        return f"Animal({self.name})"
+
+
+class Dog(Animal):
+    def __str__(self) -> str[64]:
+        return f"Dog({self.name})"
+
+
+class Label:
+    tag: int[64]
+
+    def __init__(self, tag: int[64]):
+        self.tag = tag
+
+    def __repr__(self) -> str[32]:
+        return f"Label<{self.tag}>"
+
+
+class Empty:
+    def __str__(self) -> str[8]:
+        return "Empty"
+
+
+class Token:
+    value: int[64]
+
+    def __init__(self, value: int[64]):
+        self.value = value
+
+
+p: Point = Point(1, 2)
+q: Point = Point(1, 2)
+r: Point = Point(2, 0)
+
+print(p == q)
+print(p != q)
+print(p == r)
+print(p != r)
+print(p < r)
+print(p <= q)
+print(r > p)
+print(r >= q)
+print(p is q)
+print(p is not q)
+print(p)
+print("p:", p)
+print(f"[{p}]")
+
+a: Animal = Animal(1)
+d: Animal = Dog(2)
+print(a)
+print(d)
+print(a, d)
+print(f"{a}/{d}")
+
+l: Label = Label(9)
+print(l)
+print(Empty())
+
+t1: Token = Token(4)
+t2: Token = Token(4)
+print(t1 == t2)
+print(t1 is t2)

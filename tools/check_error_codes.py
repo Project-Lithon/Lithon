@@ -630,6 +630,50 @@ FRONTEND_REFUSALS = [
      "class C:\n    def f(self) -> int[64]:\n        return 2\n"
      "class D(B, C):\n    def g(self) -> int[64]:\n        return 3\nprint(0)\n",
      "LITHON-E0135"),
+    # 4.10.5. Special methods are a deliberately small typed surface:
+    # comparison dunders take one class reference and return bool, while
+    # __str__/__repr__ may only return one literal/f-string expression that
+    # print() can inline (a bounded string has no value form). Unsupported
+    # dunders, missing ordering methods, objects without text, and explicit
+    # calls to a text method are all refused with a code.
+    ("an unsupported special method (E0134)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    def __add__(self, other: P) -> P:\n        return self\n"
+     "p: P = P(1)\nprint(p.x)\n", "LITHON-E0134"),
+    ("an equality method with the wrong arity (E0134)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    def __eq__(self) -> bool:\n        return True\n"
+     "p: P = P(1)\nprint(p.x)\n", "LITHON-E0134"),
+    ("an equality method that does not return bool (E0134)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    def __eq__(self, other: P) -> int[64]:\n        return self.x\n"
+     "p: P = P(1)\nprint(p.x)\n", "LITHON-E0134"),
+    ("a text method that does not return a bounded string (E0134)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    def __str__(self) -> int[64]:\n        return self.x\n"
+     "p: P = P(1)\nprint(p.x)\n", "LITHON-E0134"),
+    ("a text method body that is not one return expression (E0134)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    def __str__(self) -> str[32]:\n        s = \"x\"\n        return s\n"
+     "p: P = P(1)\nprint(p.x)\n", "LITHON-E0134"),
+    ("a text method f-string field that is not a scalar self attribute (E0134)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    def __str__(self) -> str[32]:\n        return f\"{self}\"\n"
+     "p: P = P(1)\nprint(p.x)\n", "LITHON-E0134"),
+    ("printing an object with neither __str__ nor __repr__ (E0135)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "p: P = P(1)\nprint(p)\n", "LITHON-E0135"),
+    ("ordering a class without the matching special method (E0135)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "p: P = P(1)\nq: P = P(2)\nprint(p < q)\n", "LITHON-E0135"),
+    ("calling __str__ as a value (E0135)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    def __str__(self) -> str[32]:\n        return \"p\"\n"
+     "p: P = P(1)\nprint(p.__str__())\n", "LITHON-E0135"),
+    ("a text method literal longer than its declared result (E0111)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    def __str__(self) -> str[4]:\n        return \"abcdef\"\n"
+     "p: P = P(1)\nprint(p)\n", "LITHON-E0111"),
     # 4.10.3. Class references as list/tuple elements. Every slot must be filled
     # by the literal (a null reference is never a value), an element slot may be
     # overwritten only with a related class reference, append has no room, and

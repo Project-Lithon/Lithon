@@ -1,0 +1,21 @@
+True
+False
+False
+True
+True
+True
+True
+True
+False
+True
+Point(1, 2)
+p: Point(1, 2)
+[Point(1, 2)]
+Animal(1)
+Dog(2)
+Animal(1) Dog(2)
+Animal(1)/Dog(2)
+Label<9>
+Empty
+False
+False

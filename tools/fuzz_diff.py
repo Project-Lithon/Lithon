@@ -75,8 +75,9 @@ ACCUM_UNROLL = False
 # the gate -- but they can disagree with CPython on the interleaving. This is the
 # same treatment --mod-negatives gives the floored-vs-truncated `%%` gap.
 # Alternate seeds use the flat 4.10.1 shape, the 4.10.2 single-inheritance
-# shape, the 4.10.3 class-references-in-containers shape, and the 4.10.4
-# multiple-inheritance diamond shape, so one --oop run exercises all four.
+# shape, the 4.10.3 class-references-in-containers shape, the 4.10.4
+# multiple-inheritance diamond shape, and the 4.10.5 special-methods shape, so
+# one --oop run exercises all five.
 OOP_MODE = False
 # --phi: run the JIT twice, with and without the SSA pipeline, and require both
 # to match the interpreter. The plain run is the control: it proves the pipeline
@@ -1582,6 +1583,112 @@ class Gen:
         lines.append("print(p.total())")
         return "\n".join(lines) + "\n"
 
+    def program_oop_special(self):
+        """A class program built around 4.10.5's special methods.
+
+        The shape keeps every comparison left-dispatched: the derived class
+        overrides object TEXT but not equality/ordering, so CPython's
+        right-operand reflected priority (which Lithon does not implement) can
+        never change the answer. It exercises equality with and without a
+        special method, every ordering operator, identity staying pointer
+        identity, `__str__` on a base and a derived receiver, `__repr__` as the
+        print fallback, object text as its own print argument and inside an
+        f-string, and mixed argument printing.
+
+        Every value stays small and every comparison result is printed as
+        True/False, so the CPython oracle is byte-exact.
+        """
+        r = self.r
+        bname = r.choice(["Point", "Vec", "Base"])
+        dname = r.choice(["Marked", "Tagged", "Derived"])
+        rname = r.choice(["Label", "Tag", "ReprOnly"])
+        iname = r.choice(["Token", "Ident", "Plain"])
+        a1, a2, a3 = "x", "y", "tag"
+        v = [r.randint(0, 9) for _ in range(7)]
+
+        lines = []
+        lines.append(f"class {bname}:")
+        lines.append(f"    {a1}: int[64]")
+        lines.append(f"    {a2}: int[64]")
+        lines.append("")
+        lines.append(f"    def __init__(self, {a1}: int[64], {a2}: int[64]):")
+        lines.append(f"        self.{a1} = {a1}")
+        lines.append(f"        self.{a2} = {a2}")
+        lines.append("")
+        lines.append(f"    def __eq__(self, other: {bname}) -> bool:")
+        lines.append(f"        return self.{a1} == other.{a1} and self.{a2} == other.{a2}")
+        lines.append("")
+        lines.append(f"    def __lt__(self, other: {bname}) -> bool:")
+        lines.append(f"        return self.{a1} < other.{a1}")
+        lines.append("")
+        lines.append(f"    def __le__(self, other: {bname}) -> bool:")
+        lines.append(f"        return self.{a1} <= other.{a1}")
+        lines.append("")
+        lines.append(f"    def __gt__(self, other: {bname}) -> bool:")
+        lines.append(f"        return self.{a1} > other.{a1}")
+        lines.append("")
+        lines.append(f"    def __ge__(self, other: {bname}) -> bool:")
+        lines.append(f"        return self.{a1} >= other.{a1}")
+        lines.append("")
+        lines.append(f"    def __str__(self) -> str[64]:")
+        lines.append(f"        return f\"{bname}({{self.{a1}}}, {{self.{a2}}})\"")
+        lines.append("")
+        lines.append(f"class {dname}({bname}):")
+        lines.append(f"    {a3}: int[64]")
+        lines.append("")
+        lines.append(f"    def __init__(self, {a1}: int[64], {a2}: int[64], "
+                     f"{a3}: int[64]):")
+        lines.append(f"        super().__init__({a1}, {a2})")
+        lines.append(f"        self.{a3} = {a3}")
+        lines.append("")
+        lines.append(f"    def __str__(self) -> str[64]:")
+        lines.append(f"        return f\"{dname}({{self.{a1}}}, {{self.{a3}}})\"")
+        lines.append("")
+        lines.append(f"class {rname}:")
+        lines.append(f"    {a1}: int[64]")
+        lines.append("")
+        lines.append(f"    def __init__(self, {a1}: int[64]):")
+        lines.append(f"        self.{a1} = {a1}")
+        lines.append("")
+        lines.append(f"    def __repr__(self) -> str[32]:")
+        lines.append(f"        return f\"{rname}<{{self.{a1}}}>\"")
+        lines.append("")
+        lines.append(f"class {iname}:")
+        lines.append(f"    {a1}: int[64]")
+        lines.append("")
+        lines.append(f"    def __init__(self, {a1}: int[64]):")
+        lines.append(f"        self.{a1} = {a1}")
+        lines.append("")
+
+        lines.append(f"p: {bname} = {bname}({v[0]}, {v[1]})")
+        lines.append(f"q: {bname} = {bname}({v[0]}, {v[1]})")
+        lines.append(f"r: {bname} = {bname}({v[0] + 1}, {v[1]})")
+        lines.append(f"d: {bname} = {dname}({v[2]}, {v[3]}, {v[4]})")
+        lines.append("print(p == q)")
+        lines.append("print(p != q)")
+        lines.append("print(p == r)")
+        lines.append("print(p != r)")
+        lines.append("print(p < r)")
+        lines.append("print(p <= q)")
+        lines.append("print(p <= r)")
+        lines.append("print(r > p)")
+        lines.append("print(r >= q)")
+        lines.append("print(r >= p)")
+        lines.append("print(p is q)")
+        lines.append("print(p is not q)")
+        lines.append("print(p)")
+        lines.append("print(q)")
+        lines.append("print(d)")
+        lines.append("print(\"p:\", p, d)")
+        lines.append("print(f\"[{p}]/[{d}]\")")
+        lines.append(f"l: {rname} = {rname}({v[5]})")
+        lines.append("print(l)")
+        lines.append(f"t1: {iname} = {iname}({v[6]})")
+        lines.append(f"t2: {iname} = {iname}({v[6]})")
+        lines.append("print(t1 == t2)")
+        lines.append("print(t1 is t2)")
+        return "\n".join(lines) + "\n"
+
     def program(self):
         call_expr = self.emit_recursive_helper() if self.r.random() < 0.5 else None
         for v in VARS[:3]:
@@ -1811,7 +1918,8 @@ def main():
                          "with and without the SSA pipeline against the interpreter")
     ap.add_argument("--oop", action="store_true",
                     help="use the class-focused generator (see Gen.program_oop): construction, "
-                         "attributes, methods, aliasing, __del__ lifetime, identity")
+                         "attributes, methods, aliasing, __del__ lifetime, identity, containers, "
+                         "inheritance, multiple inheritance and special methods")
     args = ap.parse_args()
     TIMEOUT = args.timeout
     global UNROLL_DIAMONDS, SSA_MODE, ACCUM_UNROLL, DIRECT_PHI_MODE, OOP_MODE
@@ -1836,20 +1944,23 @@ def main():
         gen = Gen(seed, args.shared_loop_vars, floats=args.floats,
                   mod_negatives=args.mod_negatives)
         if args.oop:
-            # Alternate seeds across the four OOP shapes: the flat 4.10.1
+            # Alternate seeds across the five OOP shapes: the flat 4.10.1
             # object model, the 4.10.2 single-inheritance shape, the 4.10.3
-            # class-references-in-containers shape, and the 4.10.4 diamond
-            # shape. All four are pinned by the same interpreter-vs-JIT gate;
-            # the extra shapes add vtable dispatch, super(), C3 MRO,
-            # isinstance, upcasts, and per-slot ownership.
-            if seed % 4 == 0:
+            # class-references-in-containers shape, the 4.10.4 diamond shape,
+            # and the 4.10.5 special-methods shape. All five are pinned by the
+            # same interpreter-vs-JIT gate; the extra shapes add vtable
+            # dispatch, super(), C3 MRO, isinstance, upcasts, per-slot
+            # ownership, comparison dispatch and object text.
+            if seed % 5 == 0:
                 src = gen.program_oop()
-            elif seed % 4 == 1:
+            elif seed % 5 == 1:
                 src = gen.program_oop_inherit()
-            elif seed % 4 == 2:
+            elif seed % 5 == 2:
                 src = gen.program_oop_containers()
-            else:
+            elif seed % 5 == 3:
                 src = gen.program_oop_multiple()
+            else:
+                src = gen.program_oop_special()
         elif args.phi:
             src = gen.program_phi()
         elif args.floats:

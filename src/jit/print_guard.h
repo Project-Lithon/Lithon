@@ -386,13 +386,16 @@ struct Analysis {
                         break;
 
                     // 4.10.1. Class instance ops. A class reference is a heap
-                    // pointer whose default text is an address, so it is
+                    // pointer whose default text would be an address, so it is
                     // print-UNSAFE exactly as Ptr is: `New`, `Retain` and a
                     // class-typed value all carry Kind::Object, and printing one
-                    // is what the print guard refuses (an object prints only
-                    // through __str__/__repr__, 4.10.5, not yet implemented).
-                    // A RefLoad's kind is its declared attribute type, like a
-                    // FieldLoad's; a RefStore/Release has no result.
+                    // is what the print guard refuses. 4.10.5 satisfies
+                    // `print(obj)` in the frontend instead: it inlines the
+                    // object's __str__/__repr__ text as ordinary str literals
+                    // and scalar print_bare calls, so no raw object reaches this
+                    // guard's print path. A RefLoad's kind is its declared
+                    // attribute type, like a FieldLoad's; a RefStore/Release has
+                    // no result.
                     case Op::New:
                         raise(st.vals[in.result], Kind::Object);
                         break;
