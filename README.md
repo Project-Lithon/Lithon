@@ -64,6 +64,52 @@ drop-in Python replacement.
 
 ### Recently added
 
+- **Properties and classmethods (4.10.6)** — the only decorators Lithon
+  recognises are a bare `@property` and a bare `@classmethod`; any other or
+  multiple decorators remain refused (`E0134`). A property is a read-only
+  computed attribute: it takes only `self`, must declare a scalar or class
+  reference result, and is read without parentheses (`p.total`). It is
+  inherited and overridden through the ordinary method machinery, including a
+  vtable slot, so a base-typed reference dispatches to a derived override;
+  assigning to it or calling it with `()` is refused (`E0135`). A classmethod
+  takes an unannotated `cls` instead of `self`, is called on a class name
+  (`Point.origin()`), and is not an instance method or a vtable slot. `cls` is
+  a compile-time alias for the call-time class: `cls(...)` constructs it,
+  `cls.other(...)` resolves another classmethod, and `isinstance(x, cls)` /
+  `issubclass(cls, C)` fold statically. Inlining the body means an inherited
+  classmethod constructs the call-time subclass. Calling a classmethod on an
+  instance, or an ordinary method on a class name, is refused (`E0135`). No
+  new IR opcode or runtime ABI is involved: a property read reuses the
+  zero-argument virtual-call path, and a classmethod body is inlined.
+  `tests/typed_regression/class_decorators.lio` pins property reads and
+  overrides, inherited classmethod construction, `cls(...)`, `cls.other(...)`,
+  `issubclass(cls, C)`, and a statement classmethod call, and
+  `fuzz_diff.py --oop` alternates a sixth property/classmethod shape.
+- **Special methods (4.10.5)** — classes can now define `__eq__`, `__ne__`,
+  `__lt__`, `__le__`, `__gt__` and `__ge__`. Each is an ordinary typed method
+  taking one other class reference and returning `bool`, so it uses the global
+  vtable slots, inlining and devirtualization from 4.10.2/4.10.4 unchanged.
+  `a != b` uses `__ne__` when present and otherwise negates `__eq__`; with no
+  equality method, `==`/`!=` stay pointer identity and `is`/`is not` never
+  dispatch. Ordering with no matching method is refused (`E0135`) rather than
+  silently falling back to addresses. Python's reflected/right-operand
+  subclass priority is deliberately not implemented: the left operand's
+  method runs. Object text is a separate, deliberately non-callable surface:
+  `__str__`/`__repr__` must return one string literal or f-string whose fields
+  are direct scalar `self` attributes, and they are not vtable slots because a
+  bounded string has no register value. `print(obj)` selects `__str__`, then
+  falls back to `__repr__`, for the receiver's **actual** concrete class; when
+  subclasses choose different text methods, the frontend emits `isinstance`
+  branches and inlines the chosen text as the existing literal/scalar print
+  operations. A literal longer than the declared `str[N]` result is refused
+  (`E0111`), and an object with neither method, or an explicit
+  `p.__str__()`/`p.__repr__()` call, is refused (`E0135`) rather than printing
+  an address. Scalar `<=`/`>=` lower to `not (b < a)` / `not (b > a)`, so
+  natural `__le__`/`__ge__` bodies work without a new opcode.
+  `tests/typed_regression/class_special_methods.lio` pins equality, ordering,
+  identity, dynamic text dispatch and the `__repr__` fallback, and
+  `fuzz_diff.py --oop` includes a special-methods shape in its six-shape
+  rotation.
 - **Multiple inheritance (4.10.4)** — `class D(B, C):` may combine bases that
   were declared earlier. Method lookup uses Python's **C3 linearization**, so
   `D(B, C)` searches `D, B, C, A` and `D(C, B)` searches `D, C, B, A`; the
@@ -85,8 +131,8 @@ drop-in Python replacement.
   discarded result is released at the statement that produced it.
   `tests/typed_regression/class_multiple_inherit.lio` and
   `class_multiple_lifetime.lio` pin C3 lookup, cooperative `super()`, class
-  returns and inherited-drop lifetime, and `fuzz_diff.py --oop` now includes a
-  fourth diamond shape.
+  returns and inherited-drop lifetime, and `fuzz_diff.py --oop` includes a
+  diamond shape among its six OOP shapes.
 - **Class references in containers (4.10.3)** — a `list[P, N]` or
   `tuple[P, N]` may now hold class references. Each element is one 8-byte
   reference leaf in the container's flat run, so a nested
@@ -163,9 +209,10 @@ drop-in Python replacement.
   of inferring it.
   `__del__` is **not** inlined — it is emitted as a real `__del__<Class>`
   function and pointed at from the descriptor, so it runs at the exact last drop
-  and in the same order in both tiers. `is`/`is not` and (until 4.10.5 adds
-  `__eq__`) `==`/`!=` on two references are object identity: one integer compare
-  of the addresses. Definite initialization is enforced structurally — every
+  and in the same order in both tiers. `is`/`is not` are always object identity:
+  one integer compare of the addresses. `==`/`!=` use the class's equality
+  method when one is declared (4.10.5) and otherwise stay identity. Definite
+  initialization is enforced structurally — every
   declared attribute must be assigned on every path reaching the end of
   `__init__` (E0140), and uninitialized scalar attributes are zeroed at `new`.
   An attribute is `int[w]`, `float[64]`, `bool` or a reference to another class
@@ -174,8 +221,9 @@ drop-in Python replacement.
   reach a bounded string, a struct field or an enum payload) is refused at
   declaration (E0127) rather than accepted and then unreadable. Refused by
   design: a bare class name in a value position ("did you mean `Name(...)`?"),
-  an undeclared attribute (E0141), and any decorator (4.10) — `property` and
-  `classmethod` arrive as keywords in 4.10.6. Class-typed variables are non-null
+  an undeclared attribute (E0141), and general decorators — 4.10.6 recognises
+  only a bare read-only `@property` or `@classmethod` on a class method.
+  Class-typed variables are non-null
   by default; `Optional`/`None` is a later sub-step. Class references may now
   be list/tuple elements (4.10.3); a dict, struct attribute or class attribute
   holding one remains a later sub-step.
@@ -687,14 +735,14 @@ The verification suite checks several independent layers.
 | Typed differential fuzzing           |      **300 / 300 passed**     |
 | Bitwise / shift fuzzing              |      **200 / 200 passed**     |
 | Conditional-expression / SSA fuzzing |    **200 / 200 per suite**    |
-| Direct float Phi sweep               | **93 matched / 0 mismatched** |
+| Direct float Phi sweep               | **95 matched / 0 mismatched** |
 | ABI modules audited                  |             **34**            |
 | ABI stack/callee-saved failures      |             **0**             |
-| Typed regression suite               |       **59 / 59 passed**      |
+| Typed regression suite               |       **61 / 61 passed**      |
 | General regression suite             |       **34 / 34 passed**      |
 | Type-checker unit checks             |          **145 ok**          |
-| Error-code discipline checks         |         **157 ok**           |
-| Tier differential (interp vs JIT)    |      **231 / 231 passed**     |
+| Error-code discipline checks         |         **176 ok**           |
+| Tier differential (interp vs JIT)    |      **235 / 235 passed**     |
 | Object runtime (4.10.0–4.10.4, ctest) | **107 ok**       |
 | Class (OOP) fuzzing                  |      **200 / 200 passed**     |
 | Syscall hook parity (both tiers)     |        **4 / 4 passed**      |
@@ -1662,7 +1710,10 @@ Deliberate narrowings, collected next to `%` and `v == n`:
 | references held across a trap (4.10.0) | a caught exception's frame objects are dropped when the handler runs | the references held between a trap and its `try` handler are **leaked** on the exceptional path; their `__del__` does not run | the caught trap is a plain jump, so there is no unwind step to release the abandoned frames; releasing them needs per-frame cleanup tables. Never a safety problem -- a leak, not a dangling reference |
 | `__del__` timing (4.10.0) | runs when the garbage collector notices (or at interpreter exit for some cycles) | runs at the exact program point where the last reference drops, and the optimizer may not move or elide that drop | it is the one observable lifetime event, so it must be identical in both tiers; making it a fixed drop point is what guarantees that |
 | object drop points (4.10.1) | a name is kept alive until the frame or module that bound it tears down, so a loop variable from the last iteration survives to the end of the function | a reference is dropped at the exit of the **scope that owns it**: a loop body releases what each iteration created on the back edge, and a `return`/`break`/`continue` releases the references that path owns | it keeps the reference count equal to the number of *lexically live* owners, so a per-iteration object is freed each pass instead of accumulating, and the observable `__del__` order follows the program's block structure rather than CPython's frame teardown. `fuzz_diff.py --oop` exempts this from the CPython oracle for `__del__` programs; the two tiers always agree with each other |
-| classes (4.10.1–4.10.4) | classes, instances, multiple inheritance, decorators, `__dict__`, metaclasses, dynamic attribute addition | a baseless `class Name:` or one or more bases declared earlier, combined by C3; no decorators (4.10.6 adds `property`/`classmethod` keywords); an attribute is `int[w]`/`float[64]`/`bool`/a class reference, and an instance has exactly its declared attributes; a class-typed variable is non-null; a list/tuple element may be a class reference only in a fully initialized literal (4.10.3) | a class is a layout the compiler knows, so an attribute is a fixed offset and a method is inlined or reached through a fixed slot; dynamic attributes would need a runtime shape and a hash map, nullability needs `Optional`, and a reference leaf in a container needs the per-slot ownership of 4.10.3, all later additions |
+| classes (4.10.1–4.10.6) | classes, instances, multiple inheritance, decorators, `__dict__`, metaclasses, dynamic attribute addition | a baseless `class Name:` or one or more bases declared earlier, combined by C3; the only decorators are a bare read-only `@property` and a bare `@classmethod` (general decorators and method-kind mismatches are refused, E0134/E0135); an attribute is `int[w]`/`float[64]`/`bool`/a class reference, and an instance has exactly its declared attributes; the only special methods are the six comparison dunders and restricted `__str__`/`__repr__` (4.10.5); a class-typed variable is non-null; a list/tuple element may be a class reference only in a fully initialized literal (4.10.3) | a class is a layout the compiler knows, so an attribute is a fixed offset and a method is inlined or reached through a fixed slot; dynamic attributes would need a runtime shape and a hash map, nullability needs `Optional`, and a reference leaf in a container needs the per-slot ownership of 4.10.3, all later additions |
+| computed attributes (`@property`, 4.10.6) | a property is a descriptor object with a getter, optional setter/deleter, can be called through the class, and is settable when a setter exists | a property is a restricted read-only computed attribute: a bare `@property` method taking only `self` and returning a scalar or class reference; it is read without parentheses (`p.total`), inherited/overridden through the ordinary method slot, and dispatches through `CallVirtual` when a subclass overrides it; assignment and a `()` call are refused (`E0135`) | descriptors, setters/deleters and class-level property objects would need runtime attribute descriptors and a callable-value ABI; a read-only property over a fixed method signature keeps the read a normal slot call and adds no IR opcode |
+| classmethods (`@classmethod`, 4.10.6) | `@classmethod` is a descriptor bound to the class and to instances, `cls` is a runtime class object, and a classmethod can be called through either | only a bare `@classmethod` with an unannotated first `cls`; called as `Class.method(...)`; `cls` is a compile-time alias for the call-time class inside the inlined body (`cls(...)`, `cls.other(...)`, `isinstance(x, cls)`, `issubclass(cls, C)`); inherited calls construct the call-time subclass; it is not an instance method and has no vtable slot; an instance call or a class-name call to an ordinary method is refused (`E0135`) | class objects are not runtime values in this slice, so binding a method to a class or instance would require a callable/descriptor ABI; static inlining preserves the closed-hierarchy model and lets the call-time subclass flow into construction |
+| decorator surface (4.10.6) | arbitrary decorators, stacked decorators, decorator arguments, and metaclass hooks | exactly one bare `@property` or `@classmethod` on a class method; every other decorator, a stacked decorator, or a decorated `__init__`/`__del__`/special method is refused (`E0134`); the two recognised kinds cannot be mixed across an override or inheritance chain (`E0135`) | a general decorator evaluates arbitrary Python before the method exists and needs first-class functions/descriptors; the two compiler-known forms cover computed reads and class-namespaced construction without opening that surface |
 | multiple bases' attribute state (4.10.4) | each base keeps its own independent state; a class may inherit disjoint or conflicting layouts from several bases | every base must be prefix-compatible at identical offsets; shared diamond state is stored once, and conflicting or disjoint stateful bases are refused (`E0127`) | one instance has one header and one fixed set of offsets; composing independent base states would need two headers or per-base indirection, which would make the zero-cost upcast and fixed-offset access impossible |
 | class references in a container (4.10.3) | a list/tuple holds object references and can grow, shrink, be iterated and be passed freely | a list/tuple of class references is a fixed-capacity run of one 8-byte reference per slot; the literal must fill every slot (no bare declaration, shorter literal or `append`); overwriting a slot retains the new reference before releasing the old one; scope exit drops one reference per slot in reverse flat order; reads are borrows; `in`/identity compare references; `enumerate`/`zip` and class-typed container parameters/returns are refused; dict class keys/values are deferred | one owner per slot is what keeps the reference count exactly equal to the live owners, so per-element `__del__` is deterministic in both tiers; a loop target bound to an element outlives the iteration, so its ownership rule is deliberately left for a later sub-stage, and a container has no value form to cross a function header |
 | method resolution and `super()` (4.10.2/4.10.4) | a full MRO, with multiple inheritance, cooperative `super()` and `__mro__` | Python's C3 linearization; `super()` starts after the class that **defined** the running method in the receiver's actual MRO; a dynamic `super()` requires every concrete subclass to have a later concrete implementation and every reachable definition to share the signature; `super().__init__` is resolved statically along the construction class's MRO; `__del__` is selected once by MRO and `super().__del__` is refused | a closed hierarchy can compile every lookup and keep one global slot per method; an unsupported dynamic super would leave a call site with no target on some concrete class, and construction is the one point where the exact object class is known, so its cooperative chain can be inlined with definite-init bookkeeping |
@@ -1671,7 +1722,9 @@ Deliberate narrowings, collected next to `%` and `v == n`:
 | abstract methods (4.10.2) | the `abc` module, `@abstractmethod`, and runtime enforcement | a method body of `...` marks the slot abstract; the class is flagged and refused at construction (E0140) until a subclass implements it | `...` is already the spelling a stub uses, and a static flag plus the construction check enforces the rule with no `abc` import or metaclass |
 | identity between two class references (4.10.2/4.10.4) | `a is b` is valid for any two objects and is usually `False` | same-or-related classes compare by address; two classes with **no possible common declared subclass** are refused (E0140) | the comparison can never be true when no declared class is a subclass of both; under multiple inheritance a `B`-typed and a `C`-typed reference may name the same `D`, so the relation is possible-common-subclass rather than plain disjointness, and `isinstance` is the way to ask about type |
 | a reference returned from a function (4.10.1) | the return transfers whatever the object's reference count implies: a fresh object is new, a returned parameter is a borrow the caller must not free | the callee **retains** what it returns, so every class-typed call result is one owned reference the caller drops at its own scope exit | it makes a fresh construction, an owned local and a borrowed parameter one uniform contract; without the retain, `return param` would hand the caller a reference the callee never owned (a use-after-free), so the borrow ambiguity is resolved by construction rather than by inference |
-| `==`/`!=` on two objects (4.10.1) | calls `__eq__` (default is identity) | identity -- one integer compare of the two references (`is`/`is not` are the same compare) | `__eq__` arrives with the other special methods in 4.10.5; until then "same object" is the only meaning, and it is spelled out rather than silently defaulting |
+| equality and ordering on objects (4.10.5) | `==` calls `__eq__` (default identity), `!=` calls `__ne__` or negates `__eq__`, and ordering follows the full rich-comparison protocol, including reflected methods and `NotImplemented` | `==`/`!=` use `__eq__`/`__ne__` on the left operand's class; `!=` falls back to `not __eq__`; with no equality method both stay identity; ordering requires the left class's matching dunder (`E0135`); there is no reflected/right-subclass priority (`a == b` uses `a`'s method even when `b`'s class is a proper subclass); `NotImplemented` is not a value | typed methods have one declared parameter and a `bool` result, so there is no `NotImplemented` round trip; the left method runs because the operand has a fixed static type, while Python's right-subclass priority is a dynamic-protocol rule this closed, typed slice deliberately omits |
+| object text (4.10.5) | every object has an address-bearing default `repr`; `__str__`/`__repr__` are ordinary callable methods that may build arbitrary strings | `__str__`/`__repr__` are printable text, not callable values: one return of a string literal or f-string of direct scalar `self` attributes; `print(obj)` picks `__str__`, then `__repr__`, by the receiver's actual concrete class; there is no default address text; an explicit call or an object with neither method is refused (`E0135`), and a literal over the declared `str[N]` capacity is refused (`E0111`) | a bounded string is a run, not a register value, so there is no call ABI to return it; inlining the one restricted expression at print sites keeps both tiers byte-identical and avoids exposing heap addresses |
+| membership in a class-typed container (4.10.5) | `x in xs` uses `==`, so it invokes element `__eq__` | class-typed `in` compares references by identity; direct `==` between two class references does dispatch to a declared equality method | 4.10.3 lowers membership to a flat reference scan; unrolling element equality calls would need a different loop/ownership shape, so `in` remains identity while `==` follows 4.10.5 |
 | a bare class name in a value position (4.10.1) | the class object is a first-class value | refused (`E0140`), pointing at `Name(...)` | a class is a layout, not a value; making it a value would mean a class object and the reflection surface (metaclasses, `type(name, bases, ns)`) this slice deliberately omits |
 
 ---
@@ -1822,11 +1875,13 @@ Deliberate narrowings, collected next to `%` and `v == n`:
   the references its own class-typed attributes hold, and a callee retains what
   it returns so every call result is one owned reference. `__del__` is emitted as
   a real `__del__<Class>` function reached from the descriptor, so it runs at the
-  exact last drop, in the same order in both tiers. `is`/`is not` and (pre-4.10.5
-  `__eq__`) `==`/`!=` on references are identity — one integer compare. Definite
-  init is enforced structurally (E0140); an undeclared attribute (E0141) or a
-  bare class name are refused, and 4.10 has no decorators. `Optional`/`None` is a
-  later sub-step, so a class-typed variable is non-null. Guards:
+  exact last drop, in the same order in both tiers. `is`/`is not` are identity —
+  one integer compare; `==`/`!=` use a declared equality method (4.10.5) and
+  otherwise stay identity. Definite init is enforced structurally (E0140); an
+  undeclared attribute (E0141) or a bare class name are refused, and general
+  decorators remain refused; 4.10.6 adds the two restricted forms.
+  `Optional`/`None` is a later sub-step, so a class-typed variable is non-null.
+  Guards:
   `class_basic.lio`, `class_lifetime.lio`, `class_references.lio`,
   `class_returns.lio`, and `fuzz_diff.py --oop`.
 * [x] Single inheritance (4.10.2) — `class Dog(Animal):` with the base declared
@@ -1851,8 +1906,9 @@ Deliberate narrowings, collected next to `%` and `v == n`:
   element, an overwrite retains the new reference before releasing the old, and
   scope exit drops one per slot in reverse flat order (so `__del__` timing is
   tier-identical). A bare declaration, a shorter literal and `append` are
-  refused (a slot is never a null reference); `in`, identity and default `==`
-  compare references; `enumerate`/`zip` over a class-typed container, class-typed
+  refused (a slot is never a null reference); `in` and identity compare
+  references, while direct `==` uses a declared equality method (4.10.5);
+  `enumerate`/`zip` over a class-typed container, class-typed
   container parameters/returns, and dict class keys/values are deferred with
   coded refusals. Guards: `class_container_list.lio`,
   `class_container_inherit.lio`, `class_container_lifetime.lio`, and the
@@ -1875,7 +1931,39 @@ Deliberate narrowings, collected next to `%` and `v == n`:
   allowed whenever a common declared subclass is possible. Class-typed results
   returned through `super()`/virtual calls are one owned reference. Guards:
   `class_multiple_inherit.lio`, `class_multiple_lifetime.lio`,
-  `object_runtime_test`, and the fourth diamond shape in `fuzz_diff.py --oop`.
+  `object_runtime_test`, and the diamond shape in `fuzz_diff.py --oop`.
+* [x] Special methods (4.10.5) — comparison dunders (`__eq__`, `__ne__`, `__lt__`,
+  `__le__`, `__gt__`, `__ge__`) are ordinary typed methods with one class
+  reference parameter and a `bool` result, so they use the existing global
+  slots, inlining and `CallVirtual` dispatch. `!=` prefers `__ne__` and otherwise
+  negates `__eq__`; no equality method keeps `==`/`!=` as pointer identity, and
+  `is`/`is not` never dispatch. Ordering without the left class's matching
+  method is refused (`E0135`), and reflected/right-subclass priority is
+  deliberately omitted. `__str__`/`__repr__` are not callable values or vtable
+  slots: each returns one literal or an f-string of direct scalar `self`
+  attributes, and `print(obj)` selects the text method by the receiver's actual
+  concrete class, emitting `isinstance` branches when subclasses differ and
+  inlining the chosen text as ordinary print operations. A missing text method
+  or an explicit text-method call is refused (`E0135`), an over-capacity literal
+  is refused (`E0111`), and scalar `<=`/`>=` lower to `not (b < a)` /
+  `not (b > a)` so natural method bodies work. Guards:
+  `class_special_methods.lio` and the special-methods shape in
+  `fuzz_diff.py --oop`.
+* [x] Properties and classmethods (4.10.6) — the only recognised decorators are
+  a bare `@property` and a bare `@classmethod`. A property is a read-only
+  computed attribute: only `self`, a required scalar/class-reference result,
+  inherited/overridden through the ordinary method machinery, with a vtable
+  slot for dynamic override dispatch; assignment and a `()` call are refused
+  (`E0135`). A classmethod takes an unannotated `cls`, is called on a class
+  name, and has no vtable slot or instance call. `cls` is a compile-time alias
+  for the call-time class (`cls(...)`, `cls.other(...)`, `isinstance(x, cls)`,
+  `issubclass(cls, C)`), so an inherited classmethod constructs the call-time
+  subclass. Other or stacked decorators and method-kind mismatches are refused
+  (`E0134`/`E0135`), and instance calls to classmethods or class-name calls to
+  ordinary methods are refused (`E0135`). A property read reuses the
+  zero-argument virtual-call path and a classmethod body is inlined, so no new
+  IR opcode or runtime ABI is introduced. Guards: `class_decorators.lio` and
+  the sixth shape in `fuzz_diff.py --oop`.
 
 ---
 
@@ -1991,7 +2079,7 @@ python3 tools/run_tier_diff.py
 
 Every program runs twice — once through the interpreter (the oracle) and once
 through the native tier — and the two stdout streams must be byte-identical.
-Currently **231 / 231** cases pass, 132 of them on the native tier.
+Currently **233 / 233** cases pass, 133 of them on the native tier.
 
 Two classes of case are deliberately outside this comparison:
 

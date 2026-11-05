@@ -76,8 +76,8 @@ ACCUM_UNROLL = False
 # same treatment --mod-negatives gives the floored-vs-truncated `%%` gap.
 # Alternate seeds use the flat 4.10.1 shape, the 4.10.2 single-inheritance
 # shape, the 4.10.3 class-references-in-containers shape, the 4.10.4
-# multiple-inheritance diamond shape, and the 4.10.5 special-methods shape, so
-# one --oop run exercises all five.
+# multiple-inheritance diamond shape, the 4.10.5 special-methods shape, and the
+# 4.10.6 property/classmethod shape, so one --oop run exercises all six.
 OOP_MODE = False
 # --phi: run the JIT twice, with and without the SSA pipeline, and require both
 # to match the interpreter. The plain run is the control: it proves the pipeline
@@ -1689,6 +1689,74 @@ class Gen:
         lines.append("print(t1 is t2)")
         return "\n".join(lines) + "\n"
 
+    def program_oop_decorators(self):
+        """A class program built around 4.10.6's @property and @classmethod.
+
+        A property is a read-only computed attribute; a classmethod is called
+        on a class name with `cls` bound to that call-time class. The derived
+        class overrides only the property, so the inherited classmethod still
+        constructs the DERIVED object (`D.make(...)` runs the base body with
+        `cls = D`), and reading that object through a `B` reference dispatches
+        the property override through its vtable slot. `double_make` exercises
+        a classmethod calling another through `cls`, while `check` uses `cls` as
+        an issubclass argument. All printed values are scalars or bools, so the
+        CPython oracle is byte-exact.
+        """
+        r = self.r
+        bname = r.choice(["Point", "Base", "Item"])
+        dname = r.choice(["Marked", "Derived", "Tagged"])
+        a, b, y = (r.randint(0, 9) for _ in range(3))
+        v = [r.randint(0, 9) for _ in range(6)]
+
+        lines = []
+        lines.append(f"class {bname}:")
+        lines.append("    x: int[64]")
+        lines.append("")
+        lines.append(f"    def __init__(self, x: int[64]):")
+        lines.append("        self.x = x")
+        lines.append("")
+        lines.append("    @property")
+        lines.append("    def value(self) -> int[64]:")
+        lines.append(f"        return self.x + {a}")
+        lines.append("")
+        lines.append("    @classmethod")
+        lines.append(f"    def make(cls, x: int[64]) -> {bname}:")
+        lines.append("        return cls(x)")
+        lines.append("")
+        lines.append("    @classmethod")
+        lines.append("    def double_make(cls, x: int[64]) -> int[64]:")
+        lines.append("        return cls.make(x).value")
+        lines.append("")
+        lines.append("    @classmethod")
+        lines.append(f"    def check(cls) -> bool:")
+        lines.append(f"        return issubclass(cls, {bname})")
+        lines.append("")
+        lines.append("    @classmethod")
+        lines.append("    def show(cls, x: int[64]):")
+        lines.append("        print(cls.make(x).value)")
+        lines.append("")
+        lines.append(f"class {dname}({bname}):")
+        lines.append("    y: int[64]")
+        lines.append("")
+        lines.append(f"    def __init__(self, x: int[64]):")
+        lines.append(f"        super().__init__(x)")
+        lines.append(f"        self.y = {y}")
+        lines.append("")
+        lines.append("    @property")
+        lines.append("    def value(self) -> int[64]:")
+        lines.append(f"        return self.x + self.y + {b}")
+        lines.append("")
+        lines.append(f"b: {bname} = {bname}({v[0]})")
+        lines.append("print(b.value)")
+        lines.append(f"d: {bname} = {dname}.make({v[1]})")
+        lines.append("print(d.value)")
+        lines.append(f"print(isinstance(d, {dname}))")
+        lines.append(f"print({bname}.double_make({v[2]}))")
+        lines.append(f"print({dname}.double_make({v[3]}))")
+        lines.append(f"print({dname}.check())")
+        lines.append(f"{dname}.show({v[4]})")
+        return "\n".join(lines) + "\n"
+
     def program(self):
         call_expr = self.emit_recursive_helper() if self.r.random() < 0.5 else None
         for v in VARS[:3]:
@@ -1919,7 +1987,7 @@ def main():
     ap.add_argument("--oop", action="store_true",
                     help="use the class-focused generator (see Gen.program_oop): construction, "
                          "attributes, methods, aliasing, __del__ lifetime, identity, containers, "
-                         "inheritance, multiple inheritance and special methods")
+                         "inheritance, multiple inheritance, special methods and decorators")
     args = ap.parse_args()
     TIMEOUT = args.timeout
     global UNROLL_DIAMONDS, SSA_MODE, ACCUM_UNROLL, DIRECT_PHI_MODE, OOP_MODE
@@ -1944,23 +2012,27 @@ def main():
         gen = Gen(seed, args.shared_loop_vars, floats=args.floats,
                   mod_negatives=args.mod_negatives)
         if args.oop:
-            # Alternate seeds across the five OOP shapes: the flat 4.10.1
+            # Alternate seeds across the six OOP shapes: the flat 4.10.1
             # object model, the 4.10.2 single-inheritance shape, the 4.10.3
             # class-references-in-containers shape, the 4.10.4 diamond shape,
-            # and the 4.10.5 special-methods shape. All five are pinned by the
-            # same interpreter-vs-JIT gate; the extra shapes add vtable
-            # dispatch, super(), C3 MRO, isinstance, upcasts, per-slot
-            # ownership, comparison dispatch and object text.
-            if seed % 5 == 0:
+            # the 4.10.5 special-methods shape, and the 4.10.6
+            # property/classmethod shape. All six are pinned by the same
+            # interpreter-vs-JIT gate; the extra shapes add vtable dispatch,
+            # super(), C3 MRO, isinstance, upcasts, per-slot ownership,
+            # comparison dispatch, object text, computed properties and
+            # call-time-class classmethods.
+            if seed % 6 == 0:
                 src = gen.program_oop()
-            elif seed % 5 == 1:
+            elif seed % 6 == 1:
                 src = gen.program_oop_inherit()
-            elif seed % 5 == 2:
+            elif seed % 6 == 2:
                 src = gen.program_oop_containers()
-            elif seed % 5 == 3:
+            elif seed % 6 == 3:
                 src = gen.program_oop_multiple()
-            else:
+            elif seed % 6 == 4:
                 src = gen.program_oop_special()
+            else:
+                src = gen.program_oop_decorators()
         elif args.phi:
             src = gen.program_phi()
         elif args.floats:

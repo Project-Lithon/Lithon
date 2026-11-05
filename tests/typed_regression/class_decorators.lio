@@ -1,0 +1,71 @@
+class Point:
+    x: int[64]
+    y: int[64]
+
+    def __init__(self, x: int[64], y: int[64]):
+        self.x = x
+        self.y = y
+
+    @property
+    def total(self) -> int[64]:
+        return self.x + self.y
+
+    @property
+    def scaled(self) -> int[64]:
+        return self.total * 2
+
+    @classmethod
+    def origin(cls) -> Point:
+        return cls(0, 0)
+
+    @classmethod
+    def from_total(cls, total: int[64]) -> Point:
+        return cls(total, 0)
+
+    @classmethod
+    def origin_total(cls) -> int[64]:
+        return cls.origin().total
+
+    @classmethod
+    def is_point(cls) -> bool:
+        return issubclass(cls, Point)
+
+    @classmethod
+    def show_origin(cls):
+        print(cls.origin_total())
+
+
+class Tagged(Point):
+    tag: int[64]
+
+    def __init__(self, x: int[64], y: int[64], tag: int[64]):
+        super().__init__(x, y)
+        self.tag = tag
+
+    @property
+    def total(self) -> int[64]:
+        return self.x + self.y + self.tag
+
+    @classmethod
+    def make(cls, tag: int[64]) -> Point:
+        return cls(0, 0, tag)
+
+
+p: Point = Point(2, 3)
+print(p.total)
+print(p.scaled)
+
+q: Point = Point.origin()
+print(q.x)
+print(q.y)
+print(Point.origin_total())
+
+t: Point = Tagged.make(7)
+print(t.total)
+print(isinstance(t, Tagged))
+print(Tagged.is_point())
+print(Point.is_point())
+
+r: Point = Point.from_total(11)
+print(r.x, r.total)
+Point.show_origin()

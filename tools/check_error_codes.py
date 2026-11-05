@@ -542,8 +542,48 @@ FRONTEND_REFUSALS = [
      "        self.x = x\np: P = P(1)\nprint(p.x)\n", "LITHON-E0140"),
     ("a class method with a decorator (E0134)",
      "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
-     "    @property\n    def y(self) -> int[64]:\n        return self.x\n"
+     "    @staticmethod\n    def y(self) -> int[64]:\n        return self.x\n"
      "p: P = P(1)\nprint(p.y)\n", "LITHON-E0134"),
+    # 4.10.6. @property and @classmethod are the only recognised decorators.
+    # A property is a zero-argument, read-only computed attribute; a
+    # classmethod has `cls`, is called on the class name, and is not an
+    # instance method. Everything outside that small surface is refused.
+    ("a property with a parameter (E0134)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    @property\n    def y(self, a: int[64]) -> int[64]:\n        return self.x\n"
+     "p: P = P(1)\nprint(p.y)\n", "LITHON-E0134"),
+    ("a property without a result type (E0134)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    @property\n    def y(self):\n        return self.x\n"
+     "p: P = P(1)\nprint(p.y)\n", "LITHON-E0134"),
+    ("a classmethod whose first parameter is not cls (E0134)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    @classmethod\n    def y(self) -> int[64]:\n        return self.x\n"
+     "p: P = P(1)\nprint(p.x)\n", "LITHON-E0134"),
+    ("calling a classmethod on an instance (E0135)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    @classmethod\n    def make(cls) -> P:\n        return cls(0)\n"
+     "p: P = P(1)\nq: P = p.make()\n", "LITHON-E0135"),
+    ("calling an instance method on the class name (E0135)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    def get(self) -> int[64]:\n        return self.x\n"
+     "z: int[64] = P.get()\n", "LITHON-E0135"),
+    ("calling a property as a method (E0135)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    @property\n    def y(self) -> int[64]:\n        return self.x\n"
+     "p: P = P(1)\nprint(p.y())\n", "LITHON-E0135"),
+    ("assigning to a read-only property (E0135)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    @property\n    def y(self) -> int[64]:\n        return self.x\n"
+     "p: P = P(1)\np.y = 2\n", "LITHON-E0135"),
+    ("calling a classmethod with the wrong arity (E0135)",
+     "class P:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "    @classmethod\n    def make(cls, x: int[64]) -> P:\n        return cls(x)\n"
+     "p: P = P.make()\n", "LITHON-E0135"),
+    ("a classmethod and an instance method sharing an inherited name (E0135)",
+     "class A:\n    def f(self) -> int[64]:\n        return 1\n"
+     "class B:\n    @classmethod\n    def f(cls) -> int[64]:\n        return 2\n"
+     "class C(A, B):\n    x: int[64]\nprint(0)\n", "LITHON-E0135"),
     # 4.10.2. Single inheritance. The base must be declared earlier, a subclass
     # adds attributes rather than shadowing them, an override keeps the slot's
     # signature, an abstract class cannot be instantiated, and super() has a

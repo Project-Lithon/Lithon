@@ -1179,6 +1179,16 @@ CLASS_HEADER_BYTES = 16
 COMPARISON_SPECIAL_METHODS = ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__")
 TEXT_SPECIAL_METHODS = ("__str__", "__repr__")
 
+# 4.10.6. The only two decorators Lithon recognises. They are deliberately
+# recognised by bare name rather than by evaluating a decorator expression:
+# general decorators remain a refused feature, and these two have fixed,
+# compiler-known meanings. A property is a read-only computed attribute; a
+# classmethod is a class-namespaced method whose first `cls` parameter is a
+# compile-time alias for the call-time class.
+PROPERTY_DECORATOR = "property"
+CLASSMETHOD_DECORATOR = "classmethod"
+METHOD_DECORATOR_NAMES = (PROPERTY_DECORATOR, CLASSMETHOD_DECORATOR)
+
 # The source-level comparison operator -> (method name, negate the result).
 # `!=` is included because Python lets a class define `__ne__`; when it does not,
 # the lowering falls back to `not __eq__`.
@@ -1432,6 +1442,11 @@ def _method_is_abstract(stmt):
             and only.value.value is Ellipsis)
 
 
+def _method_kind(stmt):
+    """The 4.10.6 method kind: `method`, `property` or `classmethod`."""
+    return getattr(stmt, "_lithon_method_kind", "method")
+
+
 def _method_signature(method):
     """The (parameter annotations, return annotation) a vtable slot fixes.
 
@@ -1452,35 +1467,65 @@ def _validate_class_method(stmt, owner_name, layout, classes, structs, enums,
     """Validates one `def` in a class body and stores it on the layout.
 
     `__init__` and `__del__` are the two reserved names. `__init__` returns
-    nothing; `__del__` takes only `self` and returns nothing. Every method's
-    first parameter is the unannotated `self`, and the remaining parameters and
-    the return are scalars or a class reference (so an object can be passed and
-    returned). No decorators (4.10.6 adds the two keyword forms).
+    nothing; `__del__` takes only `self` and returns nothing. Every ordinary
+    method's first parameter is the unannotated `self`, and the remaining
+    parameters and the return are scalars or a class reference (so an object
+    can be passed and returned).
+
+    4.10.6 adds exactly two decorators. `@property` defines a read-only
+    computed attribute: it takes only `self` and must return a scalar or class
+    reference. `@classmethod` takes an unannotated first `cls` instead of
+    `self`; it is called on a class name and is not an instance method or a
+    vtable slot. Any other decorator, or more than one, is still refused.
     """
     method_name = stmt.name
+    kind = "method"
     if stmt.decorator_list:
-        raise NotImplementedError(
-            f"LITHON-E0134: method '{owner_name}.{method_name}' cannot carry a decorator; "
-            f"4.10.1 has no decorators (property/classmethod are keywords in 4.10.6)")
+        if len(stmt.decorator_list) != 1:
+            raise NotImplementedError(
+                f"LITHON-E0134: method '{owner_name}.{method_name}' may carry at most one "
+                f"decorator; Lithon recognises only @property and @classmethod (4.10.6)")
+        dec = stmt.decorator_list[0]
+        if not (isinstance(dec, ast.Name) and dec.id in METHOD_DECORATOR_NAMES):
+            raise NotImplementedError(
+                f"LITHON-E0134: method '{owner_name}.{method_name}' cannot carry this "
+                f"decorator; Lithon recognises only @property and @classmethod, and general "
+                f"decorators are not supported (4.10.6)")
+        kind = dec.id
+    stmt._lithon_method_kind = kind
     a = stmt.args
     if (a.posonlyargs or a.vararg or a.kwonlyargs or a.kwarg
             or a.defaults or a.kw_defaults):
         raise NotImplementedError(
             f"LITHON-E0134: method '{owner_name}.{method_name}' takes only plain positional "
             f"parameters -- no `/`, `*`, `**` or defaults (4.10.1)")
+    if kind != "method" and (
+            method_name in ("__init__", "__del__")
+            or method_name in COMPARISON_SPECIAL_METHODS
+            or method_name in TEXT_SPECIAL_METHODS
+            or (method_name.startswith("__") and method_name.endswith("__"))):
+        raise NotImplementedError(
+            f"LITHON-E0134: special or reserved method '{owner_name}.{method_name}' cannot "
+            f"carry @{kind} (4.10.6)")
     if not a.args:
+        receiver = "cls" if kind == CLASSMETHOD_DECORATOR else "self"
         raise NotImplementedError(
-            f"LITHON-E0134: method '{owner_name}.{method_name}' must take `self` as its first "
-            f"parameter (4.10.1)")
+            f"LITHON-E0134: method '{owner_name}.{method_name}' must take `{receiver}` as its "
+            f"first parameter (4.10.{'6' if kind != 'method' else '1'})")
     self_arg = a.args[0]
-    if self_arg.arg != "self":
+    receiver = "cls" if kind == CLASSMETHOD_DECORATOR else "self"
+    if self_arg.arg != receiver:
+        context = ("a classmethod uses `cls`, the call-time class"
+                   if kind == CLASSMETHOD_DECORATOR
+                   else "the implicit receiver")
         raise NotImplementedError(
-            f"LITHON-E0134: the first parameter of method '{owner_name}.{method_name}' must be "
-            f"named `self`, the implicit receiver (4.10.1)")
+            f"LITHON-E0134: the first parameter of method '{owner_name}.{method_name}' must "
+            f"be named `{receiver}` -- {context} (4.10.{'6' if kind != 'method' else '1'})")
     if self_arg.annotation is not None:
         raise NotImplementedError(
-            f"LITHON-E0134: `self` of method '{owner_name}.{method_name}' must be unannotated "
-            f"-- it names the receiver, not a value (4.10.1)")
+            f"LITHON-E0134: `{receiver}` of method '{owner_name}.{method_name}' must be "
+            f"unannotated -- it names the {'class' if receiver == 'cls' else 'receiver'}, "
+            f"not a value (4.10.{'6' if kind != 'method' else '1'})")
     for p in a.args[1:]:
         if p.annotation is None:
             raise NotImplementedError(
@@ -1526,6 +1571,21 @@ def _validate_class_method(stmt, owner_name, layout, classes, structs, enums,
             f"LITHON-E0134: special method '{owner_name}.{method_name}' is not supported in "
             f"4.10.5; the supported special methods are {', '.join(COMPARISON_SPECIAL_METHODS)} "
             f"and {', '.join(TEXT_SPECIAL_METHODS)} (4.10.5)")
+    if kind == PROPERTY_DECORATOR:
+        if a.args[1:]:
+            raise NotImplementedError(
+                f"LITHON-E0134: property '{owner_name}.{method_name}' takes only `self` -- a "
+                f"read-only computed attribute has no arguments (4.10.6)")
+        if stmt.returns is None:
+            raise NotImplementedError(
+                f"LITHON-E0134: property '{owner_name}.{method_name}' must declare a return "
+                f"type; reading it has to produce a scalar or class reference (4.10.6)")
+        _class_method_value_type(stmt.returns, owner_name, method_name, "property return type",
+                                 classes, structs, enums)
+    elif kind == CLASSMETHOD_DECORATOR:
+        if stmt.returns is not None:
+            _class_method_value_type(stmt.returns, owner_name, method_name,
+                                     "classmethod return type", classes, structs, enums)
     if is_comparison:
         if len(a.args[1:]) != 1:
             raise NotImplementedError(
@@ -1570,12 +1630,16 @@ def _validate_class_method(stmt, owner_name, layout, classes, structs, enums,
     if inherited is not None:
         # An OVERRIDE: the signature must match the slot's, and the slot index is
         # unchanged (that stability is what a base-compiled call site relies on).
+        if _method_kind(inherited) != kind:
+            raise NotImplementedError(
+                f"LITHON-E0135: override '{owner_name}.{method_name}' changes its member kind; "
+                f"a {_method_kind(inherited)} cannot be overridden by a {kind} (4.10.6)")
         if not is_abstract and _method_signature(inherited) != _method_signature(stmt):
             raise NotImplementedError(
                 f"LITHON-E0135: override '{owner_name}.{method_name}' does not match the "
                 f"inherited signature; an override takes the same parameters and returns the "
                 f"same type (4.10.2)")
-    elif not is_text:
+    elif kind != CLASSMETHOD_DECORATOR and not is_text:
         # A NEW method: take the next GLOBAL slot. Slots are keyed by method
         # name, not by the class that first declared it, so every class in a
         # multiple-inheritance hierarchy agrees on the index even when the
@@ -1585,6 +1649,11 @@ def _validate_class_method(stmt, owner_name, layout, classes, structs, enums,
         # string result has no register form, so they cannot be called through
         # the virtual-call ABI. print() resolves them statically per concrete
         # class and inlines their one text expression.
+        #
+        # 4.10.6. A classmethod is not an instance method and has no receiver
+        # slot; a call is always on a class name and is inlined statically.
+        # A property DOES get a slot: a subclass may override it, and reading
+        # through a base-typed reference must dispatch to the override.
         if method_name not in method_slots:
             method_slots[method_name] = len(method_slots)
         layout.slots[method_name] = method_slots[method_name]
@@ -1716,11 +1785,23 @@ def _build_class_layout(stmt, classes, structs, enums, method_slots):
                         f"LITHON-E0135: class '{stmt.name}' inherits incompatible "
                         f"signatures for method '{mname}' from '{owner}' and '{other}'; "
                         f"one vtable slot must have one signature (4.10.4)")
+                if cand is not None and _method_kind(cand) != _method_kind(method):
+                    raise NotImplementedError(
+                        f"LITHON-E0135: class '{stmt.name}' inherits '{mname}' as both a "
+                        f"{_method_kind(method)} and a {_method_kind(cand)}; a member name "
+                        f"has one kind across a hierarchy (4.10.6)")
             layout.methods[mname] = method
             if mname in TEXT_SPECIAL_METHODS:
                 # 4.10.5. Object text is resolved per concrete class at print
                 # time, not through a vtable slot (a bounded string has no
                 # register return form).
+                layout.method_owners[mname] = owner
+                if _method_is_abstract(method):
+                    layout.abstract.add(mname)
+                continue
+            if _method_kind(method) == CLASSMETHOD_DECORATOR:
+                # 4.10.6. A classmethod is inherited for class-name lookup, but
+                # it has no vtable slot and no receiver ABI.
                 layout.method_owners[mname] = owner
                 if _method_is_abstract(method):
                     layout.abstract.add(mname)
@@ -1777,6 +1858,17 @@ def _build_class_layout(stmt, classes, structs, enums, method_slots):
         }
         layout.own_attrs.add(attr_name)
         offset += byte_size
+    # A method declared before an attribute of the same name would otherwise
+    # slip past the check inside _validate_class_method, because the attribute
+    # did not exist yet when the method was validated. The class body is one
+    # namespace, so verify the completed set too. The method set includes
+    # inherited methods: an attribute may not shadow one, or a class-name call
+    # could still resolve the hidden classmethod.
+    for method_name in layout.methods:
+        if method_name in layout.own_attrs:
+            raise NotImplementedError(
+                f"LITHON-E0134: class '{stmt.name}' cannot declare attribute '{method_name}'; "
+                f"it collides with a method of the same name (4.10.1)")
     # 4.10.5. The text-method shape check needs every attribute, including
     # ones declared after the method in the class body.
     for method_name in TEXT_SPECIAL_METHODS:
@@ -2609,6 +2701,14 @@ class IRBuilder:
                 raise NotImplementedError(
                     f"LITHON-E0140: '{node.id}' is a class, not a value -- did you mean "
                     f"{node.id}(...), which constructs an instance? (4.10.1)")
+            # 4.10.6. `cls` inside a classmethod is a compile-time class alias,
+            # not a runtime value: it may appear as `cls(...)`, `cls.method(...)`
+            # or as a class-name argument, but not be loaded or printed.
+            alias_class = self._cls_alias_class(node.id)
+            if alias_class is not None:
+                raise NotImplementedError(
+                    f"LITHON-E0140: '{node.id}' is the classmethod's class alias, not a value "
+                    f"-- use {node.id}(...) to construct {alias_class} (4.10.6)")
             r = self.new_reg()
             self.emit(f"{r} = load {node.id}")
             # 4.4. A load of a pointer variable brings the pointer's pointee
@@ -2812,6 +2912,17 @@ class IRBuilder:
                     and isinstance(node.func.value.func, ast.Name)
                     and node.func.value.func.id == "super"):
                 return self._build_super_call(node)
+            # 4.10.6. `Class.method(args)` and, inside a classmethod,
+            # `cls.method(args)`. A class-level call is statically resolved:
+            # only @classmethod members are callable this way.
+            class_callee = self._class_method_callee(node.func)
+            if class_callee is not None:
+                r = self._build_classmethod_call(node, class_callee)
+                if r is None:
+                    raise NotImplementedError(
+                        f"LITHON-E0135: classmethod '{class_callee}.{node.func.attr}()' "
+                        f"returns no value, so it cannot be used as a value (4.10.6)")
+                return r
             if isinstance(node.func, ast.Attribute):
                 # 6.4. `s.find(sub)` / `s.count(sub)` on a bounded string. A str
                 # has no methods in the 4.9 sense, so these lower to a two-name
@@ -2836,6 +2947,7 @@ class IRBuilder:
                 # struct/enum one.
                 recv_class = self._resolve_receiver_class(node.func.value)
                 if recv_class is not None:
+                    self._check_instance_member_callable(recv_class, node.func.attr)
                     # 4.10.2. If some subclass overrides this method, the static
                     # class does not determine the code: emit a real vtable call.
                     # Otherwise the site is monomorphic and the method is inlined
@@ -3103,6 +3215,9 @@ class IRBuilder:
                 return r
             if node.func.id in self.classes:
                 return self._build_class_construction(node.func.id, node)
+            alias_class = self._cls_alias_class(node.func.id)
+            if alias_class is not None:
+                return self._build_class_construction(alias_class, node)
             arg_regs = [self.build_expr(a) for a in node.args]
             callee = self.fn_rename.get(node.func.id, node.func.id)
             r = self.new_reg()
@@ -3661,7 +3776,19 @@ class IRBuilder:
             if isinstance(node.func, ast.Name):
                 if node.func.id in self.classes:
                     return node.func.id
+                alias_class = self._cls_alias_class(node.func.id)
+                if alias_class is not None:
+                    return alias_class
                 return self.fn_returns.get(node.func.id)
+            if isinstance(node.func, ast.Attribute):
+                class_name = self._class_method_callee(node.func)
+                if class_name is not None:
+                    resolved = self._resolve_method(class_name, node.func.attr)
+                    if (resolved is not None
+                            and _method_kind(resolved[1]) == CLASSMETHOD_DECORATOR
+                            and resolved[1].returns is not None):
+                        ret_t = parse_type_annotation(resolved[1].returns)
+                        return ret_t.ref if ret_t.kind == "class" else None
             return None
         if isinstance(node, ast.Attribute):
             recv = self._peek_receiver_class(node.value)
@@ -3671,9 +3798,17 @@ class IRBuilder:
             if field is None:
                 return None
             attr = field.attrs.get(node.attr)
-            if attr is None:
-                return None
-            return attr["class_name"] if attr["kind"] == "class" else None
+            if attr is not None:
+                return attr["class_name"] if attr["kind"] == "class" else None
+            # 4.10.6. A property's result type is known from its declaration,
+            # so `p.prop.attr` and `p.prop.method()` can resolve the next step.
+            resolved = self._resolve_method(recv, node.attr)
+            if (resolved is not None
+                    and _method_kind(resolved[1]) == PROPERTY_DECORATOR
+                    and resolved[1].returns is not None):
+                ret_t = parse_type_annotation(resolved[1].returns)
+                return ret_t.ref if ret_t.kind == "class" else None
+            return None
         if isinstance(node, ast.Subscript):
             # 4.10.3. `xs[i]`, `xs[i][j]` and `d[k]` can all name a class
             # reference when their declared leaf is a class. Walk the same
@@ -4096,11 +4231,36 @@ class IRBuilder:
                 f"assigned in __init__ before it returns (4.10.1)")
 
     def _class_name_arg(self, node, what):
-        """The class named by a bare-name argument, or a refusal."""
+        """The class named by a bare-name argument, or a refusal.
+
+        4.10.6. Inside a classmethod the `cls` local is a compile-time alias
+        for the call-time class, so isinstance(x, cls) and issubclass(cls, C)
+        can name it exactly as they name a declared class.
+        """
+        if isinstance(node, ast.Name):
+            alias_class = self._cls_alias_class(node.id)
+            if alias_class is not None:
+                return alias_class
         if not isinstance(node, ast.Name) or node.id not in self.classes:
             raise NotImplementedError(
                 f"LITHON-E0135: {what} must name a declared class, e.g. Point (4.10.2)")
         return node.id
+
+    def _cls_alias_class(self, name):
+        """The class named by the current classmethod's `cls` local, if any."""
+        class_name = getattr(self, "_cur_cls_name", None)
+        local = getattr(self, "_cur_cls_local", None)
+        if class_name is not None and local is not None and name == local:
+            return class_name
+        return None
+
+    def _class_method_callee(self, func):
+        """The class named by `C.m`/`cls.m` as a classmethod callee, or None."""
+        if not isinstance(func, ast.Attribute) or not isinstance(func.value, ast.Name):
+            return None
+        if func.value.id in self.classes:
+            return func.value.id
+        return self._cls_alias_class(func.value.id)
 
     def _class_index_of(self, cname):
         """The emitted ClassInfo index of `cname` (the `base=` numbering).
@@ -4164,7 +4324,8 @@ class IRBuilder:
         self.emit(f"{r} = const_bool {1 if _is_subclass_of(a, b, self.classes) else 0}")
         return r
 
-    def _build_virtual_call(self, call, class_name):
+    def _build_virtual_call(self, call, class_name, recv_reg=None,
+                            method_name=None, property_read=False):
         """`recv.method(args)` through the vtable -- 4.10.2.
 
         Emitted ONLY when a subclass overrides the method, so the receiver's
@@ -4179,7 +4340,7 @@ class IRBuilder:
         (the frontend refuses a mismatched override), so the call site and every
         implementation agree on the argument registers and the result type.
         """
-        method_name = call.func.attr
+        method_name = method_name or call.func.attr
         if method_name in TEXT_SPECIAL_METHODS:
             raise NotImplementedError(
                 f"LITHON-E0135: {method_name}() cannot be called as a value; a bounded string "
@@ -4194,26 +4355,43 @@ class IRBuilder:
             raise NotImplementedError(
                 f"LITHON-E0135: class '{class_name}' has no method '{method_name}' (4.10.2)")
         _defining, method = resolved
+        kind = _method_kind(method)
+        if property_read:
+            if kind != PROPERTY_DECORATOR:
+                raise NotImplementedError(
+                    f"LITHON-E0135: '{method_name}' in class '{class_name}' is a {kind}, not "
+                    f"a property (4.10.6)")
+        elif kind == PROPERTY_DECORATOR:
+            raise NotImplementedError(
+                f"LITHON-E0135: property '{class_name}.{method_name}' is read-only and not "
+                f"callable; read it without parentheses (4.10.6)")
+        elif kind == CLASSMETHOD_DECORATOR:
+            raise NotImplementedError(
+                f"LITHON-E0135: classmethod '{class_name}.{method_name}' must be called on a "
+                f"class name, not through an instance (4.10.6)")
         params = method.args.args[1:]
-        if call.keywords or any(isinstance(a, ast.Starred) for a in call.args):
+        args = [] if property_read else call.args
+        if (not property_read
+                and (call.keywords or any(isinstance(a, ast.Starred) for a in args))):
             raise NotImplementedError(
                 f"LITHON-E0135: method '{class_name}.{method_name}' takes positional arguments "
                 f"only (4.10.1)")
-        if len(call.args) != len(params):
+        if len(args) != len(params):
             raise NotImplementedError(
                 f"LITHON-E0135: method '{class_name}.{method_name}' takes {len(params)} "
-                f"argument(s), got {len(call.args)} (4.10.1)")
+                f"argument(s), got {len(args)} (4.10.1)")
         slot = self._slot_of(class_name, method_name)
         if slot is None:
             raise NotImplementedError(
                 f"LITHON-E0135: method '{class_name}.{method_name}' has no vtable slot (4.10.2)")
-        recv_reg = self.build_expr(call.func.value)
-        actual = self.reg_class.get(recv_reg)
-        if actual is None or not _is_subclass_of(actual, class_name, self.classes):
-            raise NotImplementedError(
-                f"LITHON-E0135: cannot call '{method_name}()' on a value that is not a "
-                f"{class_name} (4.10.1)")
-        arg_regs = [self.build_expr(a) for a in call.args]
+        if recv_reg is None:
+            recv_reg = self.build_expr(call.func.value)
+            actual = self.reg_class.get(recv_reg)
+            if actual is None or not _is_subclass_of(actual, class_name, self.classes):
+                raise NotImplementedError(
+                    f"LITHON-E0135: cannot call '{method_name}()' on a value that is not a "
+                    f"{class_name} (4.10.1)")
+        arg_regs = [self.build_expr(a) for a in args]
         # Bind each argument to the signature's parameter type so an argument
         # register is tagged exactly as the inlined path would tag it.
         for p, areg in zip(params, arg_regs):
@@ -4443,6 +4621,112 @@ class IRBuilder:
                       f"{slot}, {defining_index}")
         return r
 
+    def _build_classmethod_call(self, call, class_name):
+        """Inline `Class.method(args)` for a 4.10.6 classmethod.
+
+        A classmethod has no runtime receiver: its `cls` parameter is an alias
+        for the class named at the call site. That makes an inherited
+        classmethod construct the CALL-TIME class (`Derived.make()` runs the
+        base body with `cls` bound to Derived), while the method itself stays
+        out of the vtable and cannot be called on an instance.
+        """
+        method_name = call.func.attr
+        resolved = self._resolve_method(class_name, method_name)
+        if resolved is None:
+            layout = self.classes[class_name]
+            if method_name in layout.attrs:
+                raise NotImplementedError(
+                    f"LITHON-E0135: '{method_name}' in class '{class_name}' is an attribute, "
+                    f"not a classmethod (4.10.6)")
+            raise NotImplementedError(
+                f"LITHON-E0135: class '{class_name}' has no method '{method_name}' (4.10.6)")
+        defining_class, method = resolved
+        kind = _method_kind(method)
+        if kind != CLASSMETHOD_DECORATOR:
+            if kind == PROPERTY_DECORATOR:
+                raise NotImplementedError(
+                    f"LITHON-E0135: property '{class_name}.{method_name}' is a read-only "
+                    f"attribute, not a callable method; read it as `receiver.{method_name}` "
+                    f"(4.10.6)")
+            raise NotImplementedError(
+                f"LITHON-E0135: method '{class_name}.{method_name}' is an instance method; "
+                f"call it on an object, not on the class name (4.10.6)")
+        if _method_is_abstract(method):
+            raise NotImplementedError(
+                f"LITHON-E0135: classmethod '{class_name}.{method_name}' is abstract and has "
+                f"no implementation (4.10.6)")
+        params = method.args.args[1:]
+        if call.keywords or any(isinstance(a, ast.Starred) for a in call.args):
+            raise NotImplementedError(
+                f"LITHON-E0135: classmethod '{class_name}.{method_name}' takes positional "
+                f"arguments only (4.10.6)")
+        if len(call.args) != len(params):
+            raise NotImplementedError(
+                f"LITHON-E0135: classmethod '{class_name}.{method_name}' takes {len(params)} "
+                f"argument(s), got {len(call.args)} (4.10.6)")
+        has_result = method.returns is not None
+
+        token = (defining_class, method_name)
+        if token in self.inline_active:
+            chain = " -> ".join(f"{t}.{m}" for t, m in self.inline_active + [token])
+            raise NotImplementedError(
+                f"LITHON-E0135: classmethod call is recursive ({chain}); a method is inlined "
+                f"at the call site and cannot call itself, directly or indirectly (4.10.6)")
+
+        prefix = self._fresh_method_prefix()
+        cls_local = prefix + "cls"
+        rename = {nm: prefix + nm for nm in _collect_method_locals(method.body)}
+        rename["cls"] = cls_local
+        for p in params:
+            rename[p.arg] = prefix + p.arg
+        body = _SelfRename(rename).visit(
+            copy.deepcopy(ast.Module(body=method.body, type_ignores=[]))).body
+
+        ret_label = self.reserve_label()
+        result_temp = (prefix + "ret") if has_result else None
+        saved_loop = self.loop_stack
+        self.loop_stack = []
+        self.method_return_stack.append((result_temp, ret_label))
+        self.inline_own_depth[len(self.method_return_stack)] = len(
+            getattr(self, "own_scopes", []))
+        self.inline_active.append(token)
+        self.enclosing_class_stack.append(defining_class)
+        old_self = getattr(self, "_cur_self_name", None)
+        old_cls_name = getattr(self, "_cur_cls_name", None)
+        old_cls_local = getattr(self, "_cur_cls_local", None)
+        self._cur_self_name = None
+        self._cur_cls_name = class_name
+        self._cur_cls_local = cls_local
+        try:
+            if has_result:
+                self.build_stmt(ast.AnnAssign(
+                    target=ast.Name(id=result_temp, ctx=ast.Store()),
+                    annotation=copy.deepcopy(method.returns), value=None, simple=1))
+            for p, arg in zip(params, call.args):
+                self._bind_inline_param(rename[p.arg], p.annotation, arg)
+            for stmt in body:
+                self.build_stmt(stmt)
+            if not self.terminated and self.block_is_reachable(self.current.label):
+                self.emit(f"jump {ret_label}")
+            self.start_block(ret_label)
+        finally:
+            self.enclosing_class_stack.pop()
+            self.method_return_stack.pop()
+            self.inline_active.pop()
+            self.loop_stack = saved_loop
+            self._cur_self_name = old_self
+            self._cur_cls_name = old_cls_name
+            self._cur_cls_local = old_cls_local
+        if not has_result:
+            return None
+        r = self.new_reg()
+        self.emit(f"{r} = load {result_temp}")
+        ret_t = parse_type_annotation(method.returns)
+        if ret_t.kind == "class":
+            self.reg_class[r] = ret_t.ref
+            self.stmt_temps[-1].append((r, ret_t.ref))
+        return r
+
     def _build_class_call_discard(self, call, class_name):
         """A class method call used as a STATEMENT -- 4.10.2.
 
@@ -4452,6 +4736,7 @@ class IRBuilder:
         name had gone out of scope at the end of the statement.
         """
         method_name = call.func.attr
+        self._check_instance_member_callable(class_name, method_name)
         if self._method_needs_dispatch(class_name, method_name):
             r = self._build_virtual_call(call, class_name)
         else:
@@ -4463,7 +4748,8 @@ class IRBuilder:
         """The name of `self` in the current inlined scope, if any."""
         return getattr(self, "_cur_self_name", None)
 
-    def _inline_class_method_call(self, call, class_name):
+    def _inline_class_method_call(self, call, class_name, recv_reg=None,
+                                  method_name=None, property_read=False):
         """Inline `recv.method(args)` for a class method.
 
         The receiver is evaluated ONCE to a reference register, copied into a
@@ -4471,7 +4757,7 @@ class IRBuilder:
         variable. Returns the result register, or None for a void method.
         """
         layout = self.classes[class_name]
-        method_name = call.func.attr
+        method_name = method_name or call.func.attr
         if method_name in TEXT_SPECIAL_METHODS:
             raise NotImplementedError(
                 f"LITHON-E0135: {method_name}() cannot be called as a value; a bounded string "
@@ -4485,15 +4771,31 @@ class IRBuilder:
             raise NotImplementedError(
                 f"LITHON-E0135: class '{class_name}' has no method '{method_name}' (4.10.1)")
         defining_class, method = resolved
+        kind = _method_kind(method)
+        if property_read:
+            if kind != PROPERTY_DECORATOR:
+                raise NotImplementedError(
+                    f"LITHON-E0135: '{method_name}' in class '{class_name}' is a {kind}, not "
+                    f"a property (4.10.6)")
+        elif kind == PROPERTY_DECORATOR:
+            raise NotImplementedError(
+                f"LITHON-E0135: property '{class_name}.{method_name}' is read-only and not "
+                f"callable; read it without parentheses (4.10.6)")
+        elif kind == CLASSMETHOD_DECORATOR:
+            raise NotImplementedError(
+                f"LITHON-E0135: classmethod '{class_name}.{method_name}' must be called on a "
+                f"class name, not through an instance (4.10.6)")
         params = method.args.args[1:]
-        if call.keywords or any(isinstance(a, ast.Starred) for a in call.args):
+        args = [] if property_read else call.args
+        if (not property_read
+                and (call.keywords or any(isinstance(a, ast.Starred) for a in args))):
             raise NotImplementedError(
                 f"LITHON-E0135: method '{class_name}.{method_name}' takes positional arguments "
                 f"only (4.10.1)")
-        if len(call.args) != len(params):
+        if len(args) != len(params):
             raise NotImplementedError(
                 f"LITHON-E0135: method '{class_name}.{method_name}' takes {len(params)} "
-                f"argument(s), got {len(call.args)} (4.10.1)")
+                f"argument(s), got {len(args)} (4.10.1)")
         has_result = method.returns is not None
 
         token = (defining_class, method_name)
@@ -4507,7 +4809,8 @@ class IRBuilder:
         # receiver's ACTUAL class must be `class_name` or a subclass; the body's
         # `self` is typed as the DEFINING class of the method it runs, so
         # `self.attr` inside an inherited method reads the base's layout.
-        recv_reg = self.build_expr(call.func.value)
+        if recv_reg is None:
+            recv_reg = self.build_expr(call.func.value)
         actual = self.reg_class.get(recv_reg)
         if actual is None or not _is_subclass_of(actual, class_name, self.classes):
             raise NotImplementedError(
@@ -4545,7 +4848,7 @@ class IRBuilder:
                 self.build_stmt(ast.AnnAssign(
                     target=ast.Name(id=result_temp, ctx=ast.Store()),
                     annotation=copy.deepcopy(method.returns), value=None, simple=1))
-            for p, arg in zip(params, call.args):
+            for p, arg in zip(params, args):
                 self._bind_inline_param(rename[p.arg], p.annotation, arg)
             for stmt in body:
                 self.build_stmt(stmt)
@@ -4578,6 +4881,28 @@ class IRBuilder:
             if cname != class_name and _is_subclass_of(cname, class_name, self.classes):
                 out.append(cname)
         return out
+
+    def _check_instance_member_callable(self, class_name, method_name):
+        """Refuse applying `()` to a member that is not an instance method.
+
+        4.10.6. A property is read by naming it, and a classmethod is called on
+        the class name. Neither is dispatchable through an instance receiver,
+        so catch it before the vtable/inliner paths would treat it as one.
+        """
+        resolved = self._resolve_method(class_name, method_name)
+        if resolved is None:
+            return
+        kind = _method_kind(resolved[1])
+        if kind == PROPERTY_DECORATOR:
+            raise NotImplementedError(
+                f"LITHON-E0135: property '{class_name}.{method_name}' is a read-only "
+                f"computed attribute, not a method; write `receiver.{method_name}` without "
+                f"parentheses (4.10.6)")
+        if kind == CLASSMETHOD_DECORATOR:
+            raise NotImplementedError(
+                f"LITHON-E0135: classmethod '{class_name}.{method_name}' must be called on a "
+                f"class name, e.g. {class_name}.{method_name}(...), not on an instance "
+                f"(4.10.6)")
 
     def _method_needs_dispatch(self, class_name, method_name):
         """True when a call on a `class_name` receiver must go through the
@@ -4624,7 +4949,25 @@ class IRBuilder:
         The receiver register is already a reference. A class reference
         attribute loads as one pointer; a str/enum/struct attribute has no
         standalone value and is refused like its struct counterpart.
+
+        4.10.6. A property is a computed read: it is resolved like a method (and
+        dispatched through its slot when a subclass overrides it), with this
+        already-built receiver passed to the inliner so the receiver expression
+        is still evaluated exactly once.
         """
+        resolved = self._resolve_method(class_name, attr_name)
+        if resolved is not None and _method_kind(resolved[1]) == PROPERTY_DECORATOR:
+            if _method_is_abstract(resolved[1]):
+                raise NotImplementedError(
+                    f"LITHON-E0135: property '{class_name}.{attr_name}' is abstract and has "
+                    f"no implementation (4.10.6)")
+            if self._method_needs_dispatch(class_name, attr_name):
+                return self._build_virtual_call(
+                    None, class_name, recv_reg=recv_reg, method_name=attr_name,
+                    property_read=True)
+            return self._inline_class_method_call(
+                None, class_name, recv_reg=recv_reg, method_name=attr_name,
+                property_read=True)
         field = self._class_attr_field(class_name, attr_name)
         kind = field["kind"]
         if kind == "str":
@@ -6913,6 +7256,13 @@ class IRBuilder:
                 # attribute as initialized for the definite-init check.
                 recv_reg, recv_class = self._build_class_receiver(target.value)
                 if recv_class is not None:
+                    resolved = self._resolve_method(recv_class, target.attr)
+                    if (resolved is not None
+                            and _method_kind(resolved[1]) == PROPERTY_DECORATOR):
+                        raise NotImplementedError(
+                            f"LITHON-E0135: property '{recv_class}.{target.attr}' is read-only; "
+                            f"a 4.10.6 property is a computed attribute with no setter, so it "
+                            f"cannot be assigned (4.10.6)")
                     field = self._class_attr_field(recv_class, target.attr)
                     if field["kind"] in ("struct", "enum"):
                         raise NotImplementedError(
@@ -7095,6 +7445,12 @@ class IRBuilder:
                         and isinstance(call.func.value.func, ast.Name)
                         and call.func.value.func.id == "super"):
                     self.build_expr(call)
+                    return
+                # 4.10.6. A classmethod called on a class name (or on the
+                # classmethod's `cls` alias) is a statement call.
+                class_callee = self._class_method_callee(call.func)
+                if class_callee is not None:
+                    self._build_classmethod_call(call, class_callee)
                     return
                 # 4.10.2. A statement call on a CLASS receiver (a class variable,
                 # `self`, or a class parameter) goes through the class call path,
@@ -7381,6 +7737,7 @@ def build_program(tree):
         for sname, method in sorted(clayout.own_methods.items(),
                                     key=lambda kv: clayout.slots.get(kv[0], 0)):
             if (sname in ("__init__", "__del__") or sname in TEXT_SPECIAL_METHODS
+                    or _method_kind(method) == CLASSMETHOD_DECORATOR
                     or _method_is_abstract(method)):
                 continue
             _emit_class_method_function(
