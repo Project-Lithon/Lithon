@@ -14,11 +14,11 @@ import { STRINGS_PAGES } from "./strings"
 export const PAGES: DocPage[] = [
   ...START_PAGES,
   ...LANGUAGE_PAGES,
-  ...DIVERGENCE_PAGES,
   ...EXCEPTION_PAGES,
   ...MATCH_PAGES,
   ...STRINGS_PAGES,
   ...NETWORKING_PAGES,
+  ...DIVERGENCE_PAGES,
   ...ENGINE_PAGES,
   ...REFERENCE_PAGES,
   ...MACHINE_PAGES,

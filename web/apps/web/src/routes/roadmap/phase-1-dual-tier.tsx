@@ -81,7 +81,7 @@ function Phase1DualTier() {
           </>
         }
         lede="How a block of typed Python becomes x86-64 bytes, what the optimizer does to them on the way, and the eight SSA phases that turned a memory-based JIT into an SSA one."
-        meta={["Shipped", "55 of 55 opcodes", "8 SSA phases"]}
+        meta={["Shipped", "63 of 63 opcodes", "8 SSA phases"]}
       />
 
       <section className={`${WRAP} grid gap-10 py-10 lg:grid-cols-[200px_1fr]`}>

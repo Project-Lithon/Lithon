@@ -146,7 +146,7 @@ export function buildEntries(): SearchEntry[] {
         title: section.title,
         subtitle: page.title,
         group: page.group,
-        tags: [...new Set([...page.tags, ...page.tags.slice(0, 2)])],
+        tags: [...new Set([...page.tags])],
         href: `/docs/${page.slug}#${section.id}`,
         body: sectionBody(section),
       })

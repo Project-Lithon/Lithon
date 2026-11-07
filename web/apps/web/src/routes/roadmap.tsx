@@ -169,14 +169,20 @@ const PHASES: readonly {
       {
         t: "A direct Phi emitter",
         s: "active",
-        d: "All 55 IR opcodes are emitted. The direct-Phi path and the edge-copy path both ship; what is still owed is value-kind inference for a float merge and an XMM allocator pool, so a float phi does not have to round-trip through memory.",
+        d: "All 63 IR opcodes are emitted. The direct-Phi path and the edge-copy path both ship; what is still owed is value-kind inference for a float merge and an XMM allocator pool, so a float phi does not have to round-trip through memory.",
         e: "compute_edge_uses() in liveness.h · resolve_phis() in optimize.h",
       },
       {
         t: "Lift the two-argument cap",
-        s: "active",
-        d: "Functions and calls are capped at two arguments, and most of the remaining test programs are blocked waiting on this rather than on anything deeper in the compiler.",
-        e: "src/jit/jit_abi.h · kTempPool in register_alloc.h",
+        s: "done",
+        d: "Shipped: 32 positional parameters, the first two in registers and the rest in 8-byte stack slots (JIT spills args >=2 to the stack).",
+        e: "src/jit/compile_function.h · kMaxParams",
+      },
+      {
+        t: "Classes and inheritance (4.10.0–4.10.6)",
+        s: "done",
+        d: "Heap references with refcounting, C3 multiple inheritance, virtual dispatch, `super()`, special methods, `@property`/`@classmethod` — verified by 15 class_* programs and `--oop` fuzzing.",
+        e: "tests/typed_regression/class_*.lio · fuzz_diff.py --oop · object_runtime_test (107 ok)",
       },
     ],
   },
@@ -213,9 +219,9 @@ const PHASES: readonly {
     state: "Planned",
     items: [
       {
-        t: "Direct syscall emission",
+        t: "Direct syscall emission (trampoline already ships)",
         s: "later",
-        d: "The 0F 05 instruction written straight from source syntax, so a Lithon program can talk to the kernel without a libc in between. It is also the largest behavioural step in the roadmap.",
+        d: "Raw syscalls via the host trampoline already ship in both tiers; what remains is writing the 0F 05 instruction straight from source syntax so a Lithon program talks to the kernel without a libc in between.",
         e: "needs the emitter to stop assuming a hosted C entry point",
       },
       {
@@ -226,7 +232,7 @@ const PHASES: readonly {
       },
       {
         t: "AVX2 and SIMD vectorization",
-        s: "later",
+        s: "done",
         d: "Parallel list processing across a vector unit. The AVX2 vectorizer now emits 8-wide ymm code over int[32] lists; the detection gate and the VEX transition guardrail underneath it are what keep the result exact.",
         e: "cpu_features.h gates it · check_vex_transitions.py keeps it honest",
       },

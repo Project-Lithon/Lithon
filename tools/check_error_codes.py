@@ -342,7 +342,17 @@ def used_codes():
 
 
 def documented_codes():
-    return {m for m in PLAIN_CODE_RE.findall(WHITEPAPER.read_text())}
+    # Intersect the whitepaper table with the two sibling shipped tables so a
+    # code documented in only one place still fails the gate. This closes the
+    # E0140/E0141 class of drift (whitepaper-only coverage used to pass).
+    codes = {m for m in PLAIN_CODE_RE.findall(WHITEPAPER.read_text())}
+    for sibling in (
+        ROOT / "docs" / "lithon_error_system.md",
+        ROOT / "web" / "apps" / "web" / "src" / "docs" / "pages" / "reference.ts",
+    ):
+        if sibling.exists():
+            codes &= {m for m in PLAIN_CODE_RE.findall(sibling.read_text())}
+    return codes
 
 
 def check_discipline(failures):
@@ -355,6 +365,12 @@ def check_discipline(failures):
             ok_shape = False
     if not ok_shape:
         print("  FAIL discipline: a malformed code would never reach the table")
+    # Reserved-but-never-emitted codes must be named as reservations.
+    es = (ROOT / "docs" / "lithon_error_system.md").read_text() if (ROOT / "docs" / "lithon_error_system.md").exists() else ""
+    for reserved in ("E0136", "E0137", "E0138", "E0139"):
+        if reserved not in es:
+            print(f"  FAIL discipline: reserved {reserved} not named in docs/lithon_error_system.md")
+            failures.append("reserved code unnamed")
     missing = sorted(used - documented)
     if missing:
         print(f"  FAIL discipline: codes used in source but missing from docs/whitepaper.md: "

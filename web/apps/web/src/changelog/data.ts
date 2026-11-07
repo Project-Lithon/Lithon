@@ -74,12 +74,93 @@ export const KIND_META: Record<
 export const CHANGES: readonly Change[] = [
   {
     kind: "language",
+    title: "Properties and classmethods (4.10.6)",
+    detail:
+      "Only bare `@property` (read-only, occupies a vtable slot) and `@classmethod` (unannotated `cls`, no slot, `cls(...)` builds the call-time class) are recognised; everything else and any stacked pair is refused (E0134).",
+    commit: "bc214b2",
+    date: "2026-11-05",
+    href: "/docs/classes",
+  },
+  {
+    kind: "language",
+    title: "Special methods (4.10.5)",
+    detail:
+      "`__eq__`/`__ne__`/`__lt__`/`__le__`/`__gt__`/`__ge__` (one class-ref parameter, `->bool`, left-operand dispatch) and restricted `__str__`/`__repr__` (one literal/f-string of direct scalar `self.*`, `->str[N]`); `print` picks `__str__` else `__repr__`, neither defined is refused (E0135).",
+    commit: "df21f55",
+    date: "2026-11-04",
+    href: "/docs/classes",
+  },
+  {
+    kind: "language",
+    title: "Multiple inheritance, C3 and CallSuper (4.10.4)",
+    detail:
+      "C3 linearization with prefix-compatible layout (a diamond's shared base is stored once); `super()` is dynamic — it scans the receiver's actual MRO after the defining class, so inherited targets resolve correctly (df21f55).",
+    commit: "ed345a5",
+    date: "2026-11-03",
+    href: "/docs/classes",
+  },
+  {
+    kind: "language",
+    title: "Class references in containers (4.10.3)",
+    detail:
+      "`list[P,N]`/`tuple[P,N]` hold 8-byte heap refs: static element type (upcast allowed), borrow-on-read, one owned ref per slot, full-literal-only (no bare declaration or `append`), retain-before-release on overwrite; `enumerate`/`zip` and params/returns refused (E0119/E0124).",
+    commit: "ed345a5",
+    date: "2026-11-03",
+    href: "/docs/classes",
+  },
+  {
+    kind: "language",
+    title: "Single inheritance and virtual dispatch (4.10.2)",
+    detail:
+      "Base attributes keep their offsets (free upcast), one global slot per method name, `CallVirtual` on the receiver's descriptor when the exact class is unknown, `isinstance` via ancestor bitsets, `issubclass` folded through C3; an abstract `...` body refuses construction (E0140).",
+    commit: "d5295a9",
+    date: "2026-11-03",
+    href: "/docs/classes",
+  },
+  {
+    kind: "language",
+    title: "Classes: heap references, __init__/__del__ (4.10.1)",
+    detail:
+      "A baseless `class P:` is a heap object reached through an 8-byte reference with a `[vptr:8][refcount:8]` header. `__init__` must assign every attribute on every path (definite-init, E0140); `__del__` runs at the exact last drop. No `__dict__`, no `None`.",
+    commit: "d5295a9",
+    date: "2026-11-03",
+    href: "/docs/classes",
+  },
+  {
+    kind: "engine",
+    title: "Object runtime (4.10.0)",
+    detail:
+      "Reference-counted heap (`heap.h`), object layout (`object.h`), and the per-run descriptor table (`class_runtime.h`) shared identically by both tiers; `New`/`Retain`/`Release`/`RefLoad`/`RefStore` and `CallVirtual`/`CallSuper` ops.",
+    commit: "d5295a9",
+    date: "2026-11-03",
+    href: "/docs/classes",
+  },
+  {
+    kind: "toolchain",
+    title: "Version 1.0.0",
+    detail:
+      "Bumped from 0.9.8 with OOP Phase 1. Language/spec stage 4.10.6; Python package 1.0.0 (not yet on PyPI).",
+    commit: "d5295a9",
+    date: "2026-11-03",
+    href: "/docs/classes",
+  },
+  {
+    kind: "docs",
+    title: "Documentation overhaul and AI-readable site",
+    detail:
+      "Five new docs pages (strings, match, exceptions, networking, python-divergences), `llms.txt`/`llms-full.txt`, JSON-LD on every route, body-text search, a 314-repair Windows-1252 mojibake guard, and platform-reproducible IR.",
+    commit: "d42718b",
+    date: "2026-10-22",
+    href: "/docs/strings",
+  },
+  {
+    kind: "language",
     title: "`!=` is a first-class comparison",
     detail:
       "`!=` is now its own IR op (`ne`) rather than `eq` followed by `not`, so the optimizer and branch fusion see the real predicate. On floats it follows IEEE 754: `nan != nan` is true, `0.0 != -0.0` is false.",
     commit: "6003463",
     date: "2026-10-20",
-    href: "/docs/operators#comparison-boolean",
+    href: "/docs/operators",
   },
   {
     kind: "language",
@@ -103,7 +184,7 @@ export const CHANGES: readonly Change[] = [
     kind: "language",
     title: "Packed-field structs, end to end",
     detail:
-      "`class P(Struct)` with typed fields, packed with no padding, so the byte layout matches a C `#pragma pack(1)` struct exactly. Narrow integer fields keep their sign when read back.",
+      "`class P(struct)` with typed fields, packed with no padding, so the byte layout matches a C `#pragma pack(1)` struct exactly. Narrow integer fields keep their sign when read back.",
     commit: "7b40f2d",
     date: "2026-10-13",
     href: "/docs/structs",
@@ -115,7 +196,7 @@ export const CHANGES: readonly Change[] = [
       "`int(w, v)`, `float(64, v)` and `int(w, input(prompt))` are the only way to change a type or read a value: the width is always named, and a conversion that does not fit traps instead of truncating.",
     commit: "2e7bf73",
     date: "2026-10-12",
-    href: "/docs/types#explicit-conversions",
+    href: "/docs/types",
   },
   {
     kind: "language",
@@ -124,7 +205,7 @@ export const CHANGES: readonly Change[] = [
       "Loop control flow is supported, with the rotated lowering and multi-exit loop guards it needs. `range(start, stop, step)` takes a step, and a zero step is refused at compile time and trapped at run time.",
     commit: "322fd90",
     date: "2026-10-12",
-    href: "/docs/control-flow#break-continue",
+    href: "/docs/control-flow",
   },
   {
     kind: "language",
@@ -133,7 +214,7 @@ export const CHANGES: readonly Change[] = [
       "A declaration with a type and no value introduces the name and the type, emits no code, and starts unassigned. Reading it before assignment is a compile-time refusal, not a run-time surprise.",
     commit: "2454bdf",
     date: "2026-10-09",
-    href: "/docs/declarations#definite-assignment",
+    href: "/docs/declarations",
   },
   {
     kind: "language",
@@ -142,7 +223,7 @@ export const CHANGES: readonly Change[] = [
       "`%` is the C remainder: the sign follows the dividend. `-7 % 3` is `-1` in Lithon and `2` in CPython. This is the machine's behaviour, and it is now pinned by the differential suites.",
     commit: "e0b5e0c",
     date: "2026-10-01",
-    href: "/docs/semantics#modulo",
+    href: "/docs/semantics",
   },
   {
     kind: "language",
@@ -169,7 +250,7 @@ export const CHANGES: readonly Change[] = [
       "Plain `+`, `-` and `*` on `int[64]` now trap on signed overflow instead of silently wrapping. `wrap_add`, `wrap_sub` and `wrap_mul` are the explicit opt-out, and the wrapping result is pinned to be identical across tiers.",
     commit: "5326537",
     date: "2026-10-10",
-    href: "/docs/operators#wrap-arith",
+    href: "/docs/operators",
   },
   {
     kind: "engine",
@@ -187,7 +268,7 @@ export const CHANGES: readonly Change[] = [
       "A self tail call is rewritten into a loop, so tail recursion runs in O(1) stack. A call that is not in tail position stays recursive.",
     commit: "144daa5",
     date: "2026-09-30",
-    href: "/docs/functions#recursion",
+    href: "/docs/functions",
   },
   {
     kind: "engine",
@@ -232,7 +313,7 @@ export const CHANGES: readonly Change[] = [
       "`lithon script.lio` runs a program. `--strict` refuses rather than falling back to the interpreter, `--ir` prints the typed IR and stops, `--interp` forces the correctness oracle, and `-v` says which tier ran and why.",
     commit: "f62bf61",
     date: "2026-10-01",
-    href: "/docs/installation#cli",
+    href: "/docs/installation",
   },
   {
     kind: "verification",
@@ -241,7 +322,7 @@ export const CHANGES: readonly Change[] = [
       "`tools/verify_all.sh` runs the whole stack: CTest, the general regression suite, the typed regression suite, the tier differential, and the per-shape differential fuzzers. It ends with `ALL CHECKS PASSED` or it does not pass.",
     commit: "988e763",
     date: "2026-09-29",
-    href: "/docs/verification#the-gate",
+    href: "/docs/verification",
   },
   {
     kind: "verification",
@@ -250,7 +331,7 @@ export const CHANGES: readonly Change[] = [
       "The hand-written x86-64 encoder is compared instruction by instruction against GNU `as`. 18,379 cases, 0 incorrect encodings. A byte difference is not automatically an error, because x86-64 often has several valid encodings.",
     commit: "edf4937",
     date: "2026-10-07",
-    href: "/docs/verification#encoder-vs-as",
+    href: "/docs/verification",
   },
   {
     kind: "verification",

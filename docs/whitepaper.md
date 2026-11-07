@@ -1,7 +1,6 @@
-# Lithon Whitepaper
+# Lithon Whitepaper — v1.0.0 (2026-11-05)
 
-Seed content from `docs/lithon_error_system.md` (section 4c): the error-code
-table. Every code below should eventually grow a one-paragraph entry here.
+Design record for Lithon. §4.10 documents the class/object stages (4.10.0–4.10.6) with per-stage verification snapshots. Error-code calibration lives in `docs/lithon_error_system.md`; the error-code table below is the shared source — every row matches `tools/check_error_codes.py` and `docs/lithon_error_system.md`. Cumulative verification at 4.10.6 close: typed 61/61, tier-diff 235/235 (native 134), error-codes 176, ctest 107, `--oop` fuzz 200/200.
 
 ## Error code table
 
@@ -21,9 +20,9 @@ kind of failure is this" readable from the code alone.
 | `E0109` | 1 (static refusal) | Unknown or badly-sized annotation type name |
 | `E0110` | 1 (static refusal) | Annotation missing a required field |
 | `E0111` | 1 (static refusal) | Bad container capacity / literal count / `str[N]` capacity or literal length (including a `__str__`/`__repr__` literal longer than its declared result) |
-| `E0112` | 1 (static refusal) | Container element must be a plain scalar |
+| `E0112` | 1 (static refusal) | Container element must be a plain scalar or a class reference (4.10.3) |
 | `E0113` | 1 (static refusal) | Pointer (`ptr[T]`) declaration rules (4.4) |
-| `E0114` | 1 (static refusal) | Unsupported or restricted program construct (including a non-literal `str[N]` value, or a whole `str` / `str` pointee used where a value is needed) |
+| `E0114` | 1 (static refusal) | Unsupported or restricted program construct (including a non-literal `str[N]` value, a whole `str` / `str` pointee used where a value is needed, or a non-`.lio` source extension) |
 | `E0115` | 1 (static refusal) | Unsupported builtin call form |
 | `E0116` | 1 (static refusal) | Builtin argument rules (`valueof`/`addressof`/`wrap_*`) |
 | `E0117` | 1 (static refusal) | Indexing / container-subscript restrictions |
@@ -59,6 +58,39 @@ kind of failure is this" readable from the code alone.
 | `E0309` | 3 (dynamic runtime trap) | float-to-int conversion out of range or not finite |
 | `E0310` | 3 (dynamic runtime trap) | `range(a,b,step)` where `step == 0` (dynamic) |
 | `E0401` | 3 (dynamic runtime trap, resource) | Stack overflow |
+
+## IR ops — the eight class instructions
+
+| Op | Meaning |
+|---|---|
+| `New` | zeroed heap allocation + stamp `vptr`, refcount 1 (`host_class_new`) |
+| `RefLoad` / `RefStore` | bare `[ref+disp]` attribute access (both tiers; per-kind: float via helper, bool 1 B, class 8 B, int zero/sign-extend) |
+| `Retain` / `Release` | `IncRef` / `DecRef` (immortal sentinel makes both no-ops) |
+| `IsInstance` | ancestor-bitset probe |
+| `CallVirtual` | global-slot dispatch on the receiver's own descriptor |
+| `CallSuper` | scan receiver's actual MRO after the defining class (`own_slot_bits`) |
+
+`ClassInfo` carries `slot` / `ownslot` metadata (`size`/`mro`/`bases`/`abstract`); the text parser renders `class … size=/bases=/mro=/slots=` with `attr` and `slot`/`ownslot` lines. All six host-call ops are register-clobbering (`is_register_clobbering_op`), and `Kind::Object` (class refs) is print-unsafe in both tiers.
+
+## 4.10.0 — object runtime and architecture
+
+**`object.h` — pure layout.** An instance is `[vptr:8][refcount:8][attr0]…` (16-byte `ObjectHeader`, `static_assert(sizeof==16)`). `vptr` *is* the type tag (first word, so the JIT reads it at fixed `offsetof==0`); there is no separate `type_tag` word. Base attributes come first, so a subclass instance starts with a valid base instance and upcasting is a free pointer (no move). All attribute offsets are absolute from the object start. The legacy `value.h:ObjHeader` (`{refcount, type_tag, flags}`, 8 B) is superseded; every interpreter/JIT cast between `LithonValue.payload` and `ObjectHeader*` is an explicit `reinterpret_cast` contract.
+
+`ClassDescriptor` fields (who reads each): `type_id` (first word, JIT fixed offset), `slot_count`/`instance_size`/`flags` (`kClassFlagAbstract`), `table_index`, `ancestor_bits`/`word_count` (`isinstance` probe), `own_slot_bits`/`word_count` (`super()` scan), `mro`/`mro_count` (C3 order), `ref_attr_count`/`ref_attr_offsets` (absolute offsets of class-typed attrs, for nested release), `name`/`destructor`/`destructor_owner`, `slots[1]` flexible tail. Allocation over-allocates `sizeof + (slots-1)*8` (`malloc`+`memset`); descriptors live for process life (emitted code carries their addresses).
+
+**`heap.h` — allocation and refcounting.** A single 64 KiB `mmap` chunk is bump-allocated first use (no libc `malloc` on Linux; `malloc` fallback off-Linux). Freed blocks form an intrusive free list (first word = `next`) across 64 size classes (stride 16, up to 2 KiB). `reserved_bytes()` rounds the *reservation* — a 24 B request in the 32 B class hands a 32 B block (canary-tested). Bump alignment is 16; an oversized object (> chunk) gets an exact-size `mmap` block dropped on free. `g_heap.live_objects` / `destructor_runs` are the "no leak" proof (`g_live_objects==0` after a run). `reset_heap()` clears free lists and counters but *keeps* the mapping; every entry point (`run_main`, `lithon_jit.cpp:main`, `tier_runner.cpp:run_native`) calls it. **The runtime is emitted only when a `class` exists** — class-free programs pay nothing, including the AOT size budget.
+
+**Lifetime (the four tier-parity rules, verbatim design contract).** (1) Addresses are unobservable and print-unsafe. (2) `__del__`'s moment is pinned — an optimizer may not move or elide it unless `destructor==nullptr`. (3) An exceptional path that unwinds past an owning scope leaks rather than cleaning up. (4) A tail call must release before calling. `kImmortalRefcount = 0x8000…` marks descriptors and stack temporaries; `IncRef`/`DecRef` are no-ops for them and emit no instruction. `release_drop` runs `__del__` *exactly at the last drop* (instance still fully formed, CPython `tp_dealloc` analogy), *then* releases `ref_attr_offsets` children recursively, *then* frees the block — this ordering is what prevents a `Holder.leaf = Leaf()` leak. Cycles leak by design (no tracer); deterministic refcounting gives pause-free, predictable `__del__`.
+
+**`class_runtime.h` — the descriptor table both tiers build.** `ClassTable` mirrors IR class indices (`descriptors`/`names`/`slot_names`/`slot_owners`/`destructor_names`). It is rebuilt at *each entry point* beside `reset_heap`, so consecutive runs never see stale descriptors. The build is two-pass: pass 1 creates one descriptor per class (so MRO can name them), pass 2 fills vtables/destructors/ref-attrs — with five stable-storage pools (`descriptor_pool`, `ref_attr_pool`, `ancestor_bits_pool`, `own_slot_bits_pool`, `mro_pool`) so `c_str()` addresses survive `vector` growth. MRO comes from `ci.mro`; a legacy `base_index` walk serves hand-built IR and unit tests. Ancestor bitsets (`words=(n+1+63)/64`, bit = `type_id`) replace the legacy pre-order subtree-range test (diamonds are not contiguous). Resolvers: `__del__`+Class → destructor ptr; `(owner, slot, slot_name)` → `__virt__<Owner>.<method>` ptr; `nullptr` = inherited/abstract slot. The *interpreter* slot resolver always returns `nullptr` (it never indirect-calls a vtable; it dispatches by name: `names[owner]+"."+method` in `g_virt_functions`); the JIT resolves via `compiled.function_offset`. Host helpers are called *by address* with plain-int arguments so the JIT never agrees on a struct layout.
+
+## 4.10.1 — classes
+
+A baseless `class P:` lowers to heap operations, not inline storage. `Point(3,4)` emits `new Point` and splices `__init__`; a method call is inline only when the receiver's exact class is known, else `CallVirtual`. Attribute access is layout-baked `refload`/`refstore` (`[ref+disp]` both tiers, deliberately not helpers). `b=a`, `return`, and attr-store **retain**; the reference drops at the owning scope exit (block exit, loop back edge, `return`, `break`, `continue`). The callee-retains contract: a class-typed return leaves one owned reference with the caller. `__del__<Class>` is a real function run by `release_drop` at the last drop. Definite-init: every attribute assigned on every `__init__` path or construction is refused (E0140); undeclared attribute read/write is E0141. Class-typed variables are never null — there is no `None`/`Optional` yet. Tests: `class_basic.lio`, `class_lifetime.lio`, `class_references.lio`, `class_returns.lio`.
+
+## 4.10.2 — single inheritance
+
+Base-first layout (`CLASS_HEADER_BYTES=16`): base attributes keep their offsets, so `sh: Shape = s` (a `Square` value) is a free upcast — the pointer does not move. Method names have one global slot; `host_class_slot(obj, slot)` reads the *receiver's own* descriptor so an override runs. The JIT `CallVirtual` outgoing area is `[stack args][target][arg0][arg1]` (`argv+3`), with receiver and `arg1` (GP *or* XMM for float) saved across the resolver call; the target is fetched via the runtime helper, not `rel32`. The interpreter's `CallVirtual` is name-based (`slot_owners[table_index][slot]` → `__virt__<Owner>.<method>`). `super()` in `4.10.2` form starts after the *enclosing* class; the defining-class fix is §4.10.4. Abstract (`...`) bodies refuse construction. `is_instance_of` probes `ancestor_bits[word]` (`word=id>>6`), falling back to the legacy subtree range `lo<=type_id<=hi` for hand-built descriptors — out-of-range index returns `false`, never crashes. Tests: `class_inherit.lio`, `class_inherit_isinstance.lio`, `class_inherit_params.lio`.
 
 ## 4.10.3 — class references in containers
 

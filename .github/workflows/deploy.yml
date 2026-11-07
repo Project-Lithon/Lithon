@@ -6,6 +6,8 @@ on:
       - master
     paths:
       - "web/**"
+      - "benchmarks/results/latest.json"
+      - "README.md"
       - ".github/workflows/deploy.yml"
   workflow_dispatch:
 
@@ -47,7 +49,7 @@ jobs:
 
       - name: Generate robots.txt
         working-directory: web
-        run: bun run scripts/gen-seo.ts "${{ steps.deployment.outputs.page_url || format('https://{0}.github.io/{1}', github.repository_owner, github.event.repository.name) }}"
+        run: bun run scripts/gen-seo.ts "https://project-lithon.github.io/Lithon"
 
       # The AI-facing surfaces: a compact index and the whole documentation as
       # plain text, both generated from the same registry the site renders.

@@ -10,14 +10,16 @@
 import { existsSync } from "node:fs"
 import { join } from "node:path"
 
-const WINGET = join(
-  process.env.LOCALAPPDATA ?? "",
-  "Microsoft",
-  "WinGet",
-  "Packages",
-  "astral-sh.uv_Microsoft.Winget.Source_8wekyb3d8bbwe",
-  "uv.exe",
-)
+const WINGET = process.env.LOCALAPPDATA
+  ? join(
+      process.env.LOCALAPPDATA,
+      "Microsoft",
+      "WinGet",
+      "Packages",
+      "astral-sh.uv_Microsoft.Winget.Source_8wekyb3d8bbwe",
+      "uv.exe",
+    )
+  : ""
 
 const UNIX_CANDIDATES = [
   "/usr/local/bin/uv",
@@ -40,8 +42,10 @@ export function findUv(): string | null {
     if (candidate && existsSync(candidate)) return candidate
   }
 
-  // last resort: hope the shell can resolve it
-  return "uv"
+  // PATH probe (Bun.which) before giving up — returning the bare name
+  // here would make requireUv()'s actionable error dead code.
+  if (Bun.which("uv")) return "uv"
+  return null
 }
 
 /** The `uv` executable, or a thrown error with an actionable message. */

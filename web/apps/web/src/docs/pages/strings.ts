@@ -104,7 +104,7 @@ print(len(s))`,
           example: {
             title: "a string as a struct field",
             typecheck: false,
-            source: `class Header(Struct):
+            source: `class Header(struct):
     kind: str[8]
     version: int[16]
 
@@ -120,7 +120,7 @@ print(h.version)`,
     },
     {
       id: "methods",
-      title: "The three string methods",
+      title: "The three string operations (`find`/`count`/`split`)",
       blocks: [
         {
           kind: "p",
@@ -185,7 +185,7 @@ print(parts[2])`,
       blocks: [
         {
           kind: "p",
-          text: "`print(s)` writes the bytes of the run. There are no quotes around it, because a string is a byte run and not a Python object with a `repr`.",
+          text: "`print(s)` writes the bytes of the run. There are no quotes around it, because a string is a byte run and not a Python object with a `repr` — a baseless class may define `__str__`/`__repr__` returning one literal/f-string of scalar attrs, inlined by `print()`/f-string (see [Classes](/docs/classes)).",
         },
         {
           kind: "tabs",

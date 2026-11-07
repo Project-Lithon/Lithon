@@ -106,12 +106,12 @@ print(srv > 0)`,
             title: "tests/net/loopback.lio (excerpt)",
             sourceRef: "tests/net/loopback.lio",
             typecheck: false,
-            source: `class SockAddrIn(Struct):
+            source: `class SockAddrIn(struct):
     lo: int[64]
     hi: int[64]
 
 
-class Buf(Struct):
+class Buf(struct):
     v: int[64]
 
 
@@ -140,7 +140,7 @@ print(syscall(50, srv, 1))`,
             title: "the round trip (excerpt)",
             sourceRef: "tests/net/loopback.lio",
             typecheck: false,
-            source: `class Buf(Struct):
+            source: `class Buf(struct):
     v: int[64]
 
 
@@ -211,7 +211,7 @@ print(socklen)`,
             title: "the explicit failure (excerpt)",
             sourceRef: "tests/net/loopback.lio",
             typecheck: false,
-            source: `class SockAddrIn(Struct):
+            source: `class SockAddrIn(struct):
     lo: int[64]
     hi: int[64]
 

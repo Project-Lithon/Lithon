@@ -96,4 +96,15 @@ if (failed.length > 0) {
     `\n${failed.length} example(s) the frontend refused (expected for rejected-by-design examples):`,
   )
   for (const f of failed) console.log(`  ${f.where}: ${f.why.slice(0, 110)}`)
+  // A page claiming OOP coverage must not silently lose class examples:
+  // warn loudly if any classes-page example failed for a reason other than
+  // a documented refusal (rejected-by-design demos carry LITHON-E codes).
+  const unexpected = failed.filter(
+    (f) => f.where.startsWith("classes#") && !f.why.includes("LITHON-E"),
+  )
+  if (unexpected.length > 0) {
+    console.error(`\ngen-docs-ir: ${unexpected.length} unexpected classes-page failure(s):`)
+    for (const f of unexpected) console.error(`  ${f.where}: ${f.why.slice(0, 110)}`)
+    process.exit(1)
+  }
 }

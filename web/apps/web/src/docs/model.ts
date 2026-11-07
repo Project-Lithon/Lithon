@@ -148,7 +148,7 @@ export const DOC_GROUPS: readonly DocGroup[] = [
     slug: "language",
     title: "The language",
     order: 1,
-    blurb: "Types, flow, functions, containers, unsafe memory.",
+    blurb: "Types, flow, functions, containers, classes, unsafe memory.",
   },
   {
     slug: "engine",

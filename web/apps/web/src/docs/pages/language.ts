@@ -985,7 +985,7 @@ block0:
       blocks: [
         {
           kind: "p",
-          text: "A native call passes the first two arguments in registers (`rdi`/`rsi`, or `XMM0`/`XMM1` for floats) and every further argument in an 8-byte stack slot, exactly as SysV passes its later arguments. Up to 32 parameters are supported; a call or function past that budget is refused by the native tier and runs in the interpreter rather than mis-passing arguments.",
+          text: "A native call passes the first two arguments in registers (`rdi`/`rsi`, or `XMM0`/`XMM1` for floats) and every further argument in an 8-byte stack slot, exactly as SysV passes its later arguments. Up to 32 parameters are supported; a call or function past that budget is refused by the native tier and runs in the interpreter rather than mis-passing arguments. A class reference is passed as an 8-byte reference (upcast is free, dispatch is virtual); the callee retains the return and the caller owns one reference. Class-typed *containers* cannot be parameters or returns (E0124).",
         },
         {
           kind: "note",
@@ -1043,7 +1043,7 @@ const operators: DocPage = {
             ],
             [
               "`<=` `>=`",
-              "**refused**: *LITHON-E0114: comparison LtE not supported yet*. Only `<`, `>`, `==` and `!=` exist.",
+              "Supported via `not`-lowering: `a <= b` is `not (b < a)` and `a >= b` is `not (b > a)` — there is no `le`/`ge` opcode. Chained comparisons are still refused.",
             ],
             [
               "`a < b < c`",
@@ -1085,7 +1085,7 @@ print(x ** 3)`,
       blocks: [
         {
           kind: "p",
-          text: "`==` `!=` `<` `>` and the other comparisons produce `bool`. `and` `or` `not` operate on `bool`. `!=` is a first-class comparison with its own IR op (`ne`), not an `==` followed by a `not`, so the optimizer and branch fusion see the real predicate.",
+          text: "`==` `!=` `<` `>` and the other comparisons produce `bool`. `and` `or` `not` operate on `bool`. `!=` is a first-class comparison with its own IR op (`ne`), not an `==` followed by a `not`, so the optimizer and branch fusion see the real predicate. On class references, `is` / `is not` are always identity (E0114 on scalars), and `==` / `!=` / ordering dispatch to `__eq__` / `__lt__` / `__le__` / `__gt__` / `__ge__` when the class defines them — unrelated-class comparisons are refused (E0140). See [Classes](/docs/classes).",
         },
         {
           kind: "code",
@@ -1258,7 +1258,7 @@ const containers: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "A `list[T, N]` has a compile-time capacity `N` that is part of the type. The element type is a fixed-width scalar. The bare declaration `xs: list[int[64], 6]` **is** real work: it reserves the run and zeroes it: drop it and the first store writes to a name that was never allocated.",
+          text: "A `list[T, N]` has a compile-time capacity `N` that is part of the type. The element type is a fixed-width scalar or a class reference (`list[P, N]` holds 8-byte heap refs — see [Classes](/docs/classes)). The bare declaration `xs: list[int[64], 6]` **is** real work: it reserves the run and zeroes it: drop it and the first store writes to a name that was never allocated.",
         },
         {
           kind: "code",
@@ -2165,7 +2165,7 @@ print(ps[0] + ps[1])`,
           caption: "Restrictions",
           rows: [
             ["Body", "exactly one `return { <type> }`; `{}` is a dict and refused, multi-element bodies and comprehensions too"],
-            ["Composes", "scalar, container, pointer and dict types — not a struct or an enum (those are storage)"],
+            ["Composes", "scalar, container, pointer, dict and class-reference types — not a struct or an enum (those are storage)"],
             ["Parameters", "plain unannotated positional names; no `/`, `*`, `**` or defaults"],
             ["Names", "no redeclaration, and no collision with a struct, an enum or a function"],
             ["Recursion", "must bottom out in a concrete type; direct and mutual recursion are refused"],
@@ -2203,11 +2203,425 @@ print(0)`,
   ],
 }
 
+const classes: DocPage = {
+  slug: "classes",
+  title: "Classes",
+  description:
+    "Baseless classes: heap instances reached through a reference, with declared attributes, __init__, methods, and inheritance — the third class spelling alongside class(struct) and class(enum).",
+  group: "language",
+  tags: [
+    "class",
+    "classes",
+    "oop",
+    "object-oriented",
+    "__init__",
+    "self",
+    "inheritance",
+    "super",
+    "isinstance",
+    "issubclass",
+    "abstract",
+    "property",
+    "classmethod",
+    "special methods",
+    "dunder",
+    "reference",
+  ],
+  priority: "essential",
+  outcome:
+    "Declare a class, construct it with __init__, and dispatch through inheritance.",
+  minutes: 15,
+  sections: [
+    {
+      id: "what-a-class-is",
+      title: "A class is a layout, not a Python class",
+      blocks: [
+        {
+          kind: "p",
+          text: "A baseless `class Point:` declares a **heap object layout**. An instance is a reference (8 bytes) to bytes on the runtime heap — unlike `class Point(struct)`, which is an inline packed blob, and `class Point(enum)`, which is a tagged variant. There is no `__dict__`, no dynamic attributes, and no bare class name as a value (E0140): the instance exists only after `Point(...)` builds it.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/typed_regression/class_basic.lio",
+            sourceRef: "tests/typed_regression/class_basic.lio",
+            expectedRef:
+              "tests/typed_regression/expected/class_basic.out",
+            typecheck: false,
+            source: `class Point:
+    x: int[64]
+    y: int[64]
+
+    def __init__(self, x: int[64], y: int[64]):
+        self.x = x
+        self.y = y
+
+    def total(self) -> int[64]:
+        return self.x + self.y
+
+    def scaled(self, k: int[64]) -> int[64]:
+        return self.total() * k
+
+
+p: Point = Point(3, 4)
+print(p.total())
+print(p.scaled(10))
+print(p.x)
+p.x = 100
+print(p.total())
+q: Point = Point(1, 1)
+print(p.total() + q.total())`,
+            output: "7\n70\n3\n104\n106",
+          },
+        },
+        {
+          kind: "p",
+          text: "`Point(3, 4)` emits `new Point` and splices `__init__` into construction. Every declared attribute must be assigned on every `__init__` path, or construction is refused (E0140). Scalar attributes are zeroed at `new`; class-reference attributes start null and must be assigned before use on the same rule. Allowed attribute types are `int[w]`/`float[64]`/`bool` and another class reference — anything else is refused (E0127).",
+        },
+        {
+          kind: "layout",
+          caption: "Heap object: header + attributes",
+          size: "16 B header + packed attributes",
+          fields: [
+            { name: "vptr", offset: "0", size: "8 B" },
+            { name: "refcount", offset: "8", size: "8 B" },
+            { name: "attributes", offset: "16", size: "packed" },
+          ],
+        },
+        {
+          kind: "p",
+          text: "The header is `[vptr: 8][refcount: 8]`. `vptr` is the type tag — there is no separate tag word. Base attributes come first; a subclass instance starts with a valid base instance, so upcasting a derived reference to a base is free (no move, no copy). All attribute offsets are absolute from the object start.",
+        },
+      ],
+    },
+    {
+      id: "declaring-and-init",
+      title: "Declaring, constructing, and definite-init",
+      blocks: [
+        {
+          kind: "p",
+          text: "An attribute is declared once, by name and type. `__init__` takes extra annotated parameters, returns nothing, and must assign every attribute of the class and its bases (via its own statements or a `super().__init__(...)` call). A class variable must be initialized with a class value (E0140); a bare class name (`p: Point = Point`) is refused — only `Point(...)` constructs.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected · an attribute left unassigned in __init__",
+            expect: "error",
+            tool: "frontend",
+            typecheck: false,
+            errorMatch: "LITHON-E0140",
+            source: `class P:
+    x: int[64]
+    y: int[64]
+    def __init__(self):
+        self.x = 0
+p: P = P()`,
+          },
+        },
+        {
+          kind: "code",
+          example: {
+            title: "rejected · reading an undeclared attribute",
+            expect: "error",
+            tool: "frontend",
+            typecheck: false,
+            errorMatch: "LITHON-E0141",
+            source: `class P:
+    x: int[64]
+    def __init__(self):
+        self.x = 0
+p: P = P()
+print(p.z)`,
+          },
+        },
+      ],
+    },
+    {
+      id: "inheritance",
+      title: "Inheritance, super(), and C3",
+      blocks: [
+        {
+          kind: "p",
+          text: "A subclass `class B(A):` adds attributes after the base's (prefix-compatible layout) and inherits every method. Methods are **vtable-dispatched**: each name has one global slot, so `b.f()` runs the receiver's override through `CallVirtual`. Inline-able calls stay inline only when the receiver's exact class is known; otherwise the slot is read from the receiver's own descriptor.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/typed_regression/class_inherit_super.lio (excerpt)",
+            sourceRef:
+              "tests/typed_regression/class_inherit_super.lio",
+            expectedRef:
+              "tests/typed_regression/expected/class_inherit_super.out",
+            typecheck: false,
+            source: `# 4.10.2. super() over a three-level chain. \`C.__init__\` calls
+# \`super().__init__\`, which runs \`B.__init__\`, which calls the same form again
+# to run \`A.__init__\`; every level's attributes end up initialized on the one
+# object (and the derived definite-init check sees them). \`value\` is overridden
+# at each level and each override calls \`super().value()\`, so the chain adds
+# x + y + z. A \`B\`/\`A\` reference to the same \`C\` dispatches to C's override
+# through the vtable.
+#
+# The expected output is CPython's answer for the same shapes.
+
+class A:
+    x: int[64]
+
+    def __init__(self, x: int[64]):
+        self.x = x
+
+    def value(self) -> int[64]:
+        return self.x
+
+class B(A):
+    y: int[64]
+
+    def __init__(self, x: int[64], y: int[64]):
+        super().__init__(x)
+        self.y = y
+
+    def value(self) -> int[64]:
+        return super().value() + self.y
+
+class C(B):
+    z: int[64]
+
+    def __init__(self, x: int[64], y: int[64], z: int[64]):
+        super().__init__(x, y)
+        self.z = z
+
+    def value(self) -> int[64]:
+        return super().value() + self.z
+
+c: C = C(1, 2, 3)
+print(c.value())
+b: B = c
+print(b.value())
+a: A = c
+print(a.value())`,
+            output: "6\n6\n6",
+          },
+        },
+        {
+          kind: "p",
+          text: "`super()` is **dynamic**: it starts the search after the *defining* class in the receiver's actual MRO — so `Derived.bonus` calling `super().total()` reaches the base implementation even when the enclosing class does not override `total`. Each level here calls `super().value()`, and through `b: B = c` the vtable dispatches to `C.value()` anyway. A method whose body is just `...` is abstract; constructing the class is refused (E0140) until a subclass implements it.",
+        },
+        {
+          kind: "p",
+          text: "Multiple inheritance `class D(B, C):` uses the **C3 linearization**; a diamond's shared base is stored once, and the base order is observable through arithmetic over the MRO. `isinstance(x, C)` probes an ancestor bitset (compiled to a boolean); `issubclass(A, B)` is folded at compile time through C3. `super().__init__` is static along the construction MRO; `super().__del__` is refused (the destructor runs once, at the last drop).",
+        },
+        {
+          kind: "p",
+          text: "Identity is pointer identity — always. `is` / `is not` compare references; `==` / `!=` dispatch to `__eq__` when defined, else fall back to identity. Comparing unrelated classes, or assigning a derived reference where a base is required *and* the cast would narrow, is refused (E0140). There is no `None` and no `Optional` yet: a class-typed variable is never null, so there is nothing to check against.",
+        },
+      ],
+    },
+    {
+      id: "references-and-lifetime",
+      title: "References and lifetime",
+      blocks: [
+        {
+          kind: "p",
+          text: "Assigning `b = a`, returning a reference, and storing one into an attribute all **retain** (increment the refcount). The reference is released at the owning scope exit — block exit, loop back edge, `return`, `break`, `continue` — and `__del__` runs *exactly* when the last reference drops, while the instance is still fully formed; then its owned children drop recursively. Cycles leak by design (no tracer); an exceptional path that unwinds past an owning scope leaks rather than cleaning up.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/typed_regression/class_lifetime.lio (excerpt)",
+            sourceRef: "tests/typed_regression/class_lifetime.lio",
+            expectedRef:
+              "tests/typed_regression/expected/class_lifetime.out",
+            typecheck: false,
+            source: `class T:
+    v: int[64]
+
+    def __init__(self, v: int[64]):
+        self.v = v
+
+    def __del__(self):
+        print(self.v)
+
+
+def loop(n: int[64]) -> int[64]:
+    i: int[64] = 0
+    total: int[64] = 0
+    while i < n:
+        o: T = T(i)
+        total = total + o.v
+        i = i + 1
+    return total
+
+
+print(loop(3))`,
+            output: "0\n1\n2\n3",
+          },
+        },
+        {
+          kind: "p",
+          text: "A class-typed method parameter or return is a **reference** with an ownership contract: the callee retains the return, the caller owns one reference. Upcasting to a base-typed parameter is free. Class-typed **containers** are narrower: `list[P, N]` / `tuple[P, N]` hold one owned reference per slot (borrowed on read), a literal must be full, `append` and bare declarations are refused, and `enumerate`/`zip` over them plus passing or returning the container are refused (E0119/E0124) — the workaround is `for i in range(N): xs[i]`.",
+        },
+        {
+          kind: "p",
+          text: "Addresses are unobservable in both tiers (a reference is print-unsafe), so the JIT may not elide an observable `__del__` — but when a class defines no destructor, retain/release may be proven dead and removed.",
+        },
+      ],
+    },
+    {
+      id: "special-methods-and-decorators",
+      title: "Special methods and decorators",
+      blocks: [
+        {
+          kind: "p",
+          text: "Comparison methods `__eq__`/`__ne__`/`__lt__`/`__le__`/`__gt__`/`__ge__` take one class-reference parameter and return `bool`, and are looked up on the left operand only (no reflected priority, no `NotImplemented`). Ordering without the dunder is refused (E0135). `__str__` and `__repr__` are not callable methods: each is one literal or f-string of direct scalar `self.*` attributes returning `str[N]`; `print(obj)` picks `__str__`, else `__repr__`, by the concrete class — neither defined is refused (E0135).",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/typed_regression/class_special_methods.lio (excerpt)",
+            sourceRef:
+              "tests/typed_regression/class_special_methods.lio",
+            expectedRef:
+              "tests/typed_regression/expected/class_special_methods.out",
+            typecheck: false,
+            source: `class Point:
+    x: int[64]
+    y: int[64]
+
+    def __init__(self, x: int[64], y: int[64]):
+        self.x = x
+        self.y = y
+
+    def __eq__(self, other: Point) -> bool:
+        return self.x == other.x and self.y == other.y
+
+    def __lt__(self, other: Point) -> bool:
+        return self.x < other.x
+
+    def __le__(self, other: Point) -> bool:
+        return self.x <= other.x
+
+    def __gt__(self, other: Point) -> bool:
+        return self.x > other.x
+
+    def __ge__(self, other: Point) -> bool:
+        return self.x >= other.x
+
+    def __str__(self) -> str[64]:
+        return f"Point({self.x}, {self.y})"
+
+
+p: Point = Point(1, 2)
+q: Point = Point(1, 2)
+r: Point = Point(2, 0)
+
+print(p == q)
+print(p != q)
+print(p == r)
+print(p != r)
+print(p < r)
+print(p <= q)
+print(r > p)
+print(r >= q)
+print(p is q)
+print(p is not q)
+print(p)`,
+            output: "True\nFalse\nFalse\nTrue\nTrue\nTrue\nTrue\nTrue\nFalse\nTrue\nPoint(1, 2)",
+          },
+        },
+        {
+          kind: "p",
+          text: "Exactly two decorators exist, and only on baseless classes. `@property` makes a read-only computed attribute — `p.total`, not `p.total()` — occupying a vtable slot like a method; assigning to it is refused (E0135). `@classmethod` takes an unannotated `cls` first parameter, occupies no slot, and constructs through it: `cls(...)` builds the call-time class, `cls.other(...)` chains, `isinstance(x, cls)` and `issubclass(cls, C)` resolve statically. Every other decorator, and any stacked pair, is refused (E0134), as is a decorator on a struct/enum method.",
+        },
+        {
+          kind: "code",
+          example: {
+            title: "tests/typed_regression/class_decorators.lio (excerpt)",
+            sourceRef: "tests/typed_regression/class_decorators.lio",
+            expectedRef:
+              "tests/typed_regression/expected/class_decorators.out",
+            typecheck: false,
+            source: `class Point:
+    x: int[64]
+    y: int[64]
+
+    def __init__(self, x: int[64], y: int[64]):
+        self.x = x
+        self.y = y
+
+    @property
+    def total(self) -> int[64]:
+        return self.x + self.y
+
+    @property
+    def scaled(self) -> int[64]:
+        return self.total * 2
+
+    @classmethod
+    def origin(cls) -> Point:
+        return cls(0, 0)
+
+
+p: Point = Point(2, 3)
+print(p.total)
+print(p.scaled)
+q: Point = Point.origin()
+print(q.x)`,
+            output: "5\n10\n0",
+          },
+        },
+      ],
+    },
+    {
+      id: "what-classes-cannot-do",
+      title: "What a class cannot do yet",
+      blocks: [
+        {
+          kind: "table",
+          caption: "Deferred, by design",
+          rows: [
+            ["Other decorators", "only `@property` / `@classmethod` — refused (E0134)"],
+            ["Dynamic attributes", "no `__dict__`, no monkeypatching, no `setattr` beyond the declared layout"],
+            ["Nullability", "no `None` / `Optional` for class references (E0140)"],
+            ["Dict values", "no dict keys/values holding class references"],
+            ["Containers as values", "class-typed containers cannot be parameters or returns (E0124)"],
+            ["Reflected comparisons", "left-operand dispatch only; no `NotImplemented`"],
+            ["Cycles", "reference cycles leak — no tracer or weak references yet"],
+          ],
+        },
+        {
+          kind: "linkcards",
+          items: [
+            {
+              title: "Structs",
+              text: "Inline packed storage, no heap, no inheritance.",
+              href: "/docs/structs",
+            },
+            {
+              title: "Enums",
+              text: "Tagged variants read with match.",
+              href: "/docs/enums",
+            },
+            {
+              title: "Methods",
+              text: "Struct/enum methods are inlined; class methods are virtual.",
+              href: "/docs/methods",
+            },
+            {
+              title: "Python divergences",
+              text: "The sixteen deliberate differences from CPython classes.",
+              href: "/docs/python-divergences",
+            },
+          ],
+        },
+      ],
+    },
+  ],
+}
+
 const methods: DocPage = {
   slug: "methods",
   title: "Methods",
   description:
-    "A function declared in a struct or enum body, with an implicit self, inlined at each call site.",
+    "Functions declared in a body with an implicit self: inlined for struct/enum storage, vtable-dispatched for baseless classes.",
   group: "language",
   tags: [
     "methods",
@@ -2216,6 +2630,8 @@ const methods: DocPage = {
     "receiver",
     "struct methods",
     "enum methods",
+    "class methods",
+    "vtable",
     "inline",
   ],
   sections: [
@@ -2225,11 +2641,11 @@ const methods: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "A `def` inside a `struct` or `enum` body is a **method**. Its first parameter is the implicit receiver `self`, the rest are annotated scalars, and the return type is optional. A method is called on a struct or enum place: `p.f(1)`, where `p` may be a variable or a struct/enum field.",
+          text: "A `def` inside a `struct` or `enum` body is a **method** (this page). Its first parameter is the implicit receiver `self`, the rest are annotated scalars, and the return type is optional. A method is called on a struct or enum place: `p.f(1)`, where `p` may be a variable or a struct/enum field. A `def` inside a baseless `class` body is also a method but behaves differently — see [Classes](/docs/classes).",
         },
         {
           kind: "p",
-          text: "A method is **inlined at the call site**. That is forced by the storage model — a field access names a variable, not a value, and a struct or enum cannot be passed to a function (E0124). Inlining is what lets a method read and write the receiver's fields, run loops and branches, and call other methods.",
+          text: "A struct/enum method is **inlined at the call site**. That is forced by the storage model — a field access names a variable, not a value, and a struct or enum cannot be passed to a function (E0124). Inlining is what lets a method read and write the receiver's fields, run loops and branches, and call other methods. A baseless-class method is instead a **vtable slot**: it may take and return class references, can be overridden, and is dispatched by `CallVirtual` when the receiver's exact class is unknown (see [Classes](/docs/classes)). `__init__`/`__del__`/`@property`/`@classmethod` on classes are the inline exceptions.",
         },
       ],
     },
@@ -2270,7 +2686,7 @@ print(c.add(7))`,
       blocks: [
         {
           kind: "p",
-          text: "The receiver is a place, so it can be a struct field: `o.inner` resolves to the field's bytes and a method on `Inner` reads and writes the caller's `inner`. A method on an enum reads `self` with `match self` — the only way to read an enum — and returns a scalar computed from the active variant.",
+          text: "The receiver is a place, so it can be a struct field: `o.inner` resolves to the field's bytes and a method on `Inner` reads and writes the caller's `inner`. A method on an enum reads `self` with `match self` — the only way to read an enum (see [match](/docs/match)) — and returns a scalar computed from the active variant.",
         },
         {
           kind: "code",
@@ -2310,7 +2726,8 @@ print(s.code())`,
           caption: "Restrictions",
           rows: [
             ["Receiver", "the first parameter must be the unannotated name `self`"],
-            ["Signature", "scalars only (`int[w]`/`float[64]`/`bool`); not a struct, enum, container or pointer, as parameter or return"],
+            ["Signature (struct/enum)", "scalars only (`int[w]`/`float[64]`/`bool`); not a struct, enum, container or pointer, as parameter or return. Baseless-class methods additionally take/return class refs (see [Classes](/docs/classes))."],
+            ["Decorators", "struct/enum: none (E0134). Baseless class: exactly one of `@property` (read-only, `p.total`) or `@classmethod` (first param `cls`, `Point.origin()`) — see [Classes](/docs/classes)."],
             ["Arguments", "plain positional names; no `/`, `*`, `**` or defaults"],
             ["Names", "no redeclaration or overloading; may not shadow a field or variant"],
             ["Recursion", "inlined at each call site, so direct and mutual recursion are refused"],
@@ -2459,6 +2876,7 @@ export const LANGUAGE_PAGES: DocPage[] = [
   pointers,
   structs,
   enums,
+  classes,
   methods,
   typeFunctions,
   syscalls,

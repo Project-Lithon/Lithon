@@ -10,14 +10,17 @@
  * Run: bun scripts/gen-llms.ts
  */
 import { mkdirSync, writeFileSync } from "node:fs"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 
 import { DOC_GROUPS } from "../apps/web/src/docs/model"
 import { DOCS, outcomeOf, priorityOf } from "../apps/web/src/docs/registry"
 import { SITE, SITEMAP_HOST } from "../apps/web/src/lib/seo"
 import { CHANGES } from "../apps/web/src/changelog/data"
 
-const PUBLIC = join("apps", "web", "public")
+const WEB_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..")
+const PUBLIC = join(WEB_ROOT, "apps", "web", "public")
+mkdirSync(PUBLIC, { recursive: true })
 
 /** Strips the inline markup a doc block carries, leaving readable prose. */
 function plain(text: string): string {
@@ -156,11 +159,12 @@ const llms: string[] = [
   "tuple[T, N]                       fixed length N, homogeneous",
   "dict[K, V, B]                     B buckets, B must be a power of two",
   "ptr[T]                            typed pointer, variable name needs a leading _",
-  "class P(Struct)                   packed fields, no padding",
-  "class E(Enum)                    a tag plus the largest payload",
+  "class P(struct)                   packed fields, no padding",
+  "class E(enum)                    a tag plus the largest payload",
+  "class Point                   heap reference: [vptr:8][refcount:8], __init__, C3 inheritance",
   "```",
   "",
-  "There is no bare `int`, no `uint`, no `None`, no `lambda`, no closure, no `set`, no `bytes`, no `Optional`/`Union`, no `**`, no `//`, no `<=`/`>=`, and no chained comparison.",
+  "There is no bare `int`, no `uint`, no `None`, no `lambda`, no closure, no `set`, no `bytes`, no `Optional`/`Union`, no `**`, no `//`, no chained comparison (<=/>= lower via `not`).",
   "",
   "## A small program",
   "",
@@ -283,7 +287,6 @@ for (const change of CHANGES) {
 
 writeFileSync(join(PUBLIC, "llms-full.txt"), full.join("\n"), "utf8")
 
-mkdirSync(PUBLIC, { recursive: true })
 console.log(
-  `wrote llms.txt (${llms.length} lines) and llms-full.txt (${full.length} lines)`,
+  `wrote llms.txt (${llms.join("\n").split("\n").length} lines) and llms-full.txt (${full.join("\n").split("\n").length} lines)`,
 )

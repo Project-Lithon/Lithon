@@ -6,7 +6,7 @@
 
 ### Native execution for typed Python.
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen?style=flat-square\&logo=github-actions)](https://github.com/Project-Lithon/lithon/actions)
+[![Build Status](https://github.com/Project-Lithon/Lithon/actions/workflows/ci.yml/badge.svg)](https://github.com/Project-Lithon/Lithon/actions/workflows/ci.yml)
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-20-00599C?style=flat-square\&logo=c%2B%2B)](https://en.cppreference.com/w/cpp/20)
 [![Architecture](https://img.shields.io/badge/arch-x86--64-red?style=flat-square)](https://en.wikipedia.org/wiki/X86-64)
 [![Typing](https://img.shields.io/badge/typing-extended%20static-green?style=flat-square)](#-static-typing)
@@ -40,7 +40,7 @@ as Lithon.
 
 For example:
 
-```python
+```lio
 x: int[64] = 10
 y: int[64] = 20
 
@@ -50,6 +50,8 @@ print(result)
 ```
 
 ### Current status
+
+**Version:** language/spec stage **4.10.6** (OOP complete); Python package **1.0.0** (`pyproject.toml`), pre-1.0 release, not yet on PyPI. `4.10.x` numbers are spec-section numbers, not semver.
 
 **Lithon is an experimental/community-preview project.**
 
@@ -344,7 +346,7 @@ The last point is fundamental to the project:
 
 ### Static integers
 
-```python
+```lio
 a:int[64] = 20
 b:int[64] = 22
 
@@ -743,7 +745,7 @@ The verification suite checks several independent layers.
 | Type-checker unit checks             |          **145 ok**          |
 | Error-code discipline checks         |         **176 ok**           |
 | Tier differential (interp vs JIT)    |      **235 / 235 passed**     |
-| Object runtime (4.10.0–4.10.4, ctest) | **107 ok**       |
+| Object runtime (4.10.0–4.10.6, ctest) | **107 ok**       |
 | Class (OOP) fuzzing                  |      **200 / 200 passed**     |
 | Syscall hook parity (both tiers)     |        **4 / 4 passed**      |
 | Networking loopback vs a C oracle    |          **verified**        |
@@ -1297,9 +1299,13 @@ reads `self` with `match self`.
 Because the body is expanded at each call site, a method cannot recurse,
 directly or indirectly (E0135). A method signature is scalars only
 (`int[w]`/`float[64]`/`bool`): a method may not take or return a struct, an
-enum, a container or a pointer, and `self` is unannotated. There is no
-inheritance or overloading, a method name may not shadow a field or a variant,
-and the signature accepts no `/`, `*`, `**` or defaults (E0134).
+enum, a container or a pointer, and `self` is unannotated. This section covers
+`struct`/`enum` methods: struct/enum bodies still have no inheritance or
+overloading, a method name may not shadow a field or a variant, and the
+signature accepts no `/`, `*`, `**` or defaults (E0134). A real class method
+(see [Classes](#-classes-oop)) additionally accepts class-reference
+parameters/returns, supports inheritance/override, `@property`/`@classmethod`,
+and `super()`.
 
 ```python
 class Shape(enum):
@@ -1320,6 +1326,62 @@ class Shape(enum):
 method-using program and the same program with the bodies inlined by hand and
 requires both tiers to produce identical output, checks the IR is deterministic,
 and checks the E0134/E0135 refusals.
+
+---
+
+## 👥 Classes (OOP)
+
+A baseless `class` is a heap object reached through an 8-byte reference — the third `class` spelling alongside `class P(struct)` (inline packed storage) and `class E(enum)` (tagged variant). An instance layout is `[vptr:8][refcount:8][attrs...]`; base attributes come first so upcasting is free (no move). Every attribute must be assigned on every `__init__` path (definite-init, E0140), `__del__` runs at the exact last drop, and `is` is always identity.
+
+```lio
+class Point:
+    x: int[64]
+    y: int[64]
+
+    def __init__(self, x: int[64], y: int[64]):
+        self.x = x
+        self.y = y
+
+    def total(self) -> int[64]:
+        return self.x + self.y
+
+
+p: Point = Point(3, 4)
+print(p.total())
+```
+
+Single inheritance uses prefix-compatible layout and C3 for multiple inheritance (a diamond's shared base is stored once). Methods are **vtable-dispatched** (`CallVirtual` when the receiver's exact class is unknown; inline only when known). `super()` is dynamic — it searches after the *defining* class in the receiver's actual MRO — so `B.value: return super().value() + self.y` chains correctly even when the enclosing class does not override the target. `isinstance(x, C)` is an ancestor-bitset probe; `issubclass(A, B)` is a compile-time C3 fold. Comparison dunders (`__eq__`/`__lt__`/... left-operand dispatch, no reflected priority) and restricted `__str__`/`__repr__` (one literal/f-string of direct scalar `self.*`) live on the class; `print(obj)` picks `__str__` else `__repr__`. Only `@property` (read-only, `p.total`) and `@classmethod` (`cls` alias, `cls(...)` constructs the call-time class) exist — everything else is refused (E0134/E0135).
+
+```lio
+class Shape:
+    sides: int[64]
+
+    def __init__(self, sides: int[64]):
+        self.sides = sides
+
+    def area(self) -> int[64]: ...  # abstract: construction refused
+
+    def describe(self) -> int[64]:
+        return self.area() * 10 + self.sides
+
+
+class Square(Shape):
+    side: int[64]
+
+    def __init__(self, side: int[64]):
+        super().__init__(4)
+        self.side = side
+
+    def area(self) -> int[64]:
+        return self.side * self.side
+
+
+s: Square = Square(4)
+sh: Shape = s
+print(sh.area())
+```
+
+Class references can be passed and returned (callee retains → caller owns one ref) and stored in `list[P,N]`/`tuple[P,N]` (one owned ref per slot, borrow-on-read, full-literal-only; no `append`, no `enumerate`/`zip`, no params/returns). What classes cannot do yet: other decorators, `__dict__`/dynamic attributes, `None`/`Optional`, dict class values, reference cycles (they leak), and reflected comparisons. Full design: `docs/classes.md`; web: `/docs/classes`; tests: `tests/typed_regression/class_*.lio` (15 files); fuzz: `fuzz_diff.py --oop` (6 shapes, 200/200).
 
 ---
 
@@ -2079,7 +2141,7 @@ python3 tools/run_tier_diff.py
 
 Every program runs twice — once through the interpreter (the oracle) and once
 through the native tier — and the two stdout streams must be byte-identical.
-Currently **233 / 233** cases pass, 133 of them on the native tier.
+Currently **235 / 235** cases pass, 134 of them on the native tier.
 
 Two classes of case are deliberately outside this comparison:
 

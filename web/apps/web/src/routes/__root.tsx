@@ -59,7 +59,7 @@ export const Route = createRootRoute({
       {
         name: "description",
         content:
-          "Lithon | A zero-dependency, dual-tier execution engine built for native speed.",
+          "Lithon | Lithon | native execution for typed Python: classes with C3 inheritance, verified statically, emitted natively.",
       },
       { name: "theme-color", content: "#121212" },
       {
@@ -520,7 +520,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
                 Skip to content
               </a>
               <SiteHeader dir={dir} onToggleDir={toggleDir} />
-              <main id="main">{children}</main>
+              <main id="main" tabIndex={-1}>{children}</main>
               <SiteFooter />
               <ConsentBanner />
             </TooltipProvider>

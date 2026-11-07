@@ -1,5 +1,5 @@
 const REPO = "Project-Lithon/Lithon"
-const ENDPOINT = `https://api.github.com/repos/${REPO}/actions/runs?per_page=12`
+const ENDPOINT = `https://api.github.com/repos/${REPO}/actions/runs?per_page=30`
 
 /**
  * The branch the deployed site tracks. A run on a feature branch should not
@@ -82,7 +82,9 @@ export function overallStatus(runs: WorkflowRun[]): RunStatus {
     return "failure"
   if (
     meaningful.some(
-      (r) => normaliseConclusion(r.status, r.conclusion) === "in_progress"
+      (r) =>
+        normaliseConclusion(r.status, r.conclusion) === "in_progress" ||
+        normaliseConclusion(r.status, r.conclusion) === "queued"
     )
   )
     return "in_progress"
