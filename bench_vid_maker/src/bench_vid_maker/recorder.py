@@ -27,6 +27,10 @@ _FONT_CANDIDATES = [
         str(pathlib.Path.home() / ".local/share/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"),
         str(pathlib.Path.home() / ".local/share/fonts/JetBrainsMonoNerdFontMono-Bold.ttf"),
     ),  # WSL/Linux user-font install of the same Nerd Font
+    (
+        "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+        "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Bold.ttf",
+    ),  # Arch/Omarchy system install of the same Nerd Font
     ("C:/Windows/Fonts/consola.ttf", "C:/Windows/Fonts/consolab.ttf"),
     ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"),
 ]
@@ -36,6 +40,26 @@ def _find_fonts() -> tuple[str, str]:
     for regular, bold in _FONT_CANDIDATES:
         if pathlib.Path(regular).exists():
             return regular, bold if pathlib.Path(bold).exists() else regular
+    # Last resort: glob the usual font roots (family spelling/dir varies
+    # by distro: JetBrainsMonoNerdFont* vs *Mono*, TTF/ vs truetype/ ...).
+    for root in (
+        pathlib.Path.home() / ".local/share/fonts",
+        pathlib.Path("/usr/share/fonts"),
+        pathlib.Path("/usr/local/share/fonts"),
+        pathlib.Path("/usr/share/X11/fonts"),
+    ):
+        if not root.exists():
+            continue
+        for regular in sorted(root.rglob("JetBrainsMonoNerdFont*.ttf")):
+            if "Italic" in regular.name:
+                continue
+            bold = regular.with_name(regular.name.replace("Regular", "Bold"))
+            return str(regular), str(bold) if bold.exists() else str(regular)
+        for regular in sorted(root.rglob("*DejaVuSansMono*.ttf")):
+            if "Italic" in regular.name:
+                continue
+            bold = regular.with_name(regular.name.replace("Regular", "Bold").replace("Mono", "Mono-Bold"))
+            return str(regular), str(bold) if bold.exists() else str(regular)
     raise FileNotFoundError(
         "no monospace TTF font found for video rendering; looked for "
         + ", ".join(r for r, _ in _FONT_CANDIDATES)
