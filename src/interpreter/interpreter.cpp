@@ -1140,6 +1140,16 @@ LithonValue execute_function(const Module& module, const Function& fn,
                             static_cast<size_t>(instr.type_width), 0);
                         break;
                     }
+                    // 4.10.7. A valueless class store declares a class
+                    // reference and initializes it to the null object. The
+                    // frontend uses this for None (it has no null literal), so
+                    // treating it as a type-only scalar would leave the name
+                    // unbound and make `load` fail. The null object is shared,
+                    // not owned; Retain/Release are null-tolerant.
+                    if (instr.args.empty() && instr.type_kind == "class") {
+                        frame.vars[instr.name] = LithonValue::make_object(nullptr);
+                        break;
+                    }
                     // 0.6.10. A valueless scalar or pointer store is a
                     // type-only declaration: the typechecker consumed it, so
                     // there is no value to read into the variable and no

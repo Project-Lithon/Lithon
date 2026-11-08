@@ -46,6 +46,7 @@ kind of failure is this" readable from the code alone.
 | `E0135` | 1 (static refusal) | Method application and `super()` (4.9/4.10): an unknown method, a field where a method is called, a non-struct/enum/class receiver, keyword/starred arguments, an arity mismatch, a recursive inline, a method with no result used as a value, an incompatible inherited signature or changed method kind, an invalid `super()` form/target, a missing ordering method, an explicit `__str__`/`__repr__` call, an object with neither text method printed, a property assignment or call, a classmethod called on an instance, or an ordinary method called on a class name |
 | `E0140` | 1 (static refusal) | Class instance semantics (4.10.1/4.10.2/4.10.3/4.10.4): a bare class name used where a value is needed, a class-typed variable initialized with a non-class value, an identity compare between classes with no possible common declared subclass, an attempt to instantiate an abstract class, an attribute left uninitialized on some path through `__init__`, a bare declaration or `append` on a class-typed container, storing a non-class or unrelated class reference into a class-typed container element, or membership of a non-class or unrelated class in a class-typed container |
 | `E0141` | 1 (static refusal) | Class attribute access (4.10.1): a read or write of an attribute the class does not declare (an instance has exactly its declared attributes) |
+| `E0142` | 1 (static refusal) | Nullable class references (4.10.7): `Optional[T]` where `T` is not a class reference or is nested, an Optional class reference in a collection, `None` outside an Optional class target (including scalar/container/index/print/augmented-assignment/enum-payload/builtin contexts), an Optional used as an object without an `is None`/`is not None` proof, or `==`/`!=` used instead of the identity checks |
 | `E0201` | 2 (environmental) | Fallible value read before `.ok` check |
 | `E0301` | 3 (dynamic runtime trap) | Division by zero |
 | `E0302` | 3 (dynamic runtime trap) | Modulo by zero |
@@ -295,3 +296,60 @@ the flat, inheritance, container, multiple-inheritance, special-methods and
 property/classmethod shapes. The sixth shape exercises inherited `cls(...)`
 construction, `cls.other(...)`, static `issubclass(cls, C)`, property override
 dispatch and a statement classmethod call.
+
+## 4.10.7 — nullable class references
+
+`Optional[P]` is one class reference that may name either an instance of `P`
+(or a subclass) or no object at all. It is accepted as a local, a class
+attribute, a parameter and a return type. The annotation is deliberately not a
+general optional type: `P` must be a class reference, nested `Optional[...]`
+is redundant and refused, and a collection whose element type contains an
+`Optional` is deferred rather than given a second runtime representation. The
+IR spelling stays `class[P]`, and nullability is a source-level obligation the
+frontend enforces; there is no new IR opcode or runtime ABI.
+
+`None` is not a general scalar zero. It is a value only for an `Optional`
+class target, so a non-Optional class binding, scalar or container
+declaration, index, dict key/value, print/f-string, append, conversion,
+augmented assignment, enum payload, builtin or call argument refuses it
+(`E0142`). This closes the otherwise
+silent `None`-as-zero reading (`xs[None]` looking at `xs[0]`, `print(None)`
+printing `0`, and so on). `==`/`!=` against `None` is also refused: `==` may
+dispatch to a class comparison method, and `None` is not an instance of that
+class. The identity forms `is None` and `is not None` are the only accepted
+way to test absence.
+
+An `Optional` value cannot be used as an object until it has been checked.
+The frontend tracks a conservative fact per plain class-variable name through
+`if` and `while`: `p is not None` proves `p` non-null on the true arm and
+`p is None` proves it on the false arm, while an early `return`, `break` or
+`continue` in one arm lets the other arm's fact survive the merge. The same
+proof is discarded again by assigning `None`, and re-established by assigning
+a non-null reference. Attributes do not narrow: `obj.field` may change
+between the check and the use, so the programmer copies it into a local
+first. A `try` handler knows only the facts from before the `try`, and a loop
+exit knows only the facts from before the loop, because either path may have
+run with the value replaced.
+
+The runtime model is unchanged. A class reference is one pointer, and the
+frontend represents `None` with a synthetic valueless `store name : class[P]`
+followed by a `load`; both tiers initialize a valueless class store to a null
+class reference, so the result is a real class-typed null rather than an
+integer zero. `None` assignments, returns and arguments lower through that
+null reference, and the existing retain/release sequence still owns the old
+target: reassigning a nullable binding releases the reference it held at that
+statement, while retain/release are null-tolerant. The SSA pipeline keeps
+valueless class declarations in memory, because they reserve a slot rather
+than define a value; promoting them would replace the load with an invalid
+value id.
+
+Verification at the close of this stage: typed regression 62/62 (including
+`class_optional`), general regression 34/34, tier differential 237/237
+(native 135, interpreter fallback 0), direct-Phi 96 matched / 0 known gaps / 0
+mismatched, error-code checks 196, object-runtime ctest 107 ok, and
+`fuzz_diff.py --count 200 --oop` 200 passed / 0 skipped / 0 mismatches across
+the flat, inheritance, container, multiple-inheritance, special-methods,
+property/classmethod and Optional/None shapes. The seventh shape exercises
+nullable attributes and locals, Optional parameters and returns, a derived
+object through an Optional base reference, `while` and early-return narrowing,
+and the release/replace path when a nullable attribute is reassigned.

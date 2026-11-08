@@ -66,6 +66,26 @@ drop-in Python replacement.
 
 ### Recently added
 
+- **Nullable class references (4.10.7)** — `Optional[P]` is one class
+  reference that may also hold `None`; it is accepted for locals, attributes,
+  parameters and returns. `None` is not a general scalar zero: it is a value
+  only for an Optional class target, so printing it, storing it in a scalar or
+  container, indexing with it, using it in an augmented assignment or an enum
+  payload, passing it to a non-Optional parameter and the other non-class uses
+  are refused (`E0142`). An unchecked Optional cannot be used as an object:
+  `is None` / `is not None` narrow a plain class-variable name through
+  `if`/`while`, including an early `return` after a guard, and
+  `==`/`!=` with `None` is refused in favour of the identity forms. Narrowing
+  is deliberately not inferred for an attribute (copy it to a local first),
+  and try/loop exits restore the conservative pre-block facts. The runtime
+  model is unchanged: an Optional is still an 8-byte reference, with a
+  class-typed null reference for `None`, and assigning `None` (or another
+  reference) releases the old target at that statement. No IR opcode or
+  runtime ABI is added. Collections containing an Optional class reference are
+  deliberately deferred. `tests/typed_regression/class_optional.lio` pins
+  locals, attributes, parameters, returns, upcasts, narrowing, chained walks
+  and release/replace lifetime, and `fuzz_diff.py --oop` alternates a seventh
+  Optional/None shape.
 - **Properties and classmethods (4.10.6)** — the only decorators Lithon
   recognises are a bare `@property` and a bare `@classmethod`; any other or
   multiple decorators remain refused (`E0134`). A property is a read-only
@@ -110,7 +130,7 @@ drop-in Python replacement.
   natural `__le__`/`__ge__` bodies work without a new opcode.
   `tests/typed_regression/class_special_methods.lio` pins equality, ordering,
   identity, dynamic text dispatch and the `__repr__` fallback, and
-  `fuzz_diff.py --oop` includes a special-methods shape in its six-shape
+  `fuzz_diff.py --oop` includes a special-methods shape in its seven-shape
   rotation.
 - **Multiple inheritance (4.10.4)** — `class D(B, C):` may combine bases that
   were declared earlier. Method lookup uses Python's **C3 linearization**, so
@@ -134,7 +154,7 @@ drop-in Python replacement.
   `tests/typed_regression/class_multiple_inherit.lio` and
   `class_multiple_lifetime.lio` pin C3 lookup, cooperative `super()`, class
   returns and inherited-drop lifetime, and `fuzz_diff.py --oop` includes a
-  diamond shape among its six OOP shapes.
+  diamond shape among its seven OOP shapes.
 - **Class references in containers (4.10.3)** — a `list[P, N]` or
   `tuple[P, N]` may now hold class references. Each element is one 8-byte
   reference leaf in the container's flat run, so a nested
@@ -225,10 +245,12 @@ drop-in Python replacement.
   design: a bare class name in a value position ("did you mean `Name(...)`?"),
   an undeclared attribute (E0141), and general decorators — 4.10.6 recognises
   only a bare read-only `@property` or `@classmethod` on a class method.
-  Class-typed variables are non-null
-  by default; `Optional`/`None` is a later sub-step. Class references may now
-  be list/tuple elements (4.10.3); a dict, struct attribute or class attribute
-  holding one remains a later sub-step.
+  Class-typed variables are non-null unless declared `Optional[P]`; 4.10.7
+  adds `None`, the `is None`/`is not None` narrowing proof and the
+  associated refusals (`E0142`). Class references may be list/tuple elements
+  (4.10.3) and class attributes (4.10.1), but a collection holding an
+  `Optional[P]` element is deliberately deferred; a dict or struct attribute
+  holding a class or Optional reference remains a later sub-step.
   `tests/typed_regression/class_basic.lio`, `class_lifetime.lio`,
   `class_references.lio` and `class_returns.lio` are tier-identical guards, and
   `tools/fuzz_diff.py --oop` generates class programs and compares the two
@@ -740,12 +762,15 @@ The verification suite checks several independent layers.
 | Direct float Phi sweep               | **95 matched / 0 mismatched** |
 | ABI modules audited                  |             **34**            |
 | ABI stack/callee-saved failures      |             **0**             |
-| Typed regression suite               |       **61 / 61 passed**      |
+| Typed regression suite               |       **62 / 62 passed**      |
 | General regression suite             |       **34 / 34 passed**      |
 | Type-checker unit checks             |          **145 ok**          |
 | Error-code discipline checks         |         **176 ok**           |
 | Tier differential (interp vs JIT)    |      **235 / 235 passed**     |
 | Object runtime (4.10.0–4.10.6, ctest) | **107 ok**       |
+| Error-code discipline checks         |         **196 ok**           |
+| Tier differential (interp vs JIT)    |      **237 / 237 passed**     |
+| Object runtime (4.10.0–4.10.4, ctest) | **107 ok**       |
 | Class (OOP) fuzzing                  |      **200 / 200 passed**     |
 | Syscall hook parity (both tiers)     |        **4 / 4 passed**      |
 | Networking loopback vs a C oracle    |          **verified**        |
@@ -1772,7 +1797,8 @@ Deliberate narrowings, collected next to `%` and `v == n`:
 | references held across a trap (4.10.0) | a caught exception's frame objects are dropped when the handler runs | the references held between a trap and its `try` handler are **leaked** on the exceptional path; their `__del__` does not run | the caught trap is a plain jump, so there is no unwind step to release the abandoned frames; releasing them needs per-frame cleanup tables. Never a safety problem -- a leak, not a dangling reference |
 | `__del__` timing (4.10.0) | runs when the garbage collector notices (or at interpreter exit for some cycles) | runs at the exact program point where the last reference drops, and the optimizer may not move or elide that drop | it is the one observable lifetime event, so it must be identical in both tiers; making it a fixed drop point is what guarantees that |
 | object drop points (4.10.1) | a name is kept alive until the frame or module that bound it tears down, so a loop variable from the last iteration survives to the end of the function | a reference is dropped at the exit of the **scope that owns it**: a loop body releases what each iteration created on the back edge, and a `return`/`break`/`continue` releases the references that path owns | it keeps the reference count equal to the number of *lexically live* owners, so a per-iteration object is freed each pass instead of accumulating, and the observable `__del__` order follows the program's block structure rather than CPython's frame teardown. `fuzz_diff.py --oop` exempts this from the CPython oracle for `__del__` programs; the two tiers always agree with each other |
-| classes (4.10.1–4.10.6) | classes, instances, multiple inheritance, decorators, `__dict__`, metaclasses, dynamic attribute addition | a baseless `class Name:` or one or more bases declared earlier, combined by C3; the only decorators are a bare read-only `@property` and a bare `@classmethod` (general decorators and method-kind mismatches are refused, E0134/E0135); an attribute is `int[w]`/`float[64]`/`bool`/a class reference, and an instance has exactly its declared attributes; the only special methods are the six comparison dunders and restricted `__str__`/`__repr__` (4.10.5); a class-typed variable is non-null; a list/tuple element may be a class reference only in a fully initialized literal (4.10.3) | a class is a layout the compiler knows, so an attribute is a fixed offset and a method is inlined or reached through a fixed slot; dynamic attributes would need a runtime shape and a hash map, nullability needs `Optional`, and a reference leaf in a container needs the per-slot ownership of 4.10.3, all later additions |
+| classes (4.10.1–4.10.7) | classes, instances, multiple inheritance, decorators, nullable references, `__dict__`, metaclasses, dynamic attribute addition | a baseless `class Name:` or one or more bases declared earlier, combined by C3; the only decorators are a bare read-only `@property` and a bare `@classmethod` (general decorators and method-kind mismatches are refused, E0134/E0135); an attribute is `int[w]`/`float[64]`/`bool`/a class reference, and an instance has exactly its declared attributes; the only special methods are the six comparison dunders and restricted `__str__`/`__repr__` (4.10.5); a class-typed variable is non-null unless declared `Optional[P]`, which is one nullable reference in a local, attribute, parameter or return (4.10.7); a list/tuple element may be a class reference only in a fully initialized literal (4.10.3) | a class is a layout the compiler knows, so an attribute is a fixed offset and a method is inlined or reached through a fixed slot; dynamic attributes would need a runtime shape and a hash map, and a reference leaf in a container needs the per-slot ownership of 4.10.3, all later additions; Optional reuses the one-pointer reference and is narrowed statically rather than introducing a tagged value |
+| `None` and optionality (4.10.7) | `None` is a general singleton value of any optional type; comparisons, scalars, containers and truthiness all accept it, and Optional can wrap any type | `Optional[P]` exists only for a class reference; `None` is only a value for an Optional class target (scalar/container/index/print/augmented-assignment/enum-payload/builtin uses are refused, E0142); `is None`/`is not None` narrow a plain class name through `if`/`while` (not an attribute), `==`/`!=` with `None` is refused, and collections of Optional class elements are deferred | a class reference is one unchecked pointer and `None` is its null reference, not a tagged scalar union; a general `None`/any-typed Optional would require a runtime tag or a second representation, and limiting narrowing to names keeps the proof local and sound |
 | computed attributes (`@property`, 4.10.6) | a property is a descriptor object with a getter, optional setter/deleter, can be called through the class, and is settable when a setter exists | a property is a restricted read-only computed attribute: a bare `@property` method taking only `self` and returning a scalar or class reference; it is read without parentheses (`p.total`), inherited/overridden through the ordinary method slot, and dispatches through `CallVirtual` when a subclass overrides it; assignment and a `()` call are refused (`E0135`) | descriptors, setters/deleters and class-level property objects would need runtime attribute descriptors and a callable-value ABI; a read-only property over a fixed method signature keeps the read a normal slot call and adds no IR opcode |
 | classmethods (`@classmethod`, 4.10.6) | `@classmethod` is a descriptor bound to the class and to instances, `cls` is a runtime class object, and a classmethod can be called through either | only a bare `@classmethod` with an unannotated first `cls`; called as `Class.method(...)`; `cls` is a compile-time alias for the call-time class inside the inlined body (`cls(...)`, `cls.other(...)`, `isinstance(x, cls)`, `issubclass(cls, C)`); inherited calls construct the call-time subclass; it is not an instance method and has no vtable slot; an instance call or a class-name call to an ordinary method is refused (`E0135`) | class objects are not runtime values in this slice, so binding a method to a class or instance would require a callable/descriptor ABI; static inlining preserves the closed-hierarchy model and lets the call-time subclass flow into construction |
 | decorator surface (4.10.6) | arbitrary decorators, stacked decorators, decorator arguments, and metaclass hooks | exactly one bare `@property` or `@classmethod` on a class method; every other decorator, a stacked decorator, or a decorated `__init__`/`__del__`/special method is refused (`E0134`); the two recognised kinds cannot be mixed across an override or inheritance chain (`E0135`) | a general decorator evaluates arbitrary Python before the method exists and needs first-class functions/descriptors; the two compiler-known forms cover computed reads and class-namespaced construction without opening that surface |
@@ -1942,8 +1968,8 @@ Deliberate narrowings, collected next to `%` and `v == n`:
   otherwise stay identity. Definite init is enforced structurally (E0140); an
   undeclared attribute (E0141) or a bare class name are refused, and general
   decorators remain refused; 4.10.6 adds the two restricted forms.
-  `Optional`/`None` is a later sub-step, so a class-typed variable is non-null.
-  Guards:
+  4.10.7 adds `Optional`/`None`, so a class-typed variable is non-null unless
+  it is declared `Optional[P]`. Guards:
   `class_basic.lio`, `class_lifetime.lio`, `class_references.lio`,
   `class_returns.lio`, and `fuzz_diff.py --oop`.
 * [x] Single inheritance (4.10.2) — `class Dog(Animal):` with the base declared
@@ -2026,6 +2052,22 @@ Deliberate narrowings, collected next to `%` and `v == n`:
   zero-argument virtual-call path and a classmethod body is inlined, so no new
   IR opcode or runtime ABI is introduced. Guards: `class_decorators.lio` and
   the sixth shape in `fuzz_diff.py --oop`.
+* [x] Nullable class references (4.10.7) — `Optional[P]` is one pointer that
+  may also be null, supported in locals, class attributes,
+  parameters and returns. `None` is not a general zero: only an Optional class
+  target may consume it, while scalar declarations, container elements and
+  indexes, printing, appends, conversions, augmented assignments, enum
+  payloads, builtins and non-Optional calls refuse it (`E0142`).
+  `is None`/`is not None` narrow a plain class-variable
+  name through `if`/`while`, including an early return after a guard; an
+  attribute must be copied to a local, and try or loop exits restore the
+  conservative pre-block facts. `==`/`!=` with `None` is refused. Assigning
+  `None` or another reference releases the old target at that statement, and
+  Optional attributes/returns keep the 4.10.1 ownership rules. No IR opcode or
+  runtime ABI is added: the frontend emits the normal retain/release sequence
+  around a class-typed null store/load. Collections of Optional class
+  references and general any-typed Optional/None remain deferred. Guards:
+  `class_optional.lio` and the seventh shape in `fuzz_diff.py --oop`.
 
 ---
 
@@ -2141,7 +2183,11 @@ python3 tools/run_tier_diff.py
 
 Every program runs twice — once through the interpreter (the oracle) and once
 through the native tier — and the two stdout streams must be byte-identical.
+<<<<<<< HEAD
 Currently **235 / 235** cases pass, 134 of them on the native tier.
+=======
+Currently **237 / 237** cases pass, 135 of them on the native tier.
+>>>>>>> 75fdd65 (Lithon: Implemented nullable class references (4.10.7) successfully!)
 
 Two classes of case are deliberately outside this comparison:
 

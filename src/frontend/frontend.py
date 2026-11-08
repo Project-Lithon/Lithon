@@ -45,15 +45,21 @@ class Type:
     inside a container had nowhere to live and was silently flattened.
     """
 
-    __slots__ = ("kind", "width", "cap", "elem", "key", "ref")
+    __slots__ = ("kind", "width", "cap", "elem", "key", "ref", "nullable")
 
-    def __init__(self, kind, width=-1, cap=None, elem=None, key=None, ref=None):
+    def __init__(self, kind, width=-1, cap=None, elem=None, key=None, ref=None,
+                 nullable=False):
         self.kind = kind
         self.width = width
         self.cap = cap
         self.elem = elem
         self.key = key
         self.ref = ref   # a struct/enum NAME, for the source-level spelling only
+        # 4.10.7. A class reference may be Optional[P]: the same one-pointer
+        # representation as P, with a null value spelled None. The IR has no
+        # nullability metadata -- the frontend enforces it, and the IR spelling
+        # stays `class[P]` -- so this flag must never reach render().
+        self.nullable = nullable
 
     def is_container(self):
         return self.kind in CONTAINER_KINDS
@@ -85,8 +91,8 @@ class Type:
 
     def __eq__(self, other):
         if isinstance(other, Type):
-            return ((self.kind, self.width, self.cap, self.ref) ==
-                    (other.kind, other.width, other.cap, other.ref)
+            return ((self.kind, self.width, self.cap, self.ref, self.nullable) ==
+                    (other.kind, other.width, other.cap, other.ref, other.nullable)
                     and self.elem == other.elem and self.key == other.key)
         if isinstance(other, tuple):
             return self._flat() == other
@@ -94,7 +100,13 @@ class Type:
 
     def __hash__(self):
         return hash((self.kind, self.width, self.cap, self.ref,
-                     self.elem, self.key))
+                     self.nullable, self.elem, self.key))
+
+    def source(self):
+        """The source-level spelling, including Optional[] where it applies."""
+        if self.kind == "class" and self.nullable:
+            return f"Optional[{self.ref}]"
+        return self.render()
 
     def render(self):
         """The type's IR spelling, e.g. `list[tuple[int[64], 4], 2]`."""
@@ -209,7 +221,8 @@ def render_class_meta(layout, class_index):
 
 def _emit_class_method_function(builder_cls, fn_rename, structs, enums, classes,
                                fn_returns, owner_name, defining_name, method_name,
-                               method, class_index, module_parts):
+                               method, class_index, module_parts,
+                               fn_param_types=None, fn_optional_returns=None):
     """Emit one real function for a virtual method slot -- 4.10.2.
 
     A monomorphic call is inlined (4.9's promise), but a POLYMORPHIC call picks
@@ -225,7 +238,8 @@ def _emit_class_method_function(builder_cls, fn_rename, structs, enums, classes,
     verbatim. `self` is BORROWED here -- the caller owns the receiver -- so the
     body must not release the method's own incoming reference on the way out.
     """
-    db = builder_cls(fn_rename, structs, enums, classes, fn_returns)
+    db = builder_cls(fn_rename, structs, enums, classes, fn_returns,
+                     fn_param_types, fn_optional_returns)
     db.start_block(db.reserve_label())
     self_param = "self"
     db.declared[self_param] = Type("class", ref=owner_name)
@@ -239,10 +253,12 @@ def _emit_class_method_function(builder_cls, fn_rename, structs, enums, classes,
             param_strs.append(p.arg)
             continue
         t = parse_type_annotation(p.annotation)
-        if isinstance(p.annotation, ast.Name) and p.annotation.id in classes:
-            db.declared[p.arg] = Type("class", ref=p.annotation.id)
-            db.class_vars[p.arg] = p.annotation.id
-            param_strs.append(f"{p.arg}:class[{p.annotation.id}]")
+        if t.kind == "class":
+            db.declared[p.arg] = t
+            db.class_vars[p.arg] = t.ref
+            if t.nullable:
+                db.optional_vars.add(p.arg)
+            param_strs.append(f"{p.arg}:class[{t.ref}]")
         else:
             param_strs.append(f"{p.arg}{render_type_suffix(t).replace(' : ', ':')}")
 
@@ -251,17 +267,19 @@ def _emit_class_method_function(builder_cls, fn_rename, structs, enums, classes,
     result_temp = None
     if has_result:
         ret_t = parse_type_annotation(method.returns)
-        if isinstance(method.returns, ast.Name) and method.returns.id in classes:
-            return_suffix = f" -> class[{method.returns.id}]"
+        if ret_t.kind == "class":
+            return_suffix = f" -> class[{ret_t.ref}]"
         else:
             return_suffix = render_type_suffix(ret_t).replace(" : ", " -> ")
         result_temp = "virt_ret"
         db.declared[result_temp] = ret_t
-        if isinstance(method.returns, ast.Name) and method.returns.id in classes:
-            db.class_vars[result_temp] = method.returns.id
+        if ret_t.kind == "class":
+            db.class_vars[result_temp] = ret_t.ref
+            if ret_t.nullable:
+                db.optional_vars.add(result_temp)
 
     ret_label = db.reserve_label()
-    db.method_return_stack.append((result_temp, ret_label))
+    db.method_return_stack.append((result_temp, ret_label, ret_t if has_result else None))
     db.inline_own_depth[len(db.method_return_stack)] = len(getattr(db, "own_scopes", []))
     db.inline_active.append((defining_name, method_name))
     db.enclosing_class_stack.append(owner_name)
@@ -283,6 +301,8 @@ def _emit_class_method_function(builder_cls, fn_rename, structs, enums, classes,
     if has_result:
         reg = db.new_reg()
         db.emit(f"{reg} = load {result_temp}")
+        if ret_t.kind == "class" and ret_t.nullable:
+            db.optional_regs.add(reg)
         # The return statement already retained a class reference and stored
         # that owned reference in the temp, so the load TRANSFERS it to the
         # caller. Retaining again here would leak one reference per call.
@@ -630,6 +650,19 @@ def parse_type_annotation(node, structs=None):
         if not isinstance(node.value, ast.Name):
             raise NotImplementedError("LITHON-E0108: unsupported type annotation form")
         base = node.value.id
+        # 4.10.7. Optional[P] is a nullable class reference. It is the same
+        # 8-byte IR type as P (`class[P]`); nullability is a source-level
+        # obligation the frontend enforces around every use.
+        if base == "Optional":
+            inner = parse_type_annotation(node.slice, structs)
+            if inner.kind != "class":
+                raise NotImplementedError(
+                    f"LITHON-E0142: Optional[T] is only supported when T is a class "
+                    f"reference; got {inner.source()} (4.10.7)")
+            if inner.nullable:
+                raise NotImplementedError(
+                    "LITHON-E0142: nested Optional[...] is redundant (4.10.7)")
+            return Type("class", ref=inner.ref, nullable=True)
         if base == "dict":
             return _parse_dict_annotation(node.slice)
         if base == "ptr":
@@ -680,6 +713,21 @@ def _require_supported_width(base, width):
         f"LITHON-E0105: unsupported float width {width} -- float must be 64")
 
 
+def _has_optional_class(t):
+    """True when a type contains an Optional class reference anywhere.
+
+    Collections of optional references are deliberately not part of 4.10.7:
+    a slot that may be null needs a per-element check, and the container
+    ownership/print/equality paths do not carry one. Rejecting at the type
+    boundary keeps every later path honest.
+    """
+    if t is None:
+        return False
+    if t.kind == "class" and t.nullable:
+        return True
+    return _has_optional_class(t.elem) or _has_optional_class(t.key)
+
+
 def _parse_dict_annotation(slice_node):
     """Parses the `K, V, N` of `dict[K, V, N]`.
 
@@ -711,6 +759,11 @@ def _parse_dict_annotation(slice_node):
     if key_t.is_container() or key_t.kind == "ptr":
         raise NotImplementedError("LITHON-E0112: a dict key cannot itself be a container")
     val_t = parse_type_annotation(val_node)
+    if _has_optional_class(key_t) or _has_optional_class(val_t):
+        raise NotImplementedError(
+            "LITHON-E0142: a dict cannot carry an Optional class reference yet; "
+            "4.10.7 supports nullable references in locals, attributes, "
+            "parameters and returns (4.10.7)")
     if val_t.kind == "dict":
         raise NotImplementedError(
             f"LITHON-E0112: a dict cannot be a dict value (4.3)")
@@ -789,6 +842,11 @@ def _parse_container_annotation(base, slice_node):
     if cap_node.value <= 0:
         raise NotImplementedError(f"LITHON-E0111: {base} capacity must be positive, got {cap_node.value}")
     elem_t = parse_type_annotation(elem_node)
+    if _has_optional_class(elem_t):
+        raise NotImplementedError(
+            f"LITHON-E0142: {base} cannot carry an Optional class reference yet; "
+            f"4.10.7 supports nullable references in locals, attributes, "
+            f"parameters and returns (4.10.7)")
     if elem_t.is_container():
         # 4.1. A nested list or tuple is a flat leaf run and is accepted. A dict
         # is kept refused: its storage is three regions, so it has no single
@@ -1291,9 +1349,17 @@ def _class_attr_type(owner_name, attr_name, ann, classes, structs, enums):
     way for an object to hold another object. A container or pointer is refused
     for the same reason as a struct field: an object is a fixed-size block.
     """
+    if isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name) \
+            and ann.value.id == "Optional":
+        ann_t = parse_type_annotation(ann)
+        if ann_t.kind != "class":
+            raise NotImplementedError(
+                f"LITHON-E0142: Optional[T] is only supported when T is a class "
+                f"reference (4.10.7)")
+        return "class", -1, ann_t.ref, 8, True
     if isinstance(ann, ast.Name):
         if ann.id in classes or ann.id in CLASS_NAMES:
-            return "class", -1, ann.id, 8
+            return "class", -1, ann.id, 8, False
         if ann.id in structs:
             raise NotImplementedError(
                 f"LITHON-E0127: attribute '{attr_name}' of class '{owner_name}' is a struct; "
@@ -1325,12 +1391,12 @@ def _class_attr_type(owner_name, attr_name, ann, classes, structs, enums):
             f"LITHON-E0127: attribute '{attr_name}' of class '{owner_name}' has unsupported "
             f"type {kind} (4.10.1)")
     if kind == "bool":
-        return "bool", -1, None, 1
+        return "bool", -1, None, 1, False
     if width is None or width <= 0:
         raise NotImplementedError(
             f"LITHON-E0127: attribute '{attr_name}' of class '{owner_name}' needs a width, "
             f"e.g. {kind}[64] (4.10.1)")
-    return kind, width, None, width // 8
+    return kind, width, None, width // 8, False
 
 
 def _is_subclass_of(child, ancestor, classes):
@@ -1846,11 +1912,12 @@ def _build_class_layout(stmt, classes, structs, enums, method_slots):
             raise NotImplementedError(
                 f"LITHON-E0127: class '{stmt.name}' declares attribute '{attr_name}' more "
                 f"than once (4.10.1)")
-        kind, width, ref_name, byte_size = _class_attr_type(
+        kind, width, ref_name, byte_size, nullable = _class_attr_type(
             stmt.name, attr_name, member.annotation, classes, structs, enums)
         layout.attrs[attr_name] = {
             "kind": kind, "width": width, "offset": offset, "byte_size": byte_size,
             "ref": ref_name,
+            "nullable": nullable,
             "struct_name": ref_name if kind == "struct" else None,
             "enum_name": ref_name if kind == "enum" else None,
             "class_name": ref_name if kind == "class" else None,
@@ -2259,7 +2326,7 @@ BITWISE_OPS = {
 
 class IRBuilder:
     def __init__(self, fn_rename=None, structs=None, enums=None, classes=None,
-                 fn_returns=None):
+                 fn_returns=None, fn_param_types=None, fn_optional_returns=None):
         self.fn_rename = fn_rename or {}
         self.structs = structs or {}
         self.enums = enums or {}
@@ -2273,6 +2340,13 @@ class IRBuilder:
         # resolve without a second inference pass. Only class-returning callees
         # appear here.
         self.fn_returns = fn_returns or {}
+        # 4.10.7. Parameter types of every free function (including the
+        # mangled spelling), so a call can tell an Optional class parameter
+        # from a non-null one before the IR loses nullability.
+        self.fn_param_types = fn_param_types or {}
+        # 4.10.7. Free functions whose return annotation is Optional[Class].
+        # A call result is tagged optional so an unchecked use is refused.
+        self.fn_optional_returns = set(fn_optional_returns or ())
         # 4.10.1. Local variables holding a class REFERENCE, name -> class name.
         # This is the class analogue of struct_vars/enum_vars, but unlike them a
         # class variable IS a value: it can be passed, returned, aliased and
@@ -2282,6 +2356,20 @@ class IRBuilder:
         # receiver expression (`p`, or `make().f`, or `arr[i]`) can be typed
         # without a second IR type-inference pass.
         self.reg_class = {}
+        # 4.10.7. Source variables declared Optional[Class], and the subset
+        # currently proven non-null by `is None` narrowing or by a non-null
+        # assignment. A non-optional class variable is always non-null.
+        self.optional_vars = set()
+        self.nonnull_vars = set()
+        # 4.10.7. Registers that statically hold an optional class reference,
+        # and registers that hold the null reference (None). The latter are
+        # transient: every target-aware path replaces one with a class-typed
+        # null object before it reaches IR.
+        self.optional_regs = set()
+        self.null_regs = set()
+        self.null_counter = 0
+        # 4.10.7. The declared return type of the free function being built.
+        self.func_return_type = None
         self.reg_counter = 0
         self.block_counter = 0
         self.ifexpr_counter = 0
@@ -2389,6 +2477,121 @@ class IRBuilder:
         self.entry_label = None
         self.reachable_labels = set()
 
+    def _null_class_reg(self, class_name):
+        """A register holding a class-typed null object.
+
+        The IR has no null literal, and `const_i64 0` is an int. A valueless
+        `store name : class[P]` is a declaration whose zero value both tiers
+        represent as the null object (zero_of_kind("class")), so loading it
+        back gives a real class-typed null. This is what lets `is None`
+        compare two objects and what every None assignment/return/argument is
+        lowered through, keeping an int zero out of a class slot.
+        """
+        while True:
+            self.null_counter += 1
+            name = f"nullref{self.null_counter}"
+            if name not in self._known_names():
+                break
+        self.emit(f"store {name} : class[{class_name}]")
+        self.declared[name] = Type("class", ref=class_name)
+        r = self.new_reg()
+        self.emit(f"{r} = load {name}")
+        self.reg_class[r] = class_name
+        self.null_regs.add(r)
+        return r
+
+    def _is_optional_name(self, name):
+        return name in self.optional_vars and name not in self.nonnull_vars
+
+    def _prepare_class_value(self, reg, class_name, where, nullable=False):
+        """Adapt/validate a value assigned to a class target.
+
+        Returns `(register_for_store, known_nonnull)`. A None register is
+        replaced by a class-typed null object. An optional register is only
+        accepted when the target is Optional[...]; an unchecked one is
+        E0142. A non-null value keeps the existing subclass check.
+        """
+        if reg in self.null_regs:
+            if not nullable:
+                raise NotImplementedError(
+                    f"LITHON-E0142: {where} is a non-optional class reference, so it "
+                    f"cannot be None; declare it Optional[{class_name}] (4.10.7)")
+            return self._null_class_reg(class_name), False
+        actual = self.reg_class.get(reg)
+        if actual is None:
+            raise NotImplementedError(
+                f"LITHON-E0140: {where} is not a class reference (4.10.1)")
+        if actual != class_name and not _is_subclass_of(actual, class_name, self.classes):
+            raise NotImplementedError(
+                f"LITHON-E0140: {where} is a {actual}, which is not a {class_name} (4.10.2)")
+        if reg in self.optional_regs:
+            if not nullable:
+                raise NotImplementedError(
+                    f"LITHON-E0142: {where} expects a non-optional {class_name}; "
+                    f"check the Optional[{actual}] with `is None` first (4.10.7)")
+            return reg, False
+        return reg, True
+
+    def _index_reg(self, node):
+        """Build one subscript operand and refuse a null/Optional index.
+
+        A None index would otherwise become the integer zero (`xs[None]` reads
+        `xs[0]`), which is exactly the kind of silent None-as-value conversion
+        4.10.7 is replacing with a refusal.
+        """
+        reg = self.build_expr(node)
+        self._reject_optional_use(reg, "an index")
+        return reg
+
+    def _reject_optional_use(self, reg, where):
+        """Refuse an Optional/None value in a context that needs a real object."""
+        if reg in self.null_regs:
+            raise NotImplementedError(
+                f"LITHON-E0142: {where} cannot use None directly; it is only a value "
+                f"for an Optional class reference (4.10.7)")
+        if reg in self.optional_regs:
+            raise NotImplementedError(
+                f"LITHON-E0142: {where} uses an Optional class reference without "
+                f"checking it; use `is None` / `is not None` first (4.10.7)")
+
+    def _none_condition(self, test):
+        """The `(name, is_not_none)` a plain `name is [not] None` tests.
+
+        Only a bare class-variable name narrows. Attribute narrowing would
+        need the attribute's place to stay stable across the branch; a
+        programmer who needs it can copy it into a local first.
+        """
+        if not isinstance(test, ast.Compare) or len(test.ops) != 1 \
+                or len(test.comparators) != 1:
+            return None
+        op = test.ops[0]
+        if not isinstance(op, (ast.Is, ast.IsNot)):
+            return None
+        left, right = test.left, test.comparators[0]
+        target = None
+        if isinstance(right, ast.Constant) and right.value is None:
+            target = left
+        elif isinstance(left, ast.Constant) and left.value is None:
+            target = right
+        else:
+            return None
+        if not isinstance(target, ast.Name) or target.id not in self.class_vars:
+            return None
+        return target.id, isinstance(op, ast.IsNot)
+
+    def _apply_none_narrowing(self, state, narrow, truth):
+        """Return a copy of `state` narrowed by `narrow` on the true/false arm."""
+        out = set(state)
+        if narrow is None:
+            return out
+        name, is_not_none = narrow
+        positive = is_not_none if truth else not is_not_none
+        if positive:
+            out.add(name)
+        else:
+            out.discard(name)
+        return out
+
     def new_reg(self):
         r = self.reg_counter
         self.reg_counter += 1
@@ -2475,6 +2678,25 @@ class IRBuilder:
     # comparison is refused. The call is built as an ordinary method call, so
     # inlining, devirtualization and dynamic dispatch are exactly the machinery
     # 4.10.2/4.10.4 already provide.
+
+    def _build_none_comparison(self, other_node, is_not):
+        """`expr is None` / `expr is not None`, as class-object identity.
+
+        Neither tier has a null literal, so the null side is a class-typed
+        null object; both operands are then ordinary object references and the
+        existing `eq`/`ne` identity path works unchanged.
+        """
+        class_name = self._peek_receiver_class(other_node)
+        if class_name is None:
+            raise NotImplementedError(
+                "LITHON-E0142: `is None` / `is not None` is only supported for a "
+                "class reference (4.10.7)")
+        other = self.build_expr(other_node)
+        actual = self.reg_class.get(other, class_name)
+        null_obj = self._null_class_reg(actual)
+        r = self.new_reg()
+        self.emit(f"{r} = {'ne' if is_not else 'eq'} {other}, {null_obj}")
+        return r
 
     def _build_class_comparison(self, node, op_type):
         """Build a comparison on class references, or None to use the scalar /
@@ -2583,6 +2805,7 @@ class IRBuilder:
                 f"lowers to `==` over the elements, and equality only takes int, float "
                 f"or bool scalars")
         value = self.build_expr(value_node)
+        self._reject_optional_use(value, "a membership test")
         name = container_node.id
         false_r = self.new_reg()
         self.emit(f"{false_r} = const_bool 0")
@@ -2663,6 +2886,16 @@ class IRBuilder:
             self.emit(f"{r} = const_f64 {node.value}")
             return r
 
+        # 4.10.7. `None` is not a general value. It is built as a transient null
+        # register that only a target-aware path may consume; those paths
+        # replace it with a class-typed null object. Every other use is refused
+        # by _reject_optional_use or _prepare_class_value.
+        if isinstance(node, ast.Constant) and node.value is None:
+            r = self.new_reg()
+            self.emit(f"{r} = const_i64 0")
+            self.null_regs.add(r)
+            return r
+
         if isinstance(node, ast.Constant) and isinstance(node.value, int):
             r = self.new_reg()
             self.emit(f"{r} = const_i64 {node.value}")
@@ -2692,6 +2925,8 @@ class IRBuilder:
                 r = self.new_reg()
                 self.emit(f"{r} = load {node.id}")
                 self.reg_class[r] = self.class_vars[node.id]
+                if self._is_optional_name(node.id):
+                    self.optional_regs.add(r)
                 return r
             # 4.10.1. The class NAME is a type, not a value: `P` alone is not an
             # instance. Refused here with the fix spelled out, since otherwise it
@@ -2763,6 +2998,8 @@ class IRBuilder:
                         return r
                 left = self.build_expr(node.left)
                 right = self.build_expr(node.right)
+                self._reject_optional_use(left, "arithmetic")
+                self._reject_optional_use(right, "arithmetic")
                 if left in self.ptr_types or right in self.ptr_types:
                     raise NotImplementedError(
                         "LITHON-E0125: a pointer offset must be a literal integer, e.g. `_p + 1` (4.4)")
@@ -2771,6 +3008,8 @@ class IRBuilder:
                 return r
             left = self.build_expr(node.left)
             right = self.build_expr(node.right)
+            self._reject_optional_use(left, "arithmetic")
+            self._reject_optional_use(right, "arithmetic")
             r = self.new_reg()
             self.emit(f"{r} = {op_map[op_type]} {left}, {right}")
             return r
@@ -2779,6 +3018,26 @@ class IRBuilder:
             if len(node.ops) != 1 or len(node.comparators) != 1:
                 raise NotImplementedError("LITHON-E0114: chained comparisons (a < b < c) not supported yet")
             op_type = type(node.ops[0])
+            # 4.10.7. `is None` / `is not None` is the one allowed use of None
+            # in a value position. Equality to None is refused rather than
+            # silently using identity: `==` may dispatch to a class special
+            # method, and None is not an instance.
+            left_node = node.left
+            right_node = node.comparators[0]
+            if isinstance(right_node, ast.Constant) and right_node.value is None:
+                if op_type not in (ast.Is, ast.IsNot):
+                    raise NotImplementedError(
+                        "LITHON-E0142: compare a class reference with None using "
+                        "`is None` or `is not None`, not == or != (4.10.7)")
+                return self._build_none_comparison(
+                    left_node, op_type is ast.IsNot)
+            if isinstance(left_node, ast.Constant) and left_node.value is None:
+                if op_type not in (ast.Is, ast.IsNot):
+                    raise NotImplementedError(
+                        "LITHON-E0142: compare a class reference with None using "
+                        "`is None` or `is not None`, not == or != (4.10.7)")
+                return self._build_none_comparison(
+                    right_node, op_type is ast.IsNot)
             # 6.1. `x in xs` / `x not in xs` on a list. Like every other helper
             # here it is a rewrite over the compile-time capacity: the OR of
             # `x == xs[k]` for k in 0..N-1, and `not in` is that OR negated.
@@ -2832,6 +3091,10 @@ class IRBuilder:
                             f"for identity -- the classes are unrelated (4.10.2)")
                     left = self.build_expr(node.left)
                     right = self.build_expr(node.comparators[0])
+                    self._reject_optional_use(
+                        left, "identity/equality comparison")
+                    self._reject_optional_use(
+                        right, "identity/equality comparison")
                     r = self.new_reg()
                     negate = op_type in (ast.IsNot, ast.NotEq)
                     self.emit(f"{r} = {'ne' if negate else 'eq'} {left}, {right}")
@@ -2865,6 +3128,8 @@ class IRBuilder:
                 raise NotImplementedError("LITHON-E0114: and/or with exactly two operands supported for now")
             left = self.build_expr(node.values[0])
             right = self.build_expr(node.values[1])
+            self._reject_optional_use(left, "a boolean operation")
+            self._reject_optional_use(right, "a boolean operation")
             op_name = "and" if isinstance(node.op, ast.And) else "or"
             r = self.new_reg()
             self.emit(f"{r} = {op_name} {left}, {right}")
@@ -2872,6 +3137,7 @@ class IRBuilder:
 
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
             operand = self.build_expr(node.operand)
+            self._reject_optional_use(operand, "`not`")
             r = self.new_reg()
             self.emit(f"{r} = not {operand}")
             return r
@@ -2895,6 +3161,7 @@ class IRBuilder:
                     self.emit(f"{r} = const_f64 {-inner.value!r}")
                     return r
             operand = self.build_expr(inner)
+            self._reject_optional_use(operand, "unary minus")
             zero = self.new_reg()
             self.emit(f"{zero} = const_i64 0")
             r = self.new_reg()
@@ -2990,6 +3257,7 @@ class IRBuilder:
                     raise NotImplementedError(
                         "LITHON-E0115: abs() takes exactly one value, e.g. abs(x)")
                 v = self.build_expr(node.args[0])
+                self._reject_optional_use(v, "abs()")
                 zero = self.new_reg()
                 self.emit(f"{zero} = const_i64 0")
                 neg = self.new_reg()
@@ -3145,6 +3413,8 @@ class IRBuilder:
                       "wrap_mul": "wrapmul"}[node.func.id]
                 left = self.build_expr(node.args[0])
                 right = self.build_expr(node.args[1])
+                self._reject_optional_use(left, f"{node.func.id}()")
+                self._reject_optional_use(right, f"{node.func.id}()")
                 if left in self.ptr_types or right in self.ptr_types:
                     raise NotImplementedError(
                         f"LITHON-E0116: {node.func.id}() is integer-only -- pointer arithmetic "
@@ -3171,6 +3441,7 @@ class IRBuilder:
                         f"{node.func.id}(64, x)")
                 if node.func.id == "float":
                     arg_reg = self.build_expr(node.args[1])
+                    self._reject_optional_use(arg_reg, "float()")
                     r = self.new_reg()
                     self.emit(f"{r} = tofloat {arg_reg}"
                               f"{render_type_suffix('float', width)}")
@@ -3188,6 +3459,7 @@ class IRBuilder:
                               f"{render_type_suffix('int', width)}")
                     return r
                 arg_reg = self.build_expr(src)
+                self._reject_optional_use(arg_reg, "int()")
                 r = self.new_reg()
                 self.emit(f"{r} = toint {arg_reg}"
                           f"{render_type_suffix('int', width)}")
@@ -3210,6 +3482,8 @@ class IRBuilder:
                         "LITHON-E0115: syscall() takes a syscall number and up to six "
                         "arguments, e.g. syscall(102) (Phase III)")
                 arg_regs = [self.build_expr(a) for a in node.args]
+                for arg_reg in arg_regs:
+                    self._reject_optional_use(arg_reg, "syscall()")
                 r = self.new_reg()
                 self.emit(f"{r} = syscall {', '.join(arg_regs)}")
                 return r
@@ -3218,8 +3492,19 @@ class IRBuilder:
             alias_class = self._cls_alias_class(node.func.id)
             if alias_class is not None:
                 return self._build_class_construction(alias_class, node)
-            arg_regs = [self.build_expr(a) for a in node.args]
             callee = self.fn_rename.get(node.func.id, node.func.id)
+            param_types = (self.fn_param_types.get(callee)
+                           or self.fn_param_types.get(node.func.id) or [])
+            arg_regs = []
+            for i, arg in enumerate(node.args):
+                arg_reg = self.build_expr(arg)
+                if i < len(param_types):
+                    arg_reg = self._prepare_free_arg(
+                        arg_reg, param_types[i], node.func.id)
+                else:
+                    self._reject_optional_use(
+                        arg_reg, f"argument {i + 1} of '{node.func.id}'")
+                arg_regs.append(arg_reg)
             r = self.new_reg()
             if arg_regs:
                 self.emit(f"{r} = call {callee}, {', '.join(arg_regs)}")
@@ -3235,6 +3520,11 @@ class IRBuilder:
             ret_class = self.fn_returns.get(callee) or self.fn_returns.get(node.func.id)
             if ret_class is not None:
                 self.reg_class[r] = ret_class
+                # 4.10.7. An Optional[P] result is tagged so an unchecked use
+                # is refused; a non-optional result is a definite object.
+                if (callee in self.fn_optional_returns
+                        or node.func.id in self.fn_optional_returns):
+                    self.optional_regs.add(r)
                 # The callee returned a FRESH reference the caller owns. If the
                 # caller does not claim it (bind it to an owning declaration), it
                 # is a temporary and must be released at statement end.
@@ -3265,7 +3555,7 @@ class IRBuilder:
                 place = self._str_place_name(cur)
                 if place is not None and len(slices) == 1:
                     slices.reverse()
-                    idx = self.build_expr(slices[0])
+                    idx = self._index_reg(slices[0])
                     r = self.new_reg()
                     self.emit(f"{r} = Index {place}, {idx}")
                     return r
@@ -3307,7 +3597,7 @@ class IRBuilder:
                     rest = slices[1:]
                     if not rest:
                         return run
-                    idxs = [self.build_expr(s) for s in rest]
+                    idxs = [self._index_reg(s) for s in rest]
                     rr = self.new_reg()
                     self.emit(f"{rr} = Index {run}, {', '.join(idxs)}")
                     self._tag_class_read(rr, run, len(rest))
@@ -3319,7 +3609,7 @@ class IRBuilder:
                 self.emit(f"{r} = DictIndex {cur.id}, {key_operand}")
                 self._tag_class_read(r, cur.id, 1)
                 return r
-            idxs = [self.build_expr(s) for s in slices]
+            idxs = [self._index_reg(s) for s in slices]
             self.emit(f"{r} = Index {cur.id}, {', '.join(idxs)}")
             self._tag_class_read(r, cur.id, len(slices))
             return r
@@ -3332,6 +3622,7 @@ class IRBuilder:
             # Nothing is forced through a stack slot it did not already need:
             # the same shape is what a source-level merge would produce.
             cond_reg = self.build_expr(node.test)
+            self._reject_optional_use(cond_reg, "an if-expression condition")
             temp = f"{IF_EXPR_TEMP}{self.ifexpr_counter}"
             self.ifexpr_counter += 1
 
@@ -3343,11 +3634,13 @@ class IRBuilder:
 
             self.start_block(then_label)
             then_reg = self.build_expr(node.body)
+            self._reject_optional_use(then_reg, "an if-expression result")
             self.emit(f"store {temp}, {then_reg}")
             self.emit(f"jump {merge_label}")
 
             self.start_block(else_label)
             else_reg = self.build_expr(node.orelse)
+            self._reject_optional_use(else_reg, "an if-expression result")
             self.emit(f"store {temp}, {else_reg}")
             self.emit(f"jump {merge_label}")
 
@@ -3684,9 +3977,10 @@ class IRBuilder:
 
         ret_label = self.reserve_label()
         result_temp = (prefix + "ret") if has_result else None
+        ret_t = parse_type_annotation(method.returns) if has_result else None
         saved_loop = self.loop_stack
         self.loop_stack = []
-        self.method_return_stack.append((result_temp, ret_label))
+        self.method_return_stack.append((result_temp, ret_label, ret_t))
         self.inline_own_depth[len(self.method_return_stack)] = len(
             getattr(self, "own_scopes", []))
         self.inline_active.append(token)
@@ -3748,6 +4042,11 @@ class IRBuilder:
         if class_name is None:
             return None, None
         reg = self.build_expr(node)
+        # 4.10.7. A receiver must be a real object. An Optional reference is
+        # only usable after an `is None` / `is not None` check, and that check
+        # clears the optional register tag for a narrowed name.
+        self._reject_optional_use(
+            reg, f"member access on a {class_name}")
         # A built register carries its own tag; trust the peeked name when the
         # build produced no tag (e.g. a construction tags, a plain load of a
         # class-typed attribute tags) and otherwise confirm they agree.
@@ -3825,8 +4124,27 @@ class IRBuilder:
             return t.ref if t is not None and t.kind == "class" else None
         return None
 
-    def build_class_declaration(self, name, class_name, value_node):
-        """`p: Point` or `p: Point = Point(...)`.
+    def _class_annotation(self, ann):
+        """The Type of a class-reference annotation, or None for another type.
+
+        Recognises `P` and `Optional[P]`. Optional's argument is parsed here so
+        a non-class or nested Optional gets the 4.10.7 diagnostic.
+        """
+        if isinstance(ann, ast.Name) and ann.id in self.classes:
+            return Type("class", ref=ann.id)
+        if isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name) \
+                and ann.value.id == "Optional":
+            t = parse_type_annotation(ann, self.structs)
+            if t.kind != "class":
+                raise NotImplementedError(
+                    "LITHON-E0142: Optional[T] is only supported when T is a class "
+                    "reference (4.10.7)")
+            return t
+        return None
+
+    def build_class_declaration(self, name, class_name, value_node,
+                                nullable=False):
+        """`p: Point`, `p: Point = Point(...)`, or their Optional forms.
 
         A class-typed name holds one reference. A bare declaration emits
         nothing and starts the name UNASSIGNED (a read before assignment is the
@@ -3834,7 +4152,7 @@ class IRBuilder:
         and stores it, then records the reference's ownership so a later
         drop can release it.
         """
-        decl_key = Type("class", ref=class_name)
+        decl_key = Type("class", ref=class_name, nullable=nullable)
         prev_decl = self.declared.get(name)
         if prev_decl is not None and prev_decl != decl_key:
             raise NotImplementedError(
@@ -3842,24 +4160,32 @@ class IRBuilder:
                 f"one type (V1_SPEC 0.6.10)")
         self.declared[name] = decl_key
         self.class_vars[name] = class_name
+        if nullable:
+            self.optional_vars.add(name)
+            self.nonnull_vars.discard(name)
         if value_node is None:
             return
         value_reg = self.build_expr(value_node)
-        self._require_class_value(value_reg, class_name, name)
+        value_reg, known_nonnull = self._prepare_class_value(
+            value_reg, class_name, f"'{name}'", nullable=nullable)
         if value_reg in [r for r, _ in self.stmt_temps[-1]]:
             # The value is a fresh `new`: its one reference becomes `name`'s, so
             # it is claimed (not released as a temporary) and stored as-is.
             self._claim_stmt_temp(value_reg)
             self.emit(f"store {name}, {value_reg}{render_type_suffix(decl_key)}")
         else:
-            # The value is an existing reference (`p: Point = q`): `name` is a
-            # SECOND owner, so it takes its own reference.
+            # The value is an existing reference (`p: Point = q`, or a null
+            # object): `name` is a SECOND owner, so it takes its own reference.
             retained = self.new_reg()
             self.emit(f"{retained} = retain {value_reg}")
             self.emit(f"store {name}, {retained}{render_type_suffix(decl_key)}")
         self._note_owned_ref(name)
+        if nullable and known_nonnull:
+            # A declaration initialized with a definite object is usable until
+            # some later assignment loses that fact.
+            self.nonnull_vars.add(name)
 
-    def _require_class_value(self, reg, class_name, where):
+    def _require_class_value(self, reg, class_name, where, nullable=False):
         """The register must hold a reference to `class_name` or a SUBCLASS of it.
 
         4.10.2. A subclass reference is accepted wherever a base reference is
@@ -3867,17 +4193,10 @@ class IRBuilder:
         valid base instance (base attributes keep their offsets). The register
         keeps its ACTUAL class in `reg_class`, which is what later decides
         whether a method call is monomorphic (inline) or may dispatch to an
-        override (virtual)."""
-        actual = self.reg_class.get(reg)
-        if actual is None:
-            raise NotImplementedError(
-                f"LITHON-E0140: '{where}' must be initialized with a {class_name} "
-                f"reference, e.g. {class_name}(...) -- a class variable is an object "
-                f"reference, not a number (4.10.1)")
-        if actual != class_name and not _is_subclass_of(actual, class_name, self.classes):
-            raise NotImplementedError(
-                f"LITHON-E0140: cannot initialize '{where}' (a {class_name}) with a "
-                f"{actual} reference (4.10.1)")
+        override (virtual). 4.10.7 adds the null rule: None or an unchecked
+        optional is accepted only when the target itself is Optional.
+        """
+        self._prepare_class_value(reg, class_name, where, nullable=nullable)
 
     def _claim_stmt_temp(self, reg):
         """The register's `new` reference is TRANSFERRED to an owner and must
@@ -4121,24 +4440,35 @@ class IRBuilder:
         A scalar parameter has no ownership at all and is simply stored, exactly
         as an ordinary annotated local would be.
         """
-        if isinstance(annotation, ast.Name) and annotation.id in self.classes:
-            decl_key = Type("class", ref=annotation.id)
+        class_t = self._class_annotation(annotation)
+        if class_t is not None:
+            decl_key = Type("class", ref=class_t.ref,
+                            nullable=class_t.nullable)
             prev = self.declared.get(name)
             if prev is not None and prev != decl_key:
                 raise NotImplementedError(
                     f"LITHON-E0122: `{name}` is re-declared with a different type -- a "
                     f"name has one type (V1_SPEC 0.6.10)")
             self.declared[name] = decl_key
-            self.class_vars[name] = annotation.id
+            self.class_vars[name] = class_t.ref
             value_reg = self.build_expr(value_node)
-            self._require_class_value(value_reg, annotation.id, name)
+            value_reg, known_nonnull = self._prepare_class_value(
+                value_reg, class_t.ref, f"parameter '{name}'",
+                nullable=class_t.nullable)
             self.emit(f"store {name}, {value_reg}{render_type_suffix(decl_key)}")
+            if class_t.nullable:
+                self.optional_vars.add(name)
+                if known_nonnull:
+                    self.nonnull_vars.add(name)
+                else:
+                    self.nonnull_vars.discard(name)
             return
         # A scalar (int/float/bool) parameter: an ordinary annotated store, with
         # no reference to own.
         decl = parse_type_annotation(annotation)
         self.declared[name] = decl
         value_reg = self.build_expr(value_node)
+        self._reject_optional_use(value_reg, f"parameter '{name}'")
         suffix = render_type_suffix(decl) if decl[0] in ("int", "float", "bool", "ptr") else ""
         self.emit(f"store {name}, {value_reg}{suffix}")
 
@@ -4187,7 +4517,7 @@ class IRBuilder:
         ret_label = self.reserve_label()
         saved_loop = self.loop_stack
         self.loop_stack = []
-        self.method_return_stack.append((None, ret_label))
+        self.method_return_stack.append((None, ret_label, None))
         self.inline_own_depth[len(self.method_return_stack)] = len(
             getattr(self, "own_scopes", []))
         self.inline_active.append((defining, "__init__"))
@@ -4295,6 +4625,7 @@ class IRBuilder:
             raise NotImplementedError(
                 "LITHON-E0140: isinstance() is only defined for a class reference (4.10.2)")
         reg = self.build_expr(call.args[0])
+        self._reject_optional_use(reg, "isinstance()")
         if not _possible_common_subclass(static, cname, self.classes):
             r = self.new_reg()
             # A bool, not an int: isinstance() is a predicate, so printing it
@@ -4391,11 +4722,16 @@ class IRBuilder:
                 raise NotImplementedError(
                     f"LITHON-E0135: cannot call '{method_name}()' on a value that is not a "
                     f"{class_name} (4.10.1)")
+        self._reject_optional_use(
+            recv_reg, f"call to method '{method_name}'")
         arg_regs = [self.build_expr(a) for a in args]
         # Bind each argument to the signature's parameter type so an argument
-        # register is tagged exactly as the inlined path would tag it.
-        for p, areg in zip(params, arg_regs):
-            self._require_param_value(areg, p.annotation, method_name)
+        # register is tagged exactly as the inlined path would tag it. A None
+        # argument to an Optional class parameter is converted here, because a
+        # real call passes the register through the IR unchanged.
+        for i, (p, areg) in enumerate(zip(params, arg_regs)):
+            arg_regs[i] = self._require_param_value(
+                areg, p.annotation, method_name)
         has_result = method.returns is not None
         r = self.new_reg()
         operands = ", ".join([recv_reg] + arg_regs)
@@ -4410,6 +4746,8 @@ class IRBuilder:
                       f"{slot}{suffix}")
             if ret_t.kind == "class":
                 self.reg_class[r] = ret_t.ref
+                if ret_t.nullable:
+                    self.optional_regs.add(r)
                 # The callee transferred an owned class reference to us; if the
                 # caller does not bind it, the statement-end drain drops it.
                 self.stmt_temps[-1].append((r, ret_t.ref))
@@ -4426,15 +4764,70 @@ class IRBuilder:
         t = parse_type_annotation(ann)
         return t.render()
 
-    def _require_param_value(self, reg, annotation, method_name):
-        """Tag/validate one argument against a parameter annotation, mirroring
-        `_bind_inline_param`'s checks without emitting a store."""
-        if isinstance(annotation, ast.Name) and annotation.id in self.classes:
+    def _prepare_free_arg(self, reg, param_t, callee):
+        """Adapt/validate one argument to a free function's parameter.
+
+        Like the method path, but the parameter type is already parsed: the
+        function header is a separate compilation unit and only its declared
+        Type crosses. A None register becomes a class-typed null object for an
+        Optional class parameter; an unchecked Optional is refused everywhere
+        else. The callee sees a borrow, so no retain is emitted.
+        """
+        if reg in self.null_regs:
+            if param_t is not None and param_t.kind == "class" and param_t.nullable:
+                return self._null_class_reg(param_t.ref)
+            raise NotImplementedError(
+                f"LITHON-E0142: argument of function '{callee}' expects "
+                f"{param_t.source() if param_t is not None else 'a non-null value'}, "
+                f"so it cannot be None (4.10.7)")
+        if reg in self.optional_regs:
+            if param_t is not None and param_t.kind == "class" and param_t.nullable:
+                return reg
+            raise NotImplementedError(
+                f"LITHON-E0142: argument of function '{callee}' expects "
+                f"{param_t.source() if param_t is not None else 'a non-null value'}; "
+                f"check the Optional reference first (4.10.7)")
+        if param_t is not None and param_t.kind == "class":
             actual = self.reg_class.get(reg)
-            if actual is None or not _is_subclass_of(actual, annotation.id, self.classes):
+            if actual is None:
+                raise NotImplementedError(
+                    f"LITHON-E0140: argument of function '{callee}' must be a "
+                    f"{param_t.ref} reference (4.10.2)")
+            if actual != param_t.ref and not _is_subclass_of(
+                    actual, param_t.ref, self.classes):
+                raise NotImplementedError(
+                    f"LITHON-E0140: argument of function '{callee}' must be a "
+                    f"{param_t.ref} reference, got a {actual} (4.10.2)")
+        return reg
+
+    def _require_param_value(self, reg, annotation, method_name):
+        """Validate one argument against a parameter annotation, mirroring
+        `_bind_inline_param`'s checks without emitting a store.
+
+        Returns the register to pass (a None argument becomes a class-typed null
+        object for an Optional parameter).
+        """
+        t = self._class_annotation(annotation) if annotation is not None else None
+        if t is not None:
+            if reg in self.null_regs:
+                if not t.nullable:
+                    raise NotImplementedError(
+                        f"LITHON-E0142: argument of method '{method_name}' is a "
+                        f"non-optional {t.ref}, so it cannot be None (4.10.7)")
+                return self._null_class_reg(t.ref)
+            actual = self.reg_class.get(reg)
+            if actual is None or not _is_subclass_of(actual, t.ref, self.classes):
                 raise NotImplementedError(
                     f"LITHON-E0135: argument of method '{method_name}' must be a "
-                    f"{annotation.id} reference (4.10.2)")
+                    f"{t.ref} reference (4.10.2)")
+            if reg in self.optional_regs and not t.nullable:
+                raise NotImplementedError(
+                    f"LITHON-E0142: argument of method '{method_name}' expects a "
+                    f"non-optional {t.ref}; check the Optional[{actual}] first (4.10.7)")
+            return reg
+        self._reject_optional_use(
+            reg, f"argument of method '{method_name}'")
+        return reg
 
     def _build_super_call(self, call):
         """`super().method(args)` -- continue at the next MRO implementation.
@@ -4599,8 +4992,9 @@ class IRBuilder:
         self.emit(f"{recv_reg} = load {self_name}")
         self.reg_class[recv_reg] = enclosing
         arg_regs = [self.build_expr(a) for a in call.args]
-        for p, areg in zip(params, arg_regs):
-            self._require_param_value(areg, p.annotation, method_name)
+        for i, (p, areg) in enumerate(zip(params, arg_regs)):
+            arg_regs[i] = self._require_param_value(
+                areg, p.annotation, method_name)
         has_result = method.returns is not None
         r = self.new_reg()
         operands = ", ".join([recv_reg] + arg_regs)
@@ -4612,6 +5006,8 @@ class IRBuilder:
                       f"{slot}, {defining_index}{suffix}")
             if ret_t.kind == "class":
                 self.reg_class[r] = ret_t.ref
+                if ret_t.nullable:
+                    self.optional_regs.add(r)
                 # A super call returns the same owned-reference contract as any
                 # other call; mark it so a binding claims it or a statement
                 # drops it.
@@ -4684,9 +5080,10 @@ class IRBuilder:
 
         ret_label = self.reserve_label()
         result_temp = (prefix + "ret") if has_result else None
+        ret_t = parse_type_annotation(method.returns) if has_result else None
         saved_loop = self.loop_stack
         self.loop_stack = []
-        self.method_return_stack.append((result_temp, ret_label))
+        self.method_return_stack.append((result_temp, ret_label, ret_t))
         self.inline_own_depth[len(self.method_return_stack)] = len(
             getattr(self, "own_scopes", []))
         self.inline_active.append(token)
@@ -4724,6 +5121,8 @@ class IRBuilder:
         ret_t = parse_type_annotation(method.returns)
         if ret_t.kind == "class":
             self.reg_class[r] = ret_t.ref
+            if ret_t.nullable:
+                self.optional_regs.add(r)
             self.stmt_temps[-1].append((r, ret_t.ref))
         return r
 
@@ -4811,6 +5210,8 @@ class IRBuilder:
         # `self.attr` inside an inherited method reads the base's layout.
         if recv_reg is None:
             recv_reg = self.build_expr(call.func.value)
+        self._reject_optional_use(
+            recv_reg, f"call to method '{method_name}'")
         actual = self.reg_class.get(recv_reg)
         if actual is None or not _is_subclass_of(actual, class_name, self.classes):
             raise NotImplementedError(
@@ -4831,9 +5232,10 @@ class IRBuilder:
 
         ret_label = self.reserve_label()
         result_temp = (prefix + "ret") if has_result else None
+        ret_t = parse_type_annotation(method.returns) if has_result else None
         saved_loop = self.loop_stack
         self.loop_stack = []
-        self.method_return_stack.append((result_temp, ret_label))
+        self.method_return_stack.append((result_temp, ret_label, ret_t))
         self.inline_own_depth[len(self.method_return_stack)] = len(
             getattr(self, "own_scopes", []))
         self.inline_active.append(token)
@@ -4871,6 +5273,8 @@ class IRBuilder:
         ret_t = parse_type_annotation(method.returns)
         if ret_t.kind == "class":
             self.reg_class[r] = ret_t.ref
+            if ret_t.nullable:
+                self.optional_regs.add(r)
             self.stmt_temps[-1].append((r, ret_t.ref))
         return r
 
@@ -4983,6 +5387,8 @@ class IRBuilder:
                   f"{render_type_suffix(_attr_ir_type(field))}")
         if kind == "class":
             self.reg_class[r] = field["class_name"]
+            if field.get("nullable"):
+                self.optional_regs.add(r)
         return r
 
     def _class_attr_offset(self, class_name, attr_name):
@@ -5090,6 +5496,8 @@ class IRBuilder:
                     f"LITHON-E0130: variant '{enum_name}.{variant['name']}' takes exactly one "
                     f"payload value (4.7)")
             val_reg = self.build_expr(call.args[0])
+            self._reject_optional_use(
+                val_reg, f"enum payload '{enum_name}.{variant['name']}'")
             off = base_off + layout.payload_offset
             self.emit(f"fieldstore {var}, {off}, {val_reg}"
                       f"{render_type_suffix(payload['kind'], payload['width'])}")
@@ -5129,6 +5537,9 @@ class IRBuilder:
                     f"missing field(s) {', '.join(missing)} (4.7)")
         for field_name, field in fields.items():
             val_reg = self.build_expr(supplied[field_name])
+            self._reject_optional_use(
+                val_reg,
+                f"payload field '{field_name}' of '{enum_name}.{variant['name']}'")
             off = base_off + layout.payload_offset + field["offset"]
             self.emit(f"fieldstore {var}, {off}, {val_reg}"
                       f"{render_type_suffix(field['kind'], field['width'])}")
@@ -5375,6 +5786,7 @@ class IRBuilder:
             label for kinds, label, _ in handlers for _ in kinds)
         self.emit(f"tryenter {flat_kinds}, {flat_labels}")
         self.emit(f"jump {body_label}")
+        nonnull_before = set(self.nonnull_vars)
 
         self.start_block(body_label)
         for stmt in node.body:
@@ -5391,6 +5803,10 @@ class IRBuilder:
             self.emit(f"jump {after_label}")
 
         for kinds, label, body in handlers:
+            # A trap may have interrupted the body at any point, so the handler
+            # knows only what was true before the try. Keeping a fact learned in
+            # the body here would let `p.get()` run on a None.
+            self.nonnull_vars = set(nonnull_before)
             self.start_block(label)
             # The handler's own kind list, for the reader of the IR; a trap
             # already knows its target label from TryEnter, so this is a marker
@@ -5401,11 +5817,15 @@ class IRBuilder:
             self.emit(f"jump {after_label}")
 
         if node.finalbody:
+            self.nonnull_vars = set(nonnull_before)
             self.start_block(finally_label)
             for stmt in node.finalbody:
                 self.build_stmt(stmt)
             self.emit(f"jump {merge_label}")
 
+        # A try may leave by body, else, handler or finally, and only the
+        # pre-try facts are common to all of them.
+        self.nonnull_vars = set(nonnull_before)
         self.start_block(merge_label)
 
     def _except_kinds(self, type_node):
@@ -5433,7 +5853,10 @@ class IRBuilder:
 
     def build_if(self, node):
         cond_reg = self.build_expr(node.test)
+        self._reject_optional_use(cond_reg, "an if condition")
         branch_block = self.current
+        narrow = self._none_condition(node.test)
+        nonnull_before = set(self.nonnull_vars)
 
         then_label = self.reserve_label()
         else_label = self.reserve_label() if node.orelse else None
@@ -5447,9 +5870,13 @@ class IRBuilder:
         self.start_block(then_label)
         self.loop_depth += 1
         own_before = self._snapshot_owned()
+        self.nonnull_vars = self._apply_none_narrowing(
+            nonnull_before, narrow, True)
         for stmt in node.body:
             self.build_stmt(stmt)
         then_end = self._snapshot_owned()
+        then_nonnull = set(self.nonnull_vars)
+        then_terminated = self.terminated
         self.loop_depth -= 1
         self.emit(f"jump {merge_label}")
 
@@ -5457,17 +5884,47 @@ class IRBuilder:
             self.start_block(else_label)
             self.loop_depth += 1
             self._restore_owned(own_before)
+            self.nonnull_vars = self._apply_none_narrowing(
+                nonnull_before, narrow, False)
             for stmt in node.orelse:
                 self.build_stmt(stmt)
             else_end = self._snapshot_owned()
+            else_nonnull = set(self.nonnull_vars)
+            else_terminated = self.terminated
             self.loop_depth -= 1
             self.emit(f"jump {merge_label}")
         else:
             else_end = own_before
+            else_nonnull = self._apply_none_narrowing(
+                nonnull_before, narrow, False)
+            else_terminated = False
 
-        # 4.10.1. Ownership at the merge is what BOTH arms still own; a name
-        # owned on only one arm is dropped from tracking (see _merge_owned).
-        self._restore_owned(self._merge_owned(then_end, else_end))
+        # 4.10.7. A fact is known after the merge only when both reachable
+        # arms know it. If one arm terminated, the merge is reached solely from
+        # the other, so its facts survive -- that is what makes the early-return
+        # guard `if p is None: return; p.method()` narrow p.
+        if then_terminated and not else_terminated:
+            merged_nonnull = else_nonnull
+        elif else_terminated and not then_terminated:
+            merged_nonnull = then_nonnull
+        elif then_terminated and else_terminated:
+            merged_nonnull = set(nonnull_before)
+        else:
+            merged_nonnull = then_nonnull & else_nonnull
+        self.nonnull_vars = merged_nonnull
+
+        # 4.10.1. Ownership at the merge is what BOTH REACHABLE arms still
+        # own. A terminating arm has released its references and does not reach
+        # the merge, so the surviving arm's view is the correct one; that is
+        # what keeps the early-return guard `if p is None: return` from leaking
+        # every reference the function owned before the guard.
+        if then_terminated and not else_terminated:
+            merged_owned = else_end
+        elif else_terminated and not then_terminated:
+            merged_owned = then_end
+        else:
+            merged_owned = self._merge_owned(then_end, else_end)
+        self._restore_owned(merged_owned)
         self.start_block(merge_label)
 
     def build_while(self, node):
@@ -5481,9 +5938,14 @@ class IRBuilder:
 
         self.start_block(header_label)
         cond_reg = self.build_expr(node.test)
+        self._reject_optional_use(cond_reg, "a while condition")
+        narrow = self._none_condition(node.test)
+        nonnull_before = set(self.nonnull_vars)
         self.emit(f"branch {cond_reg}, {body_label}, {exit_label}")
 
         self.start_block(body_label)
+        self.nonnull_vars = self._apply_none_narrowing(
+            nonnull_before, narrow, True)
         self.loop_stack.append((header_label, exit_label))
         self.loop_depth += 1
         loop_scope = self._push_own_scope()
@@ -5505,6 +5967,10 @@ class IRBuilder:
         self.loop_stack.pop()
         self.emit(f"jump {header_label}")
 
+        # A loop may run zero times, so no optional narrowing learned in the
+        # body is known after it. Assignments in the body likewise do not
+        # establish a post-loop fact.
+        self.nonnull_vars = set(nonnull_before)
         self.start_block(exit_label)
 
     def _container_capacity(self, name):
@@ -5754,12 +6220,18 @@ class IRBuilder:
         class_name = self._peek_receiver_class(arg)
         if class_name is not None:
             arg_reg = self.build_expr(arg)
+            self._reject_optional_use(arg_reg, "print()")
             actual = self.reg_class.get(arg_reg, class_name)
             return ("object", arg_reg, actual)
         cp = self._container_print_arg(arg)
         if cp is not None:
             return ("container", cp[0], cp[1])
         arg_reg = self.build_expr(arg)
+        # 4.10.7. None and an unchecked Optional are not printable values. A
+        # class reference reached here is handled above (and has its own text
+        # rules); this guard catches `print(None)` and a scalar path that was
+        # handed a transient null before it can print the register's zero.
+        self._reject_optional_use(arg_reg, "print()")
         # 6.9. A dict value that is a container is read out into a run, so
         # `print(d[k])` names a run rather than a register. It prints its whole
         # run, exactly as `print(d)` renders the same value nested.
@@ -5964,6 +6436,7 @@ class IRBuilder:
         idx = self.new_reg()
         self.emit(f"{idx} = load {len_name}")
         val = self.build_expr(call.args[0])
+        self._reject_optional_use(val, f"append() on '{name}'")
         # The bounds check on a runtime index traps "list index out of range"
         # when idx == cap, which is exactly a full list -- the two tiers already
         # agree on that text, so append inherits it rather than adding a new trap.
@@ -6206,6 +6679,9 @@ class IRBuilder:
     def build_for(self, node):
         if node.orelse:
             raise NotImplementedError("LITHON-E0118: for/else is not supported (the else clause would be silently dropped)")
+        # 4.10.7. Like while, a for loop may run zero times, so no optional
+        # narrowing or assignment inside its body is a fact after the loop.
+        nonnull_before = set(self.nonnull_vars)
 
         # Phase 6.1: enumerate/zip are for-header rewrites. They resolve to the
         # ordinary counted loop with a literal limit, plus the element bindings
@@ -6251,6 +6727,11 @@ class IRBuilder:
             # check if literal step is 0
             # try to detect const_i64 0 in value? easier: check AST literal
             pass
+
+        # 4.10.7. A None endpoint or step would otherwise be lowered as integer
+        # zero. None belongs only to an Optional class reference, not to range().
+        for bound in (start_reg, limit_reg, step_reg):
+            self._reject_optional_use(bound, "range()")
 
         # handle step==0 literal
         if len(args) == 3 and isinstance(args[2], ast.Constant) and isinstance(args[2].value, (int, float)):
@@ -6325,6 +6806,7 @@ class IRBuilder:
             self.emit(f"store {loop_var}, {inc_reg}")
             self.emit(f"jump {header_label}")
 
+            self.nonnull_vars = set(nonnull_before)
             self.start_block(exit_label)
             return
 
@@ -6415,6 +6897,7 @@ class IRBuilder:
         self.emit(f"store {loop_var}, {ni}")
         self.emit(f"jump {body_label}")
 
+        self.nonnull_vars = set(nonnull_before)
         self.start_block(exit_label)
 
     def _build_container_literal(self, name, decl_t, value_node, prefix,
@@ -6520,6 +7003,7 @@ class IRBuilder:
                     self.emit(f"IndexStore {name}, {', '.join(chain)}, {val_reg}")
                 continue
             val_reg = self.build_expr(elt)
+            self._reject_optional_use(val_reg, f"element {i} of `{name}`")
             self.emit(f"IndexStore {name}, {', '.join(chain)}, {val_reg}")
 
     def build_tuple_declaration(self, name, decl_t, suffix, value_node):
@@ -6836,7 +7320,9 @@ class IRBuilder:
         decl = self.declared.get(dict_name)
         key_t = decl.key if decl is not None and decl.kind == "dict" else None
         if key_t is None or key_t.kind != "str":
-            return self.build_expr(key_expr)
+            reg = self.build_expr(key_expr)
+            self._reject_optional_use(reg, f"key of '{dict_name}'")
+            return reg
         place = self._str_place_name(key_expr)
         if place is None:
             if isinstance(key_expr, ast.Constant) and isinstance(key_expr.value, str):
@@ -6921,6 +7407,10 @@ class IRBuilder:
                 raise NotImplementedError(
                     f"LITHON-E0123: dict key {i} is not a literal; a dict key must be a "
                     f"constant, because the bucket is decided from it (4.3)")
+            if key_node.value is None:
+                raise NotImplementedError(
+                    f"LITHON-E0142: dict key {i} is None; None is only a value for an "
+                    f"Optional class reference (4.10.7)")
             # 6.9. A value that is a container (a list or a tuple) is built into
             # its own run and the RUN is named in the store; a scalar value is a
             # register. The two are told apart by the declared value type, which
@@ -6930,6 +7420,7 @@ class IRBuilder:
                 val_spec = self._materialize_container_value(decl_t.elem, val_node, i)
             else:
                 val_spec = self.build_expr(val_node)
+                self._reject_optional_use(val_spec, f"dict value {i}")
             if str_key:
                 # 4.3. A str key. The literal is materialised into its own bounded
                 # run and the run is NAMED in the store, so no register ever holds
@@ -7025,8 +7516,10 @@ class IRBuilder:
             # so it can take an initializer and later be reassigned, aliased and
             # passed. `self.x` inside __init__ is handled by the same path via a
             # synthetic receiver.
-            if isinstance(node.annotation, ast.Name) and node.annotation.id in self.classes:
-                self.build_class_declaration(name, node.annotation.id, node.value)
+            class_ann = self._class_annotation(node.annotation)
+            if class_ann is not None:
+                self.build_class_declaration(name, class_ann.ref, node.value,
+                                             nullable=class_ann.nullable)
                 return
             # 4.6. A struct declaration names the type on the left of the colon:
             # `s: SockAddrIn`. It is recognised before the scalar path because a
@@ -7131,6 +7624,7 @@ class IRBuilder:
                     # "not definitely assigned" error as for any scalar.
                     return
                 value_reg = self.build_expr(node.value)
+                self._reject_optional_use(value_reg, f"declaration of '{name}'")
                 # 6.2. A pointer that is born from `addressof(s)` (s a str[N])
                 # names that run, so record the companion name alongside the
                 # value. Any other initializer (a load, arithmetic) has no
@@ -7149,6 +7643,7 @@ class IRBuilder:
                 self.var_types[name] = (kind, width)
             if node.value is not None:
                 value_reg = self.build_expr(node.value)
+                self._reject_optional_use(value_reg, f"declaration of '{name}'")
                 self.emit(f"store {name}, {value_reg}{suffix}")
                 return
             # An annotation-only declaration emits nothing for a SCALAR: there
@@ -7194,8 +7689,9 @@ class IRBuilder:
                     place = self._str_place_name(cur)
                     if place is not None and len(slices) == 1:
                         slices.reverse()
-                        idx = self.build_expr(slices[0])
+                        idx = self._index_reg(slices[0])
                         val = self.build_expr(node.value)
+                        self._reject_optional_use(val, f"'{place}' element")
                         self.emit(f"IndexStore {place}, {idx}, {val}")
                         return
                     raise NotImplementedError(
@@ -7219,7 +7715,7 @@ class IRBuilder:
                     raise NotImplementedError(
                         f"LITHON-E0117: cannot store a container value into '{cur.id}[...]'; "
                         f"a container is not a value, so there is nothing to copy (4.1)")
-                idxs = [self.build_expr(s) for s in slices]
+                idxs = [self._index_reg(s) for s in slices]
                 val = self.build_expr(node.value)
                 # 4.10.3. A class element slot owns one reference. Take the new
                 # reference BEFORE dropping the old one, so `xs[0] = xs[0]` (and
@@ -7233,6 +7729,8 @@ class IRBuilder:
                     old = self.new_reg()
                     self.emit(f"{old} = Index {cur.id}, {', '.join(idxs)}")
                     self.emit(f"release {old}")
+                else:
+                    self._reject_optional_use(val, f"'{cur.id}[...]' element")
                 self.emit(f"IndexStore {cur.id}, {', '.join(idxs)}, {val}")
                 return
             # 4.7. `e = E.V(...)` (an enum variable) or `s.e = E.V(...)` (an
@@ -7274,18 +7772,26 @@ class IRBuilder:
                             f"'{target.attr}'; write its bytes one at a time (4.10.1)")
                     # Ownership: a class-typed attribute holds a reference.
                     val_reg = self.build_expr(node.value)
+                    if field["kind"] != "class":
+                        self._reject_optional_use(
+                            val_reg, f"attribute '{target.attr}'")
                     if field["kind"] == "class":
-                        if self.reg_class.get(val_reg) != field["class_name"]:
-                            raise NotImplementedError(
-                                f"LITHON-E0140: attribute '{target.attr}' is a "
-                                f"{field['class_name']} reference; a "
-                                f"{self.reg_class.get(val_reg, 'non-class')} cannot be stored "
-                                f"there (4.10.1)")
+                        val_reg, _ = self._prepare_class_value(
+                            val_reg, field["class_name"],
+                            f"attribute '{target.attr}'",
+                            nullable=bool(field.get("nullable")))
                         # The attribute now owns a reference: retain so the value
                         # survives the source's own scope.
                         retained = self.new_reg()
                         self.emit(f"{retained} = retain {val_reg}")
                         val_reg = retained
+                        # Drop the reference the slot held before. The new
+                        # reference is retained first, so `self.a = self.a`
+                        # cannot free the object before it is written back.
+                        old = self.new_reg()
+                        self.emit(f"{old} = refload {recv_reg}, {field['offset']}"
+                                  f"{render_type_suffix(_attr_ir_type(field))}")
+                        self.emit(f"release {old}")
                     self.emit(f"refstore {recv_reg}, {field['offset']}, {val_reg}"
                               f"{render_type_suffix(_attr_ir_type(field))}")
                     # Inside an inlined __init__, `self.a = ...` marks `a`
@@ -7301,6 +7807,8 @@ class IRBuilder:
                 if pf is not None:
                     reg, offset, kind, width, _ = pf
                     val_reg = self.build_expr(node.value)
+                    self._reject_optional_use(
+                        val_reg, f"field '{target.attr}'")
                     self.emit(f"fieldstore {reg}, {offset}, {val_reg}"
                               f"{render_type_suffix(kind, width)}")
                     return
@@ -7314,6 +7822,8 @@ class IRBuilder:
                     self._assign_struct_str_field(synth, width, node.value)
                     return
                 val_reg = self.build_expr(node.value)
+                self._reject_optional_use(
+                    val_reg, f"field '{target.attr}'")
                 self.emit(f"fieldstore {var}, {offset}, {val_reg}{render_type_suffix(kind, width)}")
                 return
             if not isinstance(target, ast.Name):
@@ -7329,8 +7839,12 @@ class IRBuilder:
             # own reference (retain) so both names own one.
             if target.id in self.class_vars:
                 class_name = self.class_vars[target.id]
+                target_t = self.declared.get(
+                    target.id, Type("class", ref=class_name))
+                nullable = target_t.kind == "class" and target_t.nullable
                 val_reg = self.build_expr(node.value)
-                self._require_class_value(val_reg, class_name, target.id)
+                val_reg, known_nonnull = self._prepare_class_value(
+                    val_reg, class_name, f"'{target.id}'", nullable=nullable)
                 retained = self.new_reg()
                 self.emit(f"{retained} = retain {val_reg}")
                 # 4.10.1. REASSIGNMENT drops the reference the name held before,
@@ -7343,8 +7857,13 @@ class IRBuilder:
                     self.emit(f"{old} = load {target.id}")
                     self.emit(f"release {old}")
                 self.emit(f"store {target.id}, {retained}"
-                          f"{render_type_suffix(Type('class', ref=class_name))}")
+                          f"{render_type_suffix(target_t)}")
                 self._note_owned_ref(target.id)
+                if nullable:
+                    if known_nonnull:
+                        self.nonnull_vars.add(target.id)
+                    else:
+                        self.nonnull_vars.discard(target.id)
                 return
             if isinstance(node.value, ast.Tuple):
                 # 4.2. A tuple literal belongs to its annotated declaration, where
@@ -7356,6 +7875,8 @@ class IRBuilder:
                     f"`{target.id}: tuple[int[64], {len(node.value.elts)}] = "
                     f"({', '.join(['1'] * len(node.value.elts))})` (4.2)")
             value_reg = self.build_expr(node.value)
+            self._reject_optional_use(
+                value_reg, f"assignment to '{target.id}'")
             name = target.id
             # 6.2. A pointer assignment re-binds which string (if any) the
             # pointer names, mirroring what the load/store did to the register:
@@ -7412,6 +7933,8 @@ class IRBuilder:
                 self.emit(f"store {name}, {result}")
                 return
             rhs = self.build_expr(node.value)
+            self._reject_optional_use(
+                rhs, f"augmented assignment to '{name}'")
             result = self.new_reg()
             self.emit(f"{result} = {op_map[op_type]} {current}, {rhs}")
             self.emit(f"store {name}, {result}")
@@ -7492,18 +8015,30 @@ class IRBuilder:
             # function's return: it stores the method's result (if it has one)
             # into the inline's temp and jumps to the inline's end label.
             if self.method_return_stack:
-                result_temp, ret_label = self.method_return_stack[-1]
+                result_temp, ret_label, ret_t = self.method_return_stack[-1]
                 if node.value is not None:
                     if result_temp is None:
                         raise NotImplementedError(
                             f"LITHON-E0135: this method returns no value, so `return <expr>` is "
                             f"not allowed here (4.9)")
                     val_reg = self.build_expr(node.value)
+                    # 4.10.7. A None/optional result is accepted only when the
+                    # method's declared result is Optional[...]; None becomes a
+                    # class-typed null object so no int zero reaches the class
+                    # temp.
+                    if val_reg in self.null_regs or val_reg in self.optional_regs:
+                        if ret_t is None or ret_t.kind != "class" or not ret_t.nullable:
+                            raise NotImplementedError(
+                                f"LITHON-E0142: `return` of None/an Optional reference "
+                                f"requires an Optional class result type (4.10.7)")
+                    if val_reg in self.null_regs:
+                        val_reg = self._null_class_reg(ret_t.ref)
                     # 4.10.1. Same contract as a real function's `return`: a
                     # class reference handed back is a fresh owned reference, so
                     # the inlined body retains it for the caller (see the outer
-                    # return). The result temp itself owns nothing.
-                    if self.reg_class.get(val_reg) is not None:
+                    # return). The result temp itself owns nothing. A null object
+                    # carries no reference to retain.
+                    elif self.reg_class.get(val_reg) is not None:
                         was_temp = any(r == val_reg for r, _c in self.stmt_temps[-1])
                         if was_temp:
                             self._claim_stmt_temp(val_reg)
@@ -7531,6 +8066,14 @@ class IRBuilder:
                 return
             if node.value is not None:
                 val_reg = self.build_expr(node.value)
+                if val_reg in self.null_regs or val_reg in self.optional_regs:
+                    ret_t = self.func_return_type
+                    if ret_t is None or ret_t.kind != "class" or not ret_t.nullable:
+                        raise NotImplementedError(
+                            f"LITHON-E0142: `return` of None/an Optional reference "
+                            f"requires an Optional class result type (4.10.7)")
+                if val_reg in self.null_regs:
+                    val_reg = self._null_class_reg(self.func_return_type.ref)
                 # 4.10.1. A class reference returned to the caller is ALWAYS a
                 # fresh owned reference: the callee RETAINS what it returns, so
                 # the caller can treat every call result as one reference it owns
@@ -7539,8 +8082,9 @@ class IRBuilder:
                 # would drop a reference the callee never owned, a use-after-free)
                 # and for `return Point(...)` (the fresh object would leak). The
                 # retain makes the three return shapes -- a fresh construction, an
-                # owned local, a borrowed parameter -- one uniform contract.
-                if self.reg_class.get(val_reg) is not None:
+                # owned local, a borrowed parameter -- one uniform contract. A
+                # null object owns no allocation, so it is returned as-is.
+                elif self.reg_class.get(val_reg) is not None:
                     was_temp = any(r == val_reg for r, _c in self.stmt_temps[-1])
                     if was_temp:
                         self._claim_stmt_temp(val_reg)
@@ -7662,17 +8206,47 @@ def build_program(tree):
     # fn_rename) and the source name are recorded, because a call may reach
     # either.
     fn_returns = {}
+    fn_param_types = {}
+    fn_optional_returns = set()
     for stmt in tree.body:
         if not isinstance(stmt, ast.FunctionDef) or _is_type_function_def(stmt):
             continue
-        if stmt.returns is None or not isinstance(stmt.returns, ast.Name):
+        names = (stmt.name, fn_rename.get(stmt.name, stmt.name))
+        params = []
+        for arg in stmt.args.args:
+            if arg.annotation is None:
+                params.append(None)
+                continue
+            if isinstance(arg.annotation, ast.Name) \
+                    and (arg.annotation.id in structs or arg.annotation.id in enums):
+                params.append(None)
+                continue
+            try:
+                params.append(parse_type_annotation(arg.annotation))
+            except NotImplementedError:
+                # The function-header pass below reports the precise refusal;
+                # this pre-pass only needs the types that parse cleanly.
+                params.append(None)
+        for n in names:
+            fn_param_types[n] = list(params)
+        if stmt.returns is None:
             continue
-        if stmt.returns.id not in classes:
+        if isinstance(stmt.returns, ast.Name) \
+                and (stmt.returns.id in structs or stmt.returns.id in enums):
             continue
-        fn_returns[stmt.name] = stmt.returns.id
-        fn_returns[fn_rename.get(stmt.name, stmt.name)] = stmt.returns.id
+        try:
+            ret_t = parse_type_annotation(stmt.returns)
+        except NotImplementedError:
+            continue
+        if ret_t.kind != "class":
+            continue
+        for n in names:
+            fn_returns[n] = ret_t.ref
+            if ret_t.nullable:
+                fn_optional_returns.add(n)
 
-    main_builder = IRBuilder(fn_rename, structs, enums, classes, fn_returns)
+    main_builder = IRBuilder(fn_rename, structs, enums, classes, fn_returns,
+                             fn_param_types, fn_optional_returns)
     main_builder.start_block(main_builder.reserve_label())
 
     # 4.10.2. The class index map: a class's position in the emitted ClassInfo
@@ -7697,7 +8271,8 @@ def build_program(tree):
     for cname, clayout in classes.items():
         if "__del__" not in clayout.own_methods:
             continue
-        db = IRBuilder(fn_rename, structs, enums, classes, fn_returns)
+        db = IRBuilder(fn_rename, structs, enums, classes, fn_returns,
+                       fn_param_types, fn_optional_returns)
         db.start_block(db.reserve_label())
         self_param = "self"
         db.declared[self_param] = Type("class", ref=cname)
@@ -7705,7 +8280,7 @@ def build_program(tree):
         # Mark this as an inlined-method context so a `return` is a plain jump to
         # the end rather than the function's return path.
         ret_label = db.reserve_label()
-        db.method_return_stack.append((None, ret_label))
+        db.method_return_stack.append((None, ret_label, None))
         db.inline_own_depth[len(db.method_return_stack)] = len(
             getattr(db, "own_scopes", []))
         db.inline_active.append((cname, "__del__"))
@@ -7742,7 +8317,8 @@ def build_program(tree):
                 continue
             _emit_class_method_function(
                 IRBuilder, fn_rename, structs, enums, classes, fn_returns,
-                cname, cname, sname, method, class_index, module_parts)
+                cname, cname, sname, method, class_index, module_parts,
+                fn_param_types, fn_optional_returns)
 
     for stmt in tree.body:
         if isinstance(stmt, ast.ClassDef):
@@ -7753,7 +8329,8 @@ def build_program(tree):
                 # 4.8. A type function emits no code: it was registered above and
                 # is resolved only where its name is applied in an annotation.
                 continue
-            fb = IRBuilder(fn_rename, structs, enums, classes, fn_returns)
+            fb = IRBuilder(fn_rename, structs, enums, classes, fn_returns,
+                           fn_param_types, fn_optional_returns)
             fb.start_block(fb.reserve_label())
 
             param_strs = []
@@ -7821,6 +8398,7 @@ def build_program(tree):
                     raise NotImplementedError(
                         f"LITHON-E0124: function '{stmt.name}' cannot return a pointer: like "
                         f"parameters, the header records no pointee (4.4)")
+                fb.func_return_type = ret_t
                 # " : " is stripped because the return suffix uses " -> " and the
                 # scalar path below writes the brackets itself.
                 return_suffix = render_type_suffix(ret_t).replace(" : ", " -> ")
@@ -7836,9 +8414,12 @@ def build_program(tree):
             for arg in stmt.args.args:
                 if arg.annotation is None:
                     continue
-                if isinstance(arg.annotation, ast.Name) and arg.annotation.id in classes:
-                    fb.declared[arg.arg] = Type("class", ref=arg.annotation.id)
-                    fb.class_vars[arg.arg] = arg.annotation.id
+                class_t = fb._class_annotation(arg.annotation)
+                if class_t is not None:
+                    fb.declared[arg.arg] = class_t
+                    fb.class_vars[arg.arg] = class_t.ref
+                    if class_t.nullable:
+                        fb.optional_vars.add(arg.arg)
 
             for s in stmt.body:
                 fb.build_stmt(s)

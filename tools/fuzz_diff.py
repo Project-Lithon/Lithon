@@ -76,8 +76,9 @@ ACCUM_UNROLL = False
 # same treatment --mod-negatives gives the floored-vs-truncated `%%` gap.
 # Alternate seeds use the flat 4.10.1 shape, the 4.10.2 single-inheritance
 # shape, the 4.10.3 class-references-in-containers shape, the 4.10.4
-# multiple-inheritance diamond shape, the 4.10.5 special-methods shape, and the
-# 4.10.6 property/classmethod shape, so one --oop run exercises all six.
+# multiple-inheritance diamond shape, the 4.10.5 special-methods shape, the
+# 4.10.6 property/classmethod shape, and the 4.10.7 Optional/None shape, so one
+# --oop run exercises all seven.
 OOP_MODE = False
 # --phi: run the JIT twice, with and without the SSA pipeline, and require both
 # to match the interpreter. The plain run is the control: it proves the pipeline
@@ -1757,6 +1758,119 @@ class Gen:
         lines.append(f"{dname}.show({v[4]})")
         return "\n".join(lines) + "\n"
 
+    def program_oop_optional(self):
+        """A class program built around 4.10.7's Optional[P] / None.
+
+        The chain stores optional references in attributes (`next: Optional[P]`)
+        and in locals; a method takes and returns an Optional, a free function
+        widens an object to an Optional and can return None, and a derived
+        object flows through an Optional base reference. A `while cur is not
+        None` loop and an early-return guard exercise narrowing, while assigning
+        None (and another reference) exercises the release/replace path.
+
+        Every printed value is an INT or bool, never a reference, so the two
+        engines are byte-comparable. The source needs no `typing` import in
+        Lithon; CPython sees a future annotations import in evaluate(), which
+        makes the annotation-only `Optional` name valid without changing any
+        runtime statement.
+        """
+        r = self.r
+        cname = r.choice(["Node", "Link", "Cell"])
+        dname = r.choice(["Marked", "Tagged", "Special"])
+        v = [r.randint(0, 9) for _ in range(8)]
+
+        lines = []
+        lines.append(f"class {cname}:")
+        lines.append("    value: int[64]")
+        lines.append(f"    next: Optional[{cname}]")
+        lines.append("")
+        lines.append(f"    def __init__(self, value: int[64]):")
+        lines.append("        self.value = value")
+        lines.append("        self.next = None")
+        lines.append("")
+        lines.append("    def tail_value(self, fallback: int[64]) -> int[64]:")
+        lines.append(f"        n: Optional[{cname}] = self.next")
+        lines.append("        if n is None:")
+        lines.append("            return fallback")
+        lines.append("        return n.value")
+        lines.append("")
+        lines.append(f"    def choose(self, replace: Optional[{cname}]) -> Optional[{cname}]:")
+        lines.append("        if replace is None:")
+        lines.append("            return self.next")
+        lines.append("        self.next = replace")
+        lines.append("        return replace")
+        lines.append("")
+        lines.append(f"class {dname}({cname}):")
+        lines.append("    mark: int[64]")
+        lines.append("")
+        lines.append(f"    def __init__(self, value: int[64], mark: int[64]):")
+        lines.append("        super().__init__(value)")
+        lines.append("        self.mark = mark")
+        lines.append("")
+        lines.append("    def score(self) -> int[64]:")
+        lines.append("        return self.value + self.mark")
+        lines.append("")
+        lines.append(f"def maybe(flag: bool, n: Optional[{cname}]) -> Optional[{cname}]:")
+        lines.append("    if flag:")
+        lines.append("        return n")
+        lines.append("    return None")
+        lines.append("")
+        lines.append(f"def chain_sum(head: Optional[{cname}]) -> int[64]:")
+        lines.append("    total: int[64] = 0")
+        lines.append(f"    cur: Optional[{cname}] = head")
+        lines.append("    while cur is not None:")
+        lines.append("        total = total + cur.value")
+        lines.append("        cur = cur.next")
+        lines.append("    return total")
+        lines.append("")
+        lines.append(f"a: {cname} = {cname}({v[0]})")
+        lines.append(f"b: {cname} = {cname}({v[1]})")
+        lines.append("a.next = b")
+        lines.append(f"m: {dname} = {dname}({v[2]}, {v[3]})")
+        lines.append("b.next = m")
+        lines.append("print(a.tail_value(-1))")
+        lines.append("print(b.tail_value(-2))")
+        lines.append("print(m.score())")
+        lines.append("print(chain_sum(a))")
+        lines.append("print(chain_sum(None))")
+        lines.append("print(b.tail_value(-3))")
+        lines.append(f"picked: Optional[{cname}] = a.choose(m)")
+        lines.append("if picked is not None:")
+        lines.append("    print(picked.value)")
+        lines.append("else:")
+        lines.append("    print(999)")
+        lines.append(f"old: Optional[{cname}] = b.choose(None)")
+        lines.append("if old is not None:")
+        lines.append("    print(old.value)")
+        lines.append(f"missing: Optional[{cname}] = maybe(False, a)")
+        lines.append("if missing is None:")
+        lines.append("    print(777)")
+        lines.append("else:")
+        lines.append("    print(missing.value)")
+        lines.append(f"found: Optional[{cname}] = maybe(True, m)")
+        lines.append("if found is not None:")
+        lines.append("    print(found.value)")
+        lines.append("b.next = None")
+        lines.append("print(b.tail_value(-4))")
+        lines.append("b.next = m")
+        lines.append(f"base: Optional[{cname}] = m")
+        lines.append("if base is not None:")
+        lines.append("    print(base.value)")
+        lines.append("base = None")
+        lines.append("if base is None:")
+        lines.append("    print(1)")
+        lines.append(f"late: Optional[{cname}] = None")
+        lines.append("if late is None:")
+        lines.append(f"    late = {cname}({v[4]})")
+        lines.append("print(late.value)")
+        lines.append(f"total: int[64] = 0")
+        lines.append(f"cur: Optional[{cname}] = a")
+        lines.append("while cur is not None:")
+        lines.append("    total = total + cur.value")
+        lines.append("    cur = cur.next")
+        lines.append("print(total)")
+        return "\n".join(lines) + "\n"
+
     def program(self):
         call_expr = self.emit_recursive_helper() if self.r.random() < 0.5 else None
         for v in VARS[:3]:
@@ -1780,6 +1894,24 @@ class Result:
         self.jit_out, self.jit_rc = jit_out, jit_rc
         self.cpy_out, self.cpy_rc = cpy_out, cpy_rc
         self.reason = reason    # None | "skip" | "interp_vs_cpython" | "jit_vs_interp"
+
+
+def run_cpython(py_path: Path):
+    """Run the CPython oracle, making annotation-only names legal.
+
+    4.10.7 programs spell nullable references as `Optional[P]`, which Lithon
+    parses directly. CPython would need `from typing import Optional`, and an
+    import is deliberately not part of the Lithon slice. A future-annotations
+    import changes only annotation evaluation, so the generated statement
+    semantics stay identical; it is prepended to a CPython-only copy and never
+    reaches the frontend.
+    """
+    src = py_path.read_text()
+    if "Optional[" in src and "from __future__ import annotations" not in src:
+        cpy_path = py_path.with_name(py_path.stem + "__cpython.py")
+        cpy_path.write_text("from __future__ import annotations\n" + src)
+        return run([sys.executable, str(cpy_path)])
+    return run([sys.executable, str(py_path)])
 
 
 def evaluate(py_path: Path, tmp_ir: Path):
@@ -1850,7 +1982,7 @@ def evaluate(py_path: Path, tmp_ir: Path):
             return Result(False, interp.stdout, interp.returncode,
                           jit_dp.stdout, jit_dp.returncode,
                           cpy_out=None, cpy_rc=None, reason="jit_vs_interp")
-    cpy = run([sys.executable, str(py_path)])
+    cpy = run_cpython(py_path)
     seen = (interp.stdout, interp.returncode, jit.stdout, jit.returncode, cpy.stdout, cpy.returncode)
 
     # 1. PRIMARY: the two engines must agree with each other. Checked first so a CPython disagreement
@@ -1987,7 +2119,8 @@ def main():
     ap.add_argument("--oop", action="store_true",
                     help="use the class-focused generator (see Gen.program_oop): construction, "
                          "attributes, methods, aliasing, __del__ lifetime, identity, containers, "
-                         "inheritance, multiple inheritance, special methods and decorators")
+                         "inheritance, multiple inheritance, special methods, decorators and "
+                         "Optional/None nullable references")
     args = ap.parse_args()
     TIMEOUT = args.timeout
     global UNROLL_DIAMONDS, SSA_MODE, ACCUM_UNROLL, DIRECT_PHI_MODE, OOP_MODE
@@ -2012,27 +2145,30 @@ def main():
         gen = Gen(seed, args.shared_loop_vars, floats=args.floats,
                   mod_negatives=args.mod_negatives)
         if args.oop:
-            # Alternate seeds across the six OOP shapes: the flat 4.10.1
+            # Alternate seeds across the seven OOP shapes: the flat 4.10.1
             # object model, the 4.10.2 single-inheritance shape, the 4.10.3
             # class-references-in-containers shape, the 4.10.4 diamond shape,
-            # the 4.10.5 special-methods shape, and the 4.10.6
-            # property/classmethod shape. All six are pinned by the same
-            # interpreter-vs-JIT gate; the extra shapes add vtable dispatch,
-            # super(), C3 MRO, isinstance, upcasts, per-slot ownership,
-            # comparison dispatch, object text, computed properties and
-            # call-time-class classmethods.
-            if seed % 6 == 0:
+            # the 4.10.5 special-methods shape, the 4.10.6
+            # property/classmethod shape, and the 4.10.7 Optional/None shape.
+            # All seven are pinned by the same interpreter-vs-JIT gate; the
+            # extra shapes add vtable dispatch, super(), C3 MRO, isinstance,
+            # upcasts, per-slot ownership, comparison dispatch, object text,
+            # computed properties, call-time-class classmethods and nullable
+            # references with narrowing.
+            if seed % 7 == 0:
                 src = gen.program_oop()
-            elif seed % 6 == 1:
+            elif seed % 7 == 1:
                 src = gen.program_oop_inherit()
-            elif seed % 6 == 2:
+            elif seed % 7 == 2:
                 src = gen.program_oop_containers()
-            elif seed % 6 == 3:
+            elif seed % 7 == 3:
                 src = gen.program_oop_multiple()
-            elif seed % 6 == 4:
+            elif seed % 7 == 4:
                 src = gen.program_oop_special()
-            else:
+            elif seed % 7 == 5:
                 src = gen.program_oop_decorators()
+            else:
+                src = gen.program_oop_optional()
         elif args.phi:
             src = gen.program_phi()
         elif args.floats:

@@ -278,16 +278,24 @@ inline std::unordered_set<std::string> promotable_variables(const lithon::ir::Fu
     // 4.6. A struct declaration is the same kind of instruction for the same
     // reason: its bytes are addressed by field ops that name the variable, not
     // by Load/Store, so promotion would erase the run's reservation.
+    //
+    // 4.10.7. A valueless class store is also a declaration, not a value: it
+    // reserves a class-typed slot whose null reference is supplied by the
+    // runtime. Promoting it would push kInvalidValue as the definition of the
+    // slot and turn the following Load into an invalid value id (a crash in the
+    // kind analysis); keeping the store/load pair makes the null reference
+    // ordinary memory traffic that both tiers already initialize.
     for (const auto& v : stored) {
         if (params.count(v)) continue;
-        bool is_container_decl = false;
+        bool is_declaration = false;
         for (const auto& b2 : fn.blocks)
             for (const auto& in2 : b2.instrs)
                 if (in2.op == Op::Store && in2.name == v && in2.args.empty() &&
                     (in2.type_kind == "list" || in2.type_kind == "tuple" ||
-                     in2.type_kind == "dict" || in2.type_kind == "struct"))
-                    is_container_decl = true;
-        if (is_container_decl) continue;
+                     in2.type_kind == "dict" || in2.type_kind == "struct" ||
+                     in2.type_kind == "class"))
+                    is_declaration = true;
+        if (is_declaration) continue;
 
         // 4.4. A variable whose ADDRESS is taken must stay a memory slot for
         // the same reason a container declaration does: AddressOf lowers to

@@ -868,6 +868,66 @@ FRONTEND_REFUSALS = [
     ("raise (E0114)",
      "a: int[64] = 1\ntry:\n    b: int[64] = a % 0\nexcept ZeroDivisionError:\n    raise\n",
      "LITHON-E0114"),
+    # 4.10.7. Optional[P] is the one nullable class reference. Its argument must
+    # be a class, it cannot nest, and containers of Optional references are
+    # deliberately deferred. None is not a general zero: only an Optional class
+    # target may consume it, and an Optional needs a proof before an object
+    # operation. Every case is a coded E0142 refusal.
+    ("Optional of a non-class type (E0142)",
+     "x: Optional[int[64]] = None\nprint(0)\n", "LITHON-E0142"),
+    ("nested Optional (E0142)",
+     "class P:\n    x: int[64]\np: Optional[Optional[P]] = None\nprint(0)\n",
+     "LITHON-E0142"),
+    ("Optional class element in a list (E0142)",
+     "class P:\n    x: int[64]\nxs: list[Optional[P], 2]\nprint(0)\n",
+     "LITHON-E0142"),
+    ("Optional class value in a dict (E0142)",
+     "class P:\n    x: int[64]\nd: dict[int[64], Optional[P], 2]\nprint(0)\n",
+     "LITHON-E0142"),
+    ("None stored in a non-optional class variable (E0142)",
+     "class P:\n    x: int[64]\np: P = None\nprint(0)\n", "LITHON-E0142"),
+    ("None stored in a non-optional class attribute (E0142)",
+     "class P:\n    x: int[64]\n    def __init__(self):\n        self.x = None\n"
+     "p: P = P()\nprint(p.x)\n", "LITHON-E0142"),
+    ("None stored in a scalar declaration (E0142)",
+     "x: int[64] = None\nprint(x)\n", "LITHON-E0142"),
+    ("None printed as a value (E0142)",
+     "print(None)\n", "LITHON-E0142"),
+    ("None used as a container index (E0142)",
+     "xs: list[int[64], 2] = [1, 2]\nprint(xs[None])\n", "LITHON-E0142"),
+    ("None appended to a scalar list (E0142)",
+     "xs: list[int[64], 2] = [1]\nxs.append(None)\n", "LITHON-E0142"),
+    ("unchecked Optional used as a receiver (E0142)",
+     "class P:\n    x: int[64]\np: Optional[P] = None\nprint(p.x)\n",
+     "LITHON-E0142"),
+    ("Optional copied into a non-optional class variable (E0142)",
+     "class P:\n    x: int[64]\na: Optional[P] = None\nb: P = a\nprint(0)\n",
+     "LITHON-E0142"),
+    ("None passed to a non-optional free parameter (E0142)",
+     "class P:\n    x: int[64]\ndef f(p: P) -> int[64]:\n    return p.x\n"
+     "print(f(None))\n", "LITHON-E0142"),
+    ("unchecked Optional passed to a non-optional free parameter (E0142)",
+     "class P:\n    x: int[64]\ndef f(p: P) -> int[64]:\n    return p.x\n"
+     "a: Optional[P] = None\nprint(f(a))\n", "LITHON-E0142"),
+    ("None returned from a non-optional function (E0142)",
+     "class P:\n    x: int[64]\ndef f() -> P:\n    return None\nprint(0)\n",
+     "LITHON-E0142"),
+    ("None returned from a non-optional method (E0142)",
+     "class P:\n    x: int[64]\n    def __init__(self):\n        self.x = 1\n"
+     "    def f(self) -> P:\n        return None\np: P = P()\nprint(p.x)\n",
+     "LITHON-E0142"),
+    ("Optional compared with == None (E0142)",
+     "class P:\n    x: int[64]\np: Optional[P] = None\nif p == None:\n    print(1)\n",
+     "LITHON-E0142"),
+    ("None in an enum scalar payload (E0142)",
+     "class Shape(enum):\n    Empty\n    Line: int[64]\n"
+     "s: Shape\ns = Shape.Line(None)\nprint(0)\n", "LITHON-E0142"),
+    ("None in an enum struct payload field (E0142)",
+     "class Vec(struct):\n    a: int[64]\n    b: int[64]\n"
+     "class Shape(enum):\n    Empty\n    Pair: Vec\n"
+     "s: Shape\ns = Shape.Pair(a=None, b=2)\nprint(0)\n", "LITHON-E0142"),
+    ("None in an augmented assignment (E0142)",
+     "x: int[64] = 1\nx += None\nprint(x)\n", "LITHON-E0142"),
 ]
 
 

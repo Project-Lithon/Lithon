@@ -1,0 +1,191 @@
+# 4.10.7. Nullable class references. Optional[P] is one class reference that
+# may also hold None. None is only a value for an Optional target; using an
+# unchecked Optional as an object is refused (E0142). `is None` / `is not None`
+# narrow a plain name, and `return` after a guard narrows too. The reference
+# count owns the object exactly as in 4.10.1: assigning None (or another
+# reference) releases the old target at that statement.
+#
+# The expected output is CPython's answer for the same program (with
+# `from __future__ import annotations` so the class-body annotations need no
+# `typing` import).
+
+
+class Node:
+    value: int[64]
+    next: Optional[Node]
+
+    def __init__(self, value: int[64]):
+        self.value = value
+        self.next = None
+
+    def next_value(self, fallback: int[64]) -> int[64]:
+        n: Optional[Node] = self.next
+        if n is None:
+            return fallback
+        return n.value
+
+    def set_next(self, n: Optional[Node]) -> int[64]:
+        self.next = n
+        m: Optional[Node] = self.next
+        if m is None:
+            return 0
+        return m.value
+
+
+class Animal:
+    legs: int[64]
+
+    def __init__(self, legs: int[64]):
+        self.legs = legs
+
+    def sound(self) -> int[64]:
+        return self.legs
+
+
+class Dog(Animal):
+    volume: int[64]
+
+    def __init__(self, legs: int[64], volume: int[64]):
+        super().__init__(legs)
+        self.volume = volume
+
+    def sound(self) -> int[64]:
+        return self.legs * 10 + self.volume
+
+
+class Kennel:
+    pet: Optional[Animal]
+
+    def __init__(self):
+        self.pet = None
+
+    def describe(self) -> int[64]:
+        p: Optional[Animal] = self.pet
+        if p is None:
+            return -1
+        return p.sound()
+
+
+def maybe(flag: bool, n: Optional[Node]) -> Optional[Node]:
+    if flag:
+        return n
+    return None
+
+
+def depth(n: Optional[Node]) -> int[64]:
+    if n is None:
+        return 0
+    q: Optional[Node] = n.next
+    if q is None:
+        return 1
+    return 1 + depth(q)
+
+
+head: Optional[Node] = Node(10)
+second: Node = Node(20)
+head.next = second
+third: Node = Node(30)
+second.next = third
+print(head.value)
+head.value = 11
+print(head.value)
+print(depth(head))
+print(depth(None))
+print(depth(second))
+
+cur: Optional[Node] = head
+count: int[64] = 0
+total: int[64] = 0
+while cur is not None:
+    count = count + 1
+    total = total + cur.value
+    cur = cur.next
+print(count)
+print(total)
+
+found: Optional[Node] = maybe(True, second)
+if found is not None:
+    print(found.value)
+else:
+    print(999)
+missing: Optional[Node] = maybe(False, second)
+if missing is None:
+    print(777)
+else:
+    print(missing.value)
+
+print(head.next_value(404))
+print(second.set_next(None))
+print(second.next_value(404))
+print(second.set_next(third))
+print(head.next_value(404))
+
+d: Dog = Dog(4, 10)
+a: Optional[Animal] = d
+if a is not None:
+    print(a.sound())
+a = None
+if a is None:
+    print(1)
+
+k: Kennel = Kennel()
+print(k.describe())
+k.pet = d
+print(k.describe())
+k.pet = None
+print(k.describe())
+
+head = None
+if head is None:
+    print(2)
+else:
+    print(3)
+head = Node(5)
+if head is not None:
+    print(head.value)
+
+base: Optional[Node] = None
+if base is None:
+    base = Node(42)
+print(base.value)
+
+
+class Token:
+    ident: int[64]
+
+    def __init__(self, ident: int[64]):
+        self.ident = ident
+
+    def __del__(self):
+        print(self.ident + 1000)
+
+
+class Slot:
+    item: Optional[Token]
+
+    def __init__(self):
+        self.item = None
+
+    def put(self, t: Optional[Token]) -> int[64]:
+        self.item = t
+        v: Optional[Token] = self.item
+        if v is None:
+            return -1
+        return v.ident
+
+    def clear(self):
+        self.item = None
+
+
+t: Optional[Token] = Token(500)
+s: Slot = Slot()
+print(s.put(t))
+print(s.put(None))
+print(s.put(t))
+t = Token(501)
+u: Optional[Token] = s.item
+if u is not None:
+    print(u.ident)
+s.clear()
+t = None
+print(s.put(None))

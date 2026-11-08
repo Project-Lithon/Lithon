@@ -2713,6 +2713,21 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                     }
                     break;
                 }
+                // 4.10.7. A valueless class store declares a class reference
+                // whose initial value is the null object. The frontend emits
+                // one for None because the IR has no null literal, so the slot
+                // must be zeroed rather than left as whatever the frame held.
+                if (instr.args.empty() && instr.type_kind == "class") {
+                    require_variable(instr.name, "store to");
+                    emit_xor_zero(code, kR);
+                    if (alloc.variable_in_register(instr.name)) {
+                        emit_mov_reg_reg(code, alloc.variable_reg(instr.name), kR);
+                    } else {
+                        emit_store_rbp_offset(code, kR,
+                                              alloc.variable_offset(instr.name), 8);
+                    }
+                    break;
+                }
                 // 0.6.10. Any valueless store left after the container
                 // declarations above is a type-only scalar or pointer
                 // declaration: the typechecker consumed it, there is no

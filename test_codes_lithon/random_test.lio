@@ -1,0 +1,17 @@
+def main() -> int[64]:
+    entropy: int[64] = 0
+    _entropy: ptr[int[64]] = addressof(entropy)
+    i:int[8] = 0
+    for i in range(100):
+        entropy = 0
+        result: int[64] = syscall(318, _entropy, 8, 0)
+
+        if result != 8:
+            print("Entropy acquisition failed")
+            return 1
+
+        print(entropy)
+
+    return 0
+
+main()
