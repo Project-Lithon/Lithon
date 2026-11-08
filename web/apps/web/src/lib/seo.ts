@@ -44,7 +44,12 @@ export type PageMeta = {
 }
 
 export function originFor(): string {
-  if (typeof window !== "undefined") return window.location.origin
+  if (typeof window !== "undefined") {
+    // On GitHub Pages the site lives under /<Repo>/ — window.location.origin
+    // alone would emit canonicals missing the sub-path (404s in search).
+    const base = SITE_BASE_PATH === "/" ? "" : SITE_BASE_PATH.replace(/\/$/, "")
+    return `${window.location.origin}${base}`
+  }
   return SITEMAP_HOST
 }
 
@@ -61,7 +66,7 @@ export function metaForPath(pathname: string): PageMeta {
         "Zero third-party dependencies: no LLVM, no Cranelift, no runtime package",
         "Dual-tier: native x86-64 with an honest interpreter fallback under --strict",
         "Fixed-width types: int[8..64], float[64], bool, bounded str[N], typed pointers",
-        "33/33 CTest, 18,379 encoder cases with 0 incorrect",
+        "35/35 CTest, 18,379 encoder cases with 0 incorrect",
       ],
       keywords: ["lithon", "python", "native", "x86-64", "compiler", "jit"],
     }
@@ -169,6 +174,35 @@ export function metaForPath(pathname: string): PageMeta {
         "Every example is compiled by the real Lithon frontend",
       ],
       keywords: ["lithon", "docs", "documentation", "reference"],
+    }
+  }
+
+  if (clean === "/use-cases") {
+    return {
+      title: "Use cases | Lithon",
+      description:
+        "Signal processing, dev tools, embedded and domain modelling: classes with inheritance verified statically, emitted natively.",
+      canonical: `${site}/use-cases`,
+      facts: [
+        "Domain modelling: classes/inheritance/dunders, fixed slots, refcounted heap",
+        "Signal processing: fixed-width ints, AVX2 vectorizer, syscall loopback",
+        "Dev tools: zero-dependency engine, byte-identical tiers",
+      ],
+      keywords: ["lithon", "use cases", "classes", "oop"],
+    }
+  }
+
+  if (clean.startsWith("/roadmap")) {
+    return {
+      title: "Roadmap | Lithon",
+      description:
+        "Phased plan: dual-tier JIT (shipped), AOT synthesis (next), systems & SIMD (planned). OOP Phase 1 (4.10) is done.",
+      canonical: `${site}${clean}`,
+      facts: [
+        "Phase I dual-tier shipped; Phase II AOT next; Phase III systems planned",
+        "OOP 4.10.0-4.10.6 shipped 2026-11-05",
+      ],
+      keywords: ["lithon", "roadmap", "phases"],
     }
   }
 

@@ -53,7 +53,11 @@ const TILES = [
   ],
   [
     "Layer 3 · ~5 min",
-    "Differential fuzzing per shape, each mode aimed at passes the general generator never reaches.",
+    "Differential fuzzing per shape, each mode aimed at passes the general generator never reaches (including `--oop` classes, 6 shapes, 200/200).",
+  ],
+  [
+    "Layer 4 · per commit",
+    "The benchmark bot re-measures fib(30) on every commit and publishes `benchmarks/results/latest.json` (currently 137.8x).",
   ],
 ] as const
 
@@ -133,12 +137,12 @@ function Verification() {
             </p>
             <CodeBlock title="the layers, in order">{`$ cmake -B build -DCMAKE_BUILD_TYPE=Release
 $ cmake --build build -j$(nproc)
-$ ctest --test-dir build --output-on-failure     # 33/33
+$ ctest --test-dir build --output-on-failure     # 35/35
 
 $ bash tools/verify_all.sh        # the whole gate
 $ python3 tools/run_regression.py         # 34/34 untyped
-$ python3 tools/run_typed_regression.py   # 46/46 typed
-$ python3 tools/run_tier_diff.py          # 168/168, both tiers`}</CodeBlock>
+$ python3 tools/run_typed_regression.py   # 61/61 (46 + 15 class_*) typed
+$ python3 tools/run_tier_diff.py          # 235/235, both tiers`}</CodeBlock>
             <p>
               <code>run_tier_diff.py</code> is the highest-value of those. It
               runs every program through <em>both</em> tiers and requires
@@ -172,7 +176,8 @@ $ python3 tools/run_tier_diff.py          # 168/168, both tiers`}</CodeBlock>
               shape. If you change one of these passes, the matching mode is the
               one to run.
             </p>
-            <CodeBlock title="tools/fuzz_diff.py · per-shape modes">{`$ python3 tools/fuzz_diff.py --count 300             # general
+            <CodeBlock title="tools/fuzz_diff.py · per-shape modes">{`$ python3 tools/fuzz_diff.py --count 200 --oop  # classes, 6 shapes
+$ python3 tools/fuzz_diff.py --count 300             # general
 $ python3 tools/fuzz_diff.py --count 300 --lsr        # strength reduction
 $ python3 tools/fuzz_diff.py --count 300 --diamond   # diamond unroll
 $ python3 tools/fuzz_diff.py --count 300 --floats    # int/float mixes

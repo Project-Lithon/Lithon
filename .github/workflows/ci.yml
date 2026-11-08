@@ -84,7 +84,7 @@ jobs:
           g++ -std=c++20 -Wall -Wextra -Isrc/jit -o branch_test src/jit/branch_test.cpp
           g++ -std=c++20 -Wall -Wextra -Isrc/jit -o stack_test src/jit/stack_test.cpp
 
-      - name: Compile Liveness & Register Allocation Tests
+      - name: Compile liveness & register-allocation tests
         run: |
           g++ -std=c++20 -Wall -Wextra -Isrc -o liveness_test src/jit/liveness_test.cpp
           g++ -std=c++20 -Wall -Wextra -Isrc -o regalloc_test src/jit/regalloc_test.cpp
@@ -95,7 +95,7 @@ jobs:
           ./branch_test
           ./stack_test
 
-      - name: Execute Liveness & Register Allocation Tests
+      - name: Execute liveness & register-allocation tests
         run: |
           ./liveness_test
           ./regalloc_test
@@ -161,17 +161,6 @@ jobs:
           g++ -std=c++20 -Wall -Wextra -Isrc -o liveness_test src/jit/liveness_test.cpp
           g++ -std=c++20 -Wall -Wextra -Isrc -o regalloc_test src/jit/regalloc_test.cpp
           g++ -std=c++20 -Wall -Wextra -Isrc -o compile_function_test src/jit/compile_function_test.cpp
-
-      - name: Execute Liveness & Register Allocation Tests
-        run: |
-          ./liveness_test
-          ./regalloc_test
-          ./compile_function_test
-      - name: Compile Liveness & Register Allocation Tests
-        run: |
-          g++ -std=c++20 -Wall -Wextra -Isrc -o liveness_test src/jit/liveness_test.cpp
-          g++ -std=c++20 -Wall -Wextra -Isrc -o regalloc_test src/jit/regalloc_test.cpp
-          g++ -std=c++20 -Wall -Wextra -Isrc -o compile_function_test src/jit/compile_function_test.cpp
           g++ -std=c++20 -Wall -Wextra -Isrc -o compile_function_branch_test src/jit/compile_function_branch_test.cpp
           g++ -std=c++20 -Wall -Wextra -Isrc -o compile_function_loop_test src/jit/compile_function_loop_test.cpp
           g++ -std=c++20 -Wall -Wextra -Isrc -o compile_module_call_test src/jit/compile_module_call_test.cpp
@@ -181,10 +170,8 @@ jobs:
           g++ -std=c++20 -Wall -Wextra -Isrc -o compile_function_diamond_test src/jit/compile_function_diamond_test.cpp
           g++ -std=c++20 -Wall -Wextra -Isrc -Isrc/jit -o optimize_lsr_test src/jit/optimize_lsr_test.cpp src/ir/text_parser.cpp
 
-      - name: Execute Liveness & Register Allocation Tests
+      - name: Execute compile_function & module tests (incl. liveness/regalloc)
         run: |
-          ./liveness_test
-          ./regalloc_test
           ./compile_function_test
           ./compile_function_branch_test
           ./compile_function_loop_test

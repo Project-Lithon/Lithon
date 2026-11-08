@@ -451,7 +451,7 @@ const instructionEncoding: DocPage = {
         },
         {
           kind: "p",
-          text: "The encoder covers 26 of 27 IR opcodes (`Phi` is lowered, not emitted) plus the AVX2 vector forms the auto-vectorizer emits.",
+          text: "The encoder covers 62 of 63 IR opcodes (`Phi` is lowered, not emitted) plus the AVX2 vector forms the auto-vectorizer emits, including the eight class ops (`New`/`RefLoad`/`RefStore`/`Retain`/`Release`/`IsInstance`/`CallVirtual`/`CallSuper`) and the `Try*` guards.",
         },
       ],
     },

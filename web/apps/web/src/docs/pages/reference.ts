@@ -132,7 +132,7 @@ const errors: DocPage = {
             ["`E0125`, 1 (static refusal)", "Pointer arithmetic form"],
             [
               "`E0126`, 1 (static refusal)",
-              "Struct definition (must derive from `Struct`; fields are annotations only)",
+              "Struct definition (must derive from `struct`; fields are annotations only)",
             ],
             [
               "`E0127`, 1 (static refusal)",
@@ -144,7 +144,7 @@ const errors: DocPage = {
             ],
             [
               "`E0129`, 1 (static refusal)",
-              "Enum definition (must derive from `Enum`; variants are bare unit names, payload annotations, or inline `class V(Struct)`)",
+              "Enum definition (must derive from `enum`; variants are bare unit names, payload annotations, or inline `class V(struct)`)",
             ],
             [
               "`E0130`, 1 (static refusal)",
@@ -156,7 +156,7 @@ const errors: DocPage = {
             ],
             [
               "`E0132`, 1 (static refusal)",
-              "Type-function definition (`-> NewType`): bad signature, a body that is not a one-element `{ T }`, a duplicate name, or a name colliding with a runtime function/struct/enum",
+              "Type-function definition (`-> newtype`): bad signature, a body that is not a one-element `{ T }`, a duplicate name, or a name colliding with a runtime function/struct/enum/class",
             ],
             [
               "`E0133`, 1 (static refusal)",
@@ -164,11 +164,19 @@ const errors: DocPage = {
             ],
             [
               "`E0134`, 1 (static refusal)",
-              "Method definition (a `def` in a struct/enum body): a decorator, `/`/`*`/`**`/defaults, a missing or annotated `self`, a non-scalar parameter/return, a duplicate name, or a name colliding with a field or variant",
+              "Method definition (a `def` in a struct/enum/class body): a decorator, `/`/`*`/`**`/defaults, a missing or annotated `self`, a non-scalar parameter/return, a duplicate name, or a name colliding with a field or variant. On baseless classes, `@property`/`@classmethod` are legal; `__str__`/`__repr__` must be one literal/f-string of scalar attrs",
             ],
             [
               "`E0135`, 1 (static refusal)",
-              "Method application: an unknown method, a field where a method is called, a non-struct/enum receiver, an arity mismatch, a recursive inline, or a method with no result used as a value",
+              "Method application: an unknown method, a field where a method is called, a non-struct/enum/class receiver, an arity mismatch, a recursive inline, or a method with no result used as a value, a property assignment or call, a classmethod on an instance, or an object printed with neither `__str__` nor `__repr__`",
+            ],
+            [
+              "`E0140`, 1 (static refusal)",
+              "Class instance semantics (4.10): a bare class name used where a value is needed, a class-typed variable initialized with a non-class value, an identity compare between classes with no possible common declared subclass, an attempt to instantiate an abstract class, an attribute left uninitialized on some path through `__init__`, a bare declaration or `append` on a class-typed container, storing a non-class or unrelated class reference into a class-typed container element, or membership of a non-class or unrelated class in a class-typed container",
+            ],
+            [
+              "`E0141`, 1 (static refusal)",
+              "Class attribute access (4.10): a read or write of an attribute the class does not declare (an instance has exactly its declared attributes)",
             ],
             [
               "`E0201`, 2 (environmental)",
@@ -365,14 +373,14 @@ const builtins: DocPage = {
           rows: [
             [
               "`print(x)` / `print(a, b, c)`",
-              "write one or more values, space-separated, and a newline: the only output primitive. `print()` with no arguments writes a bare newline.",
+              "write one or more values, space-separated, and a newline: the only output primitive. `print()` with no arguments writes a bare newline. An object prints via `__str__`, else `__repr__`, by its concrete class (see [Classes](/docs/classes)); an object with neither is refused (E0135).",
             ],
             [
               "`len(xs)`",
               "the **live** length of a `list`/`tuple`/`dict`, or the run-time byte count of a `str[N]`. Carried in a companion slot, so it can change at run time.",
             ],
             [
-              "`range(n)` / `range(a, b)`",
+              "`range(n)` / `range(a, b)` / `range(a, b, step)`",
               "loop values, checked against the loop variable's width at compile time when known (0.6.12)",
             ],
             ["`addressof(x)`", "`ptr[T]` to a scalar, a `str[N]`, or a struct"],
@@ -399,7 +407,7 @@ const builtins: DocPage = {
             ],
             [
               "`x in xs` / `x not in xs`",
-              "`bool`: OR of `x == xs[k]` over the compile-time length",
+              "`bool`: OR of `x == xs[k]` over the compile-time length. Class containers use a reference scan instead (identity), and an unrelated class value is refused (E0140).",
             ],
             [
               "`int(w, v)`",
@@ -423,11 +431,15 @@ const builtins: DocPage = {
             ],
             ["`wrap_sub(a, b)`", "wrapping integer sub"],
             ["`wrap_mul(a, b)`", "wrapping integer mul"],
+            [
+              "`isinstance(x, C)` / `issubclass(A, B)`",
+              "`bool`: C3-folded instance/subclass test (see [Classes](/docs/classes)); `cls` forms resolve statically in a `@classmethod`",
+            ],
           ],
         },
         {
           kind: "p",
-          text: "Two more names are built in, but only in a `for` header: `enumerate(xs)` yields `(index, value)` and `zip(xs, ys)` yields pairs, stopping at the shortest input. Used anywhere else they are refused, because a general iteration protocol does not exist yet.",
+          text: "Two more names are built in, but only in a `for` header: `enumerate(xs)` yields `(index, value)` and `zip(xs, ys)` yields pairs, stopping at the shortest input. Used anywhere else they are refused, because a general iteration protocol does not exist yet. `enumerate`/`zip` over a class-typed container are refused (E0119) — the workaround is `for i in range(N): xs[i]`.",
         },
         {
           kind: "code",
@@ -649,7 +661,7 @@ print(7 % -3)`,
         },
         {
           kind: "p",
-          text: "A trap raised by any of the rules above can be caught by name with `try`/`except` -- see [Control flow](/docs/control-flow#try-except) for the catchable set. A static refusal cannot: it happens before the program exists to catch it.",
+          text: "A trap raised by any of the rules above can be caught by name with `try`/`except` -- see [Exceptions](/docs/exceptions) for the catchable set. A static refusal cannot: it happens before the program exists to catch it.",
         },
       ],
     },
@@ -691,7 +703,7 @@ const verification: DocPage = {
   slug: "verification",
   title: "Verification",
   description:
-    "The numbers behind the claims: 33/33 CTest, 18,379 encoder cases with 0 wrong, both tiers byte-identical.",
+    "The numbers behind the claims: 35/35 CTest, 18,379 encoder cases with 0 wrong, both tiers byte-identical.",
   group: "reference",
   tags: [
     "verification",
@@ -711,20 +723,22 @@ const verification: DocPage = {
           kind: "table",
           caption: "from README.md: run it yourself, don't trust it",
           rows: [
-            ["CTest", "33 / 33 passed"],
+            ["CTest", "35 / 35 passed"],
             ["x86-64 encoder comparisons", "18,379 cases"],
             ["Incorrect encoder cases", "0"],
             ["Typed differential fuzzing", "300 / 300 passed"],
             ["Bitwise / shift fuzzing", "200 / 200 passed"],
             ["Conditional-expression / SSA fuzzing", "200 / 200 per suite"],
-            ["Direct float Phi sweep", "38 matched / 0 mismatched"],
+            ["Direct float Phi sweep", "95 matched / 0 mismatched"],
             ["ABI modules audited", "34"],
             ["ABI stack/callee-saved failures", "0"],
-            ["Typed regression suite", "46 / 46 passed"],
+            ["Typed regression suite", "61 / 61 passed (46 + 15 class_*)"],
             ["General regression suite", "34 / 34 passed"],
             ["Type-checker unit checks", "145 ok"],
-            ["Error-code discipline checks", "86 ok"],
-            ["Tier differential (interp vs JIT)", "168 / 168 passed"],
+            ["Error-code discipline checks", "176 ok"],
+            ["Tier differential (interp vs JIT)", "235 / 235 passed (native 134)"],
+            ["Object runtime (ctest)", "107 ok"],
+            ["Class (OOP) fuzzing", "200 / 200 passed"],
             ["Syscall hook parity (both tiers)", "4 / 4 passed"],
             ["Networking loopback vs a C oracle", "verified"],
             ["SIMD vectorizer loop cases", "6 / 6 passed"],
@@ -741,7 +755,7 @@ const verification: DocPage = {
           kind: "note",
           tone: "note",
           title: "Where the corpus lives",
-          text: "The general suite is `tests/programs/` (34 programs), the typed suite is `tests/typed_regression/` (46 programs), and the negative suite is `tests/typed_programs/` (22 programs the checker must reject). Every one has a pinned expected-output file, and the tier differential runs the whole corpus through both engines and requires byte-identical stdout.",
+          text: "The general suite is `tests/programs/` (34 programs), the typed suite is `tests/typed_regression/` (61 programs, incl. 15 class_*), and the negative suite is `tests/typed_programs/` (22 programs the checker must reject). Every one has a pinned expected-output file, and the tier differential runs the whole corpus through both engines and requires byte-identical stdout.",
         },
       ],
     },
@@ -807,14 +821,15 @@ $ bash tools/verify_all.sh                       # ALL CHECKS PASSED`,
 $ python3 tools/fuzz_diff.py --count 300 --floats    # int/float mixes
 $ python3 tools/fuzz_diff.py --count 300 --bitwise   # & | ^ << >>, RCX hazard
 $ python3 tools/fuzz_diff.py --mod-negatives --count 300
-$ python3 tools/fuzz_diff.py --phi --count 300        # merges, with and without --ssa`,
+$ python3 tools/fuzz_diff.py --phi --count 300        # merges, with and without --ssa
+$ python3 tools/fuzz_diff.py --count 200 --oop    # classes, 6 shapes`,
           },
         },
         {
           kind: "note",
           tone: "warn",
           title: "What a green run does not prove",
-          text: "Opcode coverage is not operand coverage. All 55 IR opcodes are emitted and exercised, but that does not prove every operand shape is right: `Mod` is the standing example: the general fuzzer only emits finite constants, so it cannot generate `1.0 % inf`, which was returning NaN natively while the interpreter was correct.",
+          text: "Opcode coverage is not operand coverage. All 63 IR opcodes are emitted and exercised, but that does not prove every operand shape is right: `Mod` is the standing example: the general fuzzer only emits finite constants, so it cannot generate `1.0 % inf`, which was returning NaN natively while the interpreter was correct.",
         },
       ],
     },
@@ -826,15 +841,15 @@ $ python3 tools/fuzz_diff.py --phi --count 300        # merges, with and without
           kind: "table",
           caption: "fib(30), from benchmarks/results/latest.json",
           rows: [
-            ["CPython 3.12", "1731.0983 ms"],
-            ["Lithon native", "10.3053 ms"],
-            ["Speedup", "**168.0×**"],
+            ["CPython 3.12", "1562.4455 ms"],
+            ["Lithon native", "11.3419 ms"],
+            ["Speedup", "**137.8×**"],
             ["Result", "832040: identical on both"],
           ],
         },
         {
           kind: "p",
-          text: "The file is written by the benchmark bot in CI (`.github/workflows/lithon-report-mamba.yml`), which also keeps one snapshot per commit under `benchmarks/results/history/`. The numbers above are the current `latest.json`; the table is regenerated rather than hand-edited.",
+          text: "The file is written by the benchmark bot in CI (`.github/workflows/lithon-report-mamba.yml`), which also keeps one snapshot per commit under `benchmarks/results/history/`. The numbers above are the current `latest.json` (fib(30); the benchmark exercises recursive fib only and never touches classes). The table is hand-synced to `latest.json`; the bot that writes `latest.json` does not yet regenerate this page.",
         },
         {
           kind: "p",
@@ -864,7 +879,7 @@ const limits: DocPage = {
         {
           kind: "table",
           rows: [
-            ["IR opcodes emitted", "55 of 55"],
+            ["IR opcodes emitted", "63 of 63"],
             [
               "`Phi`",
               "emitted on the incoming edges; a direct-Phi native path also exists and is tested",
@@ -881,7 +896,7 @@ const limits: DocPage = {
             ],
             ["`//` floor division", "refused outright: *operator FloorDiv not supported yet*"],
             ["`**` power", "refused outright: *operator Pow not supported yet*"],
-            ["`<=` and `>=`", "refused: *comparison LtE not supported yet*"],
+            ["`<=` and `>=`", "lowered via `not` (`a <= b` is `not (b < a)`); there is no `le`/`ge` opcode. Chained comparisons are still refused"],
             ["unsigned ints", "no `uint`: signed at every width"],
             ["closures", "none: a function body cannot capture a caller's variable"],
             ["first-class functions", "none: a function name is not a value"],
@@ -896,8 +911,8 @@ const limits: DocPage = {
         {
           kind: "note",
           tone: "note",
-          title: "A `str` cannot be passed to a function",
-          text: "Strings are addressed, not passed: a `str` function parameter is refused with *a str function parameter is not yet a string place*. This is the same rule that makes a struct unusable as an argument: Lithon passes scalars and containers, and addresses anything with an identity.",
+          title: "Class references can be passed; class containers cannot",
+          text: "Class references **can** be passed and returned (8-byte heap refs with a retain contract — see [Classes](/docs/classes)), while class-typed *containers* cannot be parameters or returns (E0124). Strings are addressed, not passed: a `str` function parameter is refused with *a str function parameter is not yet a string place*. This is the same rule that makes a struct unusable as an argument: Lithon passes scalars and containers, and addresses anything with an identity. `cls` in a `@classmethod` is a compile-time alias, not a class-object value.",
         },
       ],
     },

@@ -16,7 +16,8 @@ import {
   CardTitle,
 } from "@workspace/ui/components/card"
 
-import { metaForPath } from "../lib/seo"
+import type { FileRoutesByTo } from "../routeTree.gen"
+import { metaForPath, structuredData } from "../lib/seo"
 import { PageHero, WRAP } from "../site"
 
 export const Route = createFileRoute("/next")({
@@ -28,7 +29,14 @@ export const Route = createFileRoute("/next")({
         { name: "description", content: meta.description },
         { property: "og:title", content: meta.title },
         { property: "og:description", content: meta.description },
+        { property: "og:url", content: meta.canonical },
+        { name: "twitter:card", content: "summary" },
         { tagName: "link", rel: "canonical", href: meta.canonical },
+        {
+          tagName: "script",
+          type: "application/ld+json",
+          children: JSON.stringify(structuredData("/next")),
+        },
       ],
     }
   },
@@ -39,7 +47,7 @@ type Task = {
   title: string
   detail: string
   where: string
-  href?: string
+  href?: keyof FileRoutesByTo
   status: "open" | "in-progress" | "done"
 }
 
@@ -141,6 +149,36 @@ const TOOLING: Task[] = [
 
 const DONE: Task[] = [
   {
+    title: "Properties and classmethods (4.10.6)",
+    detail: "Bare `@property` / `@classmethod` only; everything else refused (E0134).",
+    where: "2026-11-05",
+    status: "done",
+  },
+  {
+    title: "Special methods (4.10.5)",
+    detail: "`__eq__` etc. and restricted `__str__`/`__repr__`.",
+    where: "2026-11-04",
+    status: "done",
+  },
+  {
+    title: "Multiple inheritance + `super()` fix (4.10.4)",
+    detail: "C3 with shared-diamond-once layout; `super()` scans the receiver's MRO after the defining class.",
+    where: "2026-11-03",
+    status: "done",
+  },
+  {
+    title: "Class references in containers (4.10.3)",
+    detail: "`list[P,N]`/`tuple[P,N]` of 8-byte heap refs.",
+    where: "2026-11-03",
+    status: "done",
+  },
+  {
+    title: "Classes, inheritance, virtual dispatch (4.10.1–4.10.2)",
+    detail: "Heap references, `__init__`/`__del__`, vtable dispatch, `isinstance`/`issubclass`.",
+    where: "2026-11-03",
+    status: "done",
+  },
+  {
     title: "`!=` as a first-class compare",
     detail: "Its own IR op, with IEEE 754 semantics on floats.",
     where: "2026-10-20",
@@ -201,13 +239,18 @@ function TaskCard({ task }: { task: Task }) {
         <div className="flex flex-wrap items-start justify-between gap-2">
           <CardTitle className="flex items-start gap-2 text-base font-semibold">
             <Icon
+              aria-hidden
               className={`mt-0.5 size-4 shrink-0 ${meta.cls}`}
               weight={task.status === "done" ? "fill" : "bold"}
             />
+            <span className="sr-only">Status: {meta.label}</span>
             {task.title}
           </CardTitle>
           <Badge variant="outline" className="shrink-0 text-[10px]">
             {task.where}
+          </Badge>
+          <Badge variant="secondary" className="shrink-0 text-[10px]">
+            {meta.label}
           </Badge>
         </div>
       </CardHeader>

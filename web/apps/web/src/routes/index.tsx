@@ -69,6 +69,14 @@ const FEATURES = [
     link: "#architecture",
     cta: "View the stack",
   },
+  {
+    index: "04",
+    tag: "Objects",
+    title: "Objects, statically.",
+    text: "Classes with C3 inheritance, virtual dispatch, dunders and properties — verified before native emit, refcounted on a shared heap.",
+    link: "/docs/classes",
+    cta: "Read Classes",
+  },
 ] as const
 
 const LAYERS = [
@@ -85,6 +93,12 @@ const LAYERS = [
     detail: "C++20 · static flow verifier",
   },
   { step: "03", icon: "C", name: "Bridge", detail: "C · ABI alignment" },
+  {
+    step: "03.5",
+    icon: "⬢",
+    name: "Object Runtime",
+    detail: "heap · descriptors · vtable",
+  },
   {
     step: "04",
     icon: "↯",

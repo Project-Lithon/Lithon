@@ -33,11 +33,11 @@ const divergences: DocPage = {
       blocks: [
         {
           kind: "p",
-          text: "Lithon's source syntax is Python's. Its *semantics* are not, in eleven specific places, all of which come from the same two decisions: **fixed-width values** and **no dynamic dispatch**. This page is the list; each row links to the page that explains it in full.",
+          text: "Lithon's source syntax is Python's. Its *semantics* are not, in twenty-seven specific places, all of which come from the same three decisions: **fixed-width values**, **no general dynamic dispatch**, and **closed, statically-checked classes**. This page is the list; each row links to the page that explains it in full.",
         },
         {
           kind: "comparison",
-          caption: "the eleven differences that will bite you",
+          caption: "the twenty-seven differences that will bite you",
           columns: ["Behaviour", "CPython", "Lithon"],
           rows: [
             [
@@ -93,13 +93,13 @@ const divergences: DocPage = {
             [
               "Comparisons",
               "`a <= b`, chained `a < b < c`",
-              "only `<`, `>`, `==`, `!=`; no chaining",
+              "`<`, `>`, `==`, `!=` with `<=`/`>=` via `not`-lowering; no chaining",
             ],
           ],
         },
         {
           kind: "callout",
-          title: "The rule behind all eleven",
+          title: "The rule behind all twenty-seven",
           text: "CPython can decide what an expression means at run time. Lithon cannot, so anything the compiler would have to guess about becomes a refusal. A refusal is a compile-time error with a precise message, not a wrong answer at run time.",
         },
       ],
@@ -341,7 +341,7 @@ if n != 0:
           kind: "note",
           tone: "note",
           title: "Where to read more",
-          text: "The full `try`/`except`/`else`/`finally` story is on the [control flow](/docs/control-flow) page.",
+          text: "The full `try`/`except`/`else`/`finally` story is on the [exceptions](/docs/exceptions) page.",
         },
       ],
     },
@@ -405,7 +405,7 @@ print(x)`,
       blocks: [
         {
           kind: "p",
-          text: "Lithon has `<`, `>`, `==` and `!=`. `<=` and `>=` are refused (*comparison LtE not supported yet*), and chained comparisons (`a < b < c`) are refused, because a chain means two comparisons and an intermediate value that a machine register cannot hold.",
+          text: "Lithon has `<`, `>`, `==` and `!=`, with `<=` and `>=` lowered via `not` (`a <= b` is `not (b < a)`). Chained comparisons (`a < b < c`) are refused, because a chain means two comparisons and an intermediate value that a machine register cannot hold. Class ordering goes through `__lt__`/`__le__`/`__gt__`/`__ge__` dunders (see [Classes](/docs/classes)).",
         },
         {
           kind: "code",
@@ -422,6 +422,39 @@ if a < b and b < 10:
         {
           kind: "p",
           text: "`!=` is a first-class operator with its own machine instruction, not `==` followed by `not`. On floats it follows IEEE 754: `nan != nan` is true.",
+        },
+      ],
+    },
+    {
+      id: "classes",
+      title: "Classes: the sixteen deliberate differences",
+      blocks: [
+        {
+          kind: "comparison",
+          caption: "CPython classes vs Lithon classes",
+          columns: ["Aspect", "CPython", "Lithon (4.10)"],
+          rows: [
+            ["Class definition", "any body, dynamic attrs", "closed layout: declared attrs only, prefix-compatible"],
+            ["Instance", "`__dict__` + type pointer", "8-byte heap ref + `[vptr:8][refcount:8]` header, no `__dict__`"],
+            ["Multiple inheritance", "C3 MRO, arbitrary bases", "C3 + prefix layout; shared diamond stored once; conflict refused (E0127)"],
+            ["Dispatch", "dynamic attribute lookup", "global vtable slots; `CallVirtual` reads receiver's own descriptor"],
+            ["`super()`", "dynamic proxy", "dynamic after the *defining* class in receiver MRO; `super().__init__` static"],
+            ["`isinstance` / `issubclass`", "runtime walk", "ancestor-bitset probe / compile-time C3 fold"],
+            ["Abstract methods", "`ABCMeta` opt-in", "`...` body alone; construction refused (E0140)"],
+            ["Decorators", "arbitrary", "only `@property` (read-only) / `@classmethod`; rest refused (E0134)"],
+            ["Identity / equality", "identity / `__eq__` dispatch", "`is` always identity; `==` dispatches to `__eq__`, else identity"],
+            ["Ordering", "reflected priority", "left-operand dispatch only; no `NotImplemented`; ordering without dunder refused (E0135)"],
+            ["Text", "`__str__`/`__repr__`, any return", "one literal/f-string of scalar attrs, `print` picks `__str__` else `__repr__`"],
+            ["Containers", "any iterator", "`list[P,N]`/`tuple[P,N]` of refs; no `append`, no `enumerate`/`zip`, no param/return (E0119/E0124)"],
+            ["Bare class name", "a value (metaclass)", "refused: only `Point(...)` constructs (E0140)"],
+            ["Nullability", "`None` default", "never null; no `None`/`Optional` yet"],
+            ["Lifetime", "GC + `__del__` at frame teardown", "deterministic refcount; `__del__` at owning-scope exit; cycles leak"],
+            ["Undeclared attributes", "created on write", "E0141: exactly the declared attributes exist"],
+          ],
+        },
+        {
+          kind: "p",
+          text: "See [Classes](/docs/classes) for the full semantics. A trap raised inside a vtable-dispatched class method follows function-boundary catchability: only traps in the same function as the `try` are catchable. A trap in `__del__` at scope exit is not catchable by the lexical `try`; the exceptional path leaks rather than unwinding cleanups.",
         },
       ],
     },

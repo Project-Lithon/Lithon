@@ -40,7 +40,7 @@ const match: DocPage = {
           example: {
             title: "the shape of a match",
             typecheck: false,
-            source: `class Shape(Enum):
+            source: `class Shape(enum):
     Empty
     Dot
     Line: int[32]
@@ -103,9 +103,9 @@ match s:
           example: {
             title: "a struct payload, bound by field name",
             typecheck: false,
-            source: `class Endpoint(Enum):
+            source: `class Endpoint(enum):
     Empty
-    class Tcp(Struct):
+    class Tcp(struct):
         port: int[16]
         addr: int[32]
     Udp: int[32]
@@ -141,7 +141,7 @@ match c:
             tool: "frontend",
             typecheck: false,
             errorMatch: "is not exhaustive",
-            source: `class E(Enum):
+            source: `class E(enum):
     A
     B
 
@@ -161,7 +161,7 @@ match e:
             tool: "frontend",
             typecheck: false,
             errorMatch: "must be the last arm",
-            source: `class E(Enum):
+            source: `class E(enum):
     A
 
 e: E
@@ -216,7 +216,7 @@ match e:
             tool: "frontend",
             typecheck: false,
             errorMatch: "LITHON-E0131",
-            source: `class E(Enum):
+            source: `class E(enum):
     A: int[32]
 
 e: E
@@ -264,15 +264,15 @@ match x:
           example: {
             title: "matching a struct field",
             typecheck: false,
-            source: `class Endpoint(Enum):
+            source: `class Endpoint(enum):
     Empty
-    class Tcp(Struct):
+    class Tcp(struct):
         port: int[16]
         addr: int[32]
     Udp: int[32]
 
 
-class Conn(Struct):
+class Conn(struct):
     proto: Endpoint
     id: int[64]
 
@@ -335,7 +335,7 @@ print(c.id)`,
             tool: "frontend",
             typecheck: false,
             errorMatch: "is not supported yet",
-            source: `class E(Enum):
+            source: `class E(enum):
     A
 
 e: E

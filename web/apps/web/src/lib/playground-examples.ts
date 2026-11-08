@@ -100,4 +100,84 @@ xs[2] = 30
 print(xs[0])
 print(len(xs))`,
   },
+  {
+    id: "class-basic",
+    title: "Classes: fields + methods",
+    note: "heap reference, __init__, inlined method",
+    source: `class Point:
+    x: int[64]
+    y: int[64]
+
+    def __init__(self, x: int[64], y: int[64]):
+        self.x = x
+        self.y = y
+
+    def total(self) -> int[64]:
+        return self.x + self.y
+
+    def scaled(self, k: int[64]) -> int[64]:
+        return self.total() * k
+
+p: Point = Point(3, 4)
+print(p.total())
+print(p.scaled(10))
+print(p.x)`,
+  },
+  {
+    id: "class-inherit",
+    title: "Inheritance + super()",
+    note: "vtable dispatch, dynamic super()",
+    source: `class Shape:
+    sides: int[64]
+
+    def __init__(self, sides: int[64]):
+        self.sides = sides
+
+    def area(self) -> int[64]: ...
+
+    def describe(self) -> int[64]:
+        return self.area() * 10 + self.sides
+
+
+class Square(Shape):
+    side: int[64]
+
+    def __init__(self, side: int[64]):
+        super().__init__(4)
+        self.side = side
+
+    def area(self) -> int[64]:
+        return self.side * self.side
+
+
+s: Square = Square(4)
+sh: Shape = s
+print(sh.area())
+print(sh.describe())`,
+  },
+  {
+    id: "class-decorators",
+    title: "Properties + classmethods",
+    note: "@property read, @classmethod construct",
+    source: `class Point:
+    x: int[64]
+    y: int[64]
+
+    def __init__(self, x: int[64], y: int[64]):
+        self.x = x
+        self.y = y
+
+    @property
+    def total(self) -> int[64]:
+        return self.x + self.y
+
+    @classmethod
+    def origin(cls) -> Point:
+        return cls(0, 0)
+
+p: Point = Point(2, 3)
+print(p.total)
+q: Point = Point.origin()
+print(q.x)`,
+  },
 ]

@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router"
+import { createFileRoute, Link } from "@tanstack/react-router"
 
 import { Badge } from "@workspace/ui/components/badge"
 import { Button } from "@workspace/ui/components/button"
@@ -46,10 +46,17 @@ const CASES = [
     tag: "Developer tools",
     title: "Build tools that explain themselves.",
     text: "Static flow makes performance decisions visible instead of hiding them behind runtime magic.",
-    link: { label: "Try the path", href: "/playground" },
+    link: { label: "Try it in the playground", href: "/playground" },
   },
   {
     type: "Case 03",
+    tag: "Domain modelling",
+    title: "Objects without boxing.",
+    text: "Classes with C3 inheritance, virtual dispatch and dunders are checked statically, then emitted natively with no interpreter in the loop.",
+    link: { label: "Read Classes", href: "/docs/classes" },
+  },
+  {
+    type: "Case 04",
     tag: "Embedded systems",
     title: "Keep the runtime close.",
     text: "Zero external dependencies make Lithon a useful direction for environments where the toolchain is part of the product.",
@@ -86,7 +93,7 @@ function UseCases() {
           lede="These are the kinds of problems Lithon is shaped to meet: systems that need a clear performance story without inheriting a massive toolchain."
         />
 
-        <div className="grid gap-4 md:grid-cols-3">
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
           {CASES.map((item) => (
             <Card key={item.type}>
               <CardHeader>
@@ -113,7 +120,7 @@ function UseCases() {
                     variant="link"
                     size="sm"
                     className="mt-3 px-0"
-                    render={<a href={item.link.href} />}
+                    render={<Link to={item.link.href as "/playground"} />}
                   >
                     {item.link.label} ↗
                   </Button>

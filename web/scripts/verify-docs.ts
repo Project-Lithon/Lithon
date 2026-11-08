@@ -12,11 +12,12 @@
  */
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, join, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 
 import { DOCS } from "../apps/web/src/docs/registry"
 import { requireUv, runTool } from "./toolchain"
 
-const APP_DIR = dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"))
+const APP_DIR = dirname(fileURLToPath(import.meta.url))
 const WEB_ROOT = resolve(APP_DIR, "..")
 const REPO_ROOT = resolve(WEB_ROOT, "..")
 

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Prove 4.9 methods are semantically transparent.
+"""Prove 4.9 struct/enum methods are semantically transparent (scope: packed storage only).
+
+Baseless-class methods are vtable-dispatched, not inlined; they are covered by
+tests/typed_regression/class_*.lio + fuzz_diff.py --oop, not by this tool.
 
 A method is inlined at the call site, so a program that uses a method and the
 same program with the method body written out by hand must do exactly the same

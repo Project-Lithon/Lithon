@@ -77,7 +77,7 @@ export function CiStatusStrip() {
   }
 
   const overall = overallStatus(status.runs)
-  const perWorkflow = latestPerWorkflow(status.runs).slice(0, 4)
+  const perWorkflow = latestPerWorkflow(status.runs)
 
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs">
