@@ -99,6 +99,37 @@ python3 tools/check_uninit_decls.py
 step "error-code discipline + coded refusals (E0105)"
 python3 tools/check_error_codes.py
 
+step "4.14 unsigned integers: every operator x width x edge value vs an exact oracle, on every execution path"
+python3 tools/check_uint.py
+
+step "4.17 x86-32 encoder: every form decodes as intended (objdump)"
+python3 tools/check_x86_32_encoding.py
+
+step "error display: positions, caret columns, syntax errors, imports, colour"
+python3 tools/check_diagnostics.py
+
+step "source positions in the IR: tier diff, error codes and the typed suite are unchanged with positions on"
+LITHON_LOCATIONS=1 python3 tools/run_tier_diff.py
+LITHON_LOCATIONS=1 python3 tools/check_error_codes.py
+LITHON_LOCATIONS=1 python3 tools/run_typed_regression.py
+
+step "4.16 Microsoft x64 ABI: Windows build under wine (callee-saved registers, shadow space, programs identical)"
+python3 tools/check_win64.py
+
+step "4.17 x86-32 native tier: differential fuzzing vs the 64-bit interpreter (int, float, mod, bitwise, break, diamond, lsr, phi, oop)"
+for mode in "" "--floats" "--mod" "--bitwise" "--break" "--diamond" "--lsr" "--phi" "--oop"; do
+    python3 tools/fuzz_x86_32.py --count 60 $mode
+done
+
+step "4.17 exported C calling conventions: cdecl / stdcall / fastcall on Win32 and System V i386"
+python3 tools/check_x86_32_conv.py
+
+step "4.17 System V i386 (native 32-bit ELF): corpus, alignment probe, fuzzing"
+python3 tools/check_sysv32.py
+for mode in "" "--floats" "--mod" "--bitwise" "--break" "--diamond" "--lsr" "--phi" "--oop"; do
+    LITHON_CHECK_ALIGN=1 python3 tools/fuzz_x86_32.py --sysv --count 60 $mode
+done
+
 step "regression suites (interpreter oracle vs CPython) + typed suite"
 python3 tools/run_regression.py
 python3 tools/run_typed_regression.py

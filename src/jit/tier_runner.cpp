@@ -20,7 +20,6 @@
 //       src/jit/tier_runner.cpp src/ir/text_parser.cpp
 //       src/interpreter/interpreter.cpp src/typecheck/typecheck.cpp
 
-#include <sys/mman.h>
 
 #include <cstdio>
 #include <cstring>
@@ -29,9 +28,12 @@
 #include <sstream>
 #include <string>
 
+#include "backend.h"
 #include "compile_function.h"
+#include "exec_memory.h"
 #include "interpreter/interpreter.h"
 #include "ir/text_parser.h"
+#include "ir/source_loc.h"
 #include "print_guard.h"
 #include "runtime/heap.h"
 #include "runtime/class_runtime.h"
@@ -56,7 +58,7 @@ void run_interpreter(const lithon::ir::Module& m) {
 bool run_native(const lithon::ir::Module& m, lithon::jit::CompileOptions options = {}) {
     lithon::jit::CompiledModule compiled;
     try {
-        compiled = lithon::jit::compile_module(m, options);
+        compiled = lithon::jit::compile_module_for_host(m, options);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[tier0] native compile refused: %s\n", e.what());
         return false;
@@ -70,15 +72,16 @@ bool run_native(const lithon::ir::Module& m, lithon::jit::CompileOptions options
         return false;
     }
 
-    void* mem = mmap(nullptr, compiled.code.size(), PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mem == MAP_FAILED) { std::perror("mmap"); return false; }
-    std::memcpy(mem, compiled.code.data(), compiled.code.size());
-    if (mprotect(mem, compiled.code.size(), PROT_READ | PROT_EXEC) != 0) {
-        std::perror("mprotect");
-        munmap(mem, compiled.code.size());
+    // The platform's own executable-memory path (mmap/mprotect on POSIX,
+    // VirtualAlloc/VirtualProtect on Windows), W^X either way.
+    lithon::jit::ExecutableBuffer exec;
+    try {
+        exec.load(compiled.code.data(), compiled.code.size());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[tier0] native compile refused: %s\n", e.what());
         return false;
     }
+    void* mem = exec.data();
 
     std::fputs("[tier1] native\n", stderr);
     using Fn = void (*)();
@@ -99,7 +102,10 @@ bool run_native(const lithon::ir::Module& m, lithon::jit::CompileOptions options
         lithon::runtime::build_class_table(
             m.classes,
             [&](const std::string& cls) -> void (*)(void*) {
-                auto d = compiled.function_offset.find("__del__" + cls);
+                // A destructor is called by the runtime as a C function; on x86-32 the
+                // backend emits a "$c" thunk that adapts the C call to its own convention.
+                auto d = compiled.function_offset.find("__del__" + cls + "$c");
+                if (d == compiled.function_offset.end()) d = compiled.function_offset.find("__del__" + cls);
                 if (d == compiled.function_offset.end()) return nullptr;
                 return reinterpret_cast<void (*)(void*)>(base + d->second);
             },
@@ -114,7 +120,6 @@ bool run_native(const lithon::ir::Module& m, lithon::jit::CompileOptions options
     }
     entry();
     std::fflush(stdout);   // native print() goes through libc stdio
-    munmap(mem, compiled.code.size());
     return true;
 }
 
@@ -184,6 +189,7 @@ int main(int argc, char** argv) {
 
     try {
         auto module = lithon::ir::parse_ir_text(buf.str());
+        lithon::ir::set_sources(module.sources);
 
         {
             auto errors = lithon::typecheck::check_module(module);
@@ -191,8 +197,7 @@ int main(int argc, char** argv) {
                 for (const auto& e : errors) {
                     // LITHON-Exxxx messages are self-identifying; prose-only
                     // messages keep the legacy "RCR error:" tag.
-                    const std::string& m = e.message;
-                    std::cerr << (m.rfind("LITHON-", 0) == 0 ? "" : "RCR error: ") << m << "\n";
+                    std::cerr << lithon::typecheck::format_error(e, module);
                 }
                 return 1;
             }
@@ -206,7 +211,7 @@ int main(int argc, char** argv) {
         // immediate, never touching CL) and a dynamic count as D3 + a CL
         // load, and neither is visible from the source or from the output.
         if (dump_hex) {
-            auto cm = lithon::jit::compile_module(module, options);
+            auto cm = lithon::jit::compile_module_for_host(module, options);
             for (size_t i = 0; i < cm.code.size(); ++i) {
                 std::fprintf(stderr, "%02x", cm.code[i]);
                 std::fputc((i % 16 == 15) ? '\n' : ' ', stderr);
@@ -250,6 +255,10 @@ int main(int argc, char** argv) {
         // runtime messages keep the legacy "error: " prefix.
         const std::string m = e.what();
         std::cerr << (m.rfind("LITHON-", 0) == 0 ? "" : "error: ") << m << "\n";
+        // Where it happened, when the IR carries positions. The native tier prints the same line
+        // from its trap site; a stack overflow has no single site, so neither tier prints one.
+        if (m.rfind("LITHON-E0401", 0) != 0)
+            std::cerr << lithon::ir::describe_pos(lithon::ir::g_cur_pos.src, lithon::ir::g_cur_pos.line);
         return 1;
     }
     return 0;

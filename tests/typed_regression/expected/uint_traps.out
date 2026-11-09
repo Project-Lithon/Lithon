@@ -1,0 +1,16 @@
+add traps
+sub traps
+mul traps
+shl traps
+mod by zero
+255
+0
+add64 traps
+sub64 traps
+mul64 traps
+shl64 traps
+18446744073709551614
+1
+18446744069414584320
+caught
+done

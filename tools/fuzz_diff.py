@@ -20,14 +20,13 @@ comparison this tool exists to make reliable.
     tools/fuzz_diff.py --count 5000
     tools/fuzz_diff.py --seed 12345 --count 200
 
-KNOWN LANGUAGE DIVERGENCE (found by this tool): Lithon lowers `for v in range(n)` to a counter that
-IS `v` (src/frontend/frontend.py build_for), so unlike CPython:
-  * after the loop, v == n (CPython: n-1);
-  * a zero-iteration loop overwrites v with 0 (CPython leaves it untouched);
-  * assigning to v inside the body changes the iteration count (can loop forever).
-`for/else` and `while/else` are also silently dropped by the frontend. Until the language semantics are
-decided, the generator uses dedicated loop variables that are never read or assigned outside their own
-loop (so the CPython oracle stays meaningful); --shared-loop-vars generates the diverging shape.
+LOOP VARIABLES (4.11). `for v in range(n)` assigns a variable the program already declared (an int
+holding a value); it never creates one. After the loop `v` holds the last value produced, a loop that
+never runs leaves it untouched, and assigning to `v` inside the body is refused -- all as in CPython,
+so a loop variable may be read after its loop and the CPython oracle stays meaningful. The generator
+declares every loop variable before its loop. --shared-loop-vars additionally draws the loop variable
+from the ordinary variable pool, so it is read and assigned outside the loop (stressing the exit value).
+`for/else` and `while/else` are still refused by the frontend.
 
 AOT is not compared here: no AOT binary emitter exists in this repo yet
 (see the src/ tree -- there is no ELF/PE writer anywhere). This tool
@@ -280,7 +279,7 @@ class Gen:
             n = self.r.randint(1, 6)
             if self.shared_loop_vars:
                 var = self.r.choice(VARS)
-                self.declare(indent, var, "0")          # later code may read/assign it: diverges from CPython
+                self.declare(indent, var, "0")          # later code may read/assign it after the loop (the exit value is CPython's)
             else:
                 var = self.r.choice(LOOPVARS)
                 self.emit(indent, f"{var}: int[64] = 0")  # deliberately NOT added to self.declared
@@ -533,6 +532,9 @@ class Gen:
         cont = self.r.randint(0, n + 2)
         form = self.r.choice(["1", "2", "3pos", "3neg"])
         iv = LOOPVARS[0]
+        # 4.11: the loop target is a declared int with a value, never created by
+        # the loop. int[64], because the stepped forms below need it.
+        self.emit(0, f"{iv}: int[64] = 0")
         if form == "1":
             self.emit(0, f"for {iv} in range({n}):")
         elif form == "2":
@@ -2100,8 +2102,8 @@ def main():
     ap.add_argument("--diamond", action="store_true",
                     help="use the small if/else-diamond-focused generator (see Gen.program_diamond)")
     ap.add_argument("--shared-loop-vars", action="store_true",
-                    help="generate loop variables that are read/assigned elsewhere (reproduces the known "
-                         "for-loop divergence from CPython; see the docstring)")
+                    help="draw loop variables from the ordinary variable pool, so they are read and "
+                         "assigned outside their loop (stresses the loop exit value; see the docstring)")
     ap.add_argument("--floats", action="store_true",
                     help="generate flat float programs (arithmetic, comparisons, printing, int/float mixing)")
     ap.add_argument("--mod", action="store_true",

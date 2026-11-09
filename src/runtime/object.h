@@ -35,8 +35,15 @@ struct ClassDescriptor;
 
 // The two words before the attributes. `vptr` points at a `ClassDescriptor`;
 // `refcount` counts strong references (see heap.h for the immortal sentinel).
-struct ObjectHeader {
-    ClassDescriptor* vptr;
+struct alignas(8) ObjectHeader {
+    // The pointer overlays a full 8-byte slot so the header is 16 bytes on every
+    // target: with 4-byte pointers (x86-32) the frontend's attribute offsets, which
+    // assume [vptr:8][refcount:8], stay valid. On a little-endian 32-bit target the
+    // pointer is the low dword of the slot, which is also what generated code reads.
+    union {
+        ClassDescriptor* vptr;
+        uint64_t vptr_slot;
+    };
     uint64_t refcount;
 };
 

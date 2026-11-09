@@ -5,6 +5,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #if defined(_WIN32)
   #ifndef WIN32_LEAN_AND_MEAN

@@ -1,0 +1,14 @@
+# A module of constants and a function that uses them. A constant here is a scalar
+# with a literal value, so it is folded into whoever uses it -- including inside
+# this module's own functions.
+const MAX: int[64] = 5
+const SIZE: int[64] = 4
+const SCALE: float[64] = 2.5
+const FLAG: bool = True
+const BYTE: uint[8] = 200
+
+
+def clamp(x: int[64]) -> int[64]:
+    if x > MAX:
+        return MAX
+    return x

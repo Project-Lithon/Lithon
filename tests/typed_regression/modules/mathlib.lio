@@ -1,0 +1,16 @@
+# A library module: it only DEFINES. The guard at the end runs only when this file
+# is the program being run, never when it is imported.
+def square(x: int[64]) -> int[64]:
+    return x * x
+
+
+def cube(x: int[64]) -> int[64]:
+    return x * square(x)
+
+
+def unused(x: int[64]) -> int[64]:
+    return x + 1000
+
+
+if __name__ == '__main__':
+    print(999)

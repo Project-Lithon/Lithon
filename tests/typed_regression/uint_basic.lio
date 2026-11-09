@@ -1,0 +1,92 @@
+# 4.14. Unsigned integers: `i: uint[size] = value` holds 0..2^size-1 for size 8,
+# 16, 32 or 64. They never mix implicitly with int (the one allowed flow is a
+# uint narrower than 64 bits widening into an int[64]), every operation that
+# would leave the range traps (E0313, see uint_traps.lio) instead of wrapping,
+# and a uint[64] at or above 2^63 compares, divides and prints as the unsigned
+# number it is.
+#
+# This file only does what cannot trap, so CPython's answer for the same program
+# (annotations only, `from __future__ import annotations`) is the oracle.
+
+const LIMIT: uint[16] = 60000
+const BIG: uint[64] = 18446744073709551615
+
+
+def add_u(x: uint[16], y: uint[16]) -> uint[16]:
+    return x + y
+
+
+def half(x: uint[64]) -> uint[64]:
+    return x >> 1
+
+
+def widen(x: uint[32]) -> int[64]:
+    return x
+
+
+def gcd(a: uint[64], b: uint[64]) -> uint[64]:
+    while b > 0:
+        t: uint[64] = b
+        b = a % b
+        a = t
+    return a
+
+
+# Declarations, literals, parameters and returns.
+a: uint[16] = 40000
+print(add_u(a, 20000))
+print(add_u(1, 2))
+print(LIMIT > a)
+
+# uint[64] past 2^63: print, order, shift, and the maximum itself.
+print(BIG)
+print(half(BIG))
+print(half(BIG) + 1)
+print(BIG > half(BIG))
+print(BIG % 10)
+print(BIG & 255)
+
+# A narrow uint widens into an int[64]; that is the one allowed mix.
+w: int[64] = a
+print(w + 5)
+print(widen(4000000000))
+
+# Every operator at a small width.
+u8: uint[8] = 7
+x16: uint[16] = u8 + 30
+print(x16)
+print(u8 << 3, u8 >> 1, u8 & 5, u8 | 8, u8 ^ 2, 100 % u8, u8 * u8, u8 - 2)
+print(u8 < 8, u8 <= 7, u8 > 7, u8 >= 8, u8 == 7, u8 != 7)
+print(f"u={u8} big={BIG}")
+
+# Augmented assignment, and a uint bounded loop.
+j: uint[8] = 0
+n: uint[8] = 4
+i: int[64] = 0
+for i in range(n):
+    j += 2
+print(j)
+
+# Fibonacci in uint[64] crosses 2^63 and ends at F(93), the largest that fits.
+f0: uint[64] = 0
+f1: uint[64] = 1
+k: int[64] = 0
+for k in range(92):
+    nxt: uint[64] = f0 + f1
+    f0 = f1
+    f1 = nxt
+print(f1)
+
+# 20! fits uint[64] (and int[64]); the unsigned product does not wrap.
+fact: uint[64] = 1
+mult: uint[64] = 1
+m: int[64] = 0
+for m in range(20):
+    fact = fact * mult
+    mult += 1
+print(fact)
+
+# Euclid with the unsigned remainder, including operands above 2^63.
+print(gcd(48, 18))
+print(gcd(18446744073709551615, 6148914691236517205))
+print(gcd(9223372036854775808, 6))

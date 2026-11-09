@@ -301,8 +301,28 @@ enum class Op : uint8_t {
     ToFloat,
     ToInt,
     InputInt,
+    // 4.12. String input: `k: str[N] = str(n, input("prompt"))`.
+    //
+    //   InputStr  name = destination str run   name2 = the prompt (decoded)
+    //             int_imm = n, the limit       no operands, no result
+    //
+    // Prints the prompt, reads one line from stdin and writes it into the
+    // destination run, NUL-terminated, with every remaining byte of the run
+    // zeroed (the same state a string literal leaves). `n` counts the NUL, so a
+    // line longer than n-1 bytes traps E0311 and is never truncated; end of
+    // input traps E0308. The destination is a named run, like StrEq's operands,
+    // so the op carries no register values. Prompt hex-encoding matches
+    // InputInt's. A NUL byte in the line traps E0312 (a str cannot hold one).
+    InputStr,
     // Range guard: dynamic step == 0 traps with E0310.
     GuardNonZero,
+    // 4.14. Unsigned range trap: `utrap %cond` traps E0313 when its bool
+    // operand is true, and does nothing otherwise. The frontend lowers every
+    // uint[w] operation to ordinary 64-bit integer ops plus a condition that
+    // says "the exact result left 0..2^w-1" (a carry, a borrow, a result above
+    // the width's maximum); this is the one op that turns that condition into
+    // the trap. No result, no memory operand.
+    UTrap,
 
     // Phase III. The raw syscall primitive. A compiler-recognized builtin
     // `syscall(number, a1..a6)` lowers to exactly this op:
@@ -408,6 +428,8 @@ inline bool is_register_clobbering_op(Op op) {
         case Op::StrNe:
         case Op::StrFind:
         case Op::StrCount:
+        // 4.12. InputStr calls a host helper by address (and does I/O).
+        case Op::InputStr:
         // 4.10.1. New/Retain/Release reach the shared class runtime by address.
         case Op::New:
         case Op::Retain:
@@ -441,6 +463,9 @@ inline std::string classify_trap_message(const std::string& what) {
     if (what.find("LITHON-E0310") != std::string::npos) return "ValueError";
     if (what.find("LITHON-E0306") != std::string::npos) return "ValueError";
     if (what.find("LITHON-E0308") != std::string::npos) return "EOFError";
+    if (what.find("LITHON-E0311") != std::string::npos) return "ValueError";
+    if (what.find("LITHON-E0312") != std::string::npos) return "ValueError";
+    if (what.find("LITHON-E0313") != std::string::npos) return "OverflowError";
     if (what.find("dict key not found") != std::string::npos) return "KeyError";
     if (what.find("too many pieces for the list") != std::string::npos) return "ValueError";
     return "";
@@ -575,6 +600,11 @@ struct Instr {
     Op op;
     ValueId result;
     std::vector<ValueId> args;
+    // Where this instruction came from: an index into Module::sources and a 1-based source
+    // line. -1 / 0 when the IR carries no position (the default; the frontend only emits
+    // positions when asked). Used to point a runtime trap or a type error at its source line.
+    int32_t src = -1;
+    int32_t line = 0;
 
     int64_t int_imm = 0;
     // A second integer immediate for CallSuper: the defining class's IR index.
@@ -688,6 +718,9 @@ struct ClassInfo {
 
 struct Module {
     std::vector<Function> functions;
+
+    // Source file paths named by Instr::src (`source <index> <path>` lines in the IR text).
+    std::vector<std::string> sources;
 
     // 4.10.1. Class layout metadata, one entry per declared class. The
     // per-instruction ops carry the attribute OFFSETS they use (so the common

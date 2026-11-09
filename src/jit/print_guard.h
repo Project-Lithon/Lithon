@@ -343,6 +343,11 @@ struct Analysis {
                         raise(st.vals[in.result], Kind::Int);
                         break;
 
+                    // 4.12. inputstr has no register operand and no result: it
+                    // writes a named run, so there is no kind to track.
+                    case Op::InputStr:
+                        break;
+
                     // 6.1. A whole-container print carries its own shape and
                     // renders every leaf with the kind the typechecker already
                     // accepted, so it imposes no closed-set obligation here. The
@@ -439,6 +444,8 @@ struct Analysis {
                         break;
                     case Op::GuardNonZero:
                         break; // no result, side-effect only (trap)
+                    case Op::UTrap:
+                        break; // 4.14: no result, side-effect only (trap)
 
                     case Op::Add: case Op::Sub: case Op::Mul:
                     // Mod is typed like Mul, NOT like Div: int % int stays int,
@@ -524,7 +531,8 @@ struct Analysis {
                         break;
 
                     case Op::Call: {
-                        if (in.name == "print" || in.name == "print_bare") {
+                        if (in.name == "print" || in.name == "print_bare" ||
+                            in.name == "print_u" || in.name == "print_bare_u") {
                             if (final_pass) check_print(st, block, in, verdict);
                             break;
                         }

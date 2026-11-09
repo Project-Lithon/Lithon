@@ -1,0 +1,38 @@
+def sum_down(n: int[64]) -> int[64]:
+    total: int[64] = 0
+    i: int[64] = 0
+    while i < n:
+        total = total + i
+        if i % 7 == 0:
+            total = total + sum_down(0)
+        i = i + 1
+    return total
+
+
+def nest(depth: int[64]) -> int[64]:
+    acc: int[64] = depth * 1000
+    k: int[64] = 0
+    while k < 5:
+        acc = acc + k
+        if depth > 0:
+            acc = acc + nest(depth - 1)
+        k = k + 1
+    return acc
+
+
+def with_try(n: int[64]) -> int[64]:
+    xs: list[int[64], 4] = [1, 2, 3, 4]
+    caught: int[64] = 0
+    j: int[64] = 0
+    while j < n:
+        try:
+            print(xs[j])
+        except IndexError:
+            caught = caught + 1
+        j = j + 1
+    return caught
+
+
+print(sum_down(50))
+print(nest(5))
+print(with_try(9))

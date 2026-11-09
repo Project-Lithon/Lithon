@@ -181,3 +181,107 @@ jobs:
           ./compile_module_bool_print_test
           ./compile_function_diamond_test
           ./optimize_lsr_test
+
+  # 4.16: the Microsoft x64 ABI. The JIT is built for Windows with MinGW and run
+  # under wine: a probe checks every callee-saved register (RBX RDI RSI R12-R15,
+  # XMM6-XMM15) survives a JIT call, and every program in the typed regression and
+  # programs suites runs identically on the Windows interpreter and native tier.
+  win64-wine:
+    name: Win64 ABI (MinGW build under wine)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install MinGW and wine
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64-win32 g++-mingw-w64-i686-win32 wine64 wine32:i386 binutils-mingw-w64-i686
+
+      # The 32-bit checks compare against the 64-bit tiers, so build that reference first.
+      - name: Build the 64-bit reference runner
+        run: |
+          mkdir -p build
+          g++ -std=c++20 -O2 -Isrc -Isrc/jit -o build/tier_runner src/jit/tier_runner.cpp src/ir/text_parser.cpp src/interpreter/interpreter.cpp src/typecheck/typecheck.cpp
+
+      - name: x86-32 encoder (every form decodes as intended)
+        run: python3 tools/check_x86_32_encoding.py --require
+
+      - name: Win64 ABI + x86-32 native tier checks
+        run: python3 tools/check_win64.py --require
+
+      - name: x86-32 native tier differential fuzzing
+        run: |
+          for mode in "" "--floats" "--mod" "--bitwise" "--break" "--diamond" "--lsr" "--phi" "--oop"; do
+            python3 tools/fuzz_x86_32.py --count 60 $mode
+          done
+
+  # The same checks on a real Windows host (MSYS2 MinGW-w64), where nothing is
+  # emulated. Not yet proven green on a real runner, so it does not block merges
+  # until it has run once; remove continue-on-error after the first clean run.
+  win64-native:
+    name: Win64 ABI (native Windows)
+    runs-on: windows-latest
+    continue-on-error: true
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (MinGW-w64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-python
+
+      - name: Win64 ABI checks
+        shell: msys2 {0}
+        run: python tools/check_win64.py --require
+
+  # 4.17: System V i386, executed natively. A 64-bit kernel runs 32-bit ELF binaries, so
+  # no emulator is needed: the same corpus as the Win32 job, an ESP-alignment probe on
+  # every call, differential fuzzing, and the exported cdecl/stdcall/fastcall entries.
+  sysv-i386:
+    name: x86-32 native tier (System V i386)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install the 32-bit toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-multilib
+
+      - name: Build the 64-bit reference runner
+        run: |
+          mkdir -p build
+          g++ -std=c++20 -O2 -Isrc -Isrc/jit -o build/tier_runner src/jit/tier_runner.cpp src/ir/text_parser.cpp src/interpreter/interpreter.cpp src/typecheck/typecheck.cpp
+
+      - name: System V i386 corpus + alignment probe
+        run: python3 tools/check_sysv32.py --require
+
+      - name: System V i386 differential fuzzing
+        run: |
+          for mode in "" "--floats" "--mod" "--bitwise" "--break" "--diamond" "--lsr" "--phi" "--oop"; do
+            LITHON_CHECK_ALIGN=1 python3 tools/fuzz_x86_32.py --sysv --count 60 $mode
+          done
+
+      - name: Exported C calling conventions
+        run: python3 tools/check_x86_32_conv.py --require

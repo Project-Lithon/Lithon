@@ -16,6 +16,7 @@
 
 #include "ir/ir.h"
 #include "ir/text_parser.h"
+#include "ir/source_loc.h"
 #include "runtime/heap.h"
 #include "runtime/class_runtime.h"
 #include "typecheck/typecheck.h"
@@ -117,6 +118,7 @@ int main(int argc, char** argv) {
 
     try {
         ir::Module module = ir::parse_ir_text(buffer.str());
+        lithon::ir::set_sources(module.sources);
 
         {
             auto errors = typecheck::check_module(module);
@@ -124,8 +126,7 @@ int main(int argc, char** argv) {
                 for (const auto& e : errors) {
                     // LITHON-Exxxx messages are self-identifying; prose-only
                     // messages keep the legacy "RCR error:" tag.
-                    const std::string& m = e.message;
-                    std::cerr << (m.rfind("LITHON-", 0) == 0 ? "" : "RCR error: ") << m << "\n";
+                    std::cerr << lithon::typecheck::format_error(e, module);
                 }
                 return 1;
             }
@@ -329,6 +330,10 @@ int main(int argc, char** argv) {
         // runtime messages keep the legacy "error: " prefix.
         const std::string m = e.what();
         std::cerr << (m.rfind("LITHON-", 0) == 0 ? "" : "error: ") << m << "\n";
+        // Where it happened, when the IR carries positions. The native tier prints the same line
+        // from its trap site; a stack overflow has no single site, so neither tier prints one.
+        if (m.rfind("LITHON-E0401", 0) != 0)
+            std::cerr << lithon::ir::describe_pos(lithon::ir::g_cur_pos.src, lithon::ir::g_cur_pos.line);
         return 1;
     }
     return 0;

@@ -199,6 +199,19 @@ E0303_TRAPS = [
     ("dynamic int64 sub underflows (source)",
      "x: int[64] = -9223372036854775808\ny: int[64] = 1\nz: int[64] = x - y\nprint(z)\n",
      "LITHON-E0303: integer overflow in sub -- use wrap_sub() to wrap instead"),
+    # 4.14. An unsigned result outside 0..2^w-1 traps E0313 in both tiers.
+    ("uint[8] sum past 255 traps (source)",
+     "a: uint[8] = 200\nb: uint[8] = 100\nr: uint[8] = a + b\nprint(r)\n",
+     "LITHON-E0313: unsigned integer result is out of range for its uint width"),
+    ("uint[8] difference below zero traps (source)",
+     "a: uint[8] = 1\nb: uint[8] = 2\nr: uint[8] = a - b\nprint(r)\n",
+     "LITHON-E0313: unsigned integer result is out of range for its uint width"),
+    ("uint[64] sum past 2^64-1 traps (source)",
+     "a: uint[64] = 18446744073709551615\nb: uint[64] = 1\nr: uint[64] = a + b\nprint(r)\n",
+     "LITHON-E0313: unsigned integer result is out of range for its uint width"),
+    ("uint[64] product past 2^64-1 traps (source)",
+     "a: uint[64] = 4294967296\nb: uint[64] = 4294967296\nr: uint[64] = a * b\nprint(r)\n",
+     "LITHON-E0313: unsigned integer result is out of range for its uint width"),
 ]
 
 # E0401 (the stack-depth guard). The two tiers share one counter, so a
@@ -284,8 +297,12 @@ def check_e0303(failures):
         for i, (name, source, needle) in enumerate(E0303_TRAPS):
             rc_i, out_i, err_i = _run_source(tmp, f"t{i}", source, "--interp")
             rc_a, out_a, err_a = _run_source(tmp, f"t{i}a", source, "--auto")
-            text_i = (out_i + "\n" + err_i)
-            text_a = (out_a + "\n" + err_a)
+            # The same program is written under two file names (t<i> and t<i>j), and with source
+            # positions on the trap prints "  --> <path>:<line>": compare the line, not the file.
+            def _same_file(t):
+                return re.sub(r"(--> ).*?t\d+j?\.lio(:\d+)", r"\1<file>\2", t)
+            text_i = _same_file(out_i + "\n" + err_i)
+            text_a = _same_file(out_a + "\n" + err_a)
             if rc_i == 0 or rc_a == 0:
                 print(f"  FAIL trap: {name}: interp rc={rc_i} auto rc={rc_a} (no trap)")
                 failures.append(name)
@@ -311,8 +328,12 @@ def check_e0401(failures):
         for i, (name, source, needle) in enumerate(E0401_TRAPS):
             rc_i, out_i, err_i = _run_source(tmp, f"t{i}", source, "--interp")
             rc_a, out_a, err_a = _run_source(tmp, f"t{i}j", source, "--auto")
-            text_i = (out_i + "\n" + err_i)
-            text_a = (out_a + "\n" + err_a)
+            # The same program is written under two file names (t<i> and t<i>j), and with source
+            # positions on the trap prints "  --> <path>:<line>": compare the line, not the file.
+            def _same_file(t):
+                return re.sub(r"(--> ).*?t\d+j?\.lio(:\d+)", r"\1<file>\2", t)
+            text_i = _same_file(out_i + "\n" + err_i)
+            text_a = _same_file(out_a + "\n" + err_a)
             if rc_i == 0 or rc_a == 0:
                 print(f"  FAIL trap: {name}: interp rc={rc_i} auto rc={rc_a} (no trap)")
                 failures.append(name)
@@ -417,14 +438,14 @@ FRONTEND_REFUSALS = [
     ("zip of a single container (E0119)",
      "xs: list[int[64], 4]\nfor a in zip(xs):\n    print(a)\n",
      "LITHON-E0119"),
-    # 6.1. A loop target is a binding, so it obeys the same one-type-per-name
-    # rule as an annotated declaration. Registering it is what turns a silent
-    # type change into a refusal that names both types.
-    ("an enumerate target rebound to a different type (E0122)",
-     "xs: list[int[64], 4]\nys: list[bool, 4]\n"
+    # 4.11. An enumerate/zip target is the user's own declared variable, and it
+    # must have exactly the element type it receives; a name keeps one type.
+    ("an enumerate element target declared with the wrong type (E0119)",
+     "xs: list[int[64], 4]\nys: list[bool, 4]\ni: int[64] = 0\nv: int[64] = 0\n"
+     "j: int[64] = 0\n"
      "for i, v in enumerate(xs):\n    print(v)\n"
      "for j, v in enumerate(ys):\n    print(v)\n",
-     "LITHON-E0122"),
+     "LITHON-E0119"),
     ("while/else dropped eagerly (E0118)",
      "x: int[64] = 0\nwhile x < 3:\n    x = x + 1\nelse:\n    print(x)\n",
      "LITHON-E0118"),
@@ -447,7 +468,7 @@ FRONTEND_REFUSALS = [
     ("ptr-valued dict value is refused (E0112)",
      "d: dict[int[64], ptr[int[64]], 4]\nprint(0)\n", "LITHON-E0112"),
     ("range(a,b,0) literal step is E0107",
-     "for i in range(5, 1, 0):\n    print(i)\n", "LITHON-E0107"),
+     "i: int[64] = 0\nfor i in range(5, 1, 0):\n    print(i)\n", "LITHON-E0107"),
     ("a class with an unknown base (E0126)",
      "class Foo(Bar):\n    x: int[64]\nprint(0)\n", "LITHON-E0126"),
     ("struct body with a non-annotation statement (E0126)",
@@ -786,8 +807,40 @@ FRONTEND_REFUSALS = [
      "s: str[2] = \"abc\"\nprint(s)\n", "LITHON-E0111"),
     ("str capacity must be positive (E0111)",
      "s: str[0]\nprint(0)\n", "LITHON-E0111"),
-    ("str value must be a string literal (E0114)",
-     "t: str[4] = \"hi\"\ns: str[4] = t\nprint(s)\n", "LITHON-E0114"),
+    ("a str built from a computed expression (E0114)",
+     "t: str[4] = \"hi\"\ns: str[8] = t + t\nprint(s)\n", "LITHON-E0114"),
+    ("a str never narrows: a wider str into a narrower one (E0111)",
+     "t: str[8] = \"hi\"\ns: str[4] = t\nprint(s)\n", "LITHON-E0111"),
+    ("a str assigned from a wider str (E0111)",
+     "t: str[8] = \"hi\"\ns: str[4] = \"x\"\ns = t\nprint(s)\n", "LITHON-E0111"),
+    # 6.11. A function that returns a str is inlined at its call sites, so it takes scalar
+    # parameters only, cannot recurse, and its result must fit the declared capacity at the
+    # return and at the receiving variable.
+    ("a str-returning function that recurses (E0114)",
+     "def f(n: int[16]) -> str[8]:\n    if n > 0:\n        return f(n - 1)\n    return \"a\"\nprint(f(2))\n",
+     "LITHON-E0114"),
+    ("a str-returning function's literal longer than its capacity (E0111)",
+     "def f() -> str[3]:\n    return \"abcd\"\nprint(f())\n", "LITHON-E0111"),
+    ("a str-returning function returns a wider str variable (E0111)",
+     "def f() -> str[4]:\n    r: str[8] = \"a\"\n    return r\nprint(f())\n", "LITHON-E0111"),
+    ("a str-returning function with a container parameter (E0124)",
+     "def f(xs: list[int[64], 2]) -> str[4]:\n    return \"a\"\nprint(0)\n", "LITHON-E0124"),
+    ("a function with a str parameter that returns a class (E0124)",
+     "class C:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+     "def f(s: str[4]) -> C:\n    return C(1)\nprint(0)\n", "LITHON-E0124"),
+    ("a str parameter that is recursive (E0114)",
+     "def f(s: str[4], n: int[16]) -> int[64]:\n    if n > 0:\n        return f(s, n - 1)\n    return 0\nprint(f(\"a\", 2))\n",
+     "LITHON-E0114"),
+    ("a str argument wider than the parameter (E0111)",
+     "def f(s: str[4]) -> int[64]:\n    return len(s)\nt: str[8] = \"hi\"\nprint(f(t))\n", "LITHON-E0111"),
+    ("a function with a str parameter that is never called is still checked (E0114)",
+     "def g(s: str[4]) -> int[64]:\n    x: int[64] = \"no\"\n    return 0\nprint(1)\n", "LITHON-E0114"),
+    ("a str result used as a scalar (E0114)",
+     "def f() -> str[4]:\n    return \"a\"\nx: int[64] = f()\n", "LITHON-E0114"),
+    ("a str result stored into a narrower str (E0111)",
+     "def f() -> str[8]:\n    return \"a\"\ns: str[4] = f()\nprint(s)\n", "LITHON-E0111"),
+    ("a str-returning function called with the wrong arity (E0114)",
+     "def f(n: int[16]) -> str[4]:\n    return \"a\"\nprint(f(1, 2))\n", "LITHON-E0114"),
     # 6.2. The same rules when the string is a struct FIELD or a pointer's
     # pointee. A field's companion run is keyed by the dotted variable path, so
     # a whole-str field read is valueless (E0114) and reading one through a
@@ -795,8 +848,8 @@ FRONTEND_REFUSALS = [
     # pointee is a place, not a value, so valueof(_p) used as one is E0114.
     ("str field literal does not fit its capacity (E0111)",
      "class C(struct):\n    a: str[2]\n\nc: C\nc.a = \"abc\"\nprint(c.a)\n", "LITHON-E0111"),
-    ("whole str field used as a value (E0114)",
-     "class C(struct):\n    a: str[4]\n\nc: C\nx: str[4] = c.a\nprint(x)\n", "LITHON-E0114"),
+    ("a whole str field into a narrower str (E0111)",
+     "class C(struct):\n    a: str[8]\n\nc: C\nx: str[4] = c.a\nprint(x)\n", "LITHON-E0111"),
     ("str field read through a pointer into the struct (E0128)",
      "class C(struct):\n    a: str[4]\n\np: C\n_pp: ptr[C] = addressof(p)\n"
      "print(valueof(_pp).a)\n", "LITHON-E0128"),
@@ -828,13 +881,13 @@ FRONTEND_REFUSALS = [
     # a list whose length is only known at run time has no fixed bound. The
     # bound is given up by an append inside a loop.
     ("sum over a run-time-length list (E0115)",
-     "xs: list[int[64], 5] = [1, 2]\nfor i in range(2):\n    xs.append(i)\n"
+     "xs: list[int[64], 5] = [1, 2]\ni: int[64] = 0\nfor i in range(2):\n    xs.append(i)\n"
      "print(sum(xs))\n", "LITHON-E0115"),
     ("in over a run-time-length list (E0114)",
-     "xs: list[int[64], 5] = [1, 2]\nfor i in range(2):\n    xs.append(i)\n"
+     "xs: list[int[64], 5] = [1, 2]\ni: int[64] = 0\nfor i in range(2):\n    xs.append(i)\n"
      "print(3 in xs)\n", "LITHON-E0114"),
     ("enumerate over a run-time-length list (E0119)",
-     "xs: list[int[64], 5] = [1, 2]\nfor i in range(2):\n    xs.append(i)\n"
+     "xs: list[int[64], 5] = [1, 2]\ni: int[64] = 0\nfor i in range(2):\n    xs.append(i)\n"
      "for j, v in enumerate(xs):\n    print(v)\n", "LITHON-E0119"),
     # 6.7. str.split: a statement-shaped call with a string source, a NON-EMPTY
     # string separator, and a destination that is a list of bounded strings.
@@ -928,6 +981,156 @@ FRONTEND_REFUSALS = [
      "s: Shape\ns = Shape.Pair(a=None, b=2)\nprint(0)\n", "LITHON-E0142"),
     ("None in an augmented assignment (E0142)",
      "x: int[64] = 1\nx += None\nprint(x)\n", "LITHON-E0142"),
+    ("enumerate index that is not declared (E0119)",
+     "xs: list[int[64], 4]\nv: int[64] = 0\nfor i, v in enumerate(xs):\n    print(v)\n",
+     "LITHON-E0119"),
+    ("enumerate element that is not declared (E0119)",
+     "xs: list[int[64], 4]\ni: int[64] = 0\nfor i, v in enumerate(xs):\n    print(v)\n",
+     "LITHON-E0119"),
+    ("zip target that is not declared (E0119)",
+     "xs: list[int[64], 4]\nys: list[int[64], 4]\na: int[64] = 0\n"
+     "for a, b in zip(xs, ys):\n    print(a)\n", "LITHON-E0119"),
+    ("assignment to a live range counter (E0119)",
+     "i: int[64] = 0\nfor i in range(3):\n    i = 5\n    print(i)\n", "LITHON-E0119"),
+    ("augmented assignment to a live range counter (E0119)",
+     "i: int[64] = 0\nfor i in range(3):\n    i += 1\n    print(i)\n", "LITHON-E0119"),
+    ("assignment to a live enumerate element (E0119)",
+     "xs: list[int[64], 3]\ni: int[64] = 0\nv: int[64] = 0\n"
+     "for i, v in enumerate(xs):\n    v = 1\n    print(v)\n", "LITHON-E0119"),
+    ("an inner loop reusing a live counter (E0119)",
+     "i: int[64] = 0\nfor i in range(2):\n    for i in range(2):\n        print(i)\n",
+     "LITHON-E0119"),
+    # 4.11. `for i in range(...)` assigns an EXISTING int variable (V1_SPEC
+    # 0.6.6); it never creates one, and it keeps the declared width.
+    ("range loop over an undeclared variable (E0119)",
+     "for i in range(3):\n    print(i)\n", "LITHON-E0119"),
+    ("range loop over a float variable (E0119)",
+     "f: float[64] = 1.0\nfor f in range(3):\n    print(f)\n", "LITHON-E0119"),
+    ("range loop bound that cannot fit the declared width (E0119)",
+     "i: int[8] = 0\nfor i in range(300):\n    print(i)\n", "LITHON-E0119"),
+    ("range loop bound not provably inside a narrow counter (E0119)",
+     "i: int[8] = 0\nn: int[64] = 5\nfor i in range(n):\n    print(i)\n",
+     "LITHON-E0119"),
+    ("stepped range over a narrow counter (E0119)",
+     "i: int[8] = 0\nfor i in range(0, 9, 2):\n    print(i)\n", "LITHON-E0119"),
+    # 4.12. `k: str[N] = str(n, input("prompt"))` is the one spelling of a string
+    # read. n is a literal limit that counts the NUL and must satisfy 1 <= n <= N.
+    ("str() limit larger than the string's capacity (E0116)",
+     "k: str[4] = str(5, input(\"x: \"))\nprint(k)\n", "LITHON-E0116"),
+    ("str() limit larger than the capacity on a re-read (E0116)",
+     "k: str[4] = str(4, input(\"x: \"))\nk = str(9, input(\"y: \"))\nprint(k)\n",
+     "LITHON-E0116"),
+    ("str() limit that is not a literal (E0116)",
+     "n: int[64] = 3\nk: str[8] = str(n, input(\"x: \"))\nprint(k)\n", "LITHON-E0116"),
+    ("str() limit of zero (E0116)",
+     "k: str[8] = str(0, input(\"x: \"))\nprint(k)\n", "LITHON-E0116"),
+    ("str() with one argument (E0115)",
+     "k: str[8] = str(5)\nprint(k)\n", "LITHON-E0115"),
+    ("str() of something that is not input() (E0115)",
+     "k: str[8] = str(5, 3)\nprint(k)\n", "LITHON-E0115"),
+    ("str(n, input()) used as a value (E0115)",
+     "print(str(5, input(\"x: \")))\n", "LITHON-E0115"),
+    ("str(n, input()) stored into an int (E0115)",
+     "x: int[64] = str(5, input(\"x: \"))\nprint(x)\n", "LITHON-E0115"),
+    # 4.13. `const var: type[size] = value` is assigned once, by its initializer.
+    ('const without an initializer (E0143)',
+     'const x: int[64]\nprint(1)\n', "LITHON-E0143"),
+    ('const without a type (E0143)',
+     'const x = 5\nprint(x)\n', "LITHON-E0143"),
+    ('assignment to a constant (E0143)',
+     'const x: int[64] = 5\nx = 6\nprint(x)\n', "LITHON-E0143"),
+    ('augmented assignment to a constant (E0143)',
+     'const x: int[64] = 5\nx += 1\nprint(x)\n', "LITHON-E0143"),
+    ('a constant redeclared as a variable (E0143)',
+     'const x: int[64] = 5\nx: int[64] = 6\nprint(x)\n', "LITHON-E0143"),
+    ('a constant declared twice (E0143)',
+     'const x: int[64] = 5\nconst x: int[64] = 6\nprint(x)\n', "LITHON-E0143"),
+    ('a constant declared over a variable (E0143)',
+     'x: int[64] = 5\nconst x: int[64] = 6\nprint(x)\n', "LITHON-E0143"),
+    ('element store into a constant list (E0143)',
+     'const xs: list[int[64], 3] = [1, 2, 3]\nxs[0] = 9\nprint(xs[0])\n', "LITHON-E0143"),
+    ('append to a constant list (E0143)',
+     'const xs: list[int[64], 3] = [1]\nxs.append(2)\nprint(xs[1])\n', "LITHON-E0143"),
+    ('address of a constant (E0143)',
+     'const x: int[64] = 5\n_p: ptr[int[64]] = addressof(x)\nprint(1)\n', "LITHON-E0143"),
+    ('a constant as a for target (E0143)',
+     'const i: int[64] = 0\nfor i in range(3):\n    print(i)\n', "LITHON-E0143"),
+    ('a constant string re-read (E0143)',
+     'const s: str[8] = "hi"\ns = str(4, input("x: "))\nprint(s)\n', "LITHON-E0143"),
+    ('a constant struct (E0143)',
+     'class P(struct):\n    x: int[64]\nconst p: P = 1\nprint(1)\n', "LITHON-E0143"),
+    ('a constant pointer (E0143)',
+     'x: int[64] = 1\nconst _p: ptr[int[64]] = addressof(x)\nprint(1)\n', "LITHON-E0143"),
+    ('a constant class reference (E0143)',
+     'class A:\n    x: int[64]\n    def __init__(self):\n        self.x = 1\nconst a: A = A()\nprint(a.x)\n', "LITHON-E0143"),
+    ('a function parameter named like a module constant (E0143)',
+     'const N: int[64] = 5\ndef f(N: int[64]) -> int[64]:\n    return N\nprint(f(1))\n', "LITHON-E0143"),
+    # 4.14. `i: uint[size] = value`: never mixes with int, never wraps, scalars only.
+    ('a negative literal into a uint (E0144)',
+     'x: uint[8] = -1\nprint(x)\n', "LITHON-E0144"),
+    ('a literal that does not fit a uint (E0144)',
+     'x: uint[8] = 256\nprint(x)\n', "LITHON-E0144"),
+    ('a signed value into a uint (E0144)',
+     'i: int[64] = 5\nu: uint[8] = i\nprint(u)\n', "LITHON-E0144"),
+    ('a uint into a narrower int (E0144)',
+     'u: uint[8] = 1\ni: int[8] = u\nprint(i)\n', "LITHON-E0144"),
+    ('a wider uint result into a narrower uint (E0144)',
+     'u: uint[8] = 1\nv: uint[16] = 1\nw: uint[8] = u + v\nprint(w)\n', "LITHON-E0144"),
+    ('uint plus int (E0144)',
+     'u: uint[8] = 1\ni: int[64] = 2\nprint(u + i)\n', "LITHON-E0144"),
+    ('uint plus float (E0144)',
+     'u: uint[8] = 1\nf: float[64] = 1.0\nprint(u + f)\n', "LITHON-E0144"),
+    ('uint compared with int (E0144)',
+     'u: uint[8] = 1\ni: int[64] = 2\nprint(u < i)\n', "LITHON-E0144"),
+    ('uint compared with a negative literal (E0144)',
+     'u: uint[8] = 1\nprint(u < -1)\n', "LITHON-E0144"),
+    ('negating a uint (E0144)',
+     'u: uint[8] = 1\nprint(-u)\n', "LITHON-E0144"),
+    ('a uint[64] as an index (E0144)',
+     'xs: list[int[64], 4] = [1, 2, 3, 4]\nu: uint[64] = 1\nprint(xs[u])\n', "LITHON-E0144"),
+    ('a uint[64] as a range bound (E0144)',
+     'i: int[64] = 0\nu: uint[64] = 3\nfor i in range(u):\n    print(i)\n', "LITHON-E0144"),
+    ('a list of uint (E0144)',
+     'xs: list[uint[8], 2] = [1, 2]\nprint(xs[0])\n', "LITHON-E0144"),
+    ('a dict of uint (E0144)',
+     'd: dict[int[64], uint[8], 2] = {1: 2}\nprint(1)\n', "LITHON-E0144"),
+    ('a uint stored into a list element (E0144)',
+     'xs: list[int[64], 2] = [1, 2]\nu: uint[8] = 1\nxs[0] = u\nprint(xs[0])\n', "LITHON-E0144"),
+    ('a uint in float() (E0144)',
+     'u: uint[8] = 1\nprint(float(64, u))\n', "LITHON-E0144"),
+    ('a uint in abs() (E0144)',
+     'u: uint[8] = 1\nprint(abs(u))\n', "LITHON-E0144"),
+    ('a uint in an if-expression (E0144)',
+     'u: uint[8] = 1\nprint(u if u > 0 else 2)\n', "LITHON-E0144"),
+    ('a method parameter that is a uint (E0134)',
+     'class A:\n    x: int[64]\n    def __init__(self, n: uint[8]):\n        self.x = 1\na: A = A(1)\nprint(a.x)\n', "LITHON-E0134"),
+    ('uint[64] true division (E0144)',
+     'a: uint[64] = 1\nb: uint[64] = 2\nprint(a / b)\n', "LITHON-E0144"),
+    ('int augmented by a uint (E0144)',
+     'i: int[64] = 1\nu: uint[8] = 1\ni += u\nprint(i)\n', "LITHON-E0144"),
+    ('an unsupported uint width (E0105)',
+     'u: uint[7] = 1\nprint(u)\n', "LITHON-E0105"),
+    ('uint without a width (E0105)',
+     'u: uint = 1\nprint(u)\n', "LITHON-E0105"),
+    ('a shift count out of range (E0103)',
+     'u: uint[8] = 1\nprint(u << 64)\n', "LITHON-E0103"),
+    ('a local declaration named like a module constant (E0143)',
+     'const N: int[64] = 5\ndef f() -> int[64]:\n    N: int[64] = 1\n    return N\nprint(f())\n', "LITHON-E0143"),
+]
+
+# (4.12 refusals are appended to FRONTEND_REFUSALS below.)
+
+# 4.11. The loop variable must hold a value before the loop (V1_SPEC 0.6.6).
+# The frontend reads it first, so the checker's definite-assignment pass (0.6.10)
+# is what refuses a declaration-only target on any path that stores nothing.
+LOOP_START_VALUE_REJECTS = [
+    ("range loop target declared but never given a value",
+     "i: int[64]\nfor i in range(3):\n    print(i)\n"),
+    ("enumerate element declared but never given a value",
+     "xs: list[int[64], 2]\ni: int[64] = 0\nv: int[64]\n"
+     "for i, v in enumerate(xs):\n    print(v)\n"),
+    ("range loop target assigned on only one path",
+     "i: int[64]\nif 1 < 2:\n    i = 1\nfor i in range(3):\n    print(i)\n"),
 ]
 
 
@@ -1022,6 +1225,217 @@ def check_extension_gate(failures):
             print("  ok   extension gate: the same bytes as .lio compile")
 
 
+def check_loop_start_value(failures):
+    with tempfile.TemporaryDirectory() as td:
+        tmp = pathlib.Path(td)
+        for i, (name, source) in enumerate(LOOP_START_VALUE_REJECTS):
+            rc, out, err = _run_source(tmp, f"lv{i}", source, "--interp")
+            text = out + "\n" + err
+            if rc == 0:
+                print(f"  FAIL loop start value: {name}: accepted")
+                failures.append(name)
+            elif "not definitely assigned" not in text:
+                print(f"  FAIL loop start value: {name}: refused without the "
+                      f"definite-assignment message: {text.strip()[:160]}")
+                failures.append(name)
+            else:
+                print(f"  ok   loop start value: {name} (V1_SPEC 0.6.6/0.6.10)")
+
+
+# 4.15. Modules and the entry point. Each case is a set of files written into a
+# fresh directory, the entry program named `main.lio`.
+MODULE_REFUSALS = [
+    ("an import of a module that does not exist",
+     {"main.lio": "import nothing\nprint(1)\n"}),
+    ("an import cycle between two modules",
+     {"main.lio": "import a\nprint(1)\n",
+      "a.lio": "import b\ndef fa() -> int[64]:\n    return 1\n",
+      "b.lio": "import a\ndef fb() -> int[64]:\n    return 2\n"}),
+    ("a module that imports itself",
+     {"main.lio": "import a\nprint(1)\n",
+      "a.lio": "import a\ndef fa() -> int[64]:\n    return 1\n"}),
+    ("an executable statement at the top level of an imported module",
+     {"main.lio": "import a\nprint(1)\n", "a.lio": "print(5)\n"}),
+    ("a variable assignment at the top level of an imported module",
+     {"main.lio": "import a\nprint(1)\n", "a.lio": "x: int[64] = 1\n"}),
+    ("an import inside a function",
+     {"main.lio": "def f() -> int[64]:\n    import a\n    return 1\nprint(f())\n",
+      "a.lio": "def g() -> int[64]:\n    return 1\n"}),
+    ("from m import *",
+     {"main.lio": "from a import *\nprint(1)\n",
+      "a.lio": "def g() -> int[64]:\n    return 1\n"}),
+    ("from m import a name the module does not define",
+     {"main.lio": "from a import missing\nprint(1)\n",
+      "a.lio": "def g() -> int[64]:\n    return 1\n"}),
+    ("import m.f where f is not a function of m",
+     {"main.lio": "import a.missing\nprint(1)\n",
+      "a.lio": "def g() -> int[64]:\n    return 1\n"}),
+    ("a relative import",
+     {"main.lio": "from .a import g\nprint(1)\n",
+      "a.lio": "def g() -> int[64]:\n    return 1\n"}),
+    ("an imported name that collides with a function of the program",
+     {"main.lio": "from a import g\ndef g() -> int[64]:\n    return 2\nprint(g())\n",
+      "a.lio": "def g() -> int[64]:\n    return 1\n"}),
+    ("two imports that bind the same name",
+     {"main.lio": "from a import g\nfrom b import g\nprint(g())\n",
+      "a.lio": "def g() -> int[64]:\n    return 1\n",
+      "b.lio": "def g() -> int[64]:\n    return 2\n"}),
+    ("an entry guard with an else branch",
+     {"main.lio": "if __name__ == '__main__':\n    print(1)\nelse:\n    print(2)\n"}),
+    ("a guard that tests __name__ with !=",
+     {"main.lio": "if __name__ != '__main__':\n    print(1)\n"}),
+    ("__name__ used as a value",
+     {"main.lio": "print(__name__)\n"}),
+    ("a string constant in an imported module (not foldable)",
+     {"main.lio": "import a\nprint(1)\n",
+      "a.lio": "const NAME: str[8] = \"hi\"\ndef g() -> int[64]:\n    return 1\n"}),
+    ("a constant with a computed value in an imported module",
+     {"main.lio": "import a\nprint(1)\n",
+      "a.lio": "const A: int[64] = 1\nconst B: int[64] = A + 1\n"}),
+    ("a parameter that reuses an imported name",
+     {"main.lio": "from a import g\ndef f(g: int[64]) -> int[64]:\n    return g\nprint(f(1))\n",
+      "a.lio": "def g() -> int[64]:\n    return 1\n"}),
+    ("a local that reuses an imported constant's name",
+     {"main.lio": "from a import LIM\ndef f() -> int[64]:\n    LIM: int[64] = 2\n    return LIM\nprint(f())\n",
+      "a.lio": "const LIM: int[64] = 1\n"}),
+    ("a write through an imported constant",
+     {"main.lio": "import a\na.LIM = 5\nprint(1)\n",
+      "a.lio": "const LIM: int[64] = 1\n"}, "E0143"),
+]
+
+# (name, files, command-line extras, environment, expected stdout)
+MODULE_ACCEPTS = [
+    ("a library next to the program, with an alias and a member import",
+     {"main.lio": "import m\nimport m.f as ff\nfrom m import g as gg\nif __name__ == '__main__':\n"
+                  "    print(m.f(2), ff(3), gg(4))\n",
+      "m.lio": "def f(x: int[64]) -> int[64]:\n    return x + 1\n"
+               "def g(x: int[64]) -> int[64]:\n    return f(x) * 2\n"},
+     [], {}, "3 4 10\n"),
+    ("a dotted package path below the program",
+     {"main.lio": "import lib.deep.m\nif __name__ == '__main__':\n    print(lib.deep.m.f(1))\n",
+      "lib/deep/m.lio": "def f(x: int[64]) -> int[64]:\n    return x + 100\n"},
+     [], {}, "101\n"),
+    ("a library that imports a sibling of the entry program",
+     {"main.lio": "import lib.m\nif __name__ == '__main__':\n    print(lib.m.f(5))\n",
+      "base.lio": "def sq(x: int[64]) -> int[64]:\n    return x * x\n",
+      "lib/m.lio": "import base\ndef f(x: int[64]) -> int[64]:\n    return base.sq(x)\n"},
+     [], {}, "25\n"),
+    ("a directory named with -I",
+     {"main.lio": "from helpers import twice\nif __name__ == '__main__':\n    print(twice(21))\n",
+      "extra/helpers.lio": "def twice(x: int[64]) -> int[64]:\n    return x * 2\n"},
+     ["-I", "extra"], {}, "42\n"),
+    ("a directory named in LITHON_PATH",
+     {"main.lio": "from helpers import twice\nif __name__ == '__main__':\n    print(twice(21))\n",
+      "extra/helpers.lio": "def twice(x: int[64]) -> int[64]:\n    return x * 2\n"},
+     [], {"LITHON_PATH": "extra"}, "42\n"),
+    ("the guard of an imported module does not run, the program's does",
+     {"main.lio": "import m\nif __name__ == '__main__':\n    print(m.f())\n",
+      "m.lio": "def f() -> int[64]:\n    return 7\nif __name__ == '__main__':\n    print(999)\n"},
+     [], {}, "7\n"),
+    ("a program with no guard still runs top to bottom",
+     {"main.lio": "import m\nprint(m.f())\nprint(2)\n",
+      "m.lio": "def f() -> int[64]:\n    return 1\n"},
+     [], {}, "1\n2\n"),
+    ("the same helper name in two modules does not clash",
+     {"main.lio": "import a\nimport b\nif __name__ == '__main__':\n    print(a.go(), b.go())\n",
+      "a.lio": "def helper() -> int[64]:\n    return 1\ndef go() -> int[64]:\n    return helper()\n",
+      "b.lio": "def helper() -> int[64]:\n    return 2\ndef go() -> int[64]:\n    return helper()\n"},
+     [], {}, "1 2\n"),
+    ("a class and its subclass imported from different modules",
+     {"main.lio": "from a import Base\nfrom b import Derived\nif __name__ == '__main__':\n"
+                  "    d: Derived = Derived(2)\n    print(d.v(), d.w())\n",
+      "a.lio": "class Base:\n    x: int[64]\n    def __init__(self, x: int[64]):\n        self.x = x\n"
+               "    def v(self) -> int[64]:\n        return self.x\n",
+      "b.lio": "from a import Base\nclass Derived(Base):\n    def __init__(self, x: int[64]):\n"
+               "        super().__init__(x)\n    def w(self) -> int[64]:\n        return self.x * 10\n"},
+     [], {}, "2 20\n"),
+    ("an imported constant as a container capacity, and a module-private constant",
+     {"main.lio": "from m import SIZE\nxs: list[int[64], SIZE] = [1, 2, 3]\n"
+                  "if __name__ == '__main__':\n    print(len(xs), m_double(2))\n"
+                  "def m_double(x: int[64]) -> int[64]:\n    return x * SIZE\n",
+      "m.lio": "const SIZE: int[64] = 3\nconst HIDDEN: int[64] = 10\n"
+               "def use() -> int[64]:\n    return HIDDEN\n"},
+     [], {}, "3 6\n"),
+    ("a module whose name starts with an underscore",
+     {"main.lio": "import _hidden\nif __name__ == '__main__':\n    print(_hidden.f(), _hidden.K)\n",
+      "_hidden.lio": "const K: int[64] = 8\ndef f() -> int[64]:\n    return K + 1\n"},
+     [], {}, "9 8\n"),
+    ("a module imported twice (a diamond) is linked once",
+     {"main.lio": "import a\nimport b\nif __name__ == '__main__':\n    print(a.fa(), b.fb())\n",
+      "common.lio": "def c() -> int[64]:\n    return 5\n",
+      "a.lio": "import common\ndef fa() -> int[64]:\n    return common.c() + 1\n",
+      "b.lio": "import common\ndef fb() -> int[64]:\n    return common.c() + 2\n"},
+     [], {}, "6 7\n"),
+]
+
+
+def _module_dir(td, files):
+    root = pathlib.Path(td)
+    for rel, text in files.items():
+        f = root / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text)
+    return root
+
+
+def check_modules(failures):
+    import os
+    for i, case in enumerate(MODULE_REFUSALS):
+        name, files = case[0], case[1]
+        code = case[2] if len(case) > 2 else "E0145"
+        with tempfile.TemporaryDirectory() as td:
+            root = _module_dir(td, files)
+            r = run(["python3", str(FRONTEND), str(root / "main.lio")])
+            if r.returncode == 0:
+                print(f"  FAIL module refusal: {name}: accepted when it must refuse")
+                failures.append(name)
+            elif f"LITHON-{code}" not in r.stderr:
+                print(f"  FAIL module refusal: {name}: refused without {code}: "
+                      f"{r.stderr.strip()[:160]}")
+                failures.append(name)
+            elif "Traceback" in r.stderr:
+                print(f"  FAIL module refusal: {name}: leaked a Python traceback")
+                failures.append(name)
+            else:
+                print(f"  ok   module refusal: {name} (LITHON-{code})")
+    for i, (name, files, extra, env, want) in enumerate(MODULE_ACCEPTS):
+        with tempfile.TemporaryDirectory() as td:
+            root = _module_dir(td, files)
+            cmd = ["python3", str(FRONTEND)]
+            for a in extra:
+                cmd.append(str(root / a) if a != "-I" else a)
+            cmd.append(str(root / "main.lio"))
+            envv = dict(os.environ)
+            for k, v in env.items():
+                envv[k] = str(root / v)
+            r = subprocess.run(cmd, capture_output=True, text=True, env=envv)
+            if r.returncode != 0:
+                print(f"  FAIL module accept: {name}: refused: {r.stderr.strip()[:200]}")
+                failures.append(name)
+                continue
+            ir = root / "out.ir"
+            ir.write_text(r.stdout)
+            if name.endswith("is linked once") and r.stdout.count("function common__c(") != 1:
+                print(f"  FAIL module accept: {name}: common linked "
+                      f"{r.stdout.count('function common__c(')} times")
+                failures.append(name)
+                continue
+            bad = None
+            for mode in ("--interp", "--auto"):
+                t = run([str(TIER), str(ir), mode])
+                out = "\n".join(ln for ln in t.stdout.splitlines()
+                                if not ln.startswith("[tier")) + "\n"
+                if t.returncode != 0 or out != want:
+                    bad = f"{mode}: rc={t.returncode} out={out!r} want {want!r} " \
+                          f"err={t.stderr.strip()[:120]!r}"
+                    break
+            if bad:
+                print(f"  FAIL module accept: {name}: {bad}")
+                failures.append(name)
+            else:
+                print(f"  ok   module accept: {name}")
+
+
 def main() -> int:
     missing = [p.name for p in (FRONTEND, TIER) if not p.exists()]
     if missing:
@@ -1031,11 +1445,15 @@ def main() -> int:
     check_discipline(failures)
     check_e0105(failures)
     check_frontend_refusals(failures)
+    check_loop_start_value(failures)
+    check_modules(failures)
     check_extension_gate(failures)
     check_e0303(failures)
     check_e0401(failures)
     total = len(E0105_REJECTS) + len(E0105_ACCEPTS) + 1
     total += len(FRONTEND_REFUSALS)
+    total += len(LOOP_START_VALUE_REJECTS)
+    total += len(MODULE_REFUSALS) + len(MODULE_ACCEPTS)
     total += 2   # check_extension_gate: the .py refusal and the .lio accept
     total += len(E0303_REJECTS) + len(E0303_WRAPS) + len(E0303_TRAPS)
     total += len(E0401_ACCEPTS) + len(E0401_TRAPS)

@@ -1,0 +1,2 @@
+big: float[64] = 1e30
+print(int(64, big))

@@ -1,0 +1,45 @@
+# 4.15, level 2: classes. An imported class, struct or enum is usable by its own
+# name after `from m import X`, or qualified (`m.X`) after `import m`, in
+# annotations, constructor calls, base lists, isinstance and enum matches. Classes
+# are linked once, under a module-qualified name, in their source order, so a base
+# class still precedes its subclasses -- including a subclass defined here of a
+# class defined there.
+
+import modules.shapes
+from modules.shapes import Shape, Square, Point, Color, make_square
+
+
+class Rect(Shape):
+    w: int[64]
+    h: int[64]
+
+    def __init__(self, w: int[64], h: int[64]):
+        super().__init__(4)
+        self.w = w
+        self.h = h
+
+    def area(self) -> int[64]:
+        return self.w * self.h
+
+
+if __name__ == '__main__':
+    s: Square = Square(3)
+    print(s.area())
+    t: Shape = modules.shapes.make_square(4)
+    print(t.area())
+    r: Rect = Rect(2, 5)
+    print(modules.shapes.total_area(s, r))
+    print(r.corners())
+    print(isinstance(s, Shape), isinstance(r, modules.shapes.Square))
+    q: modules.shapes.Square = make_square(6)
+    print(q.area())
+    p: Point
+    p.x = 1
+    p.y = 2
+    print(p.x + p.y)
+    c: Color = Color.Gray(7)
+    match c:
+        case Color.Gray(v):
+            print(v)
+        case _:
+            print(0)

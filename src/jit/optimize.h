@@ -61,6 +61,27 @@ struct OptimizeStats {
     std::vector<lithon::ir::ValueId> reassoc_float_values;
 };
 
+// Removes, from every Phi at the top of `target_label`, the operand that arrives
+// from block `from`. The operand's index is the position of `from` among the
+// target's predecessors in build_cfg's order, which is the order Mem2Reg used
+// when it sized and filled the operands.
+inline void drop_phi_operand(lithon::ir::Function& fn, size_t from,
+                             const std::string& target_label) {
+    using lithon::ir::Op;
+    const Cfg g = build_cfg(fn);
+    const auto it = g.index.find(target_label);
+    if (it == g.index.end()) return;
+    const size_t target = it->second;
+    size_t pos = g.pred[target].size();
+    for (size_t k = 0; k < g.pred[target].size(); ++k)
+        if (g.pred[target][k] == from) { pos = k; break; }
+    if (pos == g.pred[target].size()) return;
+    for (auto& in : fn.blocks[target].instrs) {
+        if (in.op != Op::Phi) break;   // phis are materialised at the top of a block
+        if (in.args.size() == g.pred[target].size()) in.args.erase(in.args.begin() + static_cast<long>(pos));
+    }
+}
+
 inline void fold_constants(lithon::ir::Function& fn, OptimizeStats& stats) {
     using namespace lithon::ir;
     std::unordered_map<ValueId, int64_t> consts;
@@ -79,7 +100,8 @@ inline void fold_constants(lithon::ir::Function& fn, OptimizeStats& stats) {
         ++stats.folded;
     };
 
-    for (auto& block : fn.blocks) {
+    for (size_t bi = 0; bi < fn.blocks.size(); ++bi) {
+        auto& block = fn.blocks[bi];
         for (auto& in : block.instrs) {
             int64_t a = 0, b = 0;
             switch (in.op) {
@@ -102,6 +124,19 @@ inline void fold_constants(lithon::ir::Function& fn, OptimizeStats& stats) {
                         // Tier 1), so folding those only ever sees pairs that
                         // fit; a Wrap* pair here is the opt-out and folds
                         // through the same well-defined wrap below.
+                        // A PLAIN op whose exact result leaves int64 is not folded:
+                        // the checker only sees constants spelled in the source, but
+                        // with the SSA pipeline a variable's constant value reaches
+                        // here after that check, so a pair that overflows would
+                        // otherwise wrap silently instead of trapping E0303 at run
+                        // time. Left alone, it traps in both tiers.
+                        if (in.op == Op::Add || in.op == Op::Sub || in.op == Op::Mul) {
+                            int64_t exact = 0;
+                            const bool ovf = in.op == Op::Add ? __builtin_add_overflow(a, b, &exact)
+                                           : in.op == Op::Sub ? __builtin_sub_overflow(a, b, &exact)
+                                                              : __builtin_mul_overflow(a, b, &exact);
+                            if (ovf) break;
+                        }
                         uint64_t ua = static_cast<uint64_t>(a), ub = static_cast<uint64_t>(b);
                         uint64_t r = in.op == Op::Add || in.op == Op::WrapAdd ? ua + ub
                                   : in.op == Op::Sub || in.op == Op::WrapSub ? ua - ub
@@ -184,8 +219,20 @@ inline void fold_constants(lithon::ir::Function& fn, OptimizeStats& stats) {
                     if (in.args.size() == 1 && as_const(in.args[0], a)) {
                         auto targets = branch_targets(in);
                         if (targets.size() == 2) {
+                            const std::string kept = a != 0 ? targets[0] : targets[1];
+                            const std::string dropped = a != 0 ? targets[1] : targets[0];
+                            // The dropped edge leaves its target with one fewer
+                            // predecessor. A Phi's operands are positional, one per
+                            // predecessor, so with direct Phis alive (not yet
+                            // resolved to memory) the operand that came over this
+                            // edge has to go too, or every later operand slides onto
+                            // the wrong edge. Done BEFORE the terminator changes,
+                            // because the operand's position is read off the CFG as
+                            // it stands. A branch whose two arms are the same block
+                            // keeps its edge and prunes nothing.
+                            if (dropped != kept) drop_phi_operand(fn, bi, dropped);
                             in.op = Op::Jump;
-                            in.name = a != 0 ? targets[0] : targets[1];
+                            in.name = kept;
                             in.args.clear();
                             ++stats.branches_folded;
                         }
@@ -229,6 +276,8 @@ inline bool is_pure_op(lithon::ir::Op op) {
         case Op::InputInt: return false;
         case Op::ToInt: return false;
         case Op::GuardNonZero: return false;
+        // 4.14. utrap traps, so it is neither movable nor removable.
+        case Op::UTrap: return false;
         // Phase III. A raw syscall has arbitrary side effects (it can write,
         // read, or exit) and its result is unproven, so it is neither movable
         // nor removable -- stated explicitly rather than left to the default
@@ -321,7 +370,10 @@ inline void eliminate_dead_code(lithon::ir::Function& fn, OptimizeStats& stats) 
                 // 6.7. StrSplit names THREE runs: the source str, the separator
                 // str, and the destination list. Each is storage, so all three
                 // must stay live.
-                in.op == Op::StrSplit) {
+                in.op == Op::StrSplit ||
+                // 4.12. InputStr writes the str run it names, so that run's
+                // declaration (and the bytes it reserves) must stay live.
+                in.op == Op::InputStr) {
                 mark_var(in.name);
                 if (in.op == Op::StrEq || in.op == Op::StrNe ||
                     in.op == Op::StrFind || in.op == Op::StrCount)

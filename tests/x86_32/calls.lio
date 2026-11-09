@@ -1,0 +1,38 @@
+def add3(a: int[64], b: int[64], c: int[64]) -> int[64]:
+    return a + b * c
+
+
+def fact(n: int[64]) -> int[64]:
+    if n <= 1:
+        return 1
+    return n * fact(n - 1)
+
+
+def fib(n: int[64]) -> int[64]:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+
+def sum_to(n: int[64]) -> int[64]:
+    total: int[64] = 0
+    i: int[64] = 0
+    for i in range(n + 1):
+        total = total + i
+    return total
+
+
+def is_big(n: int[64]) -> bool:
+    return n > 4294967296
+
+
+print(add3(1, 2, 3))
+print(fact(20))
+print(fib(20))
+print(sum_to(100000))
+print(is_big(5000000000))
+print(is_big(5))
+w: int[64] = 0
+while w < 5:
+    print(w)
+    w = w + 1

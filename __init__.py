@@ -48,9 +48,26 @@ _frontend_module = None
 class LithonError(RuntimeError):
     """Compile failure, type-check rejection, or strict-mode refusal."""
 
-    def __init__(self, message: str, returncode: Optional[int] = None):
+    def __init__(self, message: str, returncode: Optional[int] = None, *,
+                 cause=None, runner_stderr: Optional[str] = None):
         super().__init__(message)
         self.returncode = returncode
+        # `diagnostic`: the message is already a rendered, self-contained report (code,
+        # location, source line, help) and needs no "lithon:" prefix. `cause` / `runner_stderr`
+        # are what it was rendered from, so a terminal can re-render it in colour.
+        self.diagnostic = cause is not None or runner_stderr is not None
+        self.cause = cause
+        self.runner_stderr = runner_stderr
+
+    def render(self, color: bool = False) -> str:
+        """The error as text; `color` re-renders a diagnostic with ANSI colours."""
+        if color and self.diagnostic:
+            fe = _load_frontend()
+            if self.cause is not None:
+                return fe.format_diagnostic(self.cause, color=True)
+            if self.runner_stderr is not None:
+                return fe.format_runner_errors(self.runner_stderr, color=True)
+        return str(self)
 
 
 @dataclass
@@ -73,26 +90,28 @@ def _load_frontend():
     return _frontend_module
 
 
-def compile_source(source: str, *, disable_gc: bool = True) -> str:
-    """Python source -> Lithon IR text."""
+def compile_source(source: str, *, disable_gc: bool = True, base_dir=None,
+                   include=(), entry_path=None, locations: bool = True) -> str:
+    """Lithon source -> Lithon IR text. `base_dir`/`include` are where imports are
+    looked for (4.15): the entry program's directory first, then each `include`
+    directory, then LITHON_PATH."""
     fe = _load_frontend()
     was_enabled = gc.isenabled()
     if disable_gc and was_enabled:
         gc.disable()   # compile step only; the native run never uses Python's GC anyway
     try:
         try:
-            tree = ast.parse(source)
-            return fe.build_program(tree)
-        except SyntaxError as e:
-            raise LithonError(f"syntax error: {e}") from e
-        except NotImplementedError as e:
-            raise LithonError(f"not supported by Lithon yet: {e}") from e
+            tree = fe.parse_source(source, entry_path)
+            tree = fe.link_program(tree, base_dir, include, entry_path)
+            return fe.build_program(tree, locations=locations)
+        except (SyntaxError, NotImplementedError) as e:
+            raise LithonError(fe.format_diagnostic(e), 1, cause=e) from e
     finally:
         if disable_gc and was_enabled:
             gc.enable()
 
 
-def compile(path) -> str:  # noqa: A001 (shadowing the builtin is intentional here)
+def compile(path, include=(), locations: bool = True) -> str:  # noqa: A001 (shadowing the builtin is intentional here)
     """Lithon file -> Lithon IR text.
 
     A Lithon source is `.lio`. The check mirrors the frontend's own one, because
@@ -105,7 +124,8 @@ def compile(path) -> str:  # noqa: A001 (shadowing the builtin is intentional he
         raise LithonError(
             f"LITHON-E0114: Lithon source files use the .lio extension, "
             f"not '{p}'")
-    return compile_source(p.read_text())
+    return compile_source(p.read_text(), base_dir=p.resolve().parent,
+                          include=include, entry_path=str(p.resolve()), locations=locations)
 
 
 def _tier_from(stderr: str) -> str:
@@ -140,22 +160,27 @@ def run_ir(ir_text: str, mode: str = "auto", capture: bool = False) -> RunResult
     result = RunResult(proc.returncode, _tier_from(proc.stderr),
                        proc.stdout if capture else "", proc.stderr)
     if proc.returncode == 3:
-        raise LithonError(_explain(proc.stderr), 3)
+        raise LithonError(_explain(proc.stderr), 3, runner_stderr=proc.stderr)
     if proc.returncode != 0:
         raise LithonError(_explain(proc.stderr) or f"runner exited {proc.returncode}",
-                          proc.returncode)
+                          proc.returncode, runner_stderr=proc.stderr)
     return result
 
 
 def _explain(stderr: str) -> str:
-    keep = [ln for ln in stderr.splitlines()
-            if ln.startswith(("[guard]", "[strict]", "RCR error", "error:"))]
-    return "\n".join(keep) or stderr.strip()
+    """The runner's refusal / type-check / trap output as a readable report."""
+    try:
+        text = _load_frontend().format_runner_errors(stderr)
+    except Exception:   # never let rendering hide the real error
+        keep = [ln for ln in stderr.splitlines()
+                if ln.startswith(("[guard]", "[strict]", "RCR error", "error:"))]
+        text = "\n".join(keep)
+    return text or stderr.strip()
 
 
-def run(path, mode: str = "auto", capture: bool = False) -> RunResult:
-    """Compile a Python file and execute it. See module docstring for modes."""
-    return run_ir(compile(path), mode=mode, capture=capture)
+def run(path, mode: str = "auto", capture: bool = False, include=()) -> RunResult:
+    """Compile a Lithon file and execute it. See module docstring for modes."""
+    return run_ir(compile(path, include=include), mode=mode, capture=capture)
 
 
 def run_source(source: str, mode: str = "auto", capture: bool = False) -> RunResult:

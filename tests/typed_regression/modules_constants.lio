@@ -1,0 +1,31 @@
+# 4.15, level 3: constants. A scalar constant with a literal value can be imported
+# by `import m` (as `m.NAME`) or `from m import NAME [as ALIAS]`. It folds into every
+# use: an expression, a loop bound, another constant, a function body here, and a
+# container capacity (`list[int[64], N]`).
+
+import modules.limits
+from modules.limits import MAX, SIZE as N, BYTE
+
+const DOUBLE_MAX: int[64] = MAX
+xs: list[int[64], N] = [0, 0, 0, 0]
+
+
+def scaled(a: int[64]) -> int[64]:
+    return a * MAX + N
+
+
+if __name__ == '__main__':
+    print(xs)
+    print(modules.limits.clamp(9), modules.limits.clamp(2))
+    print(MAX + 1, modules.limits.SCALE * 2.0, modules.limits.FLAG)
+    b: uint[8] = BYTE
+    print(b)
+    print(scaled(3))
+    print(DOUBLE_MAX)
+    i: int[64] = 0
+    total: int[64] = 0
+    for i in range(MAX):
+        total = total + i
+    print(total)
+    k: uint[8] = 100
+    print(BYTE - k)

@@ -97,11 +97,11 @@ const errors: DocPage = {
             ],
             [
               "`E0115`, 1 (static refusal)",
-              "Unsupported builtin call form",
+              "Unsupported builtin call form, including `str(...)` anywhere but `str(n, input(\"prompt\"))` as a `str[N]` initializer or assignment",
             ],
             [
               "`E0116`, 1 (static refusal)",
-              "Builtin argument rules (`valueof`/`addressof`/`wrap_*`)",
+              "Builtin argument rules (`valueof`/`addressof`/`wrap_*`, and the `str(n, input(...))` limit: a non-literal `n`, `n < 1`, or `n` larger than the string's capacity)",
             ],
             [
               "`E0117`, 1 (static refusal)",
@@ -111,7 +111,10 @@ const errors: DocPage = {
               "`E0118`, 1 (static refusal)",
               "`else` clause on a `while`/`for` loop",
             ],
-            ["`E0119`, 1 (static refusal)", "`for`-loop form restrictions"],
+            [
+              "`E0119`, 1 (static refusal)",
+              "`for`-loop form restrictions: a `range` target must already be declared as an `int[w]` (4.11), and a narrow counter needs bounds that provably fit",
+            ],
             [
               "`E0120`, 1 (static refusal)",
               "`break`/`continue` outside a loop",
@@ -179,6 +182,22 @@ const errors: DocPage = {
               "Class attribute access (4.10): a read or write of an attribute the class does not declare (an instance has exactly its declared attributes)",
             ],
             [
+              "`E0142`, 1 (static refusal)",
+              "Nullable class references (4.10.7): `Optional[T]` where `T` is not a class reference or is nested, an Optional class reference in a collection, `None` outside an Optional class target (scalar, container, index, print, augmented-assignment, enum-payload and builtin contexts), an Optional used as an object without an `is None`/`is not None` proof, or `==`/`!=` used instead of the identity checks",
+            ],
+            [
+              "`E0143`, 1 (static refusal)",
+              "Constants (4.13): `const` with no initializer or type, a `const` struct/pointer/class reference, a write to a constant after its declaration, a constant as a `for` target, its address taken, or a parameter/local that reuses a module constant's name",
+            ],
+            [
+              "`E0144`, 1 (static refusal)",
+              "Unsigned integers (4.14): a negative or too-large literal, or a signed value, into a `uint`; a `uint` mixed with an `int` or a `float` in arithmetic or a comparison; a wider `uint` result into a narrower `uint`; a `uint` into anything but an `int[64]`; negating a `uint`; `/` of a `uint[64]`; a `uint[64]` as an index or range bound; a `uint` in a container, struct field, attribute, enum payload, method parameter, pointer, `abs`/`int`/`float`/`wrap_*`/`syscall`, or an if-expression arm",
+            ],
+            [
+              "`E0145`, 1 (static refusal)",
+              "Modules and the entry point (4.15): an import that cannot be resolved (module not found, a name the module does not define), an import cycle, an import inside a function or block, a relative import, `from m import *`, an imported name that collides with a definition or another import, an executable top-level statement, or a constant that is not a literal scalar, in an imported program, a parameter or local that reuses an imported name, an `if __name__ == '__main__':` guard with an else branch, or `__name__` used anywhere but exactly that guard",
+            ],
+            [
               "`E0201`, 2 (environmental)",
               "Fallible value read before `.ok` check -- designed, not built: `fallible[T]` does not exist yet",
             ],
@@ -206,6 +225,18 @@ const errors: DocPage = {
             [
               "`E0310`, 3 (dynamic trap)",
               "`range(a, b, step)` with `step == 0`, dynamic",
+            ],
+            [
+              "`E0311`, 3 (dynamic trap)",
+              "String input (4.12): a line read by `str(n, input(...))` is longer than `n-1` bytes; it is never truncated, and is caught as a `ValueError`",
+            ],
+            [
+              "`E0312`, 3 (dynamic trap)",
+              "String input (4.12): a line read by `str(n, input(...))` contains a NUL byte, which a `str[N]` cannot hold; refused rather than silently shortened, and caught as a `ValueError`",
+            ],
+            [
+              "`E0313`, 3 (dynamic trap)",
+              "Unsigned integers (4.14): a `uint[w]` operation whose exact result is outside `0..2^w-1` (a sum past the maximum, a difference below zero, a product or left shift that does not fit); never wraps (caught as an `OverflowError`)",
             ],
             [
               "`E0401`, 3 (resource trap)",
@@ -457,6 +488,10 @@ xs[2] = 30
 ys[0] = 1
 ys[1] = 2
 ys[2] = 3
+i: int[64] = 0
+x: int[64] = 0
+a: int[64] = 0
+b: int[64] = 0
 for i, x in enumerate(xs):
     print(i)
 for a, b in zip(xs, ys):
@@ -729,14 +764,19 @@ const verification: DocPage = {
             ["Typed differential fuzzing", "300 / 300 passed"],
             ["Bitwise / shift fuzzing", "200 / 200 passed"],
             ["Conditional-expression / SSA fuzzing", "200 / 200 per suite"],
-            ["Direct float Phi sweep", "95 matched / 0 mismatched"],
+            ["Direct float Phi sweep", "104 matched / 0 mismatched"],
             ["ABI modules audited", "34"],
             ["ABI stack/callee-saved failures", "0"],
-            ["Typed regression suite", "61 / 61 passed (46 + 15 class_*)"],
+            ["Typed regression suite", "70 / 70 passed"],
+            ["Win64 ABI (MinGW build under wine)", "6 probes ok, 104 / 104 programs identical"],
+            ["x86-32 native tier (Win32 under wine)", "130 / 130 programs native and identical, 540 fuzzed per run; encoder 118 / 118 forms"],
+            ["x86-32 native tier (System V i386)", "130 / 130 native and identical; ESP-alignment probe; 540 fuzzed per run"],
+            ["x86-32 exported conventions", "cdecl / stdcall / fastcall, 30,000 calls per target, stack balanced"],
             ["General regression suite", "34 / 34 passed"],
             ["Type-checker unit checks", "145 ok"],
-            ["Error-code discipline checks", "176 ok"],
-            ["Tier differential (interp vs JIT)", "235 / 235 passed (native 134)"],
+            ["Error-code discipline checks", "303 ok"],
+            ["Error display (positions, carets, syntax, imports, colour)", "15 / 15 passed"],
+            ["Tier differential (interp vs JIT)", "263 / 263 passed (native 143)"],
             ["Object runtime (ctest)", "107 ok"],
             ["Class (OOP) fuzzing", "200 / 200 passed"],
             ["Syscall hook parity (both tiers)", "4 / 4 passed"],
@@ -864,7 +904,7 @@ const limits: DocPage = {
   slug: "limits",
   title: "Honest limits",
   description:
-    "The gaps as they stand: no closures, no stdlib, no float promotion on merges, Win64 unproven, x86-64 only.",
+    "The gaps as they stand: no closures, no stdlib, no float promotion on merges, Win64 checked only under wine, x86-64 only.",
   group: "reference",
   tags: ["limits", "gaps", "roadmap", "not supported", "honest", "TODO"],
   sections: [
@@ -886,7 +926,7 @@ const limits: DocPage = {
             ],
             ["arguments per function / call", "two in registers, the rest on the stack · budget 32"],
             ["float merges", "never promoted · needs an XMM pool"],
-            ["Win64 ABI", "implemented, no test evidence yet"],
+            ["Win64 ABI", "C boundary verified under wine; no native Windows run yet"],
             ["AOT binary emit", "none · everything runs in-process"],
             ["architectures", "x86-64 only · ARM64 is Phase III"],
             ["AVX-512", "not emitted · feature gating only"],
@@ -897,7 +937,7 @@ const limits: DocPage = {
             ["`//` floor division", "refused outright: *operator FloorDiv not supported yet*"],
             ["`**` power", "refused outright: *operator Pow not supported yet*"],
             ["`<=` and `>=`", "lowered via `not` (`a <= b` is `not (b < a)`); there is no `le`/`ge` opcode. Chained comparisons are still refused"],
-            ["unsigned ints", "no `uint`: signed at every width"],
+            ["unsigned ints", "`uint[8|16|32|64]` exists (4.14): an out-of-range result traps E0313 and never wraps, it never mixes implicitly with `int`, and it is scalars only for now; `int[w]` is signed at every width"],
             ["closures", "none: a function body cannot capture a caller's variable"],
             ["first-class functions", "none: a function name is not a value"],
             ["`lambda`", "refused: *expression node Lambda not supported yet*"],

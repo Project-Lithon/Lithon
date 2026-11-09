@@ -119,6 +119,22 @@ print(h.version)`,
       ],
     },
     {
+      id: "reading-a-line",
+      title: "Reading a line (`str(n, input(...))`)",
+      blocks: [
+        {
+          kind: "p",
+          text: "A line from standard input is read straight into a declared string: `k: str[N] = str(n, input(\"Enter something: \"))`. The prompt is a string literal and `n` is a **literal limit that counts the NUL**, exactly as `str[N]` does, so at most `n-1` bytes are read and `1 <= n <= N`. It can also re-read into an existing string (`k = str(n, input(\"...\"))`) or into a struct's `str` field; each read rewrites the whole run, so a shorter line leaves no old tail. The newline is removed, an empty line is an empty string, and spaces are kept.",
+        },
+        {
+          kind: "note",
+          tone: "warn",
+          title: "A line that does not fit traps; it is never truncated",
+          text: "A line longer than `n-1` bytes stops the program with `LITHON-E0311` and a line containing a NUL byte with `LITHON-E0312` (both a `ValueError` to `try`/`except`; a string cannot hold a NUL, so it is refused rather than silently shortened), and end of input is `LITHON-E0308` (an `EOFError`), identically in both tiers. A limit larger than the capacity, or one that is not a literal, is refused at compile time (`E0116`), and `str(...)` anywhere else is refused (`E0115`): it reads a line *into* a string, so it has no value of its own.",
+        },
+      ],
+    },
+    {
       id: "methods",
       title: "The three string operations (`find`/`count`/`split`)",
       blocks: [
@@ -254,6 +270,42 @@ print(valueof(_p))`,
       ],
     },
     {
+      id: "returning-strings",
+      title: "Returning a string from a function",
+      blocks: [
+        {
+          kind: "p",
+          text: "A function may be declared `-> str[N]`. A string is frame storage with no value form, so such a function has no machine code of its own: **its body is expanded at each call site** into a fresh `str[N]` result buffer, with its parameters and locals renamed, and `return` writes into that buffer. The call then stands for the buffer wherever a string is accepted. Because it is a frontend rewrite, it needs no new IR operation and works unchanged on every tier and target.",
+        },
+        {
+          kind: "table",
+          caption: "where a str-returning call is accepted",
+          rows: [
+            ["`print(f(x))`, an f-string field", "the buffer prints"],
+            ["`f(x) == \"lit\"`, `f(x) != t`", "a run comparison; `s == \"literal\"` now works for any string"],
+            ["`len(f(x))`, `f(x)[i]`, `f(x).find(..)`, `.count(..)`, `.split(..)`", "the buffer is the receiver"],
+            ["`s: str[M] = f(x)`", "copied in; `M` must be at least the function's `N`"],
+            ["`s = f(x)`", "copied over the whole string and the old tail cleared, so a shorter result replaces a longer one"],
+            ["`return <literal>`, `return s`, `return g(y)`", "each is checked against the declared capacity"],
+          ],
+        },
+        {
+          kind: "table",
+          caption: "refused",
+          rows: [
+            ["Recursion", "refused: the function is inlined at its call sites and cannot call itself, directly or indirectly (E0114)"],
+            ["A parameter that is not an annotated `int`, `uint`, `float`, `bool` or `str`", "refused (E0124): such a function cannot take a container, struct, class or pointer"],
+            ["A result that may not fit", "a literal longer than `N-1` bytes, a wider str variable, or a receiving `str[M]` smaller than `N` is refused (E0111): a str is never narrowed"],
+            ["Using the result as a number", "`x: int[64] = f()` is refused (E0114) with the list of places a string is accepted"],
+          ],
+        },
+        {
+          kind: "p",
+          text: "A `uint[w]` return was already supported for ordinary functions; it needs nothing special here.",
+        },
+      ],
+    },
+    {
       id: "what-strings-cannot-do",
       title: "What strings cannot do",
       blocks: [
@@ -283,7 +335,7 @@ print(valueof(_p))`,
             ],
             [
               "A `str` function parameter",
-              "a string cannot be passed to a function: *a str function parameter is not yet a string place*. Strings are addressed, not passed.",
+              "a function can take a `str[N]` parameter and return a `str[N]` (or an int/float/bool): the function is expanded at each call site and the parameter is a *copy*. It cannot be recursive.",
             ],
           ],
         },

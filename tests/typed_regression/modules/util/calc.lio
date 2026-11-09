@@ -1,0 +1,7 @@
+# A module in a sub-directory (a package, with no __init__ file) that imports a
+# sibling of the entry program by its own dotted path.
+import modules.mathlib
+
+
+def double_square(x: int[64]) -> int[64]:
+    return 2 * modules.mathlib.square(x)

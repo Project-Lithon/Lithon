@@ -1,0 +1,82 @@
+# 4.14. An unsigned operation whose exact result leaves 0..2^size-1 TRAPS
+# (E0313, an OverflowError) instead of wrapping: a sum past the maximum, a
+# difference below zero, a product or left shift that does not fit. `%` by zero
+# is the usual ZeroDivisionError. CPython has no fixed-width unsigned integers,
+# so the expected output is written from those semantics.
+
+a: uint[8] = 200
+b: uint[8] = 100
+z: uint[8] = 0
+r: uint[8] = 0
+
+try:
+    r = a + b
+    print("no trap")
+except OverflowError:
+    print("add traps")
+try:
+    r = b - a
+    print("no trap")
+except OverflowError:
+    print("sub traps")
+try:
+    r = a * b
+    print("no trap")
+except OverflowError:
+    print("mul traps")
+try:
+    r = a << 1
+    print("no trap")
+except OverflowError:
+    print("shl traps")
+try:
+    r = a % z
+    print("no trap")
+except ZeroDivisionError:
+    print("mod by zero")
+
+# The largest and smallest values themselves are fine.
+r = a + 55
+print(r)
+r = a - 200
+print(r)
+
+# The same at 64 bits, where the signed machine word cannot say it.
+m: uint[64] = 18446744073709551615
+n: uint[64] = 0
+q: uint[64] = 0
+try:
+    q = m + 1
+    print("no trap")
+except OverflowError:
+    print("add64 traps")
+try:
+    q = n - 1
+    print("no trap")
+except OverflowError:
+    print("sub64 traps")
+try:
+    q = m * 2
+    print("no trap")
+except OverflowError:
+    print("mul64 traps")
+try:
+    q = m << 1
+    print("no trap")
+except OverflowError:
+    print("shl64 traps")
+q = m - 1
+print(q)
+q = m >> 63
+print(q)
+p1: uint[64] = 4294967296
+p2: uint[64] = 4294967295
+q = p1 * p2
+print(q)
+
+# A trap is catchable as an Exception too, and the program carries on.
+try:
+    r = a + b
+except Exception:
+    print("caught")
+print("done")

@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdio>
+#include <string>
+
+#include "ir/source_loc.h"
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -34,8 +37,23 @@ namespace lithon::jit {
 // float code. The message is tier-neutral on purpose: the identical
 // sentence is printed whichever engine traps, so it never claims to come
 // from the interpreter.
-[[noreturn]] inline void host_report_error(const char* message) {
+//
+// `loc` is the packed source position of the trapping instruction (ir::pack_pos, 0 = unknown);
+// when known it is printed as a second line, "  --> path:line", exactly as the interpreter
+// does, so the two tiers still produce identical stderr.
+[[noreturn]] inline void host_report_error(const char* message, int64_t loc = 0) {
     std::fputs(message, stderr);
+    // Some trap messages (E0309, E0310, ...) are stored without a trailing newline; the
+    // interpreter's report always ends the line, so the native one must too.
+    {
+        const size_t len = std::strlen(message);
+        if (len == 0 || message[len - 1] != '\n') std::fputc('\n', stderr);
+    }
+    if (loc != 0) {
+        const auto p = lithon::ir::unpack_pos(loc);
+        const std::string where = lithon::ir::describe_pos(p.src, p.line);
+        std::fputs(where.c_str(), stderr);
+    }
     std::fflush(stderr);
     std::fflush(stdout);
     std::exit(1);

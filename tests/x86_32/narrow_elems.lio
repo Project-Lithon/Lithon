@@ -1,0 +1,13 @@
+b: list[int[8], 3] = [1, -2, 3]
+h: list[int[16], 2] = [-300, 300]
+w: list[int[32], 2] = [-70000, 70000]
+i: int[64] = 1
+print(b[i])
+print(h[0])
+print(w[0])
+b[i] = -100
+print(b[i])
+print(b)
+print(h)
+print(w)
+print(len(b))

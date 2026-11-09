@@ -23,11 +23,11 @@ kind of failure is this" readable from the code alone.
 | `E0112` | 1 (static refusal) | Container element must be a plain scalar or a class reference (4.10.3) |
 | `E0113` | 1 (static refusal) | Pointer (`ptr[T]`) declaration rules (4.4) |
 | `E0114` | 1 (static refusal) | Unsupported or restricted program construct (including a non-literal `str[N]` value, a whole `str` / `str` pointee used where a value is needed, or a non-`.lio` source extension) |
-| `E0115` | 1 (static refusal) | Unsupported builtin call form |
-| `E0116` | 1 (static refusal) | Builtin argument rules (`valueof`/`addressof`/`wrap_*`) |
+| `E0115` | 1 (static refusal) | Unsupported builtin call form (including `str(...)` anywhere but `str(n, input("prompt"))` as a `str[N]` initializer or assignment) |
+| `E0116` | 1 (static refusal) | Builtin argument rules (`valueof`/`addressof`/`wrap_*`, and 4.12's `str(n, input(...))` limit: a non-literal `n`, `n < 1`, or `n` larger than the string's capacity) |
 | `E0117` | 1 (static refusal) | Indexing / container-subscript restrictions |
 | `E0118` | 1 (static refusal) | `else` clause on a `while`/`for` loop |
-| `E0119` | 1 (static refusal) | `for`-loop form restrictions (including `enumerate`/`zip` over a class-typed container) |
+| `E0119` | 1 (static refusal) | `for`-loop form restrictions (including `enumerate`/`zip` over a class-typed container, and 4.11's loop-variable rules: a `range` target that is undeclared, not an `int[w]`, or narrower than its bounds can be proven to fit) |
 | `E0120` | 1 (static refusal) | `break`/`continue` outside a loop |
 | `E0121` | 1 (static refusal) | Assignment / target restrictions |
 | `E0122` | 1 (static refusal) | Declaration and re-declaration rules |
@@ -47,6 +47,9 @@ kind of failure is this" readable from the code alone.
 | `E0140` | 1 (static refusal) | Class instance semantics (4.10.1/4.10.2/4.10.3/4.10.4): a bare class name used where a value is needed, a class-typed variable initialized with a non-class value, an identity compare between classes with no possible common declared subclass, an attempt to instantiate an abstract class, an attribute left uninitialized on some path through `__init__`, a bare declaration or `append` on a class-typed container, storing a non-class or unrelated class reference into a class-typed container element, or membership of a non-class or unrelated class in a class-typed container |
 | `E0141` | 1 (static refusal) | Class attribute access (4.10.1): a read or write of an attribute the class does not declare (an instance has exactly its declared attributes) |
 | `E0142` | 1 (static refusal) | Nullable class references (4.10.7): `Optional[T]` where `T` is not a class reference or is nested, an Optional class reference in a collection, `None` outside an Optional class target (including scalar/container/index/print/augmented-assignment/enum-payload/builtin contexts), an Optional used as an object without an `is None`/`is not None` proof, or `==`/`!=` used instead of the identity checks |
+| `E0143` | 1 (static refusal) | Constants (4.13): `const` with no initializer or no type, a `const` of a struct, pointer or class reference, a constant redeclared or declared over a variable, a write to a constant after its declaration (assignment, augmented assignment, an element store, `append`, a string re-read), a constant as a `for` target, taking a constant's address, or a function parameter or local that reuses a module constant's name |
+| `E0144` | 1 (static refusal) | Unsigned integers (4.14): a negative or too-large literal, or a signed value, into a `uint`; a `uint` mixed with an `int` or a `float` in arithmetic or a comparison; a wider `uint` result into a narrower `uint`; a `uint` into anything but an `int[64]`; negating a `uint`; `/` of a `uint[64]`; a `uint[64]` as an index or range bound; a `uint` in a container, struct field, attribute, enum payload, method parameter, pointer, `abs`/`int`/`float`/`wrap_*`/`syscall`, or an if-expression arm |
+| `E0145` | 1 (static refusal) | Modules and the entry point (4.15): an import that cannot be resolved (module not found, a name the module does not define), an import cycle, an import inside a function or block, a relative import, `from m import *`, an imported name that collides with a definition or another import, an executable top-level statement, or a constant that is not a literal scalar, in an imported program, a parameter or local that reuses an imported name, an `if __name__ == '__main__':` guard with an else branch, or `__name__` used anywhere but exactly that guard |
 | `E0201` | 2 (environmental) | Fallible value read before `.ok` check |
 | `E0301` | 3 (dynamic runtime trap) | Division by zero |
 | `E0302` | 3 (dynamic runtime trap) | Modulo by zero |
@@ -58,6 +61,9 @@ kind of failure is this" readable from the code alone.
 | `E0308` | 3 (dynamic runtime trap) | End of input |
 | `E0309` | 3 (dynamic runtime trap) | float-to-int conversion out of range or not finite |
 | `E0310` | 3 (dynamic runtime trap) | `range(a,b,step)` where `step == 0` (dynamic) |
+| `E0311` | 3 (dynamic runtime trap) | String input (4.12): a line read by `str(n, input(...))` is longer than `n-1` bytes; it is never truncated (caught as a `ValueError`) |
+| `E0312` | 3 (dynamic runtime trap) | String input (4.12): a line read by `str(n, input(...))` contains a NUL byte, which a `str[N]` cannot hold; refused rather than silently shortened (caught as a `ValueError`) |
+| `E0313` | 3 (dynamic runtime trap) | Unsigned integers (4.14): a `uint[w]` operation whose exact result is outside `0..2^w-1` (a sum past the maximum, a difference below zero, a product or left shift that does not fit); never wraps (caught as an `OverflowError`) |
 | `E0401` | 3 (dynamic runtime trap, resource) | Stack overflow |
 
 ## IR ops — the eight class instructions
@@ -353,3 +359,357 @@ property/classmethod and Optional/None shapes. The seventh shape exercises
 nullable attributes and locals, Optional parameters and returns, a derived
 object through an Optional base reference, `while` and early-return narrowing,
 and the release/replace path when a nullable attribute is reassigned.
+
+## 4.11 — declared loop variables
+
+`for i in range(...)` assigns a variable; it does not declare one. This
+restores V1_SPEC 0.6.1 and 0.6.6, which the production frontend had loosened:
+it used to invent an `int[64]` counter for any undeclared name, and it stored
+every counter as `int[64]` even when the program had declared a narrower one,
+so a declared `float[64]` or `int[8]` target was silently retyped.
+
+The rules are all static. The target must already be declared, and declared as
+an `int[w]` (`E0119` otherwise). It must hold a value on every path before the
+loop (V1_SPEC 0.6.6): the frontend emits a read of the target ahead of the
+loop, and the checker's definite-assignment pass (0.6.10) refuses a declaration
+that no assignment reaches, so there is a single flow analysis rather than a
+second, weaker one in the frontend. The loop keeps the declared width: the
+counter's initial store carries the declared `int[w]` annotation.
+
+Width is where the checker constrains the design. Its range proof is interval
+arithmetic with no branch refinement, and it exempts exactly one pattern from
+range checking, the canonical `load i / const 1 / add / store i` latch. A
+one- or two-argument loop ends by storing its *limit* into the counter, so a
+narrower counter is sound precisely when every bound is already inside its
+width. The frontend therefore accepts a narrow counter only when each bound is
+a literal that fits or an integer variable declared no wider than the counter,
+and refuses everything it cannot prove (`E0119`). A stepped
+`range(a, b, step)` increments with an `add` that is not the exempt pattern, so
+it is accepted only for an `int[64]` counter. An `int[64]` counter keeps every
+existing forms unchanged. No IR opcode, checker change or runtime ABI is added.
+
+`enumerate` and `zip` follow the same rule: the `enumerate` index is checked
+exactly like a `range` target, every element target must be declared, hold a
+value and have exactly the element type of its container, and only the hidden
+counter that `zip` generates is exempt.
+
+The counter now ends where CPython leaves it. A loop is lowered as a guarded,
+bottom-tested loop: the counter is stored only once the loop is known to run (so
+a loop that never runs leaves it untouched), and it is advanced only when
+`i + 1` is still inside the range (so after `range(10)` it holds `9`, not the
+limit). The test `i + 1 < limit` is computed in int64 and never stored, so it
+cannot overflow a narrow counter, and the advance is still the exempt
+`i = i + 1` pattern. The three-argument form already stopped on its last value;
+it now also skips the initial store when it does not run. Because the counter is
+the single variable the loop tests, a write to it inside the body would change
+the trip count, so assigning, augmenting or re-declaring a live loop target, and
+reusing it as the target of an inner loop, are refused (`E0119`).
+
+Making loops guarded exposed two latent defects in the opt-in SSA backend, both
+fixed here. (1) `plan_function` records an aliased load with the register its
+variable was promoted to *before* allocation, but the allocator may later
+coalesce a merge variable into a different register; stores followed the
+allocator and the alias did not, so a loop-header merge read a register nothing
+had written. The aliases are now re-pointed at the variable's final register
+after allocation. (2) `fold_constants` turned a constant `branch` into a `jump`
+without removing the dropped successor's phi operand; with direct Phis alive the
+operands are positional by predecessor, so the surviving edge read the wrong
+one (a guarded loop printed its initial value). The dropped edge's operand is
+now removed. The loops that previously failed under `--ssa`/`--direct-phis`
+(`for_range`, `nested_loop`, `break_continue`, `iter_helpers`, `if_expr`) are the
+regression coverage.
+
+Implementing it also exposed a documentation gap, closed here: the discipline
+gate intersects the whitepaper table with `docs/lithon_error_system.md` and the
+website reference page, and `E0142` was missing from the latter while the
+reserved `E0137`/`E0138` were only named as a range.
+
+Verification at the close of this stage: typed regression 63/63 (including
+`for_declared`), general regression 34/34, tier differential 239/239 (native
+136, interpreter fallback 0), direct-Phi 97 matched / 0 known gaps / 0
+mismatched, error-code checks 211 (fifteen new `E0119` and definite-assignment
+cases), object-runtime ctest 107 ok, every fuzz mode with no skipped programs
+(`--break` was fixed to declare its counter), and the full
+`tools/verify_all.sh` gate green. Five tracked programs that relied on the implicit counter
+(`break_continue`, `for_range`, `nested_loop`, `range_step`,
+`tail_recursion`) and one regression (`class_container_list`) now declare it.
+
+## 4.12 — string input
+
+`k: str[N] = str(n, input("prompt"))` reads one line from standard input into a
+bounded string. It is the string twin of `int(w, input(...))` and, like it, is
+the only spelling of the read.
+
+The two numbers follow one convention. A `str[N]` holds at most `N-1` bytes
+because the last byte is the terminating NUL, and the limit `n` in `str(n, ...)`
+counts the NUL the same way, so the read accepts at most `n-1` bytes. `n` is a
+literal (the capacity decision has to be visible in the source and checkable at
+compile time) and must satisfy `1 <= n <= N`, where `N` is the capacity of the
+string being read into; a non-literal `n`, `n < 1` or `n > N` is `E0116`, and any
+other shape of `str(...)` is `E0115`. The form is accepted where a string is
+written: a `str[N]` declaration, an assignment to a `str[N]` variable, and an
+assignment to a struct's `str` field (whose companion run is the target).
+Anywhere else `str(...)` has no value to give and is refused.
+
+A line that does not fit is never truncated. A line longer than `n-1` bytes
+traps `LITHON-E0311`, a line containing a NUL byte traps `E0312`, and end of
+input traps `E0308`; all are catchable, the first two as a `ValueError` and the
+last as an `EOFError`, through the shared trap classifier both tiers already use.
+A NUL is refused rather than stored because a `str[N]` is NUL-terminated: the
+bytes after it would be written but could never be seen, which is the silent
+loss this language refuses everywhere else. It is checked before length, since
+the content is invalid at any limit, and the line is read one byte at a time so
+the NUL is actually seen (a C-string reader would stop at it). The read removes the line terminator (`\n`, and a `\r` before it),
+keeps all other bytes including spaces, treats an empty line as the empty string
+and accepts a last line with no newline. It rewrites the whole run, content then
+zeros, the state a string literal leaves, so a shorter line leaves no old tail.
+
+One IR op carries it: `inputstr <run>, <hex prompt>, <n>`, with the destination a
+named run like `streq`'s operands, no register operands and no result. The
+interpreter and the JIT helper both call a single `read_str_line`, so the prompt
+and flush, end-of-input, the length decision and the bytes written agree by
+construction rather than by testing; the helper reads a line of any length
+without a fixed buffer, so an over-long line is detected by its true length. The
+JIT passes the frame base, a descriptor naming the run's offset, capacity and
+limit, and the prompt from the string pool, and receives a kind code (0 ok, 1
+too long, 2 NUL byte, 3 end of input) which it routes through the same trap emitter every
+other trap uses, so a `try` handler is entered identically in both tiers. The
+typechecker requires the destination to be a definitely assigned `str` and
+re-checks `1 <= n <= N`, so hand-written IR cannot bypass the frontend. The op
+is registered as register-clobbering and as a use of the run it names, so the
+optimizer neither keeps a value across it in a caller-saved register nor deletes
+the run's declaration.
+
+Verification at the close of this stage: typed regression 64/64 (including
+`str_input` with its `.in` file), general regression 34/34, tier differential
+249/249 (native 137, interpreter fallback 0) with eight hand-written `inputstr`
+pins (fits, empty line, CRLF, no final newline, overwrite clears the tail, spaces
+kept, too long, end of input) comparing the JIT with the interpreter byte for
+byte on stdout and stderr, direct-Phi 98 matched / 0 known gaps / 0 mismatched,
+error-code checks 219 (eight new `E0115`/`E0116` refusals), object-runtime ctest
+107 ok, and the full `tools/verify_all.sh` gate green.
+
+## 4.13 — constants
+
+`const var: type[size] = value` declares a name that is assigned exactly once, by
+its initializer. The stage adds no IR opcode, checker rule or runtime ABI: a
+constant lowers to an ordinary declaration and the frontend declines to let
+anything write to it, exactly as 4.10.7 enforces nullability without a runtime
+representation.
+
+`const` is not Python syntax, and the frontend parses with Python's `ast`, so a
+single entry point, `parse_source`, removes the keyword first. It uses the
+tokenizer, so a string or comment containing the word is never touched, matches
+only `const NAME :` at the start of a logical line, preserves every line number,
+and marks the resulting statement. `const x = 5` (no type) is refused here. The
+frontend's `main` and both library entry points use it.
+
+Everything that could change a constant afterwards is refused with `E0143`:
+assigning or augmenting the name, redeclaring it (as a variable, or as a second
+constant, or over an existing variable), an element or field store rooted at it,
+`append`, a string re-read, using it as a `for` target (the loop assigns it every
+iteration), and `addressof` (a pointer could write through it). A struct has no
+value to initialise it with, a pointer's address would let the pointee change, and
+a class reference names an object a method could still mutate, so those three are
+refused for now. A module constant reserves its name: a parameter or local of the
+same name is refused, so it can never be shadowed by accident.
+
+Folding is what makes a constant useful. A scalar constant whose initializer is a
+literal that fits its declared type is substituted at every read, and because an
+immutable literal is always safe to inline, a *module-level* one is visible
+inside every function even though ordinary module variables are not. The same map
+resolves a capacity written as a name in `list`, `tuple`, `str` and `dict`
+annotations, and `literal_int`, so a constant can be a `range` bound (including
+the proof a narrow 4.11 counter needs), a string limit in `str(n, input(...))`
+or a pointer offset. A constant of any other type is an ordinary immutable
+variable in its own scope. Constant *expressions* are not folded yet.
+
+Verification at the close of this stage: typed regression `const_basic` agrees with
+CPython (run on the program with the keyword removed) in the interpreter, in
+strict native and in the default tiered mode; the error-code checks add seventeen
+`E0143` refusals; the full gate is run at the end of the round.
+
+## 4.14 — unsigned integers
+
+`i: uint[size] = value` is a fixed-width unsigned integer, `size` 8, 16, 32 or 64,
+holding `0 .. 2^size-1`. It was designed with four decisions: an out-of-range
+result **traps** (E0313) and never wraps, `uint` and `int` **never mix**
+implicitly, the first stage is **scalars only**, and `0` is a valid value with the
+full range including `uint[64]` up to `2^64-1`.
+
+A `uint` has no IR type. The IR sees the 64-bit integer that holds it, because an
+unsigned value is the same bits, so the checker, the interpreter, the JIT and the
+encoder are untouched. The frontend does all of the typing, which it reads off the
+AST with a pure probe (`_peek_uint_width`) instead of tagging registers, so every
+consumer decides at the node it is looking at. Only two things were added below
+the frontend: `utrap %cond`, which traps E0313 when its bool operand is true and
+is the one op that turns "the exact result left the range" into the trap, and the
+`print_u`/`print_bare_u` builtins, which read the integer formatter's argument as
+unsigned (`%llu`) for a `uint[64]` at or above `2^63`.
+
+Mixing: arithmetic or a comparison between a `uint` and an `int` or `float`, a
+signed value into a `uint`, and a negative or too-large literal are refused
+(E0144). The allowed flows are a non-negative literal wherever a `uint` is accepted
+(it takes the other operand's width and must fit it) and a `uint` narrower than 64
+bits widening into an `int[64]`, which is exact. Between `uint`s a result takes the
+wider width and a narrowing store is refused. Parameters and returns carry the
+width (a function's return type is recorded so a call's result is known to be
+unsigned), and `const` accepts `uint` with a literal initializer and folds it.
+
+Lowering. For `uint[8|16|32]` the operands are non-negative int64 values, so the
+signed op is exact and the result is range-checked: `gt r, max` for a sum, `lt r, 0`
+for a difference, and both for a product (a `uint[32]` product can pass int64 and
+wraps negative). For `uint[64]` the signed word cannot say "unsigned", so it is
+built from signed operations: unsigned order is signed order with the sign bit
+flipped on both sides (`bxor` with `2^63`), which also detects a sum's carry
+(`s < a`) and a difference's borrow (`a < b`); a product is assembled from 32-bit
+halves and traps if both high halves are set, a cross term or their sum needs more
+than 32 bits, or adding the shifted terms carries; `%` handles `b >= 2^63` (the
+quotient is 0 or 1), both operands below `2^63` (the signed `mod`), and `a >= 2^63`
+with `b < 2^63` (`2*(a>>1 % b) + (a&1)`, subtracting `b` once if needed), each in its
+own block so a signed `mod` never receives an operand it would fault on, with
+`1 % b` first so a zero divisor traps like the signed operator; `>>` is logical (the
+IR's `shr` is arithmetic) by masking one shift first. `/` is true division, hence a
+float, and is refused for `uint[64]`; there is no integer division in Lithon. A left
+shift traps if shifting back does not recover the operand.
+
+Scope. Locals, free-function parameters and returns, constants and `print` only.
+A `uint` is refused (E0144, or the existing struct/method/pointer diagnostic) as a
+container element, a struct field, an enum payload, a class attribute, a method
+parameter, a pointer pointee, an argument to `abs`/`int`/`float`/`wrap_*`/`syscall`
+or an if-expression arm; a `uint[64]` additionally cannot index a list or bound a
+`range`, because a value at or above `2^63` would be read as negative.
+
+Two defects surfaced while verifying it, both fixed. (1) `fold_constants` folded a
+plain `add`/`sub`/`mul` of two constants with wrap semantics on the assumption that
+the checker had already refused an overflowing pair; with the SSA pipeline a
+variable's constant value reaches the folder after that check, so
+`4294967296 * 4294967296` printed `0` under `--ssa`/`--direct-phis` instead of
+trapping E0303. A plain op whose exact result leaves int64 is no longer folded and
+traps at run time on every path. (2) The `uint[32]` multiply's range check now also
+catches the negative wrapped value rather than depending on that trap.
+
+Verification at the close of this stage: `tools/check_uint.py` runs every operator
+(`+ - * % & | ^ << >>` and all six comparisons) at every width over edge-heavy
+values against an exact Python-integer oracle, and every one of its 12,177 cases
+agrees on all four execution paths (interpreter, native, SSA, direct Phi); the
+typed regressions `uint_basic` (CPython-checked: a Fibonacci that crosses `2^63` and
+ends at `F(93)`, `20!`, and Euclid's algorithm with operands above `2^63`) and
+`uint_traps` (hand-derived) pass in every tier; the error-code checks add the
+`E0144` refusals and four byte-identical `E0313` traps.
+
+## 4.15 — modules and the entry point
+
+A program can now be split across `.lio` files, with a fixed entry point:
+`if __name__ == '__main__': ...`. It was built level by level, as requested:
+functions, then classes, then constants.
+
+**No run-time import.** The stage adds no IR, checker or runtime change. A linker in
+the frontend (`link_program`) resolves every import at compile time, parses each
+file once, and merges the files into the single AST `build_program` already
+compiles, so both tiers see an ordinary one-module program and an import costs
+nothing when it runs. Imported symbols are renamed with their module's path
+(`modules__mathlib__square`; a leading underscore in a module name is guarded
+because `_name` is reserved for pointer variables), and calls are rewritten to the
+renamed symbol wherever they appear.
+
+**The entry guard.** `if __name__ == '__main__':` (either operand order, no `else`)
+is the one form. In the program being run its body is spliced in place and runs; in
+an imported file it is dropped, so a library can keep a demo or self-test that never
+runs when imported. `__name__` is not a value and is refused anywhere but exactly
+that guard. A script with no guard is unchanged and runs top to bottom.
+
+**Imports.** `import m`, `import a.b`, `import m.f`, `from m import f` and `as`
+aliases. A dotted name that is a file wins over one that is a member, so
+`import prog1.func1` names the function `func1` of `prog1` unless
+`prog1/func1.lio` exists. A directory is a package; no `__init__` file is needed.
+The search order for a module is the importing file's directory, the directory of
+the program being run (as a script's directory is for Python, so a library in
+`src/` can import a sibling of the entry program), each `-I dir` in order, then each
+`LITHON_PATH` directory. A file is keyed by its real path, so it is parsed and
+linked once however many files import it (a diamond), and an import cycle is
+detected on the import stack and refused with the chain.
+
+**Levels.**
+1. *Functions.* A module's own functions are visible by their source name inside
+   it, by qualified name (`m.f`) or bound name (`f`, `g` for `as g`) in an importer.
+2. *Classes.* A class, struct or enum (all `ClassDef`) is renamed and every place a
+   type is spelled is rewritten: annotations, constructor calls, base lists,
+   `isinstance`, classmethod calls and enum `match` patterns. A subclass in one
+   module of a class in another works, including virtual dispatch across the
+   boundary, because everything is one program with one class table.
+3. *Constants.* A scalar (`int`, `uint`, `float`, `bool`) constant with a literal
+   value is exported through the same machinery as 4.13's module constants: it is
+   renamed, registered in the fold maps and so folds into every use, including a
+   container or string capacity. An earlier integer constant is itself a literal to a
+   later `const`, so `const M: int[64] = m.N` folds. A string, list or other constant
+   is local to its own scope, as every variable is, so it cannot be defined in an
+   imported file.
+
+**An imported file only defines.** Functions, classes, structs, enums, literal
+scalar constants, imports and the guard are allowed; any other top-level statement is
+refused (E0145), because running code on import needs an initialisation order and
+state shared between files. Also refused: `from m import *`, a relative import, an
+import inside a function or block, two imports binding one name, an imported name
+that collides with a definition of the importer, a type function, and a parameter or
+local that reuses a name the module defines or imports (it would otherwise be
+silently rewritten to the import).
+
+**Only what is reachable is linked.** After renaming, the linker walks the merged
+program from everything in the entry file and links an imported function, class or
+constant only if reachable code names it, keeping each module's definitions in
+source order (a base class still precedes its subclasses). A program importing 300
+files of 20 functions each and calling three of them links in about 1.4 s, dominated
+by parsing, and compiles to an IR of exactly those three functions.
+
+Verification at the close of this stage: three typed regressions
+(`modules_functions`, `modules_classes`, `modules_constants`, with fixtures under
+`tests/typed_regression/modules/`) pass in every tier, and the error-code checks add
+twenty module cases that build their multi-file layouts on the fly — fifteen
+refusals (each `E0145`, one `E0143` for a write through an imported constant) and
+nine acceptances run on both tiers, covering a sibling library, a dotted package, a
+library importing a sibling of the entry program, `-I`, `LITHON_PATH`, the guard of
+an imported module not running, a diamond linked once, same-named helpers in two
+modules, a base and subclass in different modules, an imported constant as a
+capacity, and an underscore-named module.
+
+## 4.17 — x86-32
+
+A second native backend for 32-bit hosts, written independently of the x86-64 one.
+
+- **Everything is a pair.** IR temporaries are always 64-bit (a narrow width is only checked at `store`), so even `int[32]` programs do 64-bit arithmetic. Each value and variable is an 8-byte frame slot (low dword at +0), computed in `EAX`/`ECX`/`EDX`.
+- **Conventions.** JIT-to-JIT calls are cdecl: arguments pushed right to left as pairs, caller pops, result in `EDX:EAX`. Host calls are cdecl and use only caller-saved registers. `kStackAlign` is 4 on Win32 and 16 on System V i386; every call pads to it (the System V path has not been executed here).
+- **Same semantics.** Identical `E0303` (add/sub inline with `jno`, checked `mul` through a helper using `__builtin_mul_overflow`), `E0310`, `E0313`, shift-count and zero-divisor messages, the same `INT64_MIN % -1 == 0`, the `E0401` depth guard on the shared `g_call_depth`, and the same print formats.
+- **Floats (4.17.2).** A float is the same 8-byte pair, so loads, stores, calls and returns are unchanged. Arithmetic is inline SSE2 (`addsd`/`subsd`/`mulsd`/`divsd`); an int operand is converted by a helper first. `<`/`>` use `seta` after `ucomisd` (unordered sets CF, so NaN is false), `==` is `sete`+`setnp`, `!=` is `setne`+`setp`. A zero divisor (±0.0) is detected from the bit pattern; `%` is `fmod` normalised to +0.0; `int()` traps `E0309`. Doubles come back from helpers through an out-pointer, not the x87 stack. The 32-bit host must be built `-msse2 -mfpmath=sse`: i686 defaults to x87, whose 80-bit intermediates double-round and would differ in the last bit from the interpreter.
+- **Heap types (4.17.3).** The frame layout of variables, containers, `str`s, dicts and structs comes from the x86-64 `RegisterAllocator` (promotion off), so offsets and strides agree by construction and the print/str/dict descriptors are shared host structs with `EBP` as the base. Element access is `[ebp + idx*scale + disp]` with a per-level bounds check (a 64-bit index is in range exactly when its high dword is 0 and its low dword is below the capacity, unsigned). Dict probing is a host helper with the same hash and linear probe as the inline x86-64 code, so bucket order is identical. Objects keep their 8-byte header and attribute slots (a reference is the low dword of a pair), so the frontend's layout is unchanged. A runtime-called destructor receives one C pointer, so a `$c` thunk widens it to the JIT's argument pair. `try`/`except` is routed exactly as on x86-64 (per-block region snapshots; a trap jumps to its handler). This work found a pre-existing x86-64 bug: a narrow `int` dict value was zero-extended; fixed, with a regression test.
+- **Speed (4.17.5).** Constants that every user can read as an immediate are never stored (reading the slot of one throws, so a missed site is a refusal, not a miscompile); a single-use result is forwarded in `EAX:EDX`/`XMM0`; an integer compare whose only user is the next `Branch` is fused through the flags; checked `*` and `%` have an inline path for sign-extended 32-bit operands (`imul`, `idiv`, divisor `-1` excluded); float constants are read from a pool; parameters are used where the caller pushed them; the call-depth counter is a 32-bit add. Remaining gap: no general register allocator.
+- **Speed, second round (4.17.6).** Trap sites jump out of line (`jcc` to one shared stub per message, or directly to a catching `try` handler), constant shifts are inline `shld`/`shrd`, and the hottest scalar `int` variable (by loop-weighted use count) lives in `EBX:ESI`, saved in the frame and restored before every return. No general allocator yet.
+- **Exported conventions.** `compile_module(m, export_thunks)` adds `<fn>$cdecl`/`$stdcall`/`$fastcall` adapters (cdecl: ST0 for a double result; stdcall: `ret 8n`; fastcall: two int/bool parameters of at most 32 bits in `ECX`/`EDX`). Checked from C with real convention attributes on both targets, sampling `ESP` around each call.
+- **System V i386.** Executed natively as a static 32-bit ELF. A `LITHON_CHECK_ALIGN=1` probe (`int3` unless `ESP` is 16-byte aligned at a call) found a real misalignment in the destructor thunk that glibc never faulted on. `ObjectHeader` is `alignas(8)` with the pointer overlaid on an 8-byte slot so the header is 16 bytes on i386 Linux too. Raw `syscall` is `-ENOSYS` there.
+- **Refusal, not guessing.** A float used as a condition, `Phi` nodes, and the few constructs listed in the README Todo throw at compile time and the caller falls back to the interpreter, as with the x86-64 backend. The x86-64 backend now also refuses inside a 32-bit process; before this it emitted x86-64 code and crashed when run.
+- **Verification.** `tools/check_x86_32_encoding.py` disassembles every encoder form with `objdump` (87 forms). `tools/fuzz_x86_32.py` fuzzes 240 random programs (int, float, mod, bitwise) against the 64-bit interpreter. `tools/check_win64.py` runs the 32-bit `tier_runner` under wine: 55 programs (corpus plus `tests/x86_32`, which covers 64-bit edges, every trap and recursion overflow) compile natively and must equal the 64-bit interpreter in stdout, stderr and exit status; a floor on the native count stops a silent fallback. Breaking the 64-bit compare makes it fail.
+- **Portability fix.** The type checker used `__int128` for the shift range check, which 32-bit targets lack; it now uses a small `Wide` type on every target.
+- **Not done.** No register allocator (every value is memory); heap types and classes (4.17.3); stdcall/fastcall.
+
+## 4.16 — Microsoft x64 ABI (the C boundary)
+
+The JIT now follows the Windows calling convention wherever it meets C code, verified on a real MinGW build run under wine (`tools/check_win64.py`).
+
+- **Shadow space.** Every host call goes through `emit_host_call`, which reserves the 32 bytes the callee may spill into (zero on System V). Seventeen call sites lacked it. JIT-to-JIT calls do not use it.
+- **Callee-saved XMM.** `XMM12`–`XMM15` are scratch for float code but nonvolatile on Windows. A function that uses floats saves and restores them as full 128-bit values (`movups`, since a `movsd` load zeroes the upper half). `RBX`, `RDI`, `RSI`, `R12`–`R15` were already preserved.
+- **Probe.** `src/jit/win64_abi_probe.cpp` loads sentinels into every callee-saved register, calls JIT functions through the Win64 convention and compares them afterwards. Six cases cover float, integer, host-call and mixed-argument functions.
+- **Negative controls.** Disabling the XMM save makes the probe report `xmm12`–`xmm15` clobbered. Disabling the shadow space garbles program output (the suites are built `-O0` so helpers spill into it).
+- **Stack size.** The `E0401` guard (4096 frames) assumes an 8 MiB stack. A Windows executable gets 1–2 MiB, so the Windows interpreter crashed on `tail_recursion.lio`. Windows binaries now link 8 MiB.
+- **Portable executable memory.** `tier_runner` uses `ExecutableBuffer` (`VirtualAlloc` on Windows).
+- **Incidental fixes.** `fold_constants` wrapped overflowing constant `mul`/`add`/`sub` under `--ssa` (now left to trap `E0303`). It also now drops the phi operand of a removed edge. The phi coalescer's stale alias is fixed.
+- **Unchanged.** The internal JIT-to-JIT convention (two register arguments, then the stack). Four positional registers would shrink the Windows temp pool to `RAX` (see Todo 4.16b).
+
+## 6.11 — functions that return a string, and the error display
+
+**Str-returning functions.** `def f(...) -> str[N]` emits no IR function. The pre-pass records it in `STR_FN_DEFS` and validates its parameters (annotated `int`/`uint`/`float`/`bool` only, E0124). At a call site `_str_call_place` expands the body the way a struct method is inlined: locals and parameters are renamed with a per-call prefix (`_MethodSubst`), the result is a fresh `store <prefix>ret : str[N]` (which zeroes it, so a call in a loop starts clean), parameters are bound by annotated declarations, and `return` goes through the method return stack to `_emit_str_return`, which writes a literal byte by byte, or copies a str place with a generated copy (unrolled up to 16 bytes, a counted loop above). The expansion is cached per call node, so a place resolved twice (for example both operands of `==`) runs the body once. The buffer's name is the call's place: `_str_place_name`, `_container_print_arg`, the declaration and assignment paths all accept it. Recursion is refused with the chain, as for methods. A call used as a scalar is refused (E0114) with the list of accepted places. Because it is purely a frontend rewrite, the x86-64, Win32 and System V i386 backends needed no change. Added alongside: `s == "literal"` (the literal goes into a shared run like a `find` needle) and `s = "literal"` on an existing str (the whole-string write a struct field already had).
+
+**Error display.** A refusal is still a `NotImplementedError` whose message starts `LITHON-Exxxx: ...` and is never edited. Every AST node is tagged with its file when `parse_source` parses it (`_lithon_file`), and `parse_source` records the source text and the columns it removed from `const` lines. `build_stmt` and `build_expr` are thin wrappers that attach the position of the node being built to a refusal (`LithonRefusal.loc`; the innermost node wins, a compiler-synthesised node without a real position defers to its parent, a statement is underlined on its first line). Errors raised outside a statement build (layouts, headers) are positioned from the top-level statement being processed. `format_diagnostic` renders code, message (wrapped, nothing dropped), `--> file:line:col`, the source line with a caret under the right columns (UTF-8 byte offsets converted to characters, tabs expanded), the notes, a help line and a docs pointer; colour only on request. An error inside an imported module points into that file. Syntax errors are rendered the same way, and the tokenizer's own failures (an unclosed bracket) are turned into `SyntaxError` instead of a traceback. For the runner's output, `format_runner_errors` drops the legacy `RCR error:` tag, positions a type-checker error from its context (`declaration of 'x'`, `return in 'f'`, `argument n to 'f'`) by looking it up in the parsed trees, and gives a coded runtime trap a help line.  The type checker's range arithmetic is now saturating (it overflowed `int64` on a full-range `int[64]` and printed a nonsense range).
+
+**6.11 follow-up — string parameters, whole-string copies, and positions in the IR.** `INLINE_FN_DEFS` now holds every function that takes *or* returns a `str` (header rules in `_validate_inline_header`: annotated int/uint/float/bool/str parameters; a str, int, float or bool result). A str parameter is bound by an annotated declaration from the argument string, i.e. a copy (`s: str[N] = t`, now supported along with `s = t` and `s = "literal"`), so the callee cannot change the caller's string; a scalar result is carried in a result local like a method's. Each inlined function is expanded once into a scratch builder with placeholder arguments at definition time, so an error in a function that is never called, or recursion, is reported at its definition. Error messages show the programmer's parameter names, not the per-call renamed locals.
+
+*Positions.* `ir::Instr` gained `src`/`line`, `ir::Module` a `sources` table, and the IR text `source N path` plus a trailing ` @N:line` (stripped by the parser before the instruction is read). The frontend tracks the node being built (`cur_pos`, innermost node wins) and writes the suffix only when `build_program(locations=True)` is requested, so the default IR, and the website's committed IR, are unchanged. The type checker's `RCRError` carries the position of `cur_` (the instruction being checked). The interpreter sets `ir::g_cur_pos` before each instruction; native code passes `pack_pos(src, line)` as a second argument to `host_report_error` (x86-64: one more immediate load per trap site; x86-32: one stub per message *and* position), which prints `  --> path:line` after the message exactly as the driver prints it for the interpreter, so stderr stays identical between tiers. `host_report_error` now also terminates a message that was stored without a newline (E0309 and others), which the interpreter always did. `input()` always reports through its error code so a failed read traps at its own site. Verified by running the tier diff, the error-code checks, the typed suite and both 32-bit targets with `LITHON_LOCATIONS=1`.

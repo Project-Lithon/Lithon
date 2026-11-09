@@ -397,17 +397,17 @@ const registersAbi: DocPage = {
     },
     {
       id: "win64",
-      title: "Win64: implemented, unproven",
+      title: "Win64: the C boundary is verified under wine",
       blocks: [
         {
           kind: "p",
-          text: "The path exists behind `#if defined(_WIN32)` and compiles, but the 23-module ABI audit runs on SysV hosts only. Win64 differs where it always differs, 32-byte shadow space, different volatile set (`RAX RCX RDX R8 R9 R10 R11`), `XMM0`–`XMM5` volatile, and none of that has test evidence yet.",
+          text: "The path sits behind `#if defined(_WIN32)`. Since 4.16 every host call reserves the 32-byte shadow space, functions that use floats save and restore `XMM12`–`XMM15` (nonvolatile on Windows, saved whole), and `RBX RDI RSI R12`–`R15` are preserved. `tools/check_win64.py` builds the JIT with MinGW and runs it under wine: a probe loads sentinels into every callee-saved register and checks they survive, and 104 programs run identically on the Windows interpreter and native tier. Disabling either the XMM save or the shadow space makes the check fail. JIT-to-JIT calls keep the internal two-register convention.",
         },
         {
           kind: "note",
           tone: "warn",
-          title: "Treat Win64 as experimental",
-          text: "The [limits page](/docs/limits) lists this as an open gap. It will close with its own audit, not with a claim.",
+          title: "Not yet proven on real Windows",
+          text: "wine is a close approximation, not proof. No native Windows run, MSVC build or unwind data (`.pdata`) exists yet; the [limits page](/docs/limits) tracks these.",
         },
       ],
     },

@@ -1,0 +1,67 @@
+# 4.13. Constants: `const var: type[size] = value`. A constant is assigned
+# exactly once, by its initializer, and every later write is refused (E0143). A
+# scalar with a literal initializer is folded into each read -- including inside
+# functions and in a capacity written as a name (`list[int[64], N]`) -- because
+# an immutable literal is safe to inline. A constant of any other type (a
+# string, a list, a tuple, a dict, an enum) is an ordinary immutable variable.
+#
+# The expected output is CPython's answer for the same program with the `const`
+# keyword removed (and `from __future__ import annotations`).
+
+const N: int[64] = 4
+const STEP: int[8] = 3
+const NEG: int[16] = -7
+const SCALE: float[64] = 2.5
+const ON: bool = True
+const NAME: str[8] = "lithon"
+const PRIMES: list[int[64], 4] = [2, 3, 5, 7]
+const PAIR: tuple[int[64], 2] = (10, 20)
+
+# A constant as a capacity, and as a loop bound.
+xs: list[int[64], N] = [0, 0, 0, 0]
+i: int[64] = 0
+for i in range(N):
+    xs[i] = PRIMES[i] * STEP
+print(xs)
+
+# Folded scalars in expressions, for every scalar kind.
+print(N + STEP)
+print(NEG * 2)
+print(SCALE * 2.0)
+print(ON)
+print(not ON)
+print(N * N - 1)
+
+# Constant strings and containers read like any other.
+print(NAME)
+print(len(NAME))
+print(PRIMES[3] + PAIR[1])
+print(PAIR)
+print(sum(PRIMES))
+
+
+# A module constant is visible inside functions, folded.
+def scaled(a: int[64]) -> int[64]:
+    return a * N + STEP
+
+
+print(scaled(10))
+
+
+# A constant may also be local.
+def local_const() -> int[64]:
+    const LIMIT: int[64] = 5
+    total: int[64] = 0
+    k: int[64] = 0
+    for k in range(LIMIT):
+        total = total + k
+    return total + LIMIT
+
+
+print(local_const())
+
+# A narrow counter may be bounded by a constant that fits it.
+const SMALL: int[8] = 6
+j: int[8] = 0
+for j in range(SMALL):
+    print(j)

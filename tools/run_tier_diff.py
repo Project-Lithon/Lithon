@@ -822,6 +822,8 @@ block0:
 E0306 = "LITHON-E0306: input() expected an integer literal"
 E0307 = "LITHON-E0307: input value does not fit in the target int width"
 E0308 = "LITHON-E0308: input() reached end of input"
+E0311 = "LITHON-E0311: input line is longer than the string it is read into"
+E0312 = "LITHON-E0312: input line contains a NUL byte, which a string cannot hold"
 
 # name -> (ir_text, stdin_text, expected_trap_message_or_None)
 INPUT_PINS = {
@@ -871,6 +873,103 @@ block0:
     call print, %1
     return
 """, "200\n", E0307),
+    # 4.12. str(n, input(prompt)): one whole line into a named str run. n counts
+    # the NUL, so n-1 bytes fit; a longer line traps E0311 and is never
+    # truncated; end of input traps E0308. Both tiers share read_str_line, and
+    # these pin the bytes both write.
+    "input_str_fits": ("""
+function main():
+block0:
+    store k : str[8]
+    inputstr k, 456e7465723a20, 5
+    print_container k : str[8]
+    call print_nl
+    %0 = strlen k
+    call print, %0
+    return
+""", "abcd\n", None),
+    "input_str_empty_line": ("""
+function main():
+block0:
+    store k : str[8]
+    inputstr k, -, 5
+    %0 = strlen k
+    call print, %0
+    return
+""", "\n", None),
+    "input_str_crlf": ("""
+function main():
+block0:
+    store k : str[8]
+    inputstr k, -, 5
+    print_container k : str[8]
+    call print_nl
+    return
+""", "xy\r\n", None),
+    "input_str_no_final_newline": ("""
+function main():
+block0:
+    store k : str[8]
+    inputstr k, -, 5
+    print_container k : str[8]
+    call print_nl
+    return
+""", "end", None),
+    "input_str_overwrites_tail": ("""
+function main():
+block0:
+    store k : str[8]
+    inputstr k, -, 8
+    inputstr k, -, 8
+    %0 = strlen k
+    call print, %0
+    print_container k : str[8]
+    call print_nl
+    return
+""", "abcdefg\nxy\n", None),
+    "input_str_spaces_kept": ("""
+function main():
+block0:
+    store k : str[8]
+    inputstr k, -, 8
+    %0 = strlen k
+    call print, %0
+    return
+""", "  a b \n", None),
+    "input_str_too_long": ("""
+function main():
+block0:
+    store k : str[8]
+    inputstr k, -, 5
+    print_container k : str[8]
+    return
+""", "abcde\n", E0311),
+    # A NUL byte would end a str early and hide what follows, so the line is
+    # refused. It is checked before length: the content is invalid at any limit.
+    "input_str_nul": ("""
+function main():
+block0:
+    store k : str[8]
+    inputstr k, -, 8
+    print_container k : str[8]
+    return
+""", "ab\x00cd\n", E0312),
+    "input_str_nul_beats_length": ("""
+function main():
+block0:
+    store k : str[8]
+    inputstr k, -, 3
+    print_container k : str[8]
+    return
+""", "abcdefg\x00\n", E0312),
+    "input_str_eof": ("""
+function main():
+block0:
+    store k : str[8]
+    inputstr k, -, 5
+    print_container k : str[8]
+    return
+""", "", E0308),
     "input_eof": ("""
 function main():
 block0:

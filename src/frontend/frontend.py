@@ -29,6 +29,9 @@ class Block:
     def __init__(self, label):
         self.label = label
         self.lines = []
+        # The (source index, line) each line came from, parallel to `lines`; None = no position.
+        # Written into the IR only when positions are requested (build_program(locations=True)).
+        self.positions = []
 
 
 class Type:
@@ -106,6 +109,8 @@ class Type:
         """The source-level spelling, including Optional[] where it applies."""
         if self.kind == "class" and self.nullable:
             return f"Optional[{self.ref}]"
+        if self.kind == "uint":
+            return f"uint[{self.width}]"
         return self.render()
 
     def render(self):
@@ -126,6 +131,13 @@ class Type:
         # and both tiers use to agree on the object's declared class.
         if k == "class":
             return f"class[{self.ref}]"
+        # 4.14. A uint[w] has no IR type of its own: the frontend does all of its
+        # typing and range checking, and the IR sees the 64-bit integer that holds
+        # it (an unsigned value is the same bits). So the spelling that reaches
+        # the IR text is int[64], whatever the width; `source()` is the one that
+        # says uint[w] in diagnostics.
+        if k == "uint":
+            return "int[64]"
         return f"{k}[{self.width}]"
 
     def cell_bytes(self):
@@ -407,6 +419,433 @@ _TYPE_FUNC_ACTIVE = []
 # many places that do not thread the class registry.
 CLASS_NAMES = set()
 
+# 4.13. Module-level `const` scalars whose initializer is a literal are
+# compile-time constants visible everywhere -- every function, every annotation.
+# A name -> (kind, width, value) map for folding at a read, and the integer ones
+# again as name -> value for a capacity written as a name (`xs: list[int[64], N]`).
+# Reset by build_program, like CLASS_NAMES.
+GLOBAL_CONSTS = {}
+GLOBAL_CONST_INTS = {}
+
+# 4.14. Free function name -> its declared return Type, for the functions that
+# return a scalar. A call result's uint width is read from here (the callee
+# is a separate compilation unit, so only its header crosses). Reset by
+# build_program.
+FN_RET_TYPES = {}
+# 6.11. Functions declared `-> str[N]`, by source and emitted name. A bounded string is
+# frame storage with no value form, so such a function is never emitted as IR: its body
+# is inlined at each call site into a fresh result buffer (like a method), and the call
+# stands for that buffer wherever a str place is accepted.
+INLINE_FN_DEFS = {}
+
+# 4.14. Builtins that have no meaning for an unsigned value (or whose int
+# semantics would silently misread one): each refuses a uint argument.
+_UINT_REFUSED_BUILTINS = {"abs", "int", "float", "wrap_add", "wrap_sub", "wrap_mul",
+                          "syscall", "valueof"}
+
+_I64_MIN = -9223372036854775808
+_I64_MAX = 9223372036854775807
+
+
+def _const_int_literal(node):
+    """The int value of a literal node (a negated literal counts), or None. The
+    name of an earlier module-level integer constant counts too (4.13/4.15), so
+    `const M: int[64] = m.N` -- an imported constant -- is itself foldable."""
+    if isinstance(node, ast.Name):
+        return GLOBAL_CONST_INTS.get(node.id)
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) \
+            and not isinstance(node.value, bool):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub) \
+            and isinstance(node.operand, ast.Constant) \
+            and isinstance(node.operand.value, int) \
+            and not isinstance(node.operand.value, bool):
+        return -node.operand.value
+    return None
+
+
+def _annotation_int(node):
+    """An integer a type annotation needs at compile time -- a container or
+    string capacity, a dict bucket count: a literal, or the name of a module-level
+    integer `const` (4.13). None when it is neither."""
+    v = _const_int_literal(node)
+    if v is not None:
+        return v
+    if isinstance(node, ast.Name):
+        return GLOBAL_CONST_INTS.get(node.id)
+    return None
+
+
+def _scalar_const_fold(annotation, value):
+    """(kind, width, value) when a `const` is an int/float/bool whose initializer
+    is a literal that fits its declared type, else None (an ordinary immutable
+    variable: no folding)."""
+    try:
+        t = parse_type_annotation(annotation)
+    except NotImplementedError:
+        return None
+    if t.kind == "int":
+        v = _const_int_literal(value)
+        if v is None:
+            return None
+        lo, hi = -(1 << (t.width - 1)), (1 << (t.width - 1)) - 1
+        return ("int", t.width, v) if lo <= v <= hi else None
+    if t.kind == "uint":
+        v = _const_int_literal(value)
+        if v is None or not 0 <= v <= (1 << t.width) - 1:
+            return None
+        return ("uint", t.width, v)
+    if t.kind == "float":
+        if isinstance(value, ast.Constant) and isinstance(value.value, float):
+            return ("float", t.width, value.value)
+        if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.USub) \
+                and isinstance(value.operand, ast.Constant) \
+                and isinstance(value.operand.value, float):
+            return ("float", t.width, -value.operand.value)
+        return None
+    if t.kind == "bool":
+        if isinstance(value, ast.Constant) and isinstance(value.value, bool):
+            return ("bool", -1, value.value)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics. A refusal ("not supported yet", a bad capacity, an unresolved
+# import, ...) is raised as a plain NotImplementedError carrying a self-identifying
+# "LITHON-Exxxx: ..." message. The builder attaches the SOURCE POSITION of the node
+# being built to it (the innermost one wins), and format_diagnostic renders it the
+# way a compiler would: code, message, file:line:col, the source line with a caret
+# underline, a help line and a pointer to the docs. The message text itself is never
+# altered, so every tool that matches on "LITHON-Exxxx" keeps working.
+# ---------------------------------------------------------------------------
+import re as _re
+import textwrap as _textwrap
+
+SOURCE_TEXTS = {}      # filename -> source text, for rendering snippets
+_EMIT_LOCATIONS = False   # write `@source:line` positions into the IR (build_program(locations=True))
+_SOURCE_INDEX = {}        # filename -> its index in the IR's `source` table, in order of first use
+
+
+def _pos_of(node):
+    """(source index, line) of a real source node, else None."""
+    f = getattr(node, "_lithon_file", None)
+    ln = getattr(node, "lineno", None)
+    if f is None or ln is None:
+        return None
+    return (_SOURCE_INDEX.setdefault(f, len(_SOURCE_INDEX)), ln)
+_COL_SHIFT = {}        # filename -> {line: columns parse_source removed from that line}
+_CURRENT_TOP = [None]   # the top-level statement being processed, for refusals raised outside a statement build
+
+_COMPOUND = ("If", "While", "For", "FunctionDef", "ClassDef", "With", "Try", "Match")
+
+
+class LithonRefusal(NotImplementedError):
+    """A refusal that knows where in the source it happened: loc is
+    (file, line, col, end_line, end_col), columns counted in UTF-8 bytes like `ast`."""
+
+    def __init__(self, message, loc=None):
+        super().__init__(message)
+        self.loc = loc
+
+
+def _node_loc(node):
+    f = getattr(node, "_lithon_file", None)
+    ln = getattr(node, "lineno", None)
+    if f is None or ln is None:
+        return None       # a node the compiler synthesised: its parent is the real position
+    return (f, ln, node.col_offset, getattr(node, "end_lineno", ln) or ln,
+            getattr(node, "end_col_offset", node.col_offset + 1) or node.col_offset + 1)
+
+
+def _locate(exc, node):
+    """exc as a LithonRefusal positioned at `node`, or exc unchanged if `node` has no
+    real source position."""
+    loc = _node_loc(node)
+    if loc is None:
+        return exc
+    err = LithonRefusal(str(exc), loc)
+    for note in getattr(exc, "__notes__", []):
+        err.add_note(note)
+    return err
+
+
+class _locating:
+    """`with _locating(node):` -- any refusal raised inside is positioned at `node`."""
+
+    def __init__(self, node):
+        self.node = node
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, et, ev, tb):
+        if et is not None and issubclass(et, NotImplementedError) and not isinstance(ev, LithonRefusal):
+            located = _locate(ev, self.node)
+            if located is not ev:
+                raise located from None
+        return False
+
+
+_HINTS = {
+    "E0101": "reassigning can overflow the declared width; widen the type or compute in a wider variable",
+    "E0111": "a str[N] holds N-1 bytes plus the NUL terminator; a container capacity must be a positive literal",
+    "E0114": "this form is not supported -- the message above says what is accepted instead (the README Todo lists what is planned)",
+    "E0115": "this builtin only has the call shapes listed in the language reference",
+    "E0116": "check the builtin's argument rules in the language reference",
+    "E0117": "only the subscript forms in the language reference are supported here",
+    "E0119": "declare the loop variable first (`i: int[64] = 0`) and do not write to it inside the loop",
+    "E0121": "assign to a single name, an element, or a field",
+    "E0122": "a name has exactly one type; declare it once and keep the type",
+    "E0124": "function headers take annotated scalar parameters; a function returning a str takes scalars only",
+    "E0128": "a struct is storage, not a value: use its fields",
+    "E0135": "check the method name, its argument count and that it is not recursive",
+    "E0140": "check the class rules for instances, constructors and class-typed containers",
+    "E0143": "a `const` needs a type and an initializer and is never assigned again",
+    "E0144": "unsigned values never mix implicitly with signed ones; convert with a literal that fits",
+    "E0145": "check the import path, the search order (-I, LITHON_PATH) and that modules only define things",
+    "E0303": "use wrap_add()/wrap_sub()/wrap_mul() when wrap-around is intended",
+    "E0310": "the divisor or index was zero where a nonzero value is required",
+}
+
+_DOCS_POINTER = "docs/lithon_error_system.md"
+
+
+def _wrap(text, indent, width=96):
+    return _textwrap.fill(text, width=width, subsequent_indent=indent, break_long_words=False,
+                          break_on_hyphens=False)
+
+
+def _paint(on, code, text):
+    return f"\033[{code}m{text}\033[0m" if on else text
+
+
+def _display_path(path):
+    import os
+    try:
+        rel = os.path.relpath(path)
+        return rel if not rel.startswith("..") else path
+    except ValueError:
+        return path
+
+
+def _source_line(path, lineno):
+    text = SOURCE_TEXTS.get(path)
+    if text is None:
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError:
+            return None
+    lines = text.splitlines()
+    return lines[lineno - 1] if 1 <= lineno <= len(lines) else None
+
+
+def _snippet(path, line, col, end_line, end_col, color):
+    """The ` --> file:line:col` header and the source line with a caret underline,
+    laid out like a compiler's: the gutter is as wide as the line number."""
+    shift = _COL_SHIFT.get(path, {}).get(line, 0)
+    num = str(line)
+    pad = " " * len(num)
+    arrow = _paint(color, "1;34", "-->")
+    out = [f"{pad}{arrow} {_display_path(path)}:{line}:{col + shift + 1}"]
+    src = _source_line(path, line)
+    if src is None:
+        return out
+    raw = src.encode("utf-8")
+    pre = raw[:col + shift].decode("utf-8", errors="ignore")
+    end = end_col if end_line == line else len(raw) - shift
+    span = raw[col + shift:max(end, col + 1) + shift].decode("utf-8", errors="ignore")
+    start = len(pre.replace("\t", "    "))
+    width = max(1, len(span.replace("\t", "    ")))
+    bar = _paint(color, "1;34", "|")
+    out.append(f"{pad} {bar}")
+    out.append(f"{_paint(color, '1;34', num)} {bar} {src.replace(chr(9), '    ')}")
+    out.append(f"{pad} {bar} {' ' * start}{_paint(color, '1;31', '^' * width)}")
+    return out
+
+
+def format_diagnostic(exc, color=False):
+    """Renders a refusal (or SyntaxError) for a human. Always contains the original
+    "LITHON-Exxxx" code and message text."""
+    if isinstance(exc, SyntaxError):
+        out = [f"{_paint(color, '1;31', 'error[syntax]')}: {_paint(color, '1', exc.msg or 'invalid syntax')}"]
+        if exc.lineno and exc.filename not in (None, "<unknown>", "<string>"):
+            out += _snippet(exc.filename, exc.lineno, max((exc.offset or 1) - 1, 0), exc.lineno,
+                            max((exc.end_offset or exc.offset or 1) - 1, 1), color)
+        elif exc.lineno and exc.text:
+            num = str(exc.lineno)
+            out.append(f"  {_paint(color, '1;34', '-->')} line {exc.lineno}")
+            out.append(f"  {' ' * len(num)} {_paint(color, '1;34', '|')}")
+            out.append(f"  {_paint(color, '1;34', num)} {_paint(color, '1;34', '|')} {exc.text.rstrip()}")
+            out.append(f"  {' ' * len(num)} {_paint(color, '1;34', '|')} {' ' * max((exc.offset or 1) - 1, 0)}{_paint(color, '1;31', '^')}")
+        return "\n".join(out)
+    msg = str(exc)
+    m = _re.match(r"(LITHON-E\d{4}): ", msg)
+    code = m.group(1) if m else None
+    head = f"error[{code}]" if code else "error"
+    body = msg[m.end():] if m else msg
+    out = [_paint(color, "1;31", head) + ": " + _paint(color, "1", _wrap(body, "    "))]
+    loc = getattr(exc, "loc", None)
+    if loc is not None:
+        out += _snippet(loc[0], loc[1], loc[2], loc[3], loc[4], color)
+    for note in getattr(exc, "__notes__", []):
+        out.append(f"  {_paint(color, '1;34', '= note:')} {note}")
+    if code and code[-5:] in _HINTS:
+        out.append(f"  {_paint(color, '1;36', '= help:')} {_HINTS[code[-5:]]}")
+    if code:
+        out.append(f"  {_paint(color, '1;34', '= docs:')} {_DOCS_POINTER} ({code})")
+    return "\n".join(out)
+
+
+_POS_LINE = _re.compile(r"^\s*--> (.+):(\d+)$")
+
+
+def _line_snippet(path, line, color):
+    """`  --> path:line`, the source line, and a caret under its code (the statement itself:
+    leading blanks and a trailing comment are left out) -- for positions that are a line, not
+    a column, as a runtime trap or a checker error reports."""
+    src = _source_line(path, line)
+    num = str(line)
+    pad = " " * len(num)
+    out = [f"{pad}{_paint(color, '1;34', '-->')} {_display_path(path)}:{line}"]
+    if src is None:
+        return out
+    shown = src.replace("\t", "    ")
+    code = shown.split("#")[0].rstrip() if "#" in shown and not any(q in shown for q in "\"'") else shown.rstrip()
+    start = len(code) - len(code.lstrip())
+    width = max(1, len(code) - start)
+    bar = _paint(color, "1;34", "|")
+    out.append(f"{pad} {bar}")
+    out.append(f"{_paint(color, '1;34', num)} {bar} {shown}")
+    out.append(f"{pad} {bar} {' ' * start}{_paint(color, '1;31', '^' * width)}")
+    return out
+
+
+def format_runner_errors(stderr, color=False):
+    """Renders what the native/interpreter runner printed on stderr when it refused or failed.
+
+    A type-checker message (`RCR error: ...`) and a coded runtime trap (`LITHON-Exxxx: ...`)
+    are each followed by `  --> path:line` when the program was compiled with positions; the
+    report then shows that source line with a caret under it. Messages without a position are
+    still reformatted (no legacy tag, a help line for coded traps). Everything else passes
+    through trimmed."""
+    raw_lines = [ln.rstrip() for ln in stderr.splitlines()]
+    out = []
+    i = 0
+    seen = set()
+    while i < len(raw_lines):
+        line = raw_lines[i].strip()
+        i += 1
+        if not line or line.startswith("[tier"):
+            continue
+        # the position line that follows a message, if any
+        loc = None
+        if i < len(raw_lines):
+            m_pos = _POS_LINE.match(raw_lines[i])
+            if m_pos:
+                loc = (m_pos.group(1), int(m_pos.group(2)))
+                i += 1
+        if line.startswith("[guard]") or line.startswith("[strict]"):
+            out.append(f"{_paint(color, '1;33', 'note')}: {line}")
+            continue
+        if line.startswith("RCR error: "):
+            msg = line[len("RCR error: "):]
+            block = [f"{_paint(color, '1;31', 'error[type]')}: {_paint(color, '1', _wrap(msg, '    '))}"]
+            if loc is not None:
+                # several checker messages about one statement share one snippet
+                block += _line_snippet(loc[0], loc[1], color) if loc not in seen else \
+                    [f"  {_paint(color, '1;34', '= at:')} {_display_path(loc[0])}:{loc[1]} (as above)"]
+                seen.add(loc)
+            out.append("\n".join(block))
+            continue
+        m = _re.match(r"(?:error: )?(LITHON-E\d{4}): (.*)", line)
+        if m:
+            code = m.group(1)
+            block = [f"{_paint(color, '1;31', f'runtime error[{code}]')}: {_paint(color, '1', _wrap(m.group(2), '    '))}"]
+            if loc is not None:
+                block += _line_snippet(loc[0], loc[1], color)
+            if code[-5:] in _HINTS:
+                block.append(f"  {_paint(color, '1;36', '= help:')} {_HINTS[code[-5:]]}")
+            block.append(f"  {_paint(color, '1;34', '= docs:')} {_DOCS_POINTER} ({code})")
+            out.append("\n".join(block))
+            continue
+        if line.startswith("error: "):
+            block = [f"{_paint(color, '1;31', 'runtime error')}: {line[len('error: '):]}"]
+            if loc is not None:
+                block += _line_snippet(loc[0], loc[1], color)
+            out.append("\n".join(block))
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def parse_source(source, filename=None):
+    """Parses a Lithon source into an AST.
+
+    `const var: type[size] = value` is not Python syntax, so the keyword is
+    removed here, with the tokenizer so a string or a comment that happens to
+    contain the word is never touched, and the statement is marked so the
+    builder knows it is a constant. Every line number is preserved. This is the
+    one parse entry point: the frontend's main and the library both use it.
+    """
+    import io
+    import tokenize
+    lines = source.splitlines(keepends=True)
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    except (tokenize.TokenError, IndentationError) as e:
+        # The tokenizer fails before the parser gets a chance to explain: an unclosed
+        # bracket or statement, or bad indentation. Report it as the SyntaxError it is.
+        if isinstance(e, IndentationError):
+            e.filename = filename or "<source>"
+            raise
+        what, (lineno, col) = e.args[0], e.args[1]
+        what = ("unexpected end of file: a bracket, quote or statement was never closed"
+                if "EOF" in what else what)
+        lines_ = source.splitlines()
+        text = lines_[min(lineno, len(lines_)) - 1] if lines_ else ""
+        raise SyntaxError(what, (filename or "<source>", min(lineno, max(len(lines_), 1)),
+                                 len(text) + 1, text)) from None
+    starts = (tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT, tokenize.NL,
+              tokenize.COMMENT)
+    const_lines = set()
+    edits = []
+    prev = None
+    for k, tok in enumerate(toks):
+        at_start = prev is None or prev.type in starts
+        if tok.type == tokenize.NAME and tok.string == "const" and at_start:
+            nxt = toks[k + 1] if k + 1 < len(toks) else None
+            after = toks[k + 2] if k + 2 < len(toks) else None
+            if nxt is not None and nxt.type == tokenize.NAME and nxt.start[0] == tok.start[0]:
+                if after is not None and after.type == tokenize.OP and after.string == ":":
+                    edits.append((tok.start[0], tok.start[1], nxt.start[1]))
+                    const_lines.add(tok.start[0])
+                else:
+                    raise NotImplementedError(
+                        f"LITHON-E0143: `const {nxt.string}` needs a type and a value, "
+                        f"e.g. `const {nxt.string}: int[64] = 10` (4.13)")
+        if tok.type not in (tokenize.COMMENT, tokenize.NL):
+            prev = tok
+        elif tok.type == tokenize.NL:
+            prev = tok
+    fname = filename or "<source>"
+    SOURCE_TEXTS[fname] = source
+    _COL_SHIFT[fname] = {row: end - col for row, col, end in edits}
+    for row, col, end in sorted(edits, reverse=True):
+        text = lines[row - 1]
+        lines[row - 1] = text[:col] + text[end:]
+    try:
+        tree = ast.parse("".join(lines), filename=fname)
+    except SyntaxError as e:
+        e.filename = fname
+        raise
+    for node in ast.walk(tree):
+        node._lithon_file = fname
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AnnAssign) and node.lineno in const_lines:
+            node._lithon_const = True
+    return tree
+
 
 class _TypeSubst(ast.NodeTransformer):
     """Replaces each parameter `Name` in a type-function body with a deep copy of
@@ -639,8 +1078,8 @@ def parse_type_annotation(node, structs=None):
         # type functions are resolved through TYPE_FUNCTIONS.
         if node.id in CLASS_NAMES:
             return Type("class", ref=node.id)
-        if node.id in ("int", "float"):
-            opts = "8, 16, 32 or 64" if node.id == "int" else "64"
+        if node.id in ("int", "uint", "float"):
+            opts = "8, 16, 32 or 64" if node.id in ("int", "uint") else "64"
             raise NotImplementedError(
                 f"LITHON-E0105: {node.id} requires an explicit width -- "
                 f"{node.id} must be {opts}")
@@ -675,16 +1114,16 @@ def parse_type_annotation(node, structs=None):
         # what makes indexing a string reuse the container byte machinery.
         if base == "str":
             size_node = node.slice
-            if not isinstance(size_node, ast.Constant) \
-                    or not isinstance(size_node.value, int) \
-                    or isinstance(size_node.value, bool):
+            str_cap = _annotation_int(size_node)
+            if str_cap is None:
                 raise NotImplementedError(
-                    "LITHON-E0111: str[N] requires a literal integer capacity, e.g. str[16]")
-            if size_node.value <= 0:
+                    "LITHON-E0111: str[N] requires a literal integer capacity (or the name of "
+                    "an integer `const`), e.g. str[16]")
+            if str_cap <= 0:
                 raise NotImplementedError(
-                    f"LITHON-E0111: str capacity must be positive, got {size_node.value}")
-            return Type("str", cap=size_node.value, elem=Type("int", width=8))
-        if base not in ("int", "float"):
+                    f"LITHON-E0111: str capacity must be positive, got {str_cap}")
+            return Type("str", cap=str_cap, elem=Type("int", width=8))
+        if base not in ("int", "uint", "float"):
             raise NotImplementedError(f"LITHON-E0109: unknown type '{base}'")
         size_node = node.slice
         if not isinstance(size_node, ast.Constant) or not isinstance(size_node.value, int):
@@ -698,19 +1137,30 @@ def parse_type_annotation(node, structs=None):
 # E0105 (docs/lithon_error_system.md 4c): only int[8|16|32|64] and float[64]
 # exist. Container capacities and dict bucket counts are not widths and are
 # exempt; this is called on scalar leaves only.
-_SCALAR_WIDTHS = {"int": (8, 16, 32, 64), "float": (64,)}
+_SCALAR_WIDTHS = {"int": (8, 16, 32, 64), "uint": (8, 16, 32, 64), "float": (64,)}
 
 
 def _require_supported_width(base, width):
     allowed = _SCALAR_WIDTHS.get(base)
     if allowed is None or width in allowed:
         return
-    if base == "int":
+    if base in ("int", "uint"):
         raise NotImplementedError(
             f"LITHON-E0105: unsupported integer width {width} -- "
-            "int must be 8, 16, 32 or 64")
+            f"{base} must be 8, 16, 32 or 64")
     raise NotImplementedError(
         f"LITHON-E0105: unsupported float width {width} -- float must be 64")
+
+
+def _has_uint(t):
+    """True when a type contains a uint anywhere (4.14). Unsigned integers are
+    scalars only in this stage: a container element would be stored, loaded and
+    printed as a signed integer, which is wrong for a uint[64] at or above 2^63."""
+    if t is None:
+        return False
+    if t.kind == "uint":
+        return True
+    return _has_uint(t.elem) or _has_uint(t.key)
 
 
 def _has_optional_class(t):
@@ -746,16 +1196,20 @@ def _parse_dict_annotation(slice_node):
             "LITHON-E0111: dict[K, V, N] needs a key type, a value type and a literal bucket "
             "count, e.g. dict[int[64], int[64], 8]")
     key_node, val_node, cap_node = slice_node.elts
-    if not isinstance(cap_node, ast.Constant) or not isinstance(cap_node.value, int) \
-            or isinstance(cap_node.value, bool):
+    dict_cap = _annotation_int(cap_node)
+    if dict_cap is None:
         raise NotImplementedError("LITHON-E0111: dict bucket count must be a literal integer")
-    if cap_node.value <= 0:
+    if dict_cap <= 0:
         raise NotImplementedError(
-            f"LITHON-E0111: dict bucket count must be positive, got {cap_node.value}")
-    if cap_node.value & (cap_node.value - 1):
+            f"LITHON-E0111: dict bucket count must be positive, got {dict_cap}")
+    if dict_cap & (dict_cap - 1):
         raise NotImplementedError(
-            f"LITHON-E0111: dict bucket count must be a power of two, got {cap_node.value}")
+            f"LITHON-E0111: dict bucket count must be a power of two, got {dict_cap}")
     key_t = parse_type_annotation(key_node)
+    if _has_uint(key_t) or _has_uint(parse_type_annotation(val_node)):
+        raise NotImplementedError(
+            "LITHON-E0144: a dict cannot hold a uint yet -- unsigned integers are scalars "
+            "only in this stage (locals, parameters, returns) (4.14)")
     if key_t.is_container() or key_t.kind == "ptr":
         raise NotImplementedError("LITHON-E0112: a dict key cannot itself be a container")
     val_t = parse_type_annotation(val_node)
@@ -774,7 +1228,7 @@ def _parse_dict_annotation(slice_node):
     if val_t.kind == "ptr":
         raise NotImplementedError(
             f"LITHON-E0112: a pointer cannot be a dict value (4.3)")
-    return Type("dict", cap=cap_node.value, elem=val_t, key=key_t)
+    return Type("dict", cap=dict_cap, elem=val_t, key=key_t)
 
 
 def _parse_ptr_annotation(slice_node, structs=None):
@@ -836,12 +1290,16 @@ def _parse_container_annotation(base, slice_node):
             f"LITHON-E0111: {base}[T, N] needs an element type and a literal capacity, "
             f"e.g. {base}[int[64], 4]")
     elem_node, cap_node = slice_node.elts
-    if not isinstance(cap_node, ast.Constant) or not isinstance(cap_node.value, int) \
-            or isinstance(cap_node.value, bool):
-        raise NotImplementedError(f"LITHON-E0111: {base}[T, N] requires a literal integer capacity")
-    if cap_node.value <= 0:
-        raise NotImplementedError(f"LITHON-E0111: {base} capacity must be positive, got {cap_node.value}")
+    seq_cap = _annotation_int(cap_node)
+    if seq_cap is None:
+        raise NotImplementedError(f"LITHON-E0111: {base}[T, N] requires a literal integer capacity (or the name of an integer `const`)")
+    if seq_cap <= 0:
+        raise NotImplementedError(f"LITHON-E0111: {base} capacity must be positive, got {seq_cap}")
     elem_t = parse_type_annotation(elem_node)
+    if _has_uint(elem_t):
+        raise NotImplementedError(
+            f"LITHON-E0144: a {base} cannot hold a uint yet -- unsigned integers are scalars "
+            f"only in this stage (locals, parameters, returns) (4.14)")
     if _has_optional_class(elem_t):
         raise NotImplementedError(
             f"LITHON-E0142: {base} cannot carry an Optional class reference yet; "
@@ -855,7 +1313,7 @@ def _parse_container_annotation(base, slice_node):
             raise NotImplementedError(
                 f"LITHON-E0112: a dict cannot be an element of {base}; a nested "
                 f"dict has no flat scalar leaf to lay out (4.1)")
-    return Type(base, cap=cap_node.value, elem=elem_t)
+    return Type(base, cap=seq_cap, elem=elem_t)
 
 
 # The synthesized module-level entry point is called `__main__`, which
@@ -2200,6 +2658,7 @@ def build_type_functions(tree):
     """
     registry = {}
     for stmt in tree.body:
+        _CURRENT_TOP[0] = stmt
         if _is_type_function_def(stmt):
             _validate_type_function(stmt, registry)
     return registry
@@ -2224,6 +2683,7 @@ def build_type_registry(tree):
     classes = {}
     method_slots = {}   # method name -> GLOBAL vtable index (4.10.4)
     for stmt in tree.body:
+        _CURRENT_TOP[0] = stmt
         if not isinstance(stmt, ast.ClassDef):
             continue
         bases = stmt.bases
@@ -2435,7 +2895,10 @@ class IRBuilder:
         # the inline stack, which is what catches recursion. `inline_counter`
         # gives each call site a unique prefix so its generated locals cannot
         # collide with the caller's.
+        self.cur_pos = None            # (source index, line) of the node being built, for IR positions
         self.method_return_stack = []
+        self._str_call_cache = {}      # 6.11: id(call node) -> its result buffer's name
+        self._strcp_counter = 0
         self.inline_active = []
         # 4.10.2. The classes whose method bodies are currently being inlined,
         # innermost last. `super()` reads the top to find the base to start from;
@@ -2448,6 +2911,15 @@ class IRBuilder:
         # be guaranteed not to collide with anything the programmer did write --
         # see _fresh_loop_counter.
         self.loop_counters = set()
+        # 4.11. The names a live `for` is assigning (its counter and, for
+        # enumerate/zip, its element targets). Assigning to one inside the body
+        # would change the iteration count, so it is refused.
+        self.active_loop_targets = []
+        # 4.13. Names declared `const` in this scope (immutable), and the subset
+        # that are scalars with a literal initializer, folded at every read.
+        self.const_vars = set()
+        self.const_values = {}
+        self._const_decl_node = None   # the `const` declaration being built right now
         # Phase 6.7. The run-time length field. A list is a fixed-capacity run
         # of leaves, but it also carries a companion `int[64]` variable (named
         # `<list>.__len`) holding HOW MANY of those slots are live. Declaring a
@@ -2539,6 +3011,7 @@ class IRBuilder:
         `xs[0]`), which is exactly the kind of silent None-as-value conversion
         4.10.7 is replacing with a refusal.
         """
+        self._refuse_uint64_use(node, "an index")
         reg = self.build_expr(node)
         self._reject_optional_use(reg, "an index")
         return reg
@@ -2633,6 +3106,7 @@ class IRBuilder:
         if self.terminated:
             return
         self.current.lines.append(f"    {line}")
+        self.current.positions.append(self.cur_pos)
         stripped = line.strip()
         self.note_terminator_targets(stripped)
         if stripped.startswith("jump ") or stripped.startswith("branch ") \
@@ -2643,7 +3117,14 @@ class IRBuilder:
         """The integer value of a literal expression node, or None. Used by
         pointer arithmetic to consume an offset from source text before the IR
         sees a raw count. A negated literal counts (Python parses `-1` as
-        UnaryOp(USub, 1)); any other shape is not a literal."""
+        UnaryOp(USub, 1)); any other shape is not a literal. 4.13: the name of an
+        integer `const` with a literal initializer is one too, so a constant can
+        be a range bound, a string limit or a pointer offset."""
+        if isinstance(node, ast.Name):
+            fold = self._const_fold(node.id)
+            if fold is not None and fold[0] in ("int", "uint"):
+                return fold[2]
+            return None
         if isinstance(node, ast.Constant) and isinstance(node.value, int) \
                 and not isinstance(node.value, bool):
             return node.value
@@ -2875,7 +3356,58 @@ class IRBuilder:
                 f"capacity, e.g. `{name}: list[int[64], 8]`")
         return name, self.declared[name]
 
+    def _unsupported_expression_message(self, node):
+        """A specific refusal for an expression the builder has no lowering for, instead of
+        naming the Python AST node. A string literal is the common case: a bounded string
+        is storage with no value form, so it appears where a string is accepted, not as a
+        value."""
+        if isinstance(node, ast.Constant):
+            v = node.value
+            if isinstance(v, str):
+                return ("LITHON-E0114: a string literal is not a value here; it can be printed, "
+                        "compared with `==`, used as the needle of `find`/`count`, stored with "
+                        "`s: str[N] = \"...\"`, or returned from a function declared "
+                        "`-> str[N]`")
+            if v is None:
+                return ("LITHON-E0114: `None` is only an Optional class value (`x: Optional[C]`); "
+                        "it has no other meaning in Lithon")
+            if isinstance(v, bytes):
+                return "LITHON-E0114: bytes literals are not supported; a str[N] holds the UTF-8 bytes"
+            if isinstance(v, complex):
+                return "LITHON-E0114: complex numbers are not supported; use two float[64] values"
+            if v is Ellipsis:
+                return "LITHON-E0114: `...` is not supported"
+        friendly = {
+            "Lambda": "lambda expressions", "ListComp": "list comprehensions",
+            "SetComp": "set comprehensions", "DictComp": "dict comprehensions",
+            "GeneratorExp": "generator expressions", "Set": "set literals",
+            "Starred": "starred expressions (`*x`)", "Await": "`await`", "Yield": "`yield`",
+            "YieldFrom": "`yield from`", "NamedExpr": "the walrus operator (`:=`)",
+            "Slice": "slices (`xs[a:b]`)", "JoinedStr": "f-strings as values (they can only be printed)",
+            "FormattedValue": "f-string fields outside `print`", "IfExp": "this conditional expression",
+        }
+        name = type(node).__name__
+        what = friendly.get(name, f"`{name}` expressions")
+        return f"LITHON-E0114: {what}: not supported yet"
+
     def build_expr(self, node):
+        prev_pos = self.cur_pos
+        pos = _pos_of(node)
+        if pos is not None:
+            self.cur_pos = pos
+        try:
+            return self._build_expr_raw(node)
+        except LithonRefusal:
+            raise
+        except NotImplementedError as e:
+            located = _locate(e, node)
+            if located is e:
+                raise
+            raise located from None
+        finally:
+            self.cur_pos = prev_pos
+
+    def _build_expr_raw(self, node):
         if isinstance(node, ast.Constant) and isinstance(node.value, bool):
             r = self.new_reg()
             self.emit(f"{r} = const_bool {1 if node.value else 0}")
@@ -2902,6 +3434,22 @@ class IRBuilder:
             return r
 
         if isinstance(node, ast.Name):
+            # 4.13. A scalar constant with a literal initializer is its value.
+            fold = self._const_fold(node.id)
+            if fold is not None:
+                r = self.new_reg()
+                kind, _w, value = fold
+                if kind == "bool":
+                    self.emit(f"{r} = const_bool {1 if value else 0}")
+                elif kind == "float":
+                    self.emit(f"{r} = const_f64 {value}")
+                elif kind == "uint":
+                    # 4.14. An unsigned constant is its 64-bit pattern.
+                    self.emit(f"{r} = const_i64 "
+                              f"{value - (1 << 64) if value > _I64_MAX else value}")
+                else:
+                    self.emit(f"{r} = const_i64 {value}")
+                return r
             # 4.6. A struct variable is storage, not a value: it has no value to
             # load and nothing that could consume one. Reading it as a whole
             # (print(s), s + 1, passing it to a function) is refused here, where
@@ -2957,6 +3505,12 @@ class IRBuilder:
             return r
 
         if isinstance(node, ast.BinOp):
+            # 4.14. Any unsigned operand makes this an unsigned operation, with
+            # its own lowering and its own mixing rules.
+            lw = self._peek_uint_width(node.left)
+            rw = self._peek_uint_width(node.right)
+            if lw is not None or rw is not None:
+                return self._build_uint_binop(node, lw, rw)
             op_type = type(node.op)
             op_map = BITWISE_OPS if op_type in BITWISE_OPS else BINARY_OPS
             if op_type not in op_map:
@@ -3047,6 +3601,12 @@ class IRBuilder:
                     op_type is ast.In,
                     node.left,
                     node.comparators[0])
+            # 4.14. A comparison with an unsigned side is an unsigned comparison.
+            if op_type in (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE):
+                clw = self._peek_uint_width(node.left)
+                crw = self._peek_uint_width(node.comparators[0])
+                if clw is not None or crw is not None:
+                    return self._build_uint_compare(node, op_type, clw, crw)
             # 4.10.5. A class reference with an equality/ordering special
             # method dispatches to that method. `is`/`is not` are deliberately
             # absent from this set: they stay pointer identity.
@@ -3063,6 +3623,16 @@ class IRBuilder:
             if op_type is ast.Eq or op_type is ast.NotEq:
                 ln = self._str_place_name(node.left)
                 rn = self._str_place_name(node.comparators[0])
+                # 6.11. A string place against a string literal: the literal is put
+                # in its own run (the way `find`/`count` take a literal needle) and the
+                # two runs are compared. The place is resolved first, so a call is
+                # expanded once, in source order.
+                if ln is not None and rn is None and isinstance(node.comparators[0], ast.Constant) \
+                        and isinstance(node.comparators[0].value, str):
+                    rn, _cap = self._materialize_str_literal(node.comparators[0].value)
+                elif rn is not None and ln is None and isinstance(node.left, ast.Constant) \
+                        and isinstance(node.left.value, str):
+                    ln, _cap = self._materialize_str_literal(node.left.value)
                 if ln is not None and rn is not None:
                     r = self.new_reg()
                     self.emit(f"{r} = {'streq' if op_type is ast.Eq else 'strne'} "
@@ -3160,6 +3730,8 @@ class IRBuilder:
                     r = self.new_reg()
                     self.emit(f"{r} = const_f64 {-inner.value!r}")
                     return r
+            if self._peek_uint_width(inner) is not None:
+                self._u_err("an unsigned integer cannot be negated")
             operand = self.build_expr(inner)
             self._reject_optional_use(operand, "unary minus")
             zero = self.new_reg()
@@ -3237,6 +3809,9 @@ class IRBuilder:
                 return r
             if not isinstance(node.func, ast.Name):
                 raise NotImplementedError("LITHON-E0115: only direct name calls are supported")
+            if node.func.id in _UINT_REFUSED_BUILTINS:
+                for a in node.args:
+                    self._refuse_uint_value(a, f"{node.func.id}()")
             if node.func.id == "print":
                 raise NotImplementedError("LITHON-E0115: print() is a statement in this slice, not an expression")
             # 4.10.2. isinstance(x, C) / issubclass(A, B). Both name classes as
@@ -3249,6 +3824,16 @@ class IRBuilder:
                 return self._build_issubclass(node)
             if node.func.id in ("sum", "min", "max", "any", "all"):
                 return self._build_reduction(node.func.id, node)
+            if node.func.id == "str":
+                # 4.12. `str(n, input(...))` is the only use of `str(...)`, and it
+                # is handled where a string is written (a declaration or an
+                # assignment); reaching here means it was used as a value.
+                self._str_input_form(node)
+                raise NotImplementedError(
+                    "LITHON-E0115: `str(n, input(...))` reads a line INTO a string, so it "
+                    "is only valid as the initializer of a `str[N]` declaration or the "
+                    "right-hand side of an assignment to a `str[N]` variable, e.g. "
+                    "`k: str[16] = str(10, input(\"Name: \"))`")
             if node.func.id == "abs":
                 # 6.1. Scalar, unlike the others: abs() is a question about one
                 # value, not a walk over N. It lowers to the same diamond as an
@@ -3360,6 +3945,13 @@ class IRBuilder:
                         "LITHON-E0116: addressof() takes exactly one plain variable, e.g. "
                         "addressof(x) (4.4)")
                 name = node.args[0].id
+                if self._is_const_name(name):
+                    raise NotImplementedError(
+                        f"LITHON-E0143: cannot take the address of constant '{name}' -- a "
+                        f"pointer could write through it (4.13)")
+                if self._peek_uint_width(node.args[0]) is not None:
+                    self._u_err(f"cannot take the address of the uint '{name}' yet -- pointers "
+                                f"to unsigned integers are not supported in this stage")
                 if name in self.struct_vars:
                     # 4.4, second half. A struct is storage, and its bytes ARE
                     # its addressable run -- there is no separate box to point
@@ -3492,12 +4084,33 @@ class IRBuilder:
             alias_class = self._cls_alias_class(node.func.id)
             if alias_class is not None:
                 return self._build_class_construction(alias_class, node)
+            if node.func.id in INLINE_FN_DEFS and node.func.id not in self.declared \
+                    and not self._inline_returns_str(INLINE_FN_DEFS[node.func.id]):
+                inl = self._inline_scalar_call(node)
+                if inl is None:
+                    # a function that returns nothing: its value is unused
+                    return self.new_reg()
+                return inl
+            if node.func.id in INLINE_FN_DEFS and node.func.id not in self.declared:
+                raise NotImplementedError(
+                    f"LITHON-E0114: '{node.func.id}' returns a str, which has no scalar value; "
+                    f"use the call where a string is accepted -- `print({node.func.id}(...))`, "
+                    f"`{node.func.id}(...) == \"...\"`, `len({node.func.id}(...))`, "
+                    f"`s: str[N] = {node.func.id}(...)` or `s = {node.func.id}(...)` (6.11)")
             callee = self.fn_rename.get(node.func.id, node.func.id)
             param_types = (self.fn_param_types.get(callee)
                            or self.fn_param_types.get(node.func.id) or [])
             arg_regs = []
             for i, arg in enumerate(node.args):
-                arg_reg = self.build_expr(arg)
+                pt = param_types[i] if i < len(param_types) else None
+                if pt is not None and pt.kind == "uint":
+                    # 4.14. A uint parameter takes a literal that fits or a uint
+                    # no wider.
+                    arg_reg = self._uint_value_reg(
+                        arg, pt.width, f"argument {i + 1} of '{node.func.id}'")
+                else:
+                    self._refuse_uint_into(arg, pt, f"argument {i + 1} of '{node.func.id}'")
+                    arg_reg = self.build_expr(arg)
                 if i < len(param_types):
                     arg_reg = self._prepare_free_arg(
                         arg_reg, param_types[i], node.func.id)
@@ -3621,6 +4234,8 @@ class IRBuilder:
             # the dominance-frontier analysis sees as one Phi at the join.
             # Nothing is forced through a stack slot it did not already need:
             # the same shape is what a source-level merge would produce.
+            self._refuse_uint_value(node.body, "an if-expression arm")
+            self._refuse_uint_value(node.orelse, "an if-expression arm")
             cond_reg = self.build_expr(node.test)
             self._reject_optional_use(cond_reg, "an if-expression condition")
             temp = f"{IF_EXPR_TEMP}{self.ifexpr_counter}"
@@ -3682,7 +4297,7 @@ class IRBuilder:
             self.emit(f"{r} = fieldload {var}, {offset}{render_type_suffix(kind, width)}")
             return r
 
-        raise NotImplementedError(f"LITHON-E0114: expression node {type(node).__name__} not supported yet")
+        raise NotImplementedError(self._unsupported_expression_message(node))
 
     def _resolve_ptr_field(self, node):
         """`valueof(_p).field` -- a field read THROUGH a pointer.
@@ -4466,6 +5081,12 @@ class IRBuilder:
         # A scalar (int/float/bool) parameter: an ordinary annotated store, with
         # no reference to own.
         decl = parse_type_annotation(annotation)
+        if decl.kind == "uint":
+            raise NotImplementedError(
+                f"LITHON-E0144: parameter '{name}' of a method cannot be a uint yet -- "
+                f"unsigned integers are scalars in locals, free-function parameters and "
+                f"returns only in this stage (4.14)")
+        self._refuse_uint_value(value_node, f"parameter '{name}'")
         self.declared[name] = decl
         value_reg = self.build_expr(value_node)
         self._reject_optional_use(value_reg, f"parameter '{name}'")
@@ -5495,6 +6116,7 @@ class IRBuilder:
                 raise NotImplementedError(
                     f"LITHON-E0130: variant '{enum_name}.{variant['name']}' takes exactly one "
                     f"payload value (4.7)")
+            self._refuse_uint_value(call.args[0], f"enum payload '{enum_name}.{variant['name']}'")
             val_reg = self.build_expr(call.args[0])
             self._reject_optional_use(
                 val_reg, f"enum payload '{enum_name}.{variant['name']}'")
@@ -5536,6 +6158,7 @@ class IRBuilder:
                     f"LITHON-E0130: construction of variant '{enum_name}.{variant['name']}' is "
                     f"missing field(s) {', '.join(missing)} (4.7)")
         for field_name, field in fields.items():
+            self._refuse_uint_value(supplied[field_name], f"payload field '{field_name}'")
             val_reg = self.build_expr(supplied[field_name])
             self._reject_optional_use(
                 val_reg,
@@ -5864,6 +6487,7 @@ class IRBuilder:
 
         target_else = else_label if else_label else merge_label
         branch_block.lines.append(f"    branch {cond_reg}, {then_label}, {target_else}")
+        branch_block.positions.append(self.cur_pos)
         self.note_terminator_targets(f"branch {cond_reg}, {then_label}, {target_else}")
         self.terminated = True
 
@@ -6019,7 +6643,13 @@ class IRBuilder:
         6.2. A `str[N]` field is the second place a whole bounded string can be
         printed (`print(s.f)`): it is named by its companion run, whose capacity
         is the field's own.
+
+        6.11. A call to a function returning a str is the third: it is expanded in
+        place and its result buffer is the string that prints.
         """
+        via_call = self._str_call_place(arg)
+        if via_call is not None:
+            return via_call, self.declared[via_call]
         if isinstance(arg, ast.Name):
             decl = self.declared.get(arg.id)
             if decl is not None and decl.kind in ("list", "tuple", "dict", "str"):
@@ -6238,6 +6868,9 @@ class IRBuilder:
         decl = self.declared.get(arg_reg)
         if decl is not None and decl.kind in ("list", "tuple"):
             return ("container", arg_reg, decl)
+        if self._peek_uint_width(arg) == 64:
+            # 4.14. A uint[64] at or above 2^63 must print unsigned.
+            return ("ureg", arg_reg)
         return ("reg", arg_reg)
 
     def _print_place(self, place):
@@ -6257,7 +6890,7 @@ class IRBuilder:
                 return
             self.emit(f"print_container {value}{render_type_suffix(decl)}")
             return
-        self.emit(f"call print_bare, {value}")
+        self.emit(f"call {'print_bare_u' if kind == 'ureg' else 'print_bare'}, {value}")
 
     def _emit_print_fstring(self, node):
         """A `JoinedStr`: literal chunks verbatim, `{expr}` via the value path.
@@ -6435,6 +7068,7 @@ class IRBuilder:
         len_name = self._list_len_name(name)
         idx = self.new_reg()
         self.emit(f"{idx} = load {len_name}")
+        self._refuse_uint_value(call.args[0], f"append() on '{name}'")
         val = self.build_expr(call.args[0])
         self._reject_optional_use(val, f"append() on '{name}'")
         # The bounds check on a runtime index traps "list index out of range"
@@ -6676,9 +7310,83 @@ class IRBuilder:
             acc = nxt
         return acc
 
+    def _range_target_type(self, name, args):
+        """The declared type of a `for <name> in range(...)` target.
+
+        The loop assigns the target 0, 1, 2, ...; it does not create it. The
+        programmer has to have declared it as an `int[w]` first (`i: int[8]`,
+        with or without an initializer), so the loop variable has a type the
+        programmer chose rather than one invented here. A name that was never
+        declared, or declared as anything but an int, is refused.
+
+        The loop keeps the DECLARED width. For an int[64] counter any bounds and
+        step are fine. For a narrower one every bound must be provably inside the
+        width (a literal that fits, or an int variable no wider than the counter)
+        and a stepped range is refused, because the checker cannot prove its
+        increment stays in range.
+        """
+        decl = self.declared.get(name)
+        if decl is None:
+            raise NotImplementedError(
+                f"LITHON-E0119: loop variable '{name}' is not declared. `for {name} in "
+                f"range(...)` assigns an existing integer variable, it does not create "
+                f"one -- declare it first, e.g. `{name}: int[64]` (4.11)")
+        if decl.kind != "int":
+            raise NotImplementedError(
+                f"LITHON-E0119: loop variable '{name}' is declared "
+                f"{render_type_suffix(decl).lstrip(' :')}, but a `range` loop counts an "
+                f"integer -- declare it as an int[w] (4.11)")
+        if decl.width >= 64:
+            return decl
+        # A narrower counter. The checker proves a narrow store fits by interval
+        # arithmetic and exempts exactly one pattern, the canonical `i = i + 1`
+        # latch; a 1/2-argument loop ends by storing its LIMIT, so the counter
+        # is sound precisely when every bound already fits int[w]. A bound that
+        # cannot be shown to fit is refused rather than left to wrap.
+        lo = -(1 << (decl.width - 1))
+        hi = (1 << (decl.width - 1)) - 1
+        if len(args) == 3:
+            raise NotImplementedError(
+                f"LITHON-E0119: loop variable '{name}' is int[{decl.width}], and a "
+                f"stepped `range(a, b, step)` needs an int[64] loop variable -- its "
+                f"increment cannot be proven to stay inside int[{decl.width}] (4.11)")
+        for a in args:
+            v = self.literal_int(a)
+            if v is not None:
+                if not lo <= v <= hi:
+                    raise NotImplementedError(
+                        f"LITHON-E0119: loop variable '{name}' is int[{decl.width}] "
+                        f"(valid range {lo}..{hi}) but this range uses {v}; declare "
+                        f"it wider (4.11)")
+                continue
+            bound = self.declared.get(a.id) if isinstance(a, ast.Name) else None
+            if bound is None or bound.kind != "int" or bound.width > decl.width:
+                raise NotImplementedError(
+                    f"LITHON-E0119: loop variable '{name}' is int[{decl.width}], so each "
+                    f"range bound must be a literal that fits or an int variable no wider "
+                    f"than int[{decl.width}]; this bound cannot be proven to fit -- "
+                    f"declare '{name}' as int[64] (4.11)")
+        return decl
+
     def build_for(self, node):
         if node.orelse:
             raise NotImplementedError("LITHON-E0118: for/else is not supported (the else clause would be silently dropped)")
+        names = ([node.target.id] if isinstance(node.target, ast.Name) else
+                 [e.id for e in getattr(node.target, "elts", [])
+                  if isinstance(e, ast.Name)])
+        for n in names:
+            if self._is_const_name(n):
+                raise NotImplementedError(
+                    f"LITHON-E0143: '{n}' is a constant and cannot be a `for` target -- the "
+                    f"loop assigns it every iteration (4.13)")
+        if self.active_loop_targets:
+            live = set().union(*self.active_loop_targets)
+            for n in names:
+                if n in live:
+                    raise NotImplementedError(
+                        f"LITHON-E0119: '{n}' is already the target of an enclosing `for` "
+                        f"loop; an inner loop cannot reuse it -- declare another variable "
+                        f"(4.11)")
         # 4.10.7. Like while, a for loop may run zero times, so no optional
         # narrowing or assignment inside its body is a fact after the loop.
         nonnull_before = set(self.nonnull_vars)
@@ -6693,6 +7401,14 @@ class IRBuilder:
                      else None)
         if iter_name in ("enumerate", "zip"):
             loop_var, args, binds = self._plan_iteration_helper(iter_name, node)
+            # 4.11. The enumerate index is the user's own counter and every
+            # element target is the user's own variable: all of them must be
+            # declared and hold a value, exactly like a `range` target. A zip
+            # counter is generated, so it is exempt.
+            if iter_name == "enumerate":
+                loop_type = self._range_target_type(loop_var, args)
+            for elem_name, container in binds:
+                self._require_element_target(elem_name, container, iter_name)
         else:
             if not isinstance(node.target, ast.Name):
                 raise NotImplementedError("LITHON-E0119: only a single name for-target is supported")
@@ -6704,7 +7420,13 @@ class IRBuilder:
             loop_var = node.target.id
             if len(args) not in (1, 2, 3):
                 raise NotImplementedError("LITHON-E0119: range takes 1, 2, or 3 arguments")
-        # For now, all int[64] as per decision (user said i:int[64])
+            loop_type = self._range_target_type(loop_var, args)
+        # An enumerate/zip counter is generated (or an index the helper binds),
+        # so it stays int[64]; a `range` target is the user's own declared int.
+        loop_suffix = (render_type_suffix(loop_type) if iter_name != "zip"
+                       else " : int[64]")
+        for bound_node in args:
+            self._refuse_uint64_use(bound_node, "a range bound")
         start_reg = None
         limit_reg = None
         step_reg = None
@@ -6744,22 +7466,34 @@ class IRBuilder:
         # in none of the name collections -- record it so a later generated
         # counter (6.1 zip) cannot collide with it.
         self.loop_counters.add(loop_var)
-        self.emit("store " + loop_var + ", " + start_reg + " : int[64]")
+        if iter_name != "zip":
+            # V1_SPEC 0.6.6: a loop target carries a starting value before the
+            # loop. Reading it here lets the checker's definite-assignment pass
+            # (0.6.10) refuse a declaration-only target on any path where no
+            # value has been stored; the load itself is dead and costs nothing.
+            self.emit(f"{self.new_reg()} = load {loop_var}")
+        for elem_name, _container in binds:
+            self.emit(f"{self.new_reg()} = load {elem_name}")
 
         body_label = self.reserve_label()
         exit_label = self.reserve_label()
         latch_label = self.reserve_label()
+        init_label = self.reserve_label()
+        # The counter is stored only once the loop is known to run, so a loop
+        # that never runs leaves it untouched, and it is advanced only when
+        # another iteration follows, so it ends on the last value produced --
+        # both exactly as CPython does.
+        self.active_loop_targets.append(
+            {loop_var} | {name for name, _ in binds})
 
         if len(args) in (1, 2):
-            header_label = self.reserve_label()
-            self.emit(f"jump {header_label}")
+            pre_test = self.new_reg()
+            self.emit(f"{pre_test} = lt {start_reg}, {limit_reg}")
+            self.emit(f"branch {pre_test}, {init_label}, {exit_label}")
 
-            self.start_block(header_label)
-            i_reg = self.new_reg()
-            self.emit(f"{i_reg} = load {loop_var}")
-            cond_reg = self.new_reg()
-            self.emit(f"{cond_reg} = lt {i_reg}, {limit_reg}")
-            self.emit(f"branch {cond_reg}, {body_label}, {exit_label}")
+            self.start_block(init_label)
+            self.emit("store " + loop_var + ", " + start_reg + loop_suffix)
+            self.emit(f"jump {body_label}")
 
             self.start_block(body_label)
             # Phase 6.1: bind the element(s) before the body runs, which is what
@@ -6772,8 +7506,6 @@ class IRBuilder:
                 for elem_name, container in binds:
                     kind, width, elem_kind, elem_width = \
                         self.declared[container][:4]
-                    self._bind_target(elem_name, elem_kind, elem_width,
-                                     "enumerate" if len(binds) == 1 else "zip")
                     er = self.new_reg()
                     self.emit(f"{er} = Index {container}, {cur}")
                     self.emit(f"store {elem_name}, {er}"
@@ -6796,16 +7528,33 @@ class IRBuilder:
             self.loop_stack.pop()
             self.emit(f"jump {latch_label}")
 
+            # Bottom test: step only if the NEXT value is still inside the range.
+            # `i + 1 < limit` is computed in int64 and never stored, so it cannot
+            # overflow a narrow counter; the store below is the canonical
+            # `i = i + 1` increment the checker already exempts.
             self.start_block(latch_label)
             i_reg2 = self.new_reg()
             self.emit(f"{i_reg2} = load {loop_var}")
             one_reg = self.new_reg()
             self.emit(f"{one_reg} = const_i64 1")
-            inc_reg = self.new_reg()
-            self.emit(f"{inc_reg} = add {i_reg2}, {one_reg}")
-            self.emit(f"store {loop_var}, {inc_reg}")
-            self.emit(f"jump {header_label}")
+            nxt_reg = self.new_reg()
+            self.emit(f"{nxt_reg} = add {i_reg2}, {one_reg}")
+            more = self.new_reg()
+            self.emit(f"{more} = lt {nxt_reg}, {limit_reg}")
+            inc_label = self.reserve_label()
+            self.emit(f"branch {more}, {inc_label}, {exit_label}")
 
+            self.start_block(inc_label)
+            i_reg3 = self.new_reg()
+            self.emit(f"{i_reg3} = load {loop_var}")
+            one_reg2 = self.new_reg()
+            self.emit(f"{one_reg2} = const_i64 1")
+            inc_reg = self.new_reg()
+            self.emit(f"{inc_reg} = add {i_reg3}, {one_reg2}")
+            self.emit(f"store {loop_var}, {inc_reg}")
+            self.emit(f"jump {body_label}")
+
+            self.active_loop_targets.pop()
             self.nonnull_vars = set(nonnull_before)
             self.start_block(exit_label)
             return
@@ -6829,12 +7578,16 @@ class IRBuilder:
         self.start_block(pre_pos)
         pc = self.new_reg()
         self.emit(f"{pc} = lt {start_reg}, {limit_reg}")
-        self.emit(f"branch {pc}, {body_label}, {exit_label}")
+        self.emit(f"branch {pc}, {init_label}, {exit_label}")
 
         self.start_block(pre_neg)
         nc = self.new_reg()
         self.emit(f"{nc} = gt {start_reg}, {limit_reg}")
-        self.emit(f"branch {nc}, {body_label}, {exit_label}")
+        self.emit(f"branch {nc}, {init_label}, {exit_label}")
+
+        self.start_block(init_label)
+        self.emit("store " + loop_var + ", " + start_reg + loop_suffix)
+        self.emit(f"jump {body_label}")
 
         self.start_block(body_label)
         self.loop_stack.append((latch_label, exit_label))
@@ -6897,6 +7650,7 @@ class IRBuilder:
         self.emit(f"store {loop_var}, {ni}")
         self.emit(f"jump {body_label}")
 
+        self.active_loop_targets.pop()
         self.nonnull_vars = set(nonnull_before)
         self.start_block(exit_label)
 
@@ -7002,6 +7756,7 @@ class IRBuilder:
                 else:
                     self.emit(f"IndexStore {name}, {', '.join(chain)}, {val_reg}")
                 continue
+            self._refuse_uint_value(elt, f"element {i} of `{name}`")
             val_reg = self.build_expr(elt)
             self._reject_optional_use(val_reg, f"element {i} of `{name}`")
             self.emit(f"IndexStore {name}, {', '.join(chain)}, {val_reg}")
@@ -7186,6 +7941,51 @@ class IRBuilder:
         self.emit(f"store {len_name}, {init} : int[64]")
         self.list_len[name] = count
 
+    # ---- 4.12. String input -----------------------------------------------
+    #
+    # `k: str[N] = str(n, input("Enter something: "))` reads one line into the
+    # bounded string `k`. `n` is a literal limit that counts the NUL exactly as
+    # `str[N]` does (so at most n-1 bytes fit) and must satisfy 1 <= n <= N. The
+    # line is never truncated: one longer than n-1 bytes traps E0311 at run time.
+    # It is the string twin of `int(w, input(...))`, and like it is the only
+    # spelling of the read -- `str(...)` anywhere else is refused.
+
+    def _str_input_form(self, node):
+        """(n, prompt) when `node` is `str(n, input(...))`, None when it is not
+        a call to `str` at all. A `str(...)` call of any other shape is refused
+        here, naming the one accepted form."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "str"):
+            return None
+        form = ('`str(n, input("prompt"))`, e.g. `k: str[16] = str(10, input("Name: "))`')
+        if len(node.args) != 2 or node.keywords:
+            raise NotImplementedError(
+                f"LITHON-E0115: str() takes a literal limit and an input() call, {form}")
+        n = self.literal_int(node.args[0])
+        if n is None:
+            raise NotImplementedError(
+                f"LITHON-E0116: str()'s limit must be an integer literal -- it is checked "
+                f"against the string's capacity at compile time, {form}")
+        src = node.args[1]
+        if not (isinstance(src, ast.Call) and isinstance(src.func, ast.Name)
+                and src.func.id == "input"):
+            raise NotImplementedError(
+                f"LITHON-E0115: str() reads a line with input(), {form}")
+        if n < 1:
+            raise NotImplementedError(
+                f"LITHON-E0116: str({n}, input(...)) cannot hold even the NUL terminator; "
+                f"the limit counts it, so it must be at least 1")
+        return n, self._input_prompt_literal(src)
+
+    def _emit_str_input(self, run, cap, n, prompt, what):
+        """Emits the read into the str run `run` (declared `str[cap]`)."""
+        if n > cap:
+            raise NotImplementedError(
+                f"LITHON-E0116: str({n}, input(...)) reads up to {n - 1} bytes, but {what} "
+                f"is `str[{cap}]` and holds at most {cap - 1}; use a limit of at most {cap}")
+        hex_prompt = prompt.encode("utf-8").hex() if prompt else "-"
+        self.emit(f"inputstr {run}, {hex_prompt}, {n}")
+
     def build_str_declaration(self, name, decl_t, suffix, value_node):
         """Emits a `str[N]` declaration, with or without a string literal.
 
@@ -7200,10 +8000,27 @@ class IRBuilder:
         self.emit(f"store {name}{suffix}")
         if value_node is None:
             return
+        read = self._str_input_form(value_node)
+        if read is not None:
+            self._emit_str_input(name, decl_t.cap, read[0], read[1], f"`{name}`")
+            return
+        place = self._str_place_name(value_node)
+        if place is not None:
+            # 6.11. `s: str[M] = t` (a str variable, a field, or a str-returning call): the
+            # source string is copied in. The declaration above already zeroed `name`, so the
+            # tail past the source needs nothing. M must hold everything the source can.
+            src_cap = self._str_place_cap(value_node, place)
+            if src_cap > decl_t.cap:
+                raise NotImplementedError(
+                    f"LITHON-E0111: `{name}: str[{decl_t.cap}]` cannot hold a str[{src_cap}] -- a str "
+                    f"is never narrowed (6.11)")
+            self._emit_str_copy(name, place, src_cap)
+            return
         if not (isinstance(value_node, ast.Constant) and isinstance(value_node.value, str)):
             raise NotImplementedError(
-                f"LITHON-E0114: a str is built from a string literal, so `{name}: ... = <expr>` "
-                f"needs \"...\", not a single expression (6.2)")
+                f"LITHON-E0114: a str is built from a string literal, another str, a call to a "
+                f"str-returning function or `str(n, input(...))`, so `{name}: ... = <expr>` cannot "
+                f"take a computed expression (6.2)")
         data = value_node.value.encode("utf-8")
         n = decl_t.cap
         if len(data) >= n:
@@ -7272,6 +8089,201 @@ class IRBuilder:
             self.emit(f"{val} = const_i64 {byte}")
             self.emit(f"IndexStore {synth}, {idx}, {val}")
 
+    # ---- 6.11. Functions that return a bounded string ----------------------------
+    #
+    # `def f(...) -> str[N]` has no IR function: a str is frame storage with no value
+    # form, so a call is expanded in place. The callee's body runs with its parameters
+    # and locals renamed, `return` writes into a fresh `str[N]` result buffer and jumps to
+    # the end of the expansion, and the call then STANDS FOR that buffer wherever a str
+    # place is accepted (print, `==`, len, indexing, find/count/split, a declaration
+    # or assignment). Recursion is refused, as for methods. Every expansion re-declares
+    # the buffer, which zeroes it, so a call in a loop starts clean each time.
+
+    def _str_fn_def(self, node):
+        """The FunctionDef of an inlined function a call node names, else None."""
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in INLINE_FN_DEFS and node.func.id not in self.declared):
+            return INLINE_FN_DEFS[node.func.id]
+        return None
+
+    @staticmethod
+    def _inline_returns_str(fdef):
+        return fdef.returns is not None and parse_type_annotation(fdef.returns).kind == "str"
+
+    def _str_call_place(self, node):
+        """Expands a call to a str-RETURNING function (once per call node) and returns the
+        name of its result buffer; None when `node` is not such a call."""
+        fdef = self._str_fn_def(node)
+        if fdef is None or not self._inline_returns_str(fdef):
+            return None
+        cached = self._str_call_cache.get(id(node))
+        if cached is not None:
+            return cached
+        result = self._expand_inline_fn(node, fdef)
+        self._str_call_cache[id(node)] = result
+        return result
+
+    def _inline_scalar_call(self, node):
+        """Expands a call to an inlined function whose result is a scalar (or none): a function
+        that takes a str but returns an int/float/bool. Returns the result register, or None
+        for a function that returns nothing. None of the first kind when `node` is not one."""
+        fdef = self._str_fn_def(node)
+        if fdef is None or self._inline_returns_str(fdef):
+            return False
+        return self._expand_inline_fn(node, fdef)
+
+    def _expand_inline_fn(self, node, fdef):
+        """Expands the body of `fdef` at the call `node`, as a method is inlined: parameters
+        and locals are renamed with a per-call prefix, each parameter is bound by an annotated
+        declaration (a str parameter is a COPY of the argument string, so the callee cannot
+        change the caller's), and a `return` writes the result and jumps to the end of the
+        expansion. Returns the result buffer's name (a str result), the result register (a
+        scalar result) or None (no result). Recursion is refused: an inlined body cannot
+        contain itself."""
+        name = node.func.id
+        params = fdef.args.args
+        if node.keywords or any(isinstance(a, ast.Starred) for a in node.args):
+            raise NotImplementedError(
+                f"LITHON-E0114: function '{name}' takes positional arguments only (6.11)")
+        if len(node.args) != len(params):
+            raise NotImplementedError(
+                f"LITHON-E0114: function '{name}' takes {len(params)} argument(s), got "
+                f"{len(node.args)} (6.11)")
+        token = ("fn", name)
+        if token in self.inline_active:
+            chain = " -> ".join(t[1] if isinstance(t, tuple) and t[0] == "fn" else f"{t[0]}.{t[1]}"
+                                for t in self.inline_active + [token])
+            raise NotImplementedError(
+                f"LITHON-E0114: function '{name}' takes or returns a str and is recursive ({chain}); "
+                f"such a function is inlined at its call sites and cannot call itself, directly or "
+                f"indirectly (6.11)")
+        prefix = self._fresh_method_prefix()
+        rename = {nm: prefix + nm for nm in _collect_method_locals(fdef.body)}
+        for prm in params:
+            rename[prm.arg] = prefix + prm.arg
+        body = _MethodSubst(rename, None).visit(
+            copy.deepcopy(ast.Module(body=fdef.body, type_ignores=[]))).body
+        has_result = fdef.returns is not None
+        result_temp = prefix + "ret" if has_result else None
+        ret_t = parse_type_annotation(fdef.returns) if has_result else None
+        ret_label = self.reserve_label()
+        saved_loop = self.loop_stack
+        self.loop_stack = []
+        self.method_return_stack.append((result_temp, ret_label, ret_t))
+        self.inline_own_depth[len(self.method_return_stack)] = len(
+            getattr(self, "own_scopes", []))
+        self.inline_active.append(token)
+        try:
+            if has_result:
+                self.build_stmt(ast.AnnAssign(
+                    target=ast.Name(id=result_temp, ctx=ast.Store()),
+                    annotation=copy.deepcopy(fdef.returns), value=None, simple=1))
+            for prm, arg in zip(params, node.args):
+                self.build_stmt(ast.AnnAssign(
+                    target=ast.Name(id=rename[prm.arg], ctx=ast.Store()),
+                    annotation=copy.deepcopy(prm.annotation), value=arg, simple=1))
+            for stmt in body:
+                self.build_stmt(stmt)
+            if not self.terminated and self.block_is_reachable(self.current.label):
+                self.emit(f"jump {ret_label}")
+            self.start_block(ret_label)
+        except NotImplementedError as e:
+            # The message may name a renamed local (`m13_b` for parameter `b`): show the name
+            # the programmer wrote. A refusal not yet positioned (raised on a synthetic node)
+            # keeps its type and is positioned further out.
+            text = str(e)
+            for orig, renamed in rename.items():
+                text = _re.sub(r"(?<![A-Za-z0-9_])" + _re.escape(renamed) + r"(?![A-Za-z0-9_])", orig, text)
+            if text != str(e):
+                fixed = LithonRefusal(text, e.loc) if isinstance(e, LithonRefusal) else NotImplementedError(text)
+                for note in getattr(e, "__notes__", []):
+                    fixed.add_note(note)
+                e = fixed
+            if _node_loc(node) is not None:
+                e.add_note(f"while expanding '{name}', called at line {node.lineno}")
+            else:
+                e.add_note(f"while checking the definition of '{name}'")
+            raise e from None
+        finally:
+            self.method_return_stack.pop()
+            self.inline_active.pop()
+            self.loop_stack = saved_loop
+        if not has_result:
+            return None
+        if ret_t.kind == "str":
+            return result_temp
+        r = self.new_reg()
+        self.emit(f"{r} = load {result_temp}")
+        return r
+
+    def _str_place_cap(self, node, place):
+        """The capacity of the str place `place` (named by `node`)."""
+        decl = self.declared.get(place)
+        if decl is not None and decl.kind == "str":
+            return decl.cap
+        if isinstance(node, ast.Attribute):
+            return self._resolve_struct_field(node)[3]
+        raise NotImplementedError(
+            f"LITHON-E0114: cannot tell the capacity of this string here (6.11)")
+
+    def _emit_str_copy(self, dst, src, n):
+        """Copies the first `n` bytes of the str run `src` into `dst` (both are place
+        names, `dst` at least `n` long). Up to 16 bytes are unrolled; longer runs use a
+        counted loop, so code size does not grow with the capacity."""
+        if n <= 16:
+            text = "".join(f"{dst}[{i}] = {src}[{i}]\n" for i in range(n))
+        else:
+            self._strcp_counter += 1
+            ci = f"strcp{self._strcp_counter}i"
+            text = (f"{ci}: int[64] = 0\nwhile {ci} < {n}:\n    {dst}[{ci}] = {src}[{ci}]\n"
+                    f"    {ci} = {ci} + 1\n")
+        for st in ast.parse(text).body:
+            self.build_stmt(st)
+
+    def _emit_str_zero_tail(self, dst, start, end):
+        """Zeroes bytes [start, end) of the str run `dst`."""
+        if start >= end:
+            return
+        if end - start <= 16:
+            text = "".join(f"{dst}[{i}] = 0\n" for i in range(start, end))
+        else:
+            self._strcp_counter += 1
+            ci = f"strcp{self._strcp_counter}i"
+            text = (f"{ci}: int[64] = {start}\nwhile {ci} < {end}:\n    {dst}[{ci}] = 0\n"
+                    f"    {ci} = {ci} + 1\n")
+        for st in ast.parse(text).body:
+            self.build_stmt(st)
+
+    def _emit_str_return(self, dest, ret_t, value_node):
+        """`return <str>` inside an inlined str function: a literal, a str place, or a
+        call to another str function, each checked against the declared capacity."""
+        cap = ret_t.cap
+        if isinstance(value_node, ast.Constant) and isinstance(value_node.value, str):
+            data = value_node.value.encode("utf-8")
+            if len(data) >= cap:
+                raise NotImplementedError(
+                    f"LITHON-E0111: a function returning {ret_t.render()} can return at most "
+                    f"{cap - 1} bytes plus a NUL terminator, but the literal is {len(data)} "
+                    f"bytes (6.11)")
+            for i, byte in enumerate(data):
+                idx = self.new_reg()
+                self.emit(f"{idx} = const_i64 {i}")
+                val = self.new_reg()
+                self.emit(f"{val} = const_i64 {byte}")
+                self.emit(f"IndexStore {dest}, {idx}, {val}")
+            return
+        place = self._str_place_name(value_node)
+        if place is None:
+            raise NotImplementedError(
+                f"LITHON-E0114: a function returning {ret_t.render()} must return a string "
+                f"literal, a str variable or a call to another str function (6.11)")
+        src_cap = self._str_place_cap(value_node, place)
+        if src_cap > cap:
+            raise NotImplementedError(
+                f"LITHON-E0111: cannot return a str[{src_cap}] from a function declared "
+                f"{ret_t.render()} -- it may hold more than {cap - 1} bytes (6.11)")
+        self._emit_str_copy(dest, place, src_cap)
+
     def _str_place_name(self, node):
         """The companion/declared VARIABLE name of a bounded-string place, or
         None when `node` does not name one.
@@ -7283,7 +8295,15 @@ class IRBuilder:
         chain, all of which name the string rather than loading a value. This is
         a pure resolution: it never emits, which is what lets it be called for
         both operands of a comparison in source order.
+
+        6.11. The one exception is a call to a str-returning function: it is expanded
+        in place on first resolution (cached per call node, so resolving it again
+        reuses the buffer and the body never runs twice) and the buffer is its place.
         """
+        if isinstance(node, ast.Call):
+            via_call = self._str_call_place(node)
+            if via_call is not None:
+                return via_call
         if isinstance(node, ast.Name):
             decl = self.declared.get(node.id)
             if decl is not None and decl.kind == "str":
@@ -7419,6 +8439,7 @@ class IRBuilder:
             if container_value:
                 val_spec = self._materialize_container_value(decl_t.elem, val_node, i)
             else:
+                self._refuse_uint_value(val_node, f"dict value {i}")
                 val_spec = self.build_expr(val_node)
                 self._reject_optional_use(val_spec, f"dict value {i}")
             if str_key:
@@ -7478,7 +8499,7 @@ class IRBuilder:
         decl = self.declared.get(name)
         if decl is None:
             return ""
-        if decl[0] not in ("int", "float", "bool", "ptr", "class"):
+        if decl[0] not in ("int", "uint", "float", "bool", "ptr", "class"):
             return ""
         return render_type_suffix(decl)
 
@@ -7487,6 +8508,23 @@ class IRBuilder:
     # while, for) is not one: its own `build_stmt` calls each manage their leaf
     # statements, so the temporary stack is always balanced at a statement edge.
     def build_stmt(self, node):
+        prev_pos = self.cur_pos
+        pos = _pos_of(node)
+        if pos is not None:
+            self.cur_pos = pos
+        try:
+            return self._build_stmt_raw(node)
+        except LithonRefusal:
+            raise
+        except NotImplementedError as e:
+            located = _locate(e, node)
+            if located is e:
+                raise
+            raise located from None
+        finally:
+            self.cur_pos = prev_pos
+
+    def _build_stmt_raw(self, node):
         """Evaluate one statement, draining any class-reference temporary it
         created (see _release_stmt_temps). Temps live on a stack, so a method
         inlined while this statement is built (which runs further statements)
@@ -7506,7 +8544,544 @@ class IRBuilder:
             return
         self._build_stmt(node)
 
+    # ---- 4.14. Unsigned integers -------------------------------------------
+    #
+    # `i: uint[w] = value` holds 0..2^w-1 for w in 8/16/32/64. A uint has no IR
+    # type of its own: the IR sees the 64-bit integer that holds it (an
+    # unsigned value is the same bits), so the checker, both tiers and the
+    # encoder are untouched, and this frontend does the typing:
+    #
+    #   * uint and int never mix implicitly. The one allowed flow is a uint
+    #     narrower than 64 bits widening into an int[64]; a non-negative literal
+    #     is accepted wherever a uint is, if it fits.
+    #   * every operation lowers to ordinary 64-bit ops plus a `utrap` on the
+    #     condition "the exact result left 0..2^w-1" (a carry, a borrow, a result
+    #     above the width's maximum). It traps E0313; it never wraps.
+    #   * uint[64] needs more than signed ops can say: unsigned order is signed
+    #     order with the sign bit flipped, carries and borrows are detected with
+    #     that trick, a product is built from 32-bit halves, and `%` and `>>` get
+    #     their own sequences. Nothing here needs a new instruction but `utrap`
+    #     and the unsigned print.
+    #
+    # Whether an expression is a uint is read off the AST by a probe
+    # (`_peek_uint_width`) rather than tagged on registers, so every consumer
+    # decides at the node it is looking at.
+
+    def _u_err(self, message):
+        raise NotImplementedError(f"LITHON-E0144: {message} (4.14)")
+
+    def _const_i64(self, value):
+        """A register holding `value` (a Python int up to 2^64-1) as the 64-bit
+        pattern the IR carries."""
+        if value > _I64_MAX:
+            value -= 1 << 64
+        r = self.new_reg()
+        self.emit(f"{r} = const_i64 {value}")
+        return r
+
+    def _ir_not(self, a):
+        r = self.new_reg()
+        self.emit(f"{r} = not {a}")
+        return r
+
+    def _ir_bin(self, op, a, b):
+        r = self.new_reg()
+        self.emit(f"{r} = {op} {a}, {b}")
+        return r
+
+    def _peek_uint_width(self, node):
+        """The uint width of expression `node`, or None when it is not unsigned.
+        Emits nothing."""
+        if isinstance(node, ast.Name):
+            fold = self._const_fold(node.id)
+            if fold is not None:
+                return fold[1] if fold[0] == "uint" else None
+            d = self.declared.get(node.id)
+            return d.width if (d is not None and d.kind == "uint") else None
+        if isinstance(node, ast.BinOp):
+            lw = self._peek_uint_width(node.left)
+            rw = self._peek_uint_width(node.right)
+            if lw is None and rw is None:
+                return None
+            if isinstance(node.op, ast.Div):
+                return None          # true division yields a float
+            if isinstance(node.op, (ast.LShift, ast.RShift)):
+                return lw            # a shift keeps its left operand's width
+            return max(w for w in (lw, rw) if w is not None)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            name = self.fn_rename.get(node.func.id, node.func.id)
+            t = FN_RET_TYPES.get(name) or FN_RET_TYPES.get(node.func.id)
+            if t is not None and t.kind == "uint":
+                return t.width
+        return None
+
+    def _uint_value_reg(self, node, width, what):
+        """Builds `node` as a value of uint[width] and returns its register.
+
+        A literal must be non-negative and fit; a uint expression must be no
+        wider; anything else is a signed or non-integer value and is refused."""
+        mx = (1 << width) - 1
+        lit = self.literal_int(node)
+        if lit is not None:
+            if lit < 0:
+                self._u_err(f"{what} cannot take the negative value {lit}; a uint[{width}] "
+                            f"holds 0..{mx}")
+            if lit > mx:
+                self._u_err(f"{what} cannot take {lit}: it does not fit uint[{width}] "
+                            f"(0..{mx})")
+            return self._const_i64(lit)
+        w = self._peek_uint_width(node)
+        if w is None:
+            self._u_err(f"{what} needs an unsigned value, but this is a signed or "
+                        f"non-integer one; uint and int never mix implicitly -- use a "
+                        f"non-negative literal or a uint value")
+        if w > width:
+            self._u_err(f"{what} needs at most a uint[{width}], but this value is a "
+                        f"uint[{w}]")
+        return self.build_expr(node)
+
+    def _refuse_uint_into(self, node, target_t, what):
+        """A uint flowing into something that is not a uint: only a uint narrower
+        than 64 bits into an int[64] is allowed (it widens exactly)."""
+        w = self._peek_uint_width(node)
+        if w is None:
+            return
+        if target_t is not None and target_t.kind == "int" and target_t.width == 64 and w < 64:
+            return
+        self._u_err(f"{what} cannot take a uint[{w}]: uint and int never mix implicitly; "
+                    f"the one allowed flow is a uint narrower than 64 bits into an int[64]")
+
+    def _refuse_uint_value(self, node, where):
+        """A uint value where this stage has no unsigned behaviour yet."""
+        w = self._peek_uint_width(node)
+        if w is not None:
+            self._u_err(f"{where} cannot take a uint[{w}] yet -- unsigned integers are "
+                        f"scalars only in this stage (locals, parameters, returns)")
+
+    def _refuse_uint64_use(self, node, where):
+        """uint[64] in a context that reads the register as a signed integer (an
+        index, a range bound): a value at or above 2^63 would be misread."""
+        if self._peek_uint_width(node) == 64:
+            self._u_err(f"{where} cannot take a uint[64]: a value at or above 2^63 would be "
+                        f"read as negative; use a narrower uint or an int")
+
+    def _utrap(self, cond):
+        self.emit(f"utrap {cond}")
+
+    def _ult(self, a, b):
+        """Unsigned a < b on 64-bit patterns: signed order with the sign bit
+        flipped on both sides."""
+        m = self._const_i64(1 << 63)
+        return self._ir_bin("lt", self._ir_bin("bxor", a, m), self._ir_bin("bxor", b, m))
+
+    def _uint_operand_pair(self, node, width):
+        return (self._uint_value_reg(node.left, width, "an operand"),
+                self._uint_value_reg(node.right, width, "an operand"))
+
+    def _build_uint_binop(self, node, lw, rw):
+        op = type(node.op)
+        if op is ast.Div:
+            if lw == 64 or rw == 64:
+                self._u_err("`/` of a uint[64] would round (a 64-bit value does not fit a "
+                            "double exactly); use a narrower uint")
+            width = max(w for w in (lw, rw) if w is not None)
+            a, b = self._uint_operand_pair(node, width)
+            return self._ir_bin("div", a, b)
+        if op in (ast.LShift, ast.RShift):
+            return self._build_uint_shift(node, lw, rw, op is ast.LShift)
+        if op in (ast.BitAnd, ast.BitOr, ast.BitXor):
+            width = max(w for w in (lw, rw) if w is not None)
+            a, b = self._uint_operand_pair(node, width)
+            return self._ir_bin({ast.BitAnd: "band", ast.BitOr: "bor",
+                                 ast.BitXor: "bxor"}[op], a, b)
+        if op not in (ast.Add, ast.Sub, ast.Mult, ast.Mod):
+            self._u_err(f"operator {op.__name__} is not defined for unsigned integers")
+        width = max(w for w in (lw, rw) if w is not None)
+        a, b = self._uint_operand_pair(node, width)
+        if width < 64:
+            return self._uint_arith_narrow(op, a, b, width)
+        return self._uint_arith_64(op, a, b)
+
+    def _uint_arith_narrow(self, op, a, b, width):
+        """uint[8|16|32]: the operands are non-negative int64 values, so the
+        signed op is exact (a uint[32] product can pass int64, which the ordinary
+        E0303 overflow trap already catches); the result is then range-checked."""
+        zero = self._const_i64(0)
+        if op is ast.Mod:
+            return self._ir_bin("mod", a, b)
+        if op is ast.Sub:
+            r = self._ir_bin("sub", a, b)
+            self._utrap(self._ir_bin("lt", r, zero))
+            return r
+        r = self._ir_bin("add" if op is ast.Add else "mul", a, b)
+        over = self._ir_bin("gt", r, self._const_i64((1 << width) - 1))
+        if op is ast.Mult:
+            # A uint[32] product can pass int64 (up to (2^32-1)^2 < 2^64), and the
+            # wrapped value is negative, so a negative result is an overflow too.
+            # The signed multiply traps E0303 first when it can, but the range
+            # check does not depend on that.
+            over = self._ir_bin("or", over, self._ir_bin("lt", r, zero))
+        self._utrap(over)
+        return r
+
+    def _uint_arith_64(self, op, a, b):
+        if op is ast.Add:
+            s = self._ir_bin("wrapadd", a, b)
+            self._utrap(self._ult(s, a))          # the sum wrapped
+            return s
+        if op is ast.Sub:
+            self._utrap(self._ult(a, b))          # a borrow: b > a
+            return self._ir_bin("wrapsub", a, b)
+        if op is ast.Mult:
+            return self._u64_mul(a, b)
+        return self._u64_mod(a, b)
+
+    def _u64_mul(self, a, b):
+        """a * b for unsigned 64-bit patterns, trapping if the product needs more
+        than 64 bits. Built from 32-bit halves: with a = ah*2^32 + al and likewise
+        b, the product is al*bl + (ah*bl + al*bh) * 2^32 + ah*bh * 2^64, so it
+        overflows iff ah and bh are both set, or either cross term or their sum
+        needs more than 32 bits, or adding the shifted cross terms carries."""
+        c0 = self._const_i64(0)
+        c32 = self._const_i64(32)
+        m32 = self._const_i64(0xFFFFFFFF)
+        al = self._ir_bin("band", a, m32)
+        ah = self._ir_bin("band", self._ir_bin("shr", a, c32), m32)
+        bl = self._ir_bin("band", b, m32)
+        bh = self._ir_bin("band", self._ir_bin("shr", b, c32), m32)
+        t1 = self._ir_bin("wrapmul", ah, bl)
+        t2 = self._ir_bin("wrapmul", al, bh)
+
+        def high_set(v):
+            return self._ir_bin("ne", self._ir_bin("band", self._ir_bin("shr", v, c32), m32), c0)
+
+        c1 = self._ir_bin("and", self._ir_bin("ne", ah, c0), self._ir_bin("ne", bh, c0))
+        c2 = high_set(t1)
+        c3 = high_set(t2)
+        s = self._ir_bin("wrapadd", t1, t2)
+        c4 = high_set(s)
+        low = self._ir_bin("wrapmul", al, bl)
+        r = self._ir_bin("wrapadd", low, self._ir_bin("shl", s, c32))
+        c5 = self._ult(r, low)
+        trap = self._ir_bin("or", self._ir_bin("or", c1, c2),
+                            self._ir_bin("or", self._ir_bin("or", c3, c4), c5))
+        self._utrap(trap)
+        return r
+
+    def _u64_mod(self, a, b):
+        """a % b for unsigned 64-bit patterns. The signed `mod` is only right when
+        both are below 2^63, so the other cases are done by hand, each in its own
+        block so a signed `mod` never sees an operand it would trap on."""
+        one = self._const_i64(1)
+        zero = self._const_i64(0)
+        m63 = self._const_i64(_I64_MAX)
+        # `x % 0` must trap exactly like the signed operator does.
+        self.emit(f"{self.new_reg()} = mod {one}, {b}")
+        temp = f"{IF_EXPR_TEMP}{self.ifexpr_counter}"
+        self.ifexpr_counter += 1
+        b_big, b_small = self.reserve_label(), self.reserve_label()
+        a_big, a_small = self.reserve_label(), self.reserve_label()
+        merge = self.reserve_label()
+        self.emit(f"branch {self._ir_bin('lt', b, zero)}, {b_big}, {b_small}")
+
+        # b >= 2^63: the quotient is 0 or 1.
+        self.start_block(b_big)
+        ge = self._ir_not(self._ult(a, b))
+        r1 = self._emit_select(ge, self._ir_bin("wrapsub", a, b), a, "int", 64)
+        self.emit(f"store {temp}, {r1}")
+        self.emit(f"jump {merge}")
+
+        self.start_block(b_small)
+        self.emit(f"branch {self._ir_bin('lt', a, zero)}, {a_big}, {a_small}")
+
+        # Both below 2^63: the signed operator is exact.
+        self.start_block(a_small)
+        self.emit(f"store {temp}, {self._ir_bin('mod', a, b)}")
+        self.emit(f"jump {merge}")
+
+        # a >= 2^63, b < 2^63: (2*(a>>1 % b) + (a&1)) % b, subtracting b once if
+        # that is >= b. 2*m + bit < 2*b <= 2^64, so it fits an unsigned word.
+        self.start_block(a_big)
+        a1 = self._ir_bin("band", self._ir_bin("shr", a, one), m63)
+        m = self._ir_bin("mod", a1, b)
+        t = self._ir_bin("wrapadd", self._ir_bin("wrapadd", m, m), self._ir_bin("band", a, one))
+        ge2 = self._ir_not(self._ult(t, b))
+        r3 = self._emit_select(ge2, self._ir_bin("wrapsub", t, b), t, "int", 64)
+        self.emit(f"store {temp}, {r3}")
+        self.emit(f"jump {merge}")
+
+        self.start_block(merge)
+        r = self.new_reg()
+        self.emit(f"{r} = load {temp}")
+        return r
+
+    def _const_bool(self, v):
+        r = self.new_reg()
+        self.emit(f"{r} = const_bool {1 if v else 0}")
+        return r
+
+    def _u64_shr(self, a, k, k_lit):
+        """Logical a >> k for a 64-bit pattern (the IR's `shr` is arithmetic).
+        `k_lit` is the count when it is a literal, else None and `k` is a
+        register. 0 leaves a unchanged; otherwise one arithmetic shift is
+        masked off first so the rest cannot drag the sign bit in."""
+        m63 = self._const_i64(_I64_MAX)
+        one = self._const_i64(1)
+        if k_lit is not None:
+            if k_lit == 0:
+                return a
+            t = self._ir_bin("band", self._ir_bin("shr", a, one), m63)
+            return self._ir_bin("shr", t, self._const_i64(k_lit - 1))
+        zero = self._const_i64(0)
+        temp = f"{IF_EXPR_TEMP}{self.ifexpr_counter}"
+        self.ifexpr_counter += 1
+        is_zero, nonzero, merge = self.reserve_label(), self.reserve_label(), self.reserve_label()
+        self.emit(f"branch {self._ir_bin('eq', k, zero)}, {is_zero}, {nonzero}")
+        self.start_block(is_zero)
+        self.emit(f"store {temp}, {a}")
+        self.emit(f"jump {merge}")
+        self.start_block(nonzero)
+        t = self._ir_bin("band", self._ir_bin("shr", a, one), m63)
+        self.emit(f"store {temp}, {self._ir_bin('shr', t, self._ir_bin('sub', k, one))}")
+        self.emit(f"jump {merge}")
+        self.start_block(merge)
+        r = self.new_reg()
+        self.emit(f"{r} = load {temp}")
+        return r
+
+    def _build_uint_shift(self, node, lw, rw, left_shift):
+        if lw is None:
+            self._u_err("the left operand of a shift must be a uint when the count is one")
+        k_lit = self.literal_int(node.right)
+        if k_lit is not None:
+            if not 0 <= k_lit <= 63:
+                raise NotImplementedError(
+                    f"LITHON-E0103: shift count {k_lit} is out of range 0..63 (4.14)")
+            k = self._const_i64(k_lit)
+        else:
+            if rw is None:
+                self._u_err("a shift count must be a non-negative literal or a uint")
+            k = self.build_expr(node.right)
+        a = self.build_expr(node.left)
+        if not left_shift:
+            if lw < 64:
+                return self._ir_bin("shr", a, k)
+            return self._u64_shr(a, k, k_lit)
+        r = self._ir_bin("shl", a, k)
+        if lw < 64:
+            lost = self._ir_bin("ne", self._ir_bin("shr", r, k), a)
+            over = self._ir_bin("gt", r, self._const_i64((1 << lw) - 1))
+            self._utrap(self._ir_bin("or", lost, over))
+        else:
+            self._utrap(self._ir_bin("ne", self._u64_shr(r, k, k_lit), a))
+        return r
+
+    def _build_uint_compare(self, node, op_type, lw, rw):
+        """A comparison with at least one uint side. Both sides must be unsigned
+        (or a non-negative literal)."""
+        width = max(w for w in (lw, rw) if w is not None)
+
+        def operand(n):
+            lit = self.literal_int(n)
+            if lit is not None:
+                if lit < 0:
+                    self._u_err(f"a uint cannot be compared with the negative value {lit}")
+                if width < 64:
+                    # Past the width's range every uint compares the same way, so
+                    # a clamp to 2^width keeps all outcomes and keeps the pattern
+                    # a small positive number.
+                    lit = min(lit, 1 << width)
+                return self._const_i64(lit)
+            w = self._peek_uint_width(n)
+            if w is None:
+                self._u_err("a uint can only be compared with a uint or a non-negative "
+                            "literal; uint and int never mix implicitly")
+            return self.build_expr(n)
+
+        a = operand(node.left)
+        b = operand(node.comparators[0])
+        if op_type in (ast.Eq, ast.NotEq):
+            return self._ir_bin("eq" if op_type is ast.Eq else "ne", a, b)
+        if width < 64:
+            lt = lambda x, y: self._ir_bin("lt", x, y)
+            gt = lambda x, y: self._ir_bin("gt", x, y)
+        else:
+            m = self._const_i64(1 << 63)
+            lt = lambda x, y: self._ir_bin("lt", self._ir_bin("bxor", x, m),
+                                           self._ir_bin("bxor", y, m))
+            gt = lambda x, y: self._ir_bin("gt", self._ir_bin("bxor", x, m),
+                                           self._ir_bin("bxor", y, m))
+        if op_type is ast.Lt:
+            return lt(a, b)
+        if op_type is ast.Gt:
+            return gt(a, b)
+        # a <= b is not (a > b); a >= b is not (a < b)
+        inner = gt(a, b) if op_type is ast.LtE else lt(a, b)
+        r = self.new_reg()
+        self.emit(f"{r} = not {inner}")
+        return r
+
+    # ---- 4.13. Constants --------------------------------------------------
+    #
+    # `const var: type[size] = value` declares a name that is assigned exactly
+    # once, by its initializer. Everything that could change it afterwards is
+    # refused with E0143: assigning or augmenting the name, redeclaring it, a
+    # store into a container through it, `append`, a loop target, and taking its
+    # address. A constant needs no IR of its own -- it is an ordinary declaration
+    # the frontend declines to let anyone write to -- and a scalar with a literal
+    # initializer is also folded into every read (and, at module level, into every
+    # function and annotation), because an immutable literal is safe to inline.
+
+    def _const_fold(self, name):
+        """(kind, width, value) when `name` is a scalar constant with a literal
+        initializer visible here, else None. A local constant wins; a module
+        constant is visible unless this scope declares its own name."""
+        fold = self.const_values.get(name)
+        if fold is not None:
+            return fold
+        if name not in self.declared:
+            return GLOBAL_CONSTS.get(name)
+        return None
+
+    def _is_const_name(self, name):
+        return name in self.const_vars or (
+            name in GLOBAL_CONSTS and name not in self.declared)
+
+    def _refuse_const_write(self, node):
+        """Refuse any statement that would change a constant after its
+        initializer."""
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AugAssign):
+            targets = [node.target]
+        elif isinstance(node, ast.AnnAssign):
+            if getattr(node, "_lithon_const", False) or node is self._const_decl_node:
+                return
+            targets = [node.target]
+        elif (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+              and isinstance(node.value.func, ast.Attribute)
+              and node.value.func.attr == "append"):
+            targets = [node.value.func.value]
+        else:
+            return
+        for t in targets:
+            cur = t
+            while isinstance(cur, (ast.Subscript, ast.Attribute)):
+                cur = cur.value
+            if isinstance(cur, ast.Name) and self._is_const_name(cur.id):
+                raise NotImplementedError(
+                    f"LITHON-E0143: '{cur.id}' is a constant and cannot be changed after its "
+                    f"declaration -- {self._const_write_what(node, t)}; declare a variable "
+                    f"instead if it has to change (4.13)")
+
+    @staticmethod
+    def _const_write_what(node, target):
+        if isinstance(node, ast.Expr):
+            return "`append` writes into it"
+        if isinstance(node, ast.AnnAssign):
+            return "a name has one declaration"
+        if isinstance(node, ast.AugAssign):
+            return "an augmented assignment writes it"
+        if isinstance(target, ast.Subscript):
+            return "an element store writes into it"
+        if isinstance(target, ast.Attribute):
+            return "a field store writes into it"
+        return "an assignment writes it"
+
+    def _validate_const_decl(self, node):
+        """The shape rules for a `const` declaration."""
+        if not isinstance(node.target, ast.Name):
+            raise NotImplementedError(
+                "LITHON-E0143: a constant is a plain name, e.g. `const N: int[64] = 10` (4.13)")
+        name = node.target.id
+        if node.value is None:
+            raise NotImplementedError(
+                f"LITHON-E0143: constant '{name}' needs an initializer -- it is assigned "
+                f"exactly once, by its declaration, e.g. `const {name}: "
+                f"{ast.unparse(node.annotation)} = <value>` (4.13)")
+        if name in self.declared or name in self.const_vars:
+            raise NotImplementedError(
+                f"LITHON-E0143: '{name}' is already declared; a constant is declared once (4.13)")
+        ann = node.annotation
+        if isinstance(ann, ast.Name) and ann.id in self.structs:
+            raise NotImplementedError(
+                f"LITHON-E0143: constant '{name}' cannot be a struct -- a struct has no value to "
+                f"initialize it with (4.13)")
+        if self._class_annotation(ann) is not None:
+            raise NotImplementedError(
+                f"LITHON-E0143: constant '{name}' cannot be a class reference yet -- a method "
+                f"could still change the object it names, and that cannot be proven away "
+                f"(4.13)")
+        try:
+            t = parse_type_annotation(ann, self.structs)
+        except NotImplementedError:
+            return   # the declaration's own diagnostic is the better one
+        if t.kind == "ptr":
+            raise NotImplementedError(
+                f"LITHON-E0143: constant '{name}' cannot be a pointer -- the address would let "
+                f"the pointee change (4.13)")
+
+    def _refuse_loop_target_write(self, node):
+        """4.11. A `for` assigns its target itself; a write inside the body
+        would silently change how many times it runs, which CPython does not
+        do (it re-binds the target every iteration), so it is refused."""
+        if not self.active_loop_targets:
+            return
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        else:
+            return
+        live = set().union(*self.active_loop_targets)
+        for t in targets:
+            if isinstance(t, ast.Name) and t.id in live:
+                raise NotImplementedError(
+                    f"LITHON-E0119: '{t.id}' is the target of an enclosing `for` loop and "
+                    f"cannot be assigned inside its body -- the loop assigns it every "
+                    f"iteration; copy it into another variable instead (4.11)")
+
+    def _require_element_target(self, name, container, helper):
+        """4.11. An enumerate/zip element target is the user's own variable: it
+        must already be declared, with exactly the container's element type, and
+        hold a value (V1_SPEC 0.6.6)."""
+        elem_kind, elem_width = self.declared[container][2], self.declared[container][3]
+        want = Type(elem_kind, width=elem_width)
+        prev = self.declared.get(name)
+        if prev is None:
+            raise NotImplementedError(
+                f"LITHON-E0119: {helper} target '{name}' is not declared. A `for` header "
+                f"assigns existing variables, it does not create them -- declare it "
+                f"first, e.g. `{name}: {render_type_suffix(want).lstrip(' :')}` (4.11)")
+        if prev != want:
+            raise NotImplementedError(
+                f"LITHON-E0119: {helper} target '{name}' is declared "
+                f"{render_type_suffix(prev).lstrip(' :')} but '{container}' holds "
+                f"{render_type_suffix(want).lstrip(' :')} -- declare it with the "
+                f"element type (4.11)")
+
     def _build_stmt(self, node):
+        self._refuse_loop_target_write(node)
+        self._refuse_const_write(node)
+        if isinstance(node, ast.AnnAssign) and getattr(node, "_lithon_const", False):
+            # 4.13. Validate, build the declaration exactly as a variable's, then
+            # register the name as immutable (and fold a literal scalar). The flag
+            # is lowered for the inner build and restored so building the same
+            # node twice stays idempotent.
+            self._validate_const_decl(node)
+            node._lithon_const = False
+            self._const_decl_node = node
+            try:
+                self._build_stmt(node)
+            finally:
+                node._lithon_const = True
+                self._const_decl_node = None
+            name = node.target.id
+            self.const_vars.add(name)
+            fold = _scalar_const_fold(node.annotation, node.value)
+            if fold is not None:
+                self.const_values[name] = fold
+            return
         if isinstance(node, ast.AnnAssign):
             if not isinstance(node.target, ast.Name):
                 raise NotImplementedError("LITHON-E0121: only simple name targets are supported for annotations")
@@ -7576,7 +9151,8 @@ class IRBuilder:
             prev_decl = self.declared.get(name)
             if prev_decl is not None and prev_decl != decl_key:
                 def spell(d):
-                    return render_type_suffix(d).lstrip(" :") or "?"
+                    return d.source() if isinstance(d, Type) else (
+                        render_type_suffix(d).lstrip(" :") or "?")
                 raise NotImplementedError(
                     f"LITHON-E0122: `{name}` is re-declared with a different type: first "
                     f"declared {spell(prev_decl)}, now {spell(decl_key)} -- "
@@ -7633,15 +9209,26 @@ class IRBuilder:
                     self.ptr_str_names[name] = self.ptr_str[value_reg]
                 self.emit(f"store {name}, {value_reg}{suffix}")
                 return
-            if kind in ("int", "float", "bool"):
+            if kind in ("int", "uint", "float", "bool"):
                 # 4.4. The underscore rule's other half: an annotated scalar may
                 # not take a pointer's reserved first character.
                 if name.startswith("_"):
                     raise NotImplementedError(
                         f"LITHON-E0122: a name that starts with '_' must be a pointer, but "
-                        f"`{name}` is declared {suffix.lstrip() or kind} (4.4)")
-                self.var_types[name] = (kind, width)
+                        f"`{name}` is declared {decl_t.source()} (4.4)")
+                # A uint has no pointer or address form (4.14), so it is kept out
+                # of var_types, which is what pointers read.
+                if kind != "uint":
+                    self.var_types[name] = (kind, width)
+            if kind == "uint" and node.value is not None:
+                # 4.14. `i: uint[w] = value`: a non-negative literal that fits, or
+                # a uint no wider than w. Anything signed is refused.
+                value_reg = self._uint_value_reg(node.value, decl_t.width,
+                                                 f"declaration of '{name}'")
+                self.emit(f"store {name}, {value_reg}{suffix}")
+                return
             if node.value is not None:
+                self._refuse_uint_into(node.value, decl_t, f"declaration of '{name}'")
                 value_reg = self.build_expr(node.value)
                 self._reject_optional_use(value_reg, f"declaration of '{name}'")
                 self.emit(f"store {name}, {value_reg}{suffix}")
@@ -7672,6 +9259,8 @@ class IRBuilder:
             if len(node.targets) != 1:
                 raise NotImplementedError("LITHON-E0121: only single-target assignment is supported")
             target = node.targets[0]
+            if not isinstance(target, ast.Name):
+                self._refuse_uint_value(node.value, "a container element, field or attribute")
             if isinstance(target, ast.Subscript):
                 # `xs[i][j]... = v`. Op::IndexStore carries the container name in
                 # `name`, every index, and the value last. The chain is collected
@@ -7814,6 +9403,13 @@ class IRBuilder:
                     return
                 var, offset, kind, width, synth = self._resolve_struct_field(target)
                 if kind == "str":
+                    # 4.12. `s.f = str(n, input(...))` reads a line into the
+                    # field's companion run, like a top-level `k = str(...)`.
+                    read = self._str_input_form(node.value)
+                    if read is not None:
+                        self._emit_str_input(synth, width, read[0], read[1],
+                                             f"field '{target.attr}'")
+                        return
                     # 6.2. `s.f = "literal"`: a whole-string write, like a
                     # top-level `s: str[N] = "literal"`. It is stored as one
                     # IndexStore per byte into the field's companion byte run,
@@ -7828,6 +9424,35 @@ class IRBuilder:
                 return
             if not isinstance(target, ast.Name):
                 raise NotImplementedError("LITHON-E0121: only single-name assignment targets are supported")
+            # 4.12. `k = str(n, input(...))` re-reads into an existing `str[N]`
+            # variable. It is the only whole-string assignment there is; a string
+            # literal is still written byte by byte.
+            tdecl = self.declared.get(target.id)
+            if tdecl is not None and tdecl.kind == "str":
+                read = self._str_input_form(node.value)
+                if read is not None:
+                    self._emit_str_input(target.id, tdecl.cap, read[0], read[1],
+                                         f"`{target.id}`")
+                    return
+                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                    # 6.11. `s = "literal"` on an existing str: the whole-string write a
+                    # struct field already had (bytes, then zeros through the capacity so a
+                    # shorter literal clears a longer old value).
+                    self._assign_struct_str_field(target.id, tdecl.cap, node.value)
+                    return
+                place = self._str_place_name(node.value)
+                if place is not None:
+                    # 6.11. `s = t` / `s = f(...)`: copy the source string over the whole of `s`,
+                    # then clear the bytes past it so a shorter value replaces a longer old one.
+                    src_cap = self._str_place_cap(node.value, place)
+                    if src_cap > tdecl.cap:
+                        raise NotImplementedError(
+                            f"LITHON-E0111: `{target.id}` is str[{tdecl.cap}] but the value is a "
+                            f"str[{src_cap}] -- a str is never narrowed (6.11)")
+                    if place != target.id:
+                        self._emit_str_copy(target.id, place, src_cap)
+                        self._emit_str_zero_tail(target.id, src_cap, tdecl.cap)
+                    return
             # 4.6. A whole-struct assignment has no meaning: there is no struct
             # value to copy. The fields are the only writable surface.
             if target.id in self.struct_vars:
@@ -7874,6 +9499,14 @@ class IRBuilder:
                     f"LITHON-E0123: a tuple is built on its annotation, so write "
                     f"`{target.id}: tuple[int[64], {len(node.value.elts)}] = "
                     f"({', '.join(['1'] * len(node.value.elts))})` (4.2)")
+            tdecl_u = self.declared.get(target.id)
+            if tdecl_u is not None and tdecl_u.kind == "uint":
+                # 4.14. Assigning to a uint: same rules as its declaration.
+                u_reg = self._uint_value_reg(node.value, tdecl_u.width,
+                                             f"assignment to '{target.id}'")
+                self.emit(f"store {target.id}, {u_reg}{self.declared_suffix(target.id)}")
+                return
+            self._refuse_uint_into(node.value, tdecl_u, f"assignment to '{target.id}'")
             value_reg = self.build_expr(node.value)
             self._reject_optional_use(
                 value_reg, f"assignment to '{target.id}'")
@@ -7909,6 +9542,24 @@ class IRBuilder:
                 raise NotImplementedError(
                     f"LITHON-E0128: cannot use `{name} <op>=` on a struct -- assign its fields "
                     f"one at a time, e.g. {name}.<field> += ... (4.6)")
+            adecl = self.declared.get(name)
+            if adecl is not None and adecl.kind == "uint":
+                # 4.14. `u op= x` is `u = u op x` under the unsigned rules; the
+                # result must still fit the target's width.
+                synth = ast.BinOp(left=ast.Name(id=name, ctx=ast.Load()), op=node.op,
+                                  right=node.value)
+                ast.copy_location(synth, node)
+                ast.fix_missing_locations(synth)
+                rw = self._peek_uint_width(synth)
+                if rw is not None and rw > adecl.width:
+                    self._u_err(f"`{name}` is a uint[{adecl.width}] but this result is a "
+                                f"uint[{rw}]")
+                r = self.build_expr(synth)
+                self.emit(f"store {name}, {r}")
+                return
+            if self._peek_uint_width(node.value) is not None:
+                self._u_err(f"`{name} <op>=` cannot take a uint: uint and int never mix "
+                            f"implicitly")
             current = self.new_reg()
             self.emit(f"{current} = load {name}")
             if name in self.ptr_names:
@@ -8016,7 +9667,11 @@ class IRBuilder:
             # into the inline's temp and jumps to the inline's end label.
             if self.method_return_stack:
                 result_temp, ret_label, ret_t = self.method_return_stack[-1]
-                if node.value is not None:
+                if node.value is not None and ret_t is not None and ret_t.kind == "str":
+                    # 6.11. A str result is written into the result buffer, not stored
+                    # from a register.
+                    self._emit_str_return(result_temp, ret_t, node.value)
+                elif node.value is not None:
                     if result_temp is None:
                         raise NotImplementedError(
                             f"LITHON-E0135: this method returns no value, so `return <expr>` is "
@@ -8065,7 +9720,13 @@ class IRBuilder:
                 self.emit(f"jump {ret_label}")
                 return
             if node.value is not None:
-                val_reg = self.build_expr(node.value)
+                frt = self.func_return_type
+                if frt is not None and frt.kind == "uint":
+                    # 4.14. A uint result: a literal that fits, or a uint no wider.
+                    val_reg = self._uint_value_reg(node.value, frt.width, "return")
+                else:
+                    self._refuse_uint_into(node.value, frt, "return")
+                    val_reg = self.build_expr(node.value)
                 if val_reg in self.null_regs or val_reg in self.optional_regs:
                     ret_t = self.func_return_type
                     if ret_t is None or ret_t.kind != "class" or not ret_t.nullable:
@@ -8133,11 +9794,444 @@ class IRBuilder:
         out = [header_line]
         for b in self.blocks:
             out.append(f"{b.label}:")
-            out.extend(b.lines)
+            if _EMIT_LOCATIONS:
+                for text, pos in zip(b.lines, b.positions):
+                    out.append(f"{text} @{pos[0]}:{pos[1]}" if pos is not None else text)
+            else:
+                out.extend(b.lines)
         return "\n".join(out)
 
 
-def build_program(tree):
+
+# ---- 4.15. Modules and the entry point --------------------------------------
+#
+# A Lithon program may be split across files. There is no run-time import: the
+# linker below resolves every import at COMPILE time and merges the files into the
+# one AST that build_program already compiles, so both tiers see an ordinary
+# single-module program and an import costs nothing at run time. Each file is
+# parsed once, and an imported function is linked only if something reachable
+# calls it, so unused library code is never compiled.
+#
+#   import m                 -> m.f()          the file m.lio next to the importer
+#   import a.b               -> a.b.f()        a/b.lio below a search root
+#   import m.f               -> m.f()          only the function f of m
+#   from m import f          -> f()
+#   import m as x / from m import f as g       aliases
+#
+# Search order for a dotted name: the importing file's own directory, then every
+# `-I dir` in the order given, then each directory of LITHON_PATH. A directory is a
+# package; no __init__ file is needed. Imported symbols are renamed
+# `<module>__<name>` in the merged program.
+#
+# An imported file may only DEFINE: functions (and, as later levels land, classes
+# and constants) and the entry guard. Executable top-level statements are refused,
+# so there is no hidden initialisation order or shared module state.
+#
+# The entry point is `if __name__ == '__main__': ...`. Its body runs when the file is
+# the program being run and is dropped when the file is imported. A script with no
+# guard still runs top to bottom as before.
+
+def _mod_err(message):
+    raise NotImplementedError(f"LITHON-E0145: {message} (4.15)")
+
+
+def _is_main_guard(node):
+    """True for `if __name__ == '__main__':` (either operand order, no else)."""
+    if not isinstance(node, ast.If):
+        return False
+    t = node.test
+    if not (isinstance(t, ast.Compare) and len(t.ops) == 1 and isinstance(t.ops[0], ast.Eq)
+            and len(t.comparators) == 1):
+        return False
+    pair = (t.left, t.comparators[0])
+    name = [n for n in pair if isinstance(n, ast.Name) and n.id == "__name__"]
+    lit = [n for n in pair if isinstance(n, ast.Constant) and n.value == "__main__"]
+    return len(name) == 1 and len(lit) == 1
+
+
+def _dotted(node):
+    """`a.b.c` for a Name/Attribute chain, else None."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+class _CallRewriter(ast.NodeTransformer):
+    """Rewrites each use of an imported or module-local name to its
+    module-qualified name, wherever it appears: a call to a function, and a class
+    wherever a type is spelled (an annotation, a constructor call, a base list,
+    `isinstance`, a classmethod call)."""
+
+    def __init__(self, table, ctable):
+        self.table = table
+        self.ctable = ctable
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        key = _dotted(node.func)
+        if key is not None and key in self.table:
+            node.func = ast.copy_location(ast.Name(id=self.table[key], ctx=ast.Load()),
+                                          node.func)
+        return node
+
+    def visit_Attribute(self, node):
+        key = _dotted(node)
+        if key is not None and key in self.ctable:
+            return ast.copy_location(ast.Name(id=self.ctable[key], ctx=ast.Load()), node)
+        self.generic_visit(node)
+        return node
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load) and node.id in self.ctable:
+            node.id = self.ctable[node.id]
+        return node
+
+
+class _Module:
+    def __init__(self, path, prefix, tree):
+        self.path = path
+        self.prefix = prefix          # mangling prefix, '' for the entry program
+        self.tree = tree
+        self.funcs = {}               # source name -> FunctionDef
+        self.classes = {}             # source name -> ClassDef (struct/enum included)
+        self.consts = {}              # source name -> `const` AnnAssign (foldable scalar)
+        self.table = {}               # visible dotted name -> merged function name
+        self.ctable = {}              # visible dotted name -> merged class name
+
+
+def _search_roots(importer_dir, include):
+    import os
+    roots = [importer_dir] + [os.path.abspath(d) for d in include]
+    roots += [os.path.abspath(d) for d in
+              os.environ.get("LITHON_PATH", "").split(os.pathsep) if d]
+    seen, out = set(), []
+    for r in roots:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def _find_module_file(dotted, importer_dir, include):
+    import os
+    rel = os.path.join(*dotted.split(".")) + ".lio"
+    for root in _search_roots(importer_dir, include):
+        cand = os.path.join(root, rel)
+        if os.path.isfile(cand):
+            return os.path.realpath(cand)
+    return None
+
+
+def link_program(tree, base_dir=None, include=(), entry_path=None):
+    """Resolves imports, drops or inlines the entry guard, and returns the merged
+    AST. A program with no imports and no guard is returned unchanged."""
+    import os
+    has_import = any(isinstance(n, (ast.Import, ast.ImportFrom)) for n in tree.body)
+    has_guard = any(_is_main_guard(n) for n in tree.body)
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Import, ast.ImportFrom)) and n not in tree.body:
+            _mod_err("an import must be a top-level statement, not inside a function, "
+                     "class or block")
+    if not has_import and not has_guard:
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Name) and n.id == "__name__":
+                _mod_err("`__name__` is only valid in the entry guard "
+                         "`if __name__ == '__main__':`")
+        return tree
+
+    importer_dir = os.path.abspath(base_dir) if base_dir else os.getcwd()
+    # The directory of the program being run is always a search root (after the
+    # importing file's own directory), as a script's directory is for Python: a
+    # library in src/ can import a sibling of the entry program.
+    include = [importer_dir] + list(include)
+    loaded = {}                       # realpath -> _Module
+    prefixes = set()
+    order = []                        # imported modules, dependencies first
+
+    def check_guard_uses(t):
+        for n in ast.walk(t):
+            if isinstance(n, ast.If) and not _is_main_guard(n):
+                for m in ast.walk(n.test):
+                    if isinstance(m, ast.Name) and m.id == "__name__":
+                        _mod_err("`__name__` is only valid as exactly "
+                                 "`if __name__ == '__main__':`")
+
+    def prefix_for(dotted):
+        base = dotted.replace(".", "__")
+        if base.startswith("_"):
+            base = "m" + base      # a leading '_' is reserved for pointer variables
+        pre, k = base, 1
+        while pre in prefixes:
+            k += 1
+            pre = f"{base}_{k}"
+        prefixes.add(pre)
+        return pre
+
+    def load(dotted, from_dir, stack):
+        path = _find_module_file(dotted, from_dir, include)
+        if path is None:
+            return None
+        if path in stack:
+            chain = " -> ".join(os.path.basename(x) for x in stack + [path])
+            _mod_err(f"import cycle: {chain}; a module cannot import itself, directly or "
+                     f"through another")
+        if path in loaded:
+            return loaded[path]
+        with open(path) as f:
+            sub_tree = parse_source(f.read(), path)
+        mod = _Module(path, prefix_for(dotted), sub_tree)
+        loaded[path] = mod
+        check_guard_uses(sub_tree)
+        resolve_imports(mod, os.path.dirname(path), stack + [path], imported=True)
+        order.append(mod)
+        return mod
+
+    def resolve_imports(mod, mod_dir, stack, imported):
+        tree_ = mod.tree
+        for stmt in list(tree_.body):
+            if isinstance(stmt, ast.FunctionDef):
+                if _is_type_function_def(stmt):
+                    if imported:
+                        _mod_err(f"'{stmt.name}' in {os.path.basename(mod.path)} is a type "
+                                 f"function, which cannot be imported yet")
+                    continue
+                mod.funcs[stmt.name] = stmt
+            elif isinstance(stmt, ast.ClassDef):
+                mod.classes[stmt.name] = stmt
+            elif imported:
+                if isinstance(stmt, (ast.Import, ast.ImportFrom)) or _is_main_guard(stmt):
+                    pass
+                elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) \
+                        and isinstance(stmt.value.value, str):
+                    pass   # a docstring
+                elif isinstance(stmt, ast.AnnAssign) and getattr(stmt, "_lithon_const", False):
+                    if not isinstance(stmt.target, ast.Name) or stmt.value is None \
+                            or _scalar_const_fold(stmt.annotation, stmt.value) is None:
+                        nm = stmt.target.id if isinstance(stmt.target, ast.Name) else "?"
+                        _mod_err(f"the constant '{nm}' in {os.path.basename(mod.path)} cannot "
+                                 f"be part of an imported program: only a scalar "
+                                 f"(int, uint, float or bool) with a literal value can be "
+                                 f"imported, because it is folded into whoever uses it; a "
+                                 f"string, list or other constant lives only in its own scope")
+                    mod.consts[stmt.target.id] = stmt
+                else:
+                    _mod_err(f"{os.path.basename(mod.path)} has an executable top-level "
+                             f"statement ({type(stmt).__name__}); an imported program may "
+                             f"only define -- put what should run under "
+                             f"`if __name__ == '__main__':`")
+        # own definitions are visible by their source name
+        for name in mod.funcs:
+            mod.table[name] = (mod.prefix + "__" + name) if mod.prefix else name
+        for name in mod.classes:
+            mod.ctable[name] = (mod.prefix + "__" + name) if mod.prefix else name
+        for name in mod.consts:
+            mod.ctable[name] = mod.prefix + "__" + name
+        for stmt in list(tree_.body):
+            if isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    bind_import(mod, alias, mod_dir, stack)
+            elif isinstance(stmt, ast.ImportFrom):
+                bind_from(mod, stmt, mod_dir, stack)
+
+    def where_of(mod):
+        return os.path.basename(mod.path) if mod.path else "the program"
+
+    def add_name(mod, key, merged, how, is_class):
+        for tbl in (mod.table, mod.ctable):
+            if key in tbl and tbl[key] != merged:
+                _mod_err(f"the name '{key}' is imported into {where_of(mod)} but it is "
+                         f"already defined or imported ({how})")
+        (mod.ctable if is_class else mod.table)[key] = merged
+
+    def bind_import(mod, alias, mod_dir, stack):
+        dotted = alias.name
+        target = load(dotted, mod_dir, stack)
+        if target is not None:
+            bound = alias.asname or dotted
+            for name in target.funcs:
+                add_name(mod, f"{bound}.{name}", target.table[name], f"`import {dotted}`", False)
+            for name in list(target.classes) + list(target.consts):
+                add_name(mod, f"{bound}.{name}", target.ctable[name], f"`import {dotted}`", True)
+            return
+        # `import m.f`: the function or class f of module m
+        if "." in dotted:
+            head, member = dotted.rsplit(".", 1)
+            target = load(head, mod_dir, stack)
+            if target is not None:
+                bound = alias.asname or dotted
+                if member in target.funcs:
+                    add_name(mod, bound, target.table[member], f"`import {dotted}`", False)
+                elif member in target.classes or member in target.consts:
+                    add_name(mod, bound, target.ctable[member], f"`import {dotted}`", True)
+                else:
+                    _mod_err(f"module '{head}' has no function, class or constant "
+                             f"'{member}' to import")
+                return
+        _mod_err(f"cannot find the module '{dotted}' (searched "
+                 f"{', '.join(_search_roots(mod_dir, include))})")
+
+    def bind_from(mod, stmt, mod_dir, stack):
+        if stmt.level:
+            _mod_err("relative imports (`from .m import f`) are not supported yet")
+        dotted = stmt.module
+        target = load(dotted, mod_dir, stack)
+        if target is None:
+            _mod_err(f"cannot find the module '{dotted}' (searched "
+                     f"{', '.join(_search_roots(mod_dir, include))})")
+        for alias in stmt.names:
+            if alias.name == "*":
+                _mod_err("`from m import *` is not supported -- name what you import")
+            how = f"`from {dotted} import {alias.name}`"
+            if alias.name in target.funcs:
+                add_name(mod, alias.asname or alias.name, target.table[alias.name], how, False)
+            elif alias.name in target.classes or alias.name in target.consts:
+                add_name(mod, alias.asname or alias.name, target.ctable[alias.name], how, True)
+            else:
+                _mod_err(f"module '{dotted}' has no function, class or constant "
+                         f"'{alias.name}' to import")
+
+    entry = _Module(entry_path or "", "", tree)
+    check_guard_uses(tree)
+    resolve_imports(entry, importer_dir, [os.path.realpath(entry_path)] if entry_path else [],
+                    imported=False)
+
+    # A parameter or local that reuses an imported or module-qualified name would
+    # be silently rewritten to the import, so it is refused instead.
+    def check_shadowing(mod):
+        plain = {k for k, v in list(mod.table.items()) + list(mod.ctable.items())
+                 if "." not in k and v != k}
+        if not plain:
+            return
+        for fn in ast.walk(mod.tree):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            declared = [a.arg for a in fn.args.args]
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    declared.append(n.id)
+            for d in declared:
+                if d in plain:
+                    _mod_err(f"'{d}' in {where_of(mod)} has the name of something it "
+                             f"defines or imports from another module; a parameter or "
+                             f"local cannot reuse it")
+
+    for mod in order + [entry]:
+        check_shadowing(mod)
+
+    # rewrite uses, mangle imported definitions
+    for mod in order:
+        for fn in mod.funcs.values():
+            fn.name = mod.table[fn.name]
+        for cd in mod.classes.values():
+            cd.name = mod.ctable[cd.name]
+        for cst in mod.consts.values():
+            cst.target.id = mod.ctable[cst.target.id]
+        _CallRewriter(mod.table, mod.ctable).visit(mod.tree)
+    _CallRewriter(entry.table, entry.ctable).visit(tree)
+
+    # entry guard: its body runs here, in place; in an imported file it is dropped
+    new_body = []
+    for stmt in tree.body:
+        _CURRENT_TOP[0] = stmt
+        if _is_main_guard(stmt):
+            if stmt.orelse:
+                _mod_err("`if __name__ == '__main__':` cannot have an else branch")
+            new_body.extend(stmt.body)
+        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            continue
+        else:
+            new_body.append(stmt)
+    tree.body = new_body
+
+    # Link only what is reachable: everything in the entry program, plus each
+    # imported function or class that it (transitively) names. Definitions keep
+    # their module and source order, so a base class still precedes its subclasses.
+    def is_symbol(n):
+        if isinstance(n, ast.FunctionDef):
+            return not _is_type_function_def(n)
+        if isinstance(n, ast.AnnAssign):
+            return getattr(n, "_lithon_const", False)
+        return isinstance(n, ast.ClassDef)
+
+    def sym_name(n):
+        return n.target.id if isinstance(n, ast.AnnAssign) else n.name
+
+    ordered = []
+    for mod in order:
+        for stmt in mod.tree.body:
+            if is_symbol(stmt):
+                ordered.append(stmt)
+    symbols = {sym_name(n): n for n in ordered}
+
+    def names_in(node):
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and n.id in symbols:
+                yield n.id
+
+    wanted, work = set(), list(names_in(tree))
+    while work:
+        name = work.pop()
+        if name not in wanted:
+            wanted.add(name)
+            work.extend(names_in(symbols[name]))
+    tree.body = [n for n in ordered if sym_name(n) in wanted] + tree.body
+    return tree
+
+
+def _validate_inline_header(stmt, params):
+    """The header rules of a function that is inlined because it returns or takes a str: every
+    parameter is an annotated int, uint, float, bool or str, and the result is a str or one of the
+    scalars (not a class, container or pointer)."""
+    for arg, pt in zip(stmt.args.args, params):
+        if pt is None or pt.kind not in ("int", "uint", "float", "bool", "str"):
+            raise NotImplementedError(
+                f"LITHON-E0124: parameter '{arg.arg}' of '{stmt.name}' must be an annotated int, "
+                f"uint, float, bool or str: a function that takes or returns a str is inlined at "
+                f"each call site and cannot take a container, struct, class or pointer (6.11)")
+    if stmt.returns is not None:
+        try:
+            rt = parse_type_annotation(stmt.returns)
+        except NotImplementedError:
+            rt = None
+        if rt is None or rt.kind not in ("int", "float", "bool", "str"):
+            raise NotImplementedError(
+                f"LITHON-E0124: '{stmt.name}' takes or returns a str, so it is inlined at each call "
+                f"site and may return a str, int, float or bool only"
+                + (" -- a uint result is not supported on such a function yet" if rt is not None and rt.kind == "uint" else "")
+                + " (6.11)")
+
+
+def build_program(tree, locations=False):
+    """Lowers a linked program to IR text. With `locations`, every instruction carries the source
+    file and line it came from (` @source:line`, plus a `source` table), which lets a runtime trap
+    or a type error point at its line. Off by default: the IR is then byte-for-byte what it was."""
+    global _EMIT_LOCATIONS
+    _CURRENT_TOP[0] = None
+    _SOURCE_INDEX.clear()
+    _EMIT_LOCATIONS = bool(locations)
+    try:
+        text = _build_program_raw(tree)
+        if _EMIT_LOCATIONS and _SOURCE_INDEX:
+            table = "".join(f"source {i} {path}\n" for path, i in sorted(_SOURCE_INDEX.items(), key=lambda kv: kv[1]))
+            text = table + text
+        return text
+    except LithonRefusal:
+        raise
+    except NotImplementedError as e:
+        located = _locate(e, _CURRENT_TOP[0]) if _CURRENT_TOP[0] is not None else e
+        if located is e:
+            raise
+        raise located from None
+    finally:
+        _EMIT_LOCATIONS = False
+
+
+def _build_program_raw(tree):
     global TYPE_FUNCTIONS, _TYPE_FUNC_CACHE, _TYPE_FUNC_ACTIVE
     module_parts = []
 
@@ -8147,6 +10241,22 @@ def build_program(tree):
     TYPE_FUNCTIONS = build_type_functions(tree)
     _TYPE_FUNC_CACHE = {}
     _TYPE_FUNC_ACTIVE = []
+
+    # 4.13. Module-level scalar constants with a literal initializer are folded
+    # everywhere, so they are collected before any annotation is parsed (a
+    # capacity may name one).
+    global GLOBAL_CONSTS, GLOBAL_CONST_INTS
+    GLOBAL_CONSTS = {}
+    GLOBAL_CONST_INTS = {}
+    for stmt in tree.body:
+        _CURRENT_TOP[0] = stmt
+        if (isinstance(stmt, ast.AnnAssign) and getattr(stmt, "_lithon_const", False)
+                and isinstance(stmt.target, ast.Name) and stmt.value is not None):
+            fold = _scalar_const_fold(stmt.annotation, stmt.value)
+            if fold is not None:
+                GLOBAL_CONSTS[stmt.target.id] = fold
+                if fold[0] == "int":
+                    GLOBAL_CONST_INTS[stmt.target.id] = fold[2]
 
     # 4.6/4.7/4.10.1. Struct, enum and class definitions are collected in one
     # source-order pass before anything is built, so any kind is visible to every
@@ -8208,7 +10318,11 @@ def build_program(tree):
     fn_returns = {}
     fn_param_types = {}
     fn_optional_returns = set()
+    global FN_RET_TYPES, INLINE_FN_DEFS
+    FN_RET_TYPES = {}
+    INLINE_FN_DEFS = {}
     for stmt in tree.body:
+        _CURRENT_TOP[0] = stmt
         if not isinstance(stmt, ast.FunctionDef) or _is_type_function_def(stmt):
             continue
         names = (stmt.name, fn_rename.get(stmt.name, stmt.name))
@@ -8229,6 +10343,23 @@ def build_program(tree):
                 params.append(None)
         for n in names:
             fn_param_types[n] = list(params)
+        # 6.11. A function that returns a str or takes a str is INLINED at its call sites: a
+        # str is frame storage with no value form, so it can neither be returned in a register
+        # nor passed in a call. Its other parameters are scalars and its result is a str or a
+        # scalar.
+        takes_str = any(pt is not None and pt.kind == "str" for pt in params)
+        returns_str = False
+        if stmt.returns is not None and not (isinstance(stmt.returns, ast.Name)
+                                             and (stmt.returns.id in structs or stmt.returns.id in enums)):
+            try:
+                returns_str = parse_type_annotation(stmt.returns).kind == "str"
+            except NotImplementedError:
+                returns_str = False
+        if takes_str or returns_str:
+            _validate_inline_header(stmt, params)
+            for n in names:
+                INLINE_FN_DEFS[n] = stmt
+            continue
         if stmt.returns is None:
             continue
         if isinstance(stmt.returns, ast.Name) \
@@ -8238,6 +10369,9 @@ def build_program(tree):
             ret_t = parse_type_annotation(stmt.returns)
         except NotImplementedError:
             continue
+        if ret_t.kind == "uint":
+            for n in names:
+                FN_RET_TYPES[n] = ret_t
         if ret_t.kind != "class":
             continue
         for n in names:
@@ -8248,6 +10382,31 @@ def build_program(tree):
     main_builder = IRBuilder(fn_rename, structs, enums, classes, fn_returns,
                              fn_param_types, fn_optional_returns)
     main_builder.start_block(main_builder.reserve_label())
+
+    # 6.11. An inlined function (it takes or returns a str) emits nothing until it is called, so
+    # its body would otherwise never be checked if it never is. Expand each one once into a
+    # scratch builder with placeholder arguments (output discarded): a refusal in the body, or
+    # recursion, then surfaces at the DEFINITION, at the line it is on.
+    _seen_inline = set()
+    for _fdef in list(INLINE_FN_DEFS.values()):
+        if id(_fdef) in _seen_inline:
+            continue
+        _seen_inline.add(id(_fdef))
+        _CURRENT_TOP[0] = _fdef
+        _chk = IRBuilder(fn_rename, structs, enums, classes, fn_returns,
+                         fn_param_types, fn_optional_returns)
+        _chk.start_block(_chk.reserve_label())
+        _args = []
+        for _i, _arg in enumerate(_fdef.args.args):
+            _pt = parse_type_annotation(_arg.annotation)
+            _default = {"int": 0, "uint": 0, "float": 0.0, "bool": False}.get(_pt.kind)
+            _nm = f"check{_i}_{_arg.arg}"
+            _chk.build_stmt(ast.AnnAssign(
+                target=ast.Name(id=_nm, ctx=ast.Store()), annotation=copy.deepcopy(_arg.annotation),
+                value=None if _pt.kind == "str" else ast.Constant(value=_default), simple=1))
+            _args.append(ast.Name(id=_nm, ctx=ast.Load()))
+        _call = ast.Call(func=ast.Name(id=_fdef.name, ctx=ast.Load()), args=_args, keywords=[])
+        _chk._expand_inline_fn(_call, _fdef)
 
     # 4.10.2. The class index map: a class's position in the emitted ClassInfo
     # list. `class Name` blocks are emitted in this order and `build_class_table`
@@ -8321,6 +10480,7 @@ def build_program(tree):
                 fn_param_types, fn_optional_returns)
 
     for stmt in tree.body:
+        _CURRENT_TOP[0] = stmt
         if isinstance(stmt, ast.ClassDef):
             # Already validated and registered; a type definition emits no code.
             continue
@@ -8329,12 +10489,24 @@ def build_program(tree):
                 # 4.8. A type function emits no code: it was registered above and
                 # is resolved only where its name is applied in an annotation.
                 continue
+            if stmt.name in INLINE_FN_DEFS:
+                # 6.11. A function returning a str is inlined at each call site and
+                # emits no function of its own.
+                continue
             fb = IRBuilder(fn_rename, structs, enums, classes, fn_returns,
                            fn_param_types, fn_optional_returns)
             fb.start_block(fb.reserve_label())
 
             param_strs = []
             for arg in stmt.args.args:
+                # 4.13. A module constant reserves its name everywhere, so a
+                # parameter cannot quietly shadow it (a local declaration cannot
+                # either).
+                if arg.arg in GLOBAL_CONSTS:
+                    raise NotImplementedError(
+                        f"LITHON-E0143: parameter '{arg.arg}' of '{stmt.name}' has the name of "
+                        f"a module constant; a constant's name is reserved, pick another "
+                        f"(4.13)")
                 if arg.annotation is not None:
                     # 4.6/4.7. A struct or an enum is storage, not a value, so it
                     # cannot be passed or returned: the function header names a
@@ -8420,6 +10592,13 @@ def build_program(tree):
                     fb.class_vars[arg.arg] = class_t.ref
                     if class_t.nullable:
                         fb.optional_vars.add(arg.arg)
+                    continue
+                # 4.14. A uint parameter is recorded so its reads are known to be
+                # unsigned; other scalar parameters stay known to the checker only.
+                if isinstance(arg.annotation, ast.Subscript):
+                    scalar_t = parse_type_annotation(arg.annotation)
+                    if scalar_t.kind == "uint":
+                        fb.declared[arg.arg] = scalar_t
 
             for s in stmt.body:
                 fb.build_stmt(s)
@@ -8444,9 +10623,21 @@ def build_program(tree):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("usage: frontend.py <source.lio>", file=sys.stderr)
+    import os
+    argv = sys.argv[1:]
+    include = []
+    locations = bool(os.environ.get("LITHON_LOCATIONS"))
+    while argv and (argv[0] in ("-g", "--locations") or (len(argv) >= 2 and argv[0] in ("-I", "--include"))):
+        if argv[0] in ("-g", "--locations"):
+            locations = True
+            argv = argv[1:]
+            continue
+        include.append(argv[1])
+        argv = argv[2:]
+    if len(argv) != 1:
+        print("usage: frontend.py [-I dir]... [-g] <source.lio>", file=sys.stderr)
         return 1
+    sys.argv = [sys.argv[0]] + argv
 
     # A Lithon source file is `.lio`, and only `.lio`. The language is its own
     # thing now -- the extension is what says "this is a Lithon program" rather
@@ -8462,15 +10653,19 @@ def main():
         source = f.read()
 
     try:
-        tree = ast.parse(source)
+        import os
+        tree = parse_source(source, os.path.abspath(sys.argv[1]))
+        tree = link_program(tree, os.path.dirname(os.path.abspath(sys.argv[1])), include,
+                            os.path.abspath(sys.argv[1]))
         # build_program raises NotImplementedError for every construct this
         # frontend slice refuses. Those messages are self-identifying
         # ("LITHON-E01xx: ..."), so they print bare on stderr like a tier
         # refusal would, instead of leaking a Python traceback -- one clean
         # line, a nonzero exit, nothing else.
-        ir_text = build_program(tree)
-    except NotImplementedError as e:
-        print(f"{e}", file=sys.stderr)
+        ir_text = build_program(tree, locations=locations)
+    except (NotImplementedError, SyntaxError) as e:
+        color = sys.stderr.isatty() and "NO_COLOR" not in os.environ
+        print(format_diagnostic(e, color=color), file=sys.stderr)
         return 1
 
     sys.stdout.write(ir_text)

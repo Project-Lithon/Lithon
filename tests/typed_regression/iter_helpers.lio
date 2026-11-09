@@ -7,13 +7,11 @@
 # same loop bounded at min(N1, N2) -- a compile-time constant, because the
 # declared capacity is what len() folds to.
 #
-# Every loop target below has a name of its own. That is not decoration: a name
-# is expected to hold one type, so binding `b` to an int in one header and to a
-# bool in another would leave it unresolved, and the print guard would (rightly)
-# refuse to compile this file natively -- which is the one thing this file
-# exists to check. Distinct names keep every value provably typed, so the file
-# runs on the NATIVE tier and the tier-diff comparison is a real comparison of
-# generated code against the interpreter.
+# 4.11. Every loop target below is declared first, with a value and with exactly
+# the type of the element it receives (an enumerate index is an ordinary integer
+# counter). Each also has a name of its own, so every value stays provably typed
+# and the file runs on the NATIVE tier: the tier-diff comparison is then a real
+# comparison of generated code against the interpreter.
 
 xs: list[int[64], 5]
 xs[0] = 10
@@ -23,6 +21,8 @@ xs[3] = 40
 xs[4] = 50
 
 # enumerate: the index is an ordinary int[64].
+ei: int[64] = 0
+ex: int[64] = 0
 for ei, ex in enumerate(xs):
     print(ei)
     print(ex)
@@ -42,6 +42,8 @@ short3[1] = 8
 short3[2] = 9
 
 total: int[64] = 0
+za: int[64] = 0
+zb: int[64] = 0
 for za, zb in zip(long6, short3):
     total = za + zb
 print(total)
@@ -53,6 +55,9 @@ r: list[int[64], 2]
 p[0] = 1
 q[0] = 10
 r[0] = 100
+zx: int[64] = 0
+zy: int[64] = 0
+zz: int[64] = 0
 for zx, zy, zz in zip(p, q, r):
     print(zx)
     print(zy)
@@ -69,6 +74,12 @@ bs[0] = True
 bs[1] = False
 ns[0] = -5
 ns[1] = 300
+fi: int[64] = 0
+fv: float[64] = 0.0
+bi: int[8] = 0
+bv: bool = False
+ni: int[16] = 0
+nv: int[16] = 0
 for fi, fv in enumerate(fs):
     print(fv)
 for bi, bv in enumerate(bs):
@@ -85,6 +96,8 @@ u[2] = 3
 v[0] = 10
 v[1] = 20
 v[2] = 30
+ba: int[64] = 0
+bb: int[64] = 0
 for ba, bb in zip(u, v):
     if ba == 2:
         continue

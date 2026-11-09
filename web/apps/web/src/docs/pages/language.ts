@@ -465,7 +465,7 @@ print(total)`,
       blocks: [
         {
           kind: "p",
-          text: "`range(stop)` and `range(start, stop)` produce values checked against the loop variable's declared width at compile time when known (V1_SPEC 0.6.12). The loop variable is a normal declared binding:",
+          text: "`range(stop)` and `range(start, stop)` produce values checked against the loop variable's declared width at compile time when known (V1_SPEC 0.6.12). The loop variable is an ordinary variable you declare first, with a value (V1_SPEC 0.6.6): `range` assigns it and never creates it, it keeps its declared width, and after the loop it holds the last value produced (a loop that never runs leaves it untouched). Assigning to it inside the body is refused (`E0119`):",
         },
         {
           kind: "code",
@@ -489,27 +489,28 @@ block0:
     %2 = const_i64 0
     %3 = const_i64 10
     %4 = const_i64 1
+    %5 = load i
     store i, %2 : int[64]
     jump block4
 block4:
-    %5 = load i
-    %6 = lt %5, %3
-    branch %6, block1, block2
+    %6 = load i
+    %7 = lt %6, %3
+    branch %7, block1, block2
 block1:
-    %7 = load total
-    %8 = load i
-    %9 = add %7, %8
-    store total, %9 : int[64]
+    %8 = load total
+    %9 = load i
+    %10 = add %8, %9
+    store total, %10 : int[64]
     jump block3
 block3:
-    %10 = load i
-    %11 = const_i64 1
-    %12 = add %10, %11
-    store i, %12
+    %11 = load i
+    %12 = const_i64 1
+    %13 = add %11, %12
+    store i, %13
     jump block4
 block2:
-    %13 = load total
-    call print_bare, %13
+    %14 = load total
+    call print_bare, %14
     call print_nl
     return`,
               note: "The `for` lowers to an init / test / body / increment block structure: a pre-test loop with an explicit back edge, exactly what the encoder emits a `jcc` for.",
@@ -533,7 +534,8 @@ block2:
             typecheck: false,
             sourceRef: "tests/programs/range_step.lio",
             expectedRef: "tests/programs/expected/range_step.out",
-            source: `for i in range(1, 10, 3):
+            source: `i: int[64] = 0
+for i in range(1, 10, 3):
     print(i)
 for i in range(10, 1, -3):
     print(i)
@@ -574,6 +576,7 @@ for i in range(-1, -5, -2):
             sourceRef: "tests/programs/break_continue.lio",
             expectedRef: "tests/programs/expected/break_continue.out",
             source: `total: int[64] = 0
+i: int[64] = 0
 for i in range(100):
     if i == 5:
         continue
@@ -596,7 +599,7 @@ print(total)`,
         },
         {
           kind: "p",
-          text: "`zip` stops at the shortest input, exactly as Python does. Elements bind with their declared type, and `break`/`continue` work inside either header because the rewrite is a real loop.",
+          text: "`zip` stops at the shortest input, exactly as Python does. Every target is a variable you declared first, with the element's exact type, and each ends on the last value it received. `break`/`continue` work inside either header because the rewrite is a real loop.",
         },
         {
           kind: "code",
@@ -612,6 +615,8 @@ xs[2] = 30
 xs[3] = 40
 xs[4] = 50
 
+ei: int[64] = 0
+ex: int[64] = 0
 for ei, ex in enumerate(xs):
     print(ei)
     print(ex)
@@ -626,6 +631,8 @@ short3[1] = 8
 short3[2] = 9
 
 total: int[64] = 0
+za: int[64] = 0
+zb: int[64] = 0
 for za, zb in zip(long6, short3):
     total = za + zb
 print(total)`,

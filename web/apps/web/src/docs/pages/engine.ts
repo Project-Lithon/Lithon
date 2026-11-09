@@ -142,7 +142,7 @@ block0:
             ["SysV (Linux/macOS)", "implemented and audited on every host"],
             [
               "Win64",
-              "implemented behind `#if defined(_WIN32)`: no test evidence yet",
+              "checked under wine since 4.16 (shadow space, callee-saved registers); CI runs it on Windows",
             ],
             [
               "Stack alignment",
@@ -157,8 +157,8 @@ block0:
         {
           kind: "note",
           tone: "warn",
-          title: "Win64 is implemented but unproven",
-          text: "The path exists and compiles, but the 23-module ABI audit runs on SysV hosts. Treat Win64 as experimental until it has its own evidence.",
+          title: "Win64: verified under wine, not on real Windows",
+          text: "Since 4.16 the C boundary (shadow space, callee-saved registers incl. XMM12-15) is checked by a MinGW build run under wine. A native Windows run and an MSVC build are still open.",
         },
       ],
     },

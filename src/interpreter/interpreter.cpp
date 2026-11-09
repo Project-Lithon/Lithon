@@ -3,6 +3,7 @@
 #include "runtime/heap.h"
 #include "runtime/value.h"
 #include "ir/ir.h"
+#include "ir/source_loc.h"
 #include "jit/container_print.h"
 #include "jit/float_runtime.h"
 #include "jit/input_runtime.h"
@@ -1033,6 +1034,7 @@ LithonValue execute_function(const Module& module, const Function& fn,
 
         try {
         for (const auto& instr : cur->instrs) {
+            lithon::ir::g_cur_pos = {instr.src, instr.line};
             switch (instr.op) {
                 case Op::ConstInt:
                     frame.regs[instr.result] = LithonValue::make_int(instr.int_imm);
@@ -1826,6 +1828,37 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     frame.regs[instr.result] = LithonValue::make_int(value);
                     break;
                 }
+                // 4.12. `str(n, input(prompt))`: one whole line into the named str
+                // run. It shares read_str_line with the JIT's helper, so end of
+                // input (E0308), a line longer than n-1 bytes (E0311) and the
+                // exact bytes written agree by construction. The run is rewritten
+                // end to end -- content, then zeros -- like a string literal.
+                case Op::InputStr: {
+                    std::string text;
+                    const char* err = nullptr;
+                    if (!lithon::jit::read_str_line(instr.name2.c_str(), instr.int_imm,
+                                                    &text, &err)) {
+                        throw std::runtime_error(err);
+                    }
+                    std::vector<LithonValue>& bytes = frame.get_list(instr.name, "input into");
+                    int64_t cap = static_cast<int64_t>(bytes.size());
+                    auto tit = frame.list_types.find(instr.name);
+                    if (tit != frame.list_types.end() && tit->second &&
+                        tit->second->kind == "str")
+                        cap = tit->second->cap;
+                    for (int64_t j = 0; j < cap && j < static_cast<int64_t>(bytes.size()); ++j) {
+                        const int64_t c = j < static_cast<int64_t>(text.size())
+                            ? static_cast<unsigned char>(text[static_cast<size_t>(j)]) : 0;
+                        bytes[static_cast<size_t>(j)] = LithonValue::make_int(c);
+                    }
+                    break;
+                }
+                // 4.14. `utrap %cond`: an unsigned operation left its range.
+                case Op::UTrap: {
+                    LithonValue c = frame.get_reg(instr.args.at(0));
+                    if (c.is_truthy()) throw std::runtime_error(lithon::jit::kE0313Message);
+                    break;
+                }
                 case Op::GuardNonZero: {
                     LithonValue v = frame.get_reg(instr.args.at(0));
                     if (!v.is_int()) {
@@ -1940,6 +1973,18 @@ LithonValue execute_function(const Module& module, const Function& fn,
                     break;
                 }
                 case Op::Call: {
+                    // 4.14. print_u / print_bare_u: the int formatter read as an
+                    // UNSIGNED 64-bit value, for a uint[64] at or above 2^63. The
+                    // JIT uses "%llu" for the same bytes.
+                    if (instr.name == "print_u" || instr.name == "print_bare_u") {
+                        const lithon::ir::ValueId arg = instr.args.at(0);
+                        LithonValue v = frame.get_reg(arg);
+                        if (!v.is_int())
+                            throw std::runtime_error("interpreter: print_u of a non-integer");
+                        std::cout << static_cast<unsigned long long>(v.as_int())
+                                  << (instr.name == "print_u" ? "\n" : "");
+                        break;
+                    }
                     if (instr.name == "print") {
                         const lithon::ir::ValueId arg = instr.args.at(0);
                         if (print_arg_is_ptr(module, fn, arg)) do_print_ptr(frame.get_reg(arg), "\n");

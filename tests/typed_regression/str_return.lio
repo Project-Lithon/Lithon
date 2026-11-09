@@ -1,0 +1,71 @@
+# 6.11. Functions that return a bounded string. A str is frame storage with no value
+# form, so the function is expanded at each call site into a fresh result buffer and
+# the call stands for that buffer: it prints, compares, measures, indexes, is searched,
+# and is stored into a declaration or an assignment.
+
+
+def verdict(buy: int[16], sell: int[16]) -> str[32]:
+    if buy > sell:
+        return "Lossed"
+    return "Profited"
+
+
+def pick(n: int[16]) -> str[8]:
+    r: str[8] = "ab"
+    if n > 3:
+        r = "abcdef"
+    return r
+
+
+def grade(score: uint[8]) -> str[4]:
+    if score >= 90:
+        return "A"
+    if score >= 80:
+        return "B"
+    return "C"
+
+
+def wrap(n: int[16]) -> str[16]:
+    return pick(n)
+
+
+def label(n: int[16]) -> str[12]:
+    i: int[16] = 0
+    while i < n:
+        i = i + 1
+    return "done"
+
+
+print(verdict(5, 3))
+print(verdict(3, 5))
+v: str[32] = verdict(9, 1)
+print(v)
+print(len(verdict(1, 2)))
+print(verdict(1, 2) == "Profited")
+print("Lossed" == verdict(9, 1))
+print(verdict(1, 2) != "Profited")
+print(pick(1), pick(9))
+
+w: str[16] = "zz"
+w = pick(1)
+print(w)
+w = pick(9)
+print(w)
+w = pick(1)
+print(w)
+print(len(w))
+
+print(grade(95), grade(85), grade(10))
+print(wrap(2), wrap(7))
+print(label(4))
+
+k: int[16] = 0
+total: int[64] = 0
+while k < 5:
+    total = total + len(pick(k))
+    k = k + 1
+print(total)
+
+print(pick(9)[2])
+print(pick(9).find("de"))
+print(pick(1).count("a"))

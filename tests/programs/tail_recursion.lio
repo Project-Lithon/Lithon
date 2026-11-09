@@ -34,6 +34,7 @@ def go(n: int[64], t: int[64]) -> int[64]:
     if n < 1:
         return t
     x: int[64] = 0
+    i: int[64] = 0
     for i in range(3):
         x = x + i
     return go(n - 1, t + x)

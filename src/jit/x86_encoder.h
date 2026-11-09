@@ -1453,6 +1453,28 @@ inline void emit_movsd_rbp_mem(CodeBuffer& buf, Xmm src, int32_t offset) {
     emit_disp32_le(buf, offset);
 }
 
+// movups xmm, [rbp + disp32] / movups [rbp + disp32], xmm -- a full 128-bit,
+// alignment-free move between an XMM register and a frame slot. The Microsoft
+// x64 ABI makes the whole low 128 bits of XMM6-XMM15 nonvolatile, and a scalar
+// `movsd` load zeroes the upper half, so preserving one of them takes this and
+// not `movsd`. Encoding: [REX] 0F 10 /r (load), [REX] 0F 11 /r (store), no
+// mandatory prefix.
+inline void emit_movups_xmm_rbp(CodeBuffer& buf, Xmm dst, int32_t offset) {
+    if (xmm_is_extended(dst)) emit_u8(buf, rex_sse(dst));
+    emit_u8(buf, 0x0F);
+    emit_u8(buf, 0x10);
+    emit_u8(buf, static_cast<uint8_t>(0x80 | (xmm_low3(dst) << 3) | reg_low3(Reg::RBP)));
+    emit_disp32_le(buf, offset);
+}
+
+inline void emit_movups_rbp_xmm(CodeBuffer& buf, Xmm src, int32_t offset) {
+    if (xmm_is_extended(src)) emit_u8(buf, rex_sse(src));
+    emit_u8(buf, 0x0F);
+    emit_u8(buf, 0x11);
+    emit_u8(buf, static_cast<uint8_t>(0x80 | (xmm_low3(src) << 3) | reg_low3(Reg::RBP)));
+    emit_disp32_le(buf, offset);
+}
+
 // movsd [rsp + disp32], xmm -- store a stack-passed float argument into the
 // caller's outgoing-argument area, the float counterpart of
 // emit_store_rsp_offset. Same mod=10 + RSP SIB-no-index shape, F2 prefix.

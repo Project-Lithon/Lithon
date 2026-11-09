@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <cstdint>
 #include <string>
 
 // Host-side support for input() and the float -> int conversion trap.
@@ -40,6 +41,21 @@ inline constexpr const char kE0309Message[] =
     "LITHON-E0309: float-to-int conversion is out of range or not finite";
 inline constexpr const char kE0310Message[] =
     "LITHON-E0310: range step is zero";
+// 4.12. A line read for `str(n, input(...))` that does not fit: longer than n-1
+// bytes. The bytes are never truncated; the program stops (or the enclosing
+// try/except catches it as a ValueError).
+inline constexpr const char kE0311Message[] =
+    "LITHON-E0311: input line is longer than the string it is read into";
+// 4.12. A NUL byte inside a line read for `str(n, input(...))`. A str[N] is
+// NUL-terminated, so the bytes after one could never be seen; the line is
+// refused rather than silently shortened.
+// 4.14. An unsigned integer operation whose exact result is outside
+// 0..2^w-1: a sum past the maximum, a difference below zero, a product or shift
+// that does not fit. Never wraps; catchable as an OverflowError.
+inline constexpr const char kE0313Message[] =
+    "LITHON-E0313: unsigned integer result is out of range for its uint width";
+inline constexpr const char kE0312Message[] =
+    "LITHON-E0312: input line contains a NUL byte, which a string cannot hold";
 
 // Prints `message` followed by a newline, flushes, and exits. The JIT twin of
 // stack_guard.h's host_report_stack_overflow, used for the conversion trap.
@@ -102,6 +118,78 @@ inline bool read_int_line(const char* prompt, int width, int64_t* out,
     }
     *out = static_cast<int64_t>(v);
     return true;
+}
+
+// 4.12. Prints the prompt (if any), reads ONE whole line from stdin and stores
+// its bytes in *out, with the line terminator removed ("\n", and a "\r" before
+// it). Unlike read_int_line this does not trim spaces -- a string keeps its
+// content -- and it has no fixed-size buffer: a line of any length is read in
+// full, one byte at a time, so a too-long line is detected by its true length
+// and a NUL byte is SEEN (a C-string reader such as fgets would stop at it and
+// hide everything after). `limit` is the literal n of `str(n, input(...))` and
+// counts the terminating NUL, so at most n-1 bytes fit. Returns true on success;
+// on failure returns false with *err pointing at kE0308Message (end of input
+// before any byte), kE0312Message (a NUL byte in the line) or kE0311Message (too
+// long). A final line with no newline at end of file is still a line, as in
+// Python. A NUL is reported before length: the content is invalid at any limit.
+inline bool read_str_line(const char* prompt, int64_t limit, std::string* out,
+                          const char** err) {
+    if (prompt != nullptr && *prompt != '\0') {
+        std::fputs(prompt, stdout);
+        std::fflush(stdout);
+    }
+    std::string line;
+    bool got_any = false;
+    for (int c = std::fgetc(stdin); c != EOF; c = std::fgetc(stdin)) {
+        got_any = true;
+        if (c == '\n') break;
+        line.push_back(static_cast<char>(c));
+    }
+    if (!got_any) { *err = kE0308Message; return false; }
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.find('\0') != std::string::npos) { *err = kE0312Message; return false; }
+    if (static_cast<int64_t>(line.size()) > limit - 1) {
+        *err = kE0311Message;
+        return false;
+    }
+    *out = std::move(line);
+    return true;
+}
+
+// Writes `text` into a NUL-terminated byte run of `cap` bytes and zeroes the
+// rest, the state `s: str[cap] = "literal"` leaves. The caller has already
+// proved text.size() <= cap - 1.
+inline void fill_str_run(unsigned char* run, int64_t cap, const std::string& text) {
+    for (int64_t j = 0; j < cap; ++j)
+        run[j] = j < static_cast<int64_t>(text.size())
+                     ? static_cast<unsigned char>(text[static_cast<size_t>(j)]) : 0;
+}
+
+// The JIT's frame descriptor for InputStr, registered once per call site and
+// handed to the helper by address (the same convention as the str find/split
+// helpers: the run is addressed from the frame base).
+struct StrInputDesc {
+    int64_t dest_offset;   // frame offset of the destination run's first byte
+    int64_t cap;           // N, the run's declared capacity
+    int64_t limit;         // n, the literal limit (<= N, counts the NUL)
+};
+
+// Reads a line into the destination run. Returns a KIND code, not a value, for
+// the reason host_input_int_ex does: 0 success, 1 too long (E0311 -> ValueError),
+// 2 NUL byte in the line (E0312 -> ValueError), 3 end of input (E0308 ->
+// EOFError). The caller reports or routes the trap, so a
+// try/except around the read behaves exactly as it does in the interpreter.
+inline int64_t host_input_str(const void* frame_base, const StrInputDesc* d,
+                              const char* prompt) {
+    std::string text;
+    const char* err = nullptr;
+    if (!read_str_line(prompt, d->limit, &text, &err)) {
+        return err == kE0311Message ? 1 : err == kE0312Message ? 2 : 3;
+    }
+    fill_str_run(const_cast<unsigned char*>(
+                     static_cast<const unsigned char*>(frame_base)) + d->dest_offset,
+                 d->cap, text);
+    return 0;
 }
 
 // The JIT entry point. On failure it prints the message and exits, matching the

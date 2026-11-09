@@ -1,0 +1,32 @@
+def add3(a: int[64], b: int[64], c: int[64]) -> int[64]:
+    return a * 100 + b * 10 + c
+
+
+def five(a: int[64], b: int[64], c: int[64], d: int[64], e: int[64]) -> int[64]:
+    return a + b * 2 + c * 3 + d * 4 + e * 5
+
+
+def mix(a: int[64], x: float[64], b: int[64]) -> float[64]:
+    return x * a + b
+
+
+def half(x: float[64]) -> float[64]:
+    return x / 2.0
+
+
+def pick(flag: bool, a: int[32], b: int[32]) -> int[32]:
+    if flag:
+        return a
+    return b
+
+
+def neg(a: int[32]) -> int[64]:
+    return a - 1000000
+
+
+def isbig(a: int[64]) -> bool:
+    return a > 4294967296
+
+
+def nothing() -> int[64]:
+    return 42

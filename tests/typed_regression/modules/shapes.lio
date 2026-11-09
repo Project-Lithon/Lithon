@@ -1,0 +1,53 @@
+# A module of types and functions: classes (with inheritance and a virtual
+# method), a struct and an enum, plus functions over them. It only defines.
+class Shape:
+    sides: int[64]
+
+    def __init__(self, sides: int[64]):
+        self.sides = sides
+
+    def area(self) -> int[64]:
+        return 0
+
+    def corners(self) -> int[64]:
+        return self.sides
+
+
+class Square(Shape):
+    side: int[64]
+
+    def __init__(self, side: int[64]):
+        super().__init__(4)
+        self.side = side
+
+    def area(self) -> int[64]:
+        return self.side * self.side
+
+
+class Point(struct):
+    x: int[64]
+    y: int[64]
+
+
+class Color(enum):
+    Red
+    Gray: int[64]
+
+
+def make_square(n: int[64]) -> Square:
+    return Square(n)
+
+
+def total_area(a: Shape, b: Shape) -> int[64]:
+    return a.area() + b.area()
+
+
+def manhattan(p: int[64], q: int[64]) -> int[64]:
+    return p + q
+
+
+class Orphan:
+    n: int[64]
+
+    def __init__(self, n: int[64]):
+        self.n = n

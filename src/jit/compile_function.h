@@ -16,6 +16,7 @@
 #include "float_runtime.h"
 #include "input_runtime.h"
 #include "ir/ir.h"
+#include "ir/source_loc.h"
 #include "jit_abi.h"
 #include "liveness.h"
 #include "optimize.h"
@@ -70,6 +71,9 @@ namespace lithon::jit {
 
 namespace {
 static const char kIntPrintFormat[] = "%lld\n";
+// 4.14. The unsigned twin, for a uint[64] at or above 2^63.
+static const char kUIntPrintFormat[] = "%llu\n";
+static const char kUIntPrintFormatBare[] = "%llu";
 // A pointer prints as a hexadecimal address, "0x" + lowercase hex with no
 // padding -- what C's %p does on glibc and Rust's {:p} does. Spelled out rather
 // than using %p because %p is implementation-defined (MSVC zero-pads it and
@@ -620,6 +624,16 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
     using namespace lithon::ir;
     using detail::TempInfo;
 
+    // This backend emits x86-64 machine code (64-bit registers, 64-bit pointers
+    // baked into the code as immediates). In a 32-bit process that code could be
+    // emitted but never executed, and running it crashes; refuse so the caller
+    // falls back to the interpreter. A 32-bit host needs the x86-32 backend (4.17).
+    if (sizeof(void*) != 8) {
+        throw std::runtime_error(
+            "compile_module: the x86-64 backend cannot run in a 32-bit process "
+            "(no x86-32 backend for this construct yet)");
+    }
+
     CodeBuffer code;
     std::unordered_map<std::string, size_t> function_offset;
     size_t phi_copies_in_registers = 0;
@@ -882,6 +896,23 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
         // while allocating -- see RegisterAllocator::coalesce_phi_registers.
         phi_copies_coalesced += alloc.phi_copies_coalesced();
 
+        // plan_function recorded each aliased Load with the register the
+        // variable was promoted to BEFORE allocation. Coalescing may since have
+        // moved a merge variable to a different register (every store and every
+        // fused store follows the allocator), so an alias left as planned would
+        // read the old, now unrelated register. A loop-header merge whose load
+        // is an alias showed it: the first iteration read a register nothing
+        // had written. Re-point every alias at the variable's final register.
+        for (const auto& block : fn.blocks) {
+            for (const auto& in : block.instrs) {
+                if (in.op != Op::Load || in.result == kInvalidValue) continue;
+                auto it = plan.info.find(in.result);
+                if (it == plan.info.end() || it->second.kind != TempInfo::Kind::Alias) continue;
+                auto home = alloc.promoted().find(in.name);
+                if (home != alloc.promoted().end()) it->second.alias = home->second;
+            }
+        }
+
         constexpr Reg kL = abi::kScratchLeft;
         constexpr Reg kR = abi::kScratchRight;
 
@@ -912,7 +943,16 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
             }
         }
         const int out_area = ((static_cast<int>(out_args) * 8 + 15) / 16) * 16;
-        const int total_frame = alloc.frame_size() + out_area;
+        // Windows x64: XMM12-XMM15, which the float code uses as scratch, are
+        // callee-saved there, so a function that touches floats saves them in its
+        // prologue and restores them before it returns. 16 bytes each (the whole
+        // register is preserved), in a block just above the outgoing-argument area.
+        bool uses_floats = !float_values.empty();
+        for (bool fp : float_params) uses_floats = uses_floats || fp;
+        const bool save_xmm = uses_floats && !abi::kCalleeSavedXmm.empty();
+        const int xmm_save_area = save_xmm ? static_cast<int>(abi::kCalleeSavedXmm.size()) * 16 : 0;
+        const int xmm_save_base = alloc.frame_size() + xmm_save_area;   // slot k at -(base - 16k)
+        const int total_frame = alloc.frame_size() + xmm_save_area + out_area;
         if (total_frame > abi::kMaxNativeFrame) {
             throw std::runtime_error(
                 "compile_module: function '" + fn.name + "' needs a " +
@@ -1037,6 +1077,10 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
         // sentence has to read correctly whichever one traps first.
         // run_tier_diff.py compares stderr, so anything less than an exact
         // match here is a diff.
+        // The packed source position of the instruction being emitted (0 = unknown). A trap
+        // passes it to host_report_error, which prints "  --> path:line" under the message,
+        // exactly as the interpreter does.
+        int64_t cur_trap_loc = 0;
         auto emit_host_error_trap = [&](const char* message) {
             // 6.10. If an enclosing try catches this trap, the "trap" is a jump
             // to that handler block rather than a program end. The kind is
@@ -1051,10 +1095,24 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 }
             }
             emit_mov_reg_imm(code, abi::kArgRegs[0], reinterpret_cast<int64_t>(message));
+            emit_mov_reg_imm(code, abi::kArgRegs[1], cur_trap_loc);
             emit_mov_reg_imm(code, kR, reinterpret_cast<int64_t>(&host_report_error));
             emit_xor_zero(code, Reg::RAX);
             if (abi::kShadowSpace) emit_sub_rsp_imm32(code, abi::kShadowSpace);
             emit_call_reg(code, kR);
+            if (abi::kShadowSpace) emit_add_rsp_imm32(code, abi::kShadowSpace);
+        };
+
+        // A call to a HOST (C) function. Under the Microsoft x64 ABI the caller
+        // owns 32 bytes of "shadow space" directly above the return address, which
+        // the callee may spill its register arguments into; a call made without
+        // reserving it lets the callee overwrite the low 32 bytes of this frame
+        // (the outgoing-argument area, then locals). So every host call goes through
+        // here. On System V the reserve is zero and this is a plain call. A call to
+        // another JIT function uses the JIT's own convention and does not.
+        auto emit_host_call = [&](Reg target) {
+            if (abi::kShadowSpace) emit_sub_rsp_imm32(code, abi::kShadowSpace);
+            emit_call_reg(code, target);
             if (abi::kShadowSpace) emit_add_rsp_imm32(code, abi::kShadowSpace);
         };
 
@@ -1701,6 +1759,11 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
         for (const auto& saved : alloc.callee_saved_slots()) {
             emit_store_rbp_offset(code, saved.first, saved.second);
         }
+        if (save_xmm) {
+            for (size_t k = 0; k < abi::kCalleeSavedXmm.size(); ++k)
+                emit_movups_rbp_xmm(code, abi::kCalleeSavedXmm[k],
+                                    -(xmm_save_base - static_cast<int>(k) * 16));
+        }
         for (size_t i = 0; i < fn.params.size(); ++i) {
             // A float[64] parameter arrives in XMM_i, NOT in kArgRegs[i]. The
             // GP spill below put a GP register's bits in the slot, so reading the
@@ -2036,6 +2099,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 if ((flags & detail::kStopBeforeTerminator) && pos + 1 == block.instrs.size()) break;
                 if (plan.skip_instr[bi][pos]) continue;
                 const Instr& instr = block.instrs[pos];
+                cur_trap_loc = lithon::ir::pack_pos(instr.src, instr.line);
 
         // 4.3. Hashes the key in the dict's key slot into a starting bucket, in kL.
         //
@@ -2291,7 +2355,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 reinterpret_cast<int64_t>(
                     insert ? reinterpret_cast<void*>(&lithon::jit::host_dict_str_insert)
                            : reinterpret_cast<void*>(&lithon::jit::host_dict_str_find)));
-            emit_call_reg(code, kR);
+            emit_host_call(kR);
             // The helper answers with the bucket in rax, or -1 for an absent key.
             // kL takes it because that is where both continuations read the bucket
             // from, which is the whole reason this lambda's callers do not have to
@@ -2479,23 +2543,10 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 for (const char* n : kNames)
                     if (!trap_handler_label(n).empty()) any_catchable = true;
 
-                if (!any_catchable) {
-                    // The common case: no enclosing try, or one that names none
-                    // of these. The original one-call form, byte for byte.
-                    emit_lea_pool_string(abi::kArgRegs[0], instr.name);
-                    emit_mov_reg_imm(code, abi::kArgRegs[1],
-                                     static_cast<int64_t>(instr.type_width));
-                    emit_mov_reg_imm(code, kR,
-                                     reinterpret_cast<int64_t>(&lithon::jit::host_input_int));
-                    emit_xor_zero(code, Reg::RAX);
-                    if (abi::kShadowSpace) emit_sub_rsp_imm32(code, abi::kShadowSpace);
-                    emit_call_reg(code, kR);
-                    if (abi::kShadowSpace) emit_add_rsp_imm32(code, abi::kShadowSpace);
-                    Reg dst0 = compute_dest(instr.result);
-                    emit_mov_reg_reg(code, dst0, Reg::RAX);
-                    commit_result(instr.result, dst0);
-                    break;
-                }
+                // The read always reports through its error code (the helper never exits), so a
+                // failed read traps at THIS site and carries its source position like any other
+                // trap; a kind nothing catches is reported by emit_host_error_trap below.
+                (void)any_catchable;
 
                 // Reserve 16 bytes: the value slot is [rsp], and the extra 8
                 // keeps the call site 16-byte aligned.
@@ -2540,12 +2591,69 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 commit_result(instr.result, dst);
                 break;
             }
+            // 4.12. `str(n, input(prompt))`. The destination run is addressed from
+            // the frame base like the str find/split helpers', so the helper gets
+            // RBP, a descriptor naming the run's offset/capacity/limit, and the
+            // prompt from the string pool. It returns a KIND code (0 ok, 1 line
+            // too long, 2 NUL byte in the line, 3 end of input) rather than ending the process; each kind
+            // goes through emit_host_error_trap, which routes to an enclosing
+            // try/except handler by the SAME message classifier the interpreter
+            // uses and otherwise reports and exits -- so a caught trap behaves
+            // identically in both tiers.
+            case Op::InputStr: {
+                if (function_vex_used) emit_vzeroupper(code);
+                const int dest_cap = alloc.container_capacity(instr.name);
+                if (dest_cap <= 0) {
+                    throw std::runtime_error(
+                        "compile_module: inputstr into '" + instr.name + "' which is not a str");
+                }
+                lithon::jit::StrInputDesc desc{};
+                desc.dest_offset = alloc.element_offset(instr.name, 0);
+                desc.cap = dest_cap;
+                desc.limit = instr.int_imm;
+                const auto* descp = lithon::jit::register_print_desc(desc);
+                emit_mov_reg_reg(code, abi::kArgRegs[0], Reg::RBP);
+                emit_mov_reg_imm(code, abi::kArgRegs[1],
+                                 reinterpret_cast<int64_t>(descp));
+                emit_lea_pool_string(abi::kArgReg2, instr.name2);
+                emit_mov_reg_imm(code, kR,
+                    reinterpret_cast<int64_t>(&lithon::jit::host_input_str));
+                emit_xor_zero(code, Reg::RAX);
+                if (abi::kShadowSpace) emit_sub_rsp_imm32(code, abi::kShadowSpace);
+                emit_call_reg(code, kR);
+                if (abi::kShadowSpace) emit_add_rsp_imm32(code, abi::kShadowSpace);
+                emit_test_reg_reg(code, Reg::RAX);
+                JumpPatch input_ok = emit_jcc_rel32(code, Cond::Equal);
+                emit_cmp_reg_imm32(code, Reg::RAX, 1);
+                JumpPatch not_long = emit_jcc_rel32(code, Cond::NotEqual);
+                emit_host_error_trap(lithon::jit::kE0311Message);
+                resolve_jump_patch(code, not_long, code.size());
+                emit_cmp_reg_imm32(code, Reg::RAX, 2);
+                JumpPatch not_nul = emit_jcc_rel32(code, Cond::NotEqual);
+                emit_host_error_trap(lithon::jit::kE0312Message);
+                resolve_jump_patch(code, not_nul, code.size());
+                emit_host_error_trap(lithon::jit::kE0308Message);
+                resolve_jump_patch(code, input_ok, code.size());
+                break;
+            }
             case Op::GuardNonZero: {
                 Reg v = compute_src(instr.args.at(0));
                 emit_test_reg_reg(code, v);
                 JumpPatch nz = emit_jcc_rel32(code, Cond::NotZero);
                 emit_host_error_trap(lithon::jit::kE0310Message);
                 resolve_jump_patch(code, nz, code.size());
+                break;
+            }
+            // 4.14. `utrap %cond`: trap E0313 when the condition is true. The
+            // trap goes through emit_host_error_trap, so an enclosing try/except
+            // that catches an OverflowError is entered exactly as in the
+            // interpreter.
+            case Op::UTrap: {
+                Reg v = compute_src(instr.args.at(0));
+                emit_test_reg_reg(code, v);
+                JumpPatch no_trap = emit_jcc_rel32(code, Cond::Equal);
+                emit_host_error_trap(lithon::jit::kE0313Message);
+                resolve_jump_patch(code, no_trap, code.size());
                 break;
             }
 
@@ -2786,7 +2894,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                                  reinterpret_cast<int64_t>(descp));
                 emit_mov_reg_imm(code, kR,
                     reinterpret_cast<int64_t>(&lithon::jit::host_strlen));
-                emit_call_reg(code, kR);
+                emit_host_call(kR);
                 Reg dst = compute_dest(instr.result);
                 if (dst != Reg::RAX) emit_mov_reg_reg(code, dst, Reg::RAX);
                 commit_result(instr.result, dst);
@@ -2820,7 +2928,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                                  reinterpret_cast<int64_t>(descp));
                 emit_mov_reg_imm(code, kR,
                     reinterpret_cast<int64_t>(&lithon::jit::host_streq));
-                emit_call_reg(code, kR);
+                emit_host_call(kR);
                 Reg dst = compute_dest(instr.result);
                 if (dst != Reg::RAX) emit_mov_reg_reg(code, dst, Reg::RAX);
                 // host_streq returns 0/1, so `!=` is that XOR 1. Done on the
@@ -2860,7 +2968,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                     reinterpret_cast<int64_t>(instr.op == Op::StrFind
                         ? &lithon::jit::host_strfind
                         : &lithon::jit::host_strcount));
-                emit_call_reg(code, kR);
+                emit_host_call(kR);
                 Reg dst = compute_dest(instr.result);
                 if (dst != Reg::RAX) emit_mov_reg_reg(code, dst, Reg::RAX);
                 commit_result(instr.result, dst);
@@ -2897,7 +3005,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                                  reinterpret_cast<int64_t>(descp));
                 emit_mov_reg_imm(code, kR,
                     reinterpret_cast<int64_t>(&lithon::jit::host_strsplit));
-                emit_call_reg(code, kR);
+                emit_host_call(kR);
                 // RAX is the true piece count. Anything past the destination's
                 // capacity was dropped by the helper, so trap rather than let the
                 // length run past the run it describes.
@@ -3111,7 +3219,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                     emit_mov_reg_imm(code, reg1, reinterpret_cast<int64_t>(descp));
                     emit_mov_reg_imm(code, kR,
                         reinterpret_cast<int64_t>(&lithon::jit::host_print_mapping));
-                    emit_call_reg(code, kR);
+                    emit_host_call(kR);
                     break;
                 }
                 // 4.1 (phase 3). A nested list/tuple prints through the
@@ -3161,7 +3269,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                     emit_mov_reg_imm(code, reg1, reinterpret_cast<int64_t>(root));
                     emit_mov_reg_imm(code, kR,
                         reinterpret_cast<int64_t>(&lithon::jit::host_print_flat));
-                    emit_call_reg(code, kR);
+                    emit_host_call(kR);
                     break;
                 }
                 // 6.2. A str prints its bytes as text, the one aggregate that is
@@ -3182,7 +3290,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                     emit_mov_reg_imm(code, reg1, reinterpret_cast<int64_t>(descp));
                     emit_mov_reg_imm(code, kR,
                         reinterpret_cast<int64_t>(&lithon::jit::host_print_string));
-                    emit_call_reg(code, kR);
+                    emit_host_call(kR);
                     break;
                 }
                 const int cap = alloc.container_capacity(instr.name);
@@ -3209,7 +3317,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 emit_mov_reg_imm(code, reg1, reinterpret_cast<int64_t>(descp));
                 emit_mov_reg_imm(code, kR,
                     reinterpret_cast<int64_t>(&lithon::jit::host_print_sequence));
-                emit_call_reg(code, kR);
+                emit_host_call(kR);
                 break;
             }
 
@@ -3326,7 +3434,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 emit_mov_reg_imm(code, abi::kArgRegs[0], static_cast<int64_t>(idx));
                 emit_mov_reg_imm(code, kR,
                                  reinterpret_cast<int64_t>(&lithon::runtime::host_class_new));
-                emit_call_reg(code, kR);
+                emit_host_call(kR);
                 Reg dst = compute_dest(instr.result);
                 if (dst != Reg::RAX) emit_mov_reg_reg(code, dst, Reg::RAX);
                 commit_result(instr.result, dst);
@@ -3347,7 +3455,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                         reinterpret_cast<int64_t>(&lithon::runtime::class_attr_load_f64));
                     // The helper returns a double in XMM0; move it to the
                     // result's float home.
-                    emit_call_reg(code, kR);
+                    emit_host_call(kR);
                     Xmm dst = float_dest(instr.result);
                     if (dst != Xmm::XMM0) emit_movsd_xmm_xmm(code, dst, Xmm::XMM0);
                     commit_float_result(instr.result, dst);
@@ -3376,7 +3484,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                     emit_mov_reg_imm(
                         code, kR,
                         reinterpret_cast<int64_t>(&lithon::runtime::class_attr_store_f64));
-                    emit_call_reg(code, kR);
+                    emit_host_call(kR);
                     break;
                 }
                 const int disp = static_cast<int>(instr.int_imm);
@@ -3395,7 +3503,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 emit_mov_reg_imm(
                     code, kR,
                     reinterpret_cast<int64_t>(&lithon::runtime::host_class_retain));
-                emit_call_reg(code, kR);
+                emit_host_call(kR);
                 Reg dst = compute_dest(instr.result);
                 if (dst != Reg::RAX) emit_mov_reg_reg(code, dst, Reg::RAX);
                 commit_result(instr.result, dst);
@@ -3407,7 +3515,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 emit_mov_reg_imm(
                     code, kR,
                     reinterpret_cast<int64_t>(&lithon::runtime::host_class_release));
-                emit_call_reg(code, kR);
+                emit_host_call(kR);
                 break;
             }
             // 4.10.2. isinstance(x, C): the shared runtime helper does the two
@@ -3419,7 +3527,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 emit_mov_reg_imm(
                     code, kR,
                     reinterpret_cast<int64_t>(&lithon::runtime::host_class_is_instance));
-                emit_call_reg(code, kR);
+                emit_host_call(kR);
                 Reg dst = compute_dest(instr.result);
                 if (dst != Reg::RAX) emit_mov_reg_reg(code, dst, Reg::RAX);
                 commit_result(instr.result, dst);
@@ -3494,7 +3602,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 emit_mov_reg_imm(
                     code, kR,
                     reinterpret_cast<int64_t>(&lithon::runtime::host_class_slot));
-                emit_call_reg(code, kR);
+                emit_host_call(kR);
                 emit_store_rsp_offset(code, Reg::RAX, target_off);
                 // Restore the two register arguments the resolver call clobbered
                 // and load the target, so the setup is again the last thing
@@ -3579,7 +3687,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 emit_mov_reg_imm(
                     code, kR,
                     reinterpret_cast<int64_t>(&lithon::runtime::host_class_super_slot));
-                emit_call_reg(code, kR);
+                emit_host_call(kR);
                 emit_store_rsp_offset(code, Reg::RAX, target_off);
                 emit_load_rsp_offset(code, abi::kArgRegs[0], arg0_off);
                 if (nargs > 1) {
@@ -3765,8 +3873,15 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                             commit_float_result(instr.result, dst);
                         } else {
                             Reg dst = compute_dest(instr.result);
-                            emit_load_rbp_scaled(code, dst, kL, d.values_offset,
-                                                 d.value_stride);
+                            // An int[8|16|32] value is signed: a negative one must read back
+                            // negative (the interpreter's answer), so it is sign-extended. A
+                            // bool is 0/1 and stays zero-extended; 8-byte lanes are a plain mov.
+                            if (d.value_kind == "int" && d.value_stride < 8)
+                                emit_load_rbp_scaled_sext(code, dst, kL, d.values_offset,
+                                                          d.value_stride);
+                            else
+                                emit_load_rbp_scaled(code, dst, kL, d.values_offset,
+                                                     d.value_stride);
                             commit_result(instr.result, dst);
                         }
                     };
@@ -4454,7 +4569,8 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                         // callee's SSE works with stale state (and pays the
                         // transition penalty on every entry).
                         if (function_vex_used) emit_vzeroupper(code);
-                        if (instr.name == "print" || instr.name == "print_bare") {
+                        if (instr.name == "print" || instr.name == "print_bare" ||
+                            instr.name == "print_u" || instr.name == "print_bare_u") {
                             if (instr.args.size() != 1) {
                                 throw std::runtime_error(
                                     "compile_module: " + instr.name + "() with " +
@@ -4464,8 +4580,12 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                             // 6.1. print_bare is the same formatter with no
                             // trailing newline; only the format-string constants
                             // differ, so one path serves both.
-                            const bool nl = (instr.name == "print");
-                            const char* int_fmt = nl ? kIntPrintFormat : kIntPrintFormatBare;
+                            const bool unsigned_int =
+                                instr.name == "print_u" || instr.name == "print_bare_u";
+                            const bool nl = (instr.name == "print" || instr.name == "print_u");
+                            const char* int_fmt = unsigned_int
+                                ? (nl ? kUIntPrintFormat : kUIntPrintFormatBare)
+                                : (nl ? kIntPrintFormat : kIntPrintFormatBare);
                             const char* ptr_fmt = nl ? kPtrPrintFormat : kPtrPrintFormatBare;
                             const char* bool_true = nl ? kBoolTrueLiteral : kBoolTrueLiteralBare;
                             const char* bool_false = nl ? kBoolFalseLiteral : kBoolFalseLiteralBare;
@@ -4680,6 +4800,13 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                         if (function_vex_used) emit_vzeroupper(code);
                         for (const auto& saved : alloc.callee_saved_slots()) {
                             emit_load_rbp_offset(code, saved.first, saved.second);
+                        }
+                        // XMM0 holds a float result and is not one of these, so the
+                        // restore cannot disturb the return value.
+                        if (save_xmm) {
+                            for (size_t k = 0; k < abi::kCalleeSavedXmm.size(); ++k)
+                                emit_movups_xmm_rbp(code, abi::kCalleeSavedXmm[k],
+                                                    -(xmm_save_base - static_cast<int>(k) * 16));
                         }
                         // E0401: this call is leaving. Decrement the shared
                         // depth counter. RAX/XMM0 hold the return value and

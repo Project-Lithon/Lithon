@@ -141,8 +141,8 @@ $ ctest --test-dir build --output-on-failure     # 35/35
 
 $ bash tools/verify_all.sh        # the whole gate
 $ python3 tools/run_regression.py         # 34/34 untyped
-$ python3 tools/run_typed_regression.py   # 61/61 (46 + 15 class_*) typed
-$ python3 tools/run_tier_diff.py          # 235/235, both tiers`}</CodeBlock>
+$ python3 tools/run_typed_regression.py   # 70/70 typed
+$ python3 tools/run_tier_diff.py          # 263/263, both tiers`}</CodeBlock>
             <p>
               <code>run_tier_diff.py</code> is the highest-value of those. It
               runs every program through <em>both</em> tiers and requires

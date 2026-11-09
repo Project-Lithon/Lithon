@@ -286,6 +286,7 @@ if n != 0:
             ["Slicing", "`s[1:3]`", "refused"],
             ["Comparison", "by content", "by content, across different capacities"],
             ["Methods", "dozens", "three: `find`, `count`, `split`"],
+            ["Reading a line", "`input()` returns a `str` of any length", "`str(n, input(...))` into a `str[N]`; a line over `n-1` bytes traps (E0311), never truncates"],
             ["In a `list`", "yes", "yes, as a `str[N]` element"],
             ["As a function argument", "yes", "refused: a string is addressed, not passed"],
           ],

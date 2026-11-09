@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: lithon
-Version: 0.9.8
+Version: 1.0.0
 Summary: Zero-dependency C++ execution engine and JIT compiler for Python
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
@@ -15,7 +15,7 @@ Dynamic: license-file
 
 ### Native execution for typed Python.
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen?style=flat-square\&logo=github-actions)](https://github.com/Project-Lithon/lithon/actions)
+[![Build Status](https://github.com/Project-Lithon/Lithon/actions/workflows/ci.yml/badge.svg)](https://github.com/Project-Lithon/Lithon/actions/workflows/ci.yml)
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-20-00599C?style=flat-square\&logo=c%2B%2B)](https://en.cppreference.com/w/cpp/20)
 [![Architecture](https://img.shields.io/badge/arch-x86--64-red?style=flat-square)](https://en.wikipedia.org/wiki/X86-64)
 [![Typing](https://img.shields.io/badge/typing-extended%20static-green?style=flat-square)](#-static-typing)
@@ -49,7 +49,7 @@ as Lithon.
 
 For example:
 
-```python
+```lio
 x: int[64] = 10
 y: int[64] = 20
 
@@ -59,6 +59,8 @@ print(result)
 ```
 
 ### Current status
+
+**Version:** language/spec stage **4.10.6** (OOP complete); Python package **1.0.0** (`pyproject.toml`), pre-1.0 release, not yet on PyPI. `4.10.x` numbers are spec-section numbers, not semver.
 
 **Lithon is an experimental/community-preview project.**
 
@@ -73,6 +75,342 @@ drop-in Python replacement.
 
 ### Recently added
 
+- **x86-32 native tier (4.17)** — a second, independent backend for 32-bit hosts,
+  written in `src/jit/x86_32_encoder.h` (IA-32 encoder, every form checked by
+  disassembling the bytes with `objdump`, `tools/check_x86_32_encoding.py`) and
+  `src/jit/x86_32_backend.h`. Every IR value is an 8-byte `EDX:EAX` pair, because IR
+  temporaries are always 64-bit. It compiles **everything the x86-64 backend does**:
+  `int[64]`/`uint[64]` arithmetic with the `E0303` traps, `wrap_*`, `%`, shifts, bitwise
+  ops, floats (SSE2, NaN rules, `E0309`), containers, `str`, dicts, structs and
+  pointers, classes (`new`/refcounts/virtual calls/`isinstance`/destructors), `try`/
+  `except`, `input`, `syscall`, recursion with the `E0401` guard. All 130 programs of the
+  corpus run natively on 32-bit under wine and match the 64-bit tiers byte for byte
+  (stdout, stderr, exit status), and 540 random programs per gate run fuzzed across nine generator
+  modes (`tools/fuzz_x86_32.py`) match too. The frame layout comes from the same
+  allocator the x86-64 backend uses, so container/dict/struct offsets agree by
+  construction. It runs on both 32-bit ABIs: Win32 (i686 MinGW under wine) and System V
+  i386 (a native 32-bit ELF, with a stack-alignment probe), and can export its functions
+  under cdecl, stdcall and fastcall. `tier_runner` picks the backend by the host's pointer
+  size (`src/jit/backend.h`); the x86-64 backend refuses in a 32-bit process.
+  Speed (4.17.5): constants are immediate operands, single-use results are forwarded in
+  `EAX:EDX`/`XMM0`, integer compares feed branches through the flags, checked `*` and `%`
+  have an inline 32-bit fast path, and float constants are read from a pool. On the
+  benchmarks (`tools/bench_x86_32.py`) native is 25–105x faster than the 32-bit
+  interpreter and roughly 2–3x off 64-bit native once wine's ~0.125 s start-up is
+  subtracted. There is still no general register allocator (values live in frame slots).
+- **Microsoft x64 ABI (4.16)** — the JIT now follows the Windows calling convention
+  everywhere it meets C code, verified on a real Windows build run under wine.
+  Every call into a host (C) function reserves the 32-byte *shadow space* the
+  callee may spill into (17 call sites did not, so a host helper could overwrite
+  the low bytes of the JIT's own frame); a function that touches floats saves and
+  restores `XMM12`–`XMM15`, which Windows makes callee-saved, as full 128-bit
+  values; `RBX`, `RDI`, `RSI` and `R12`–`R15` were already preserved; and the
+  stack is 16-byte aligned at every call. `tools/check_win64.py` builds the JIT
+  with MinGW and runs (1) a conformance probe that loads every callee-saved
+  register with a sentinel, calls JIT functions through the Win64 convention and
+  checks each one comes back bit-for-bit, and (2) every program in
+  `tests/typed_regression` and `tests/programs` through the Windows interpreter
+  and native tier, built `-O0` so a missing shadow space corrupts a frame instead
+  of hiding. Two controls confirm the checks bite: disabling the `XMM` save makes
+  the probe report `xmm12 xmm13 xmm14 xmm15` clobbered, and disabling the shadow
+  space garbles program output. `tier_runner` now maps code through the portable
+  `ExecutableBuffer` (`VirtualAlloc` on Windows) and Windows binaries link an
+  8 MiB stack, the size the `E0401` call-depth guard was calibrated for. The JIT's
+  *internal* function-to-function convention is unchanged (two register arguments,
+  then the stack); see the Todo for what it would take to make JIT functions
+  directly callable from C with more.
+- **Modules and the entry point (4.15)** — a program may be split across `.lio`
+  files. The entry point is `if __name__ == '__main__': ...`: its body runs when
+  the file is the program being run and is dropped when the file is imported (a
+  script with no guard still runs top to bottom). Imports use Python's spelling:
+  `import m` (then `m.f()`), `import a.b` (a file below a directory, `a.b.f()`),
+  `import m.f` (just `f`), `from m import f`, and `as` aliases. A directory is a
+  package with no `__init__` file. Other directories are found through the
+  importing file's directory, the entry program's directory, `-I dir` on the
+  command line (repeatable) and `LITHON_PATH`, in that order. What can be
+  imported grows level by level and all three levels are in: **functions**,
+  **classes** (and the structs and enums that share their syntax; a subclass here
+  of a class there works, and so does dispatch across the boundary) and
+  **constants** (scalars with a literal value, which fold into the importer and
+  can size a container). There is no run-time import: everything is linked at
+  compile time into one program, each file is parsed once, and an imported
+  function or class is compiled only if something reachable names it, so a
+  300-module, 6,000-function library the program barely touches links in about a
+  second and compiles to just what it uses. An imported file may only *define*;
+  an executable top-level statement, an import cycle, `from m import *`, a
+  relative import, a name collision and a parameter that shadows an import are all
+  refused (`E0145`).
+- **Unsigned integers (4.14)** — `i: uint[size] = value` holds `0 .. 2^size-1`
+  for `size` 8, 16, 32 or 64, including `uint[64]` up to `18446744073709551615`,
+  which compares, takes `%` and prints as the unsigned number it is. `uint` and
+  `int` **never mix implicitly**: arithmetic or a comparison between them, a
+  negative or too-large literal, and a signed value into a `uint` are refused
+  (`E0144`); the one allowed flow is a `uint` narrower than 64 bits widening into
+  an `int[64]`, and a non-negative literal is accepted wherever a `uint` is, if
+  it fits. An operation whose exact result leaves `0 .. 2^size-1` — a sum past
+  the maximum, `3 - 5`, a product or left shift that does not fit — **traps**
+  (`LITHON-E0313`, an `OverflowError`) and never wraps. Scalars only in this
+  stage: locals, parameters, returns, `const`s, `print`; containers, struct
+  fields, pointers, class attributes and methods are refused for now. The IR
+  sees an ordinary 64-bit integer, so the checker and both tiers are unchanged
+  but for one `utrap` op and an unsigned print; the frontend does the typing and
+  builds `uint[64]` carries, products, `%` and `>>` from existing ops.
+  `tools/check_uint.py` compares every operator at every width over edge values
+  against an exact oracle on four execution paths (12,177 cases each).
+- **Constants (4.13)** — `const var: type[size] = value` declares a name that
+  is assigned exactly once, by its initializer. Every later write is refused
+  (`E0143`): assignment, augmented assignment, redeclaration, an element store
+  into a constant list, `append`, a string re-read, using it as a `for` target,
+  and taking its address. A scalar (`int`, `float`, `bool`) with a literal
+  initializer is also **folded** into every read, and a module-level one is
+  visible inside every function and can be written as a capacity
+  (`xs: list[int[64], N]`, `s: str[N]`, a dict bucket count); a constant of any
+  other type (`str`, `list`, `tuple`, `dict`, `enum`) is an ordinary immutable
+  variable. A struct, a pointer and a class reference cannot be a constant yet.
+  No IR, checker or runtime change: immutability is enforced in the frontend.
+  `tests/typed_regression/const_basic.lio` is checked against CPython.
+- **String input (4.12)** — `k: str[N] = str(n, input("Enter something: "))`
+  reads one line into the bounded string `k`. `n` is a literal limit that counts
+  the NUL exactly as `str[N]` does, so at most `n-1` bytes are read and
+  `1 <= n <= N`. A line longer than `n-1` bytes **traps** (`LITHON-E0311`, a
+  `ValueError` to `try`/`except`) and is never truncated; a line containing a
+  NUL byte traps `E0312` (a string cannot hold one, and the bytes after it would
+  be hidden); end of input is `E0308` (an `EOFError`). It also re-reads into an existing `str[N]` variable
+  or a struct's `str` field, and every read rewrites the whole run, so a shorter
+  line leaves no old tail. A limit larger than the capacity or that is not a
+  literal is refused (`E0116`), and `str(...)` anywhere else is refused
+  (`E0115`). One new IR op, `inputstr`, shares its line reader with the
+  interpreter and the JIT helper, so both tiers decide EOF, overflow and the
+  bytes written identically. `tests/typed_regression/str_input.lio` (with its
+  `.in`) pins the surface and `tools/run_tier_diff.py` pins the traps.
+- **Declared loop variables (4.11)** — `for i in range(...)` only *assigns* a
+  variable the program has already declared; it never creates one. The target
+  must be an `int[w]` that already holds a value (V1_SPEC 0.6.6), and the loop
+  keeps the width it was declared with, so `i: int[8] = 10` then
+  `for i in range(10)` runs `i = 0, 1, ..., 9` and leaves `i == 9`, exactly as
+  CPython does; a loop that never runs leaves `i` untouched. `enumerate`/`zip`
+  targets follow the same rule (declared, valued, with the element's exact
+  type). A target that is undeclared, not an integer, or narrower than its
+  bounds can be proven to fit is refused (`E0119`), as is assigning to a live
+  target inside the loop body (it would change the iteration count); a
+  declared-but-unassigned target is refused by the definite-assignment check
+  (0.6.10). Previously the frontend silently invented an `int[64]` and ignored
+  the declared width, and ended the counter on the limit. The new bottom-tested
+  loop shape also exposed and fixed two latent SSA-backend bugs (a stale
+  register alias after phi coalescing, and a constant-folded branch leaving a
+  phi operand on the wrong edge). `tests/typed_regression/for_declared.lio`
+  pins the accepted forms against CPython and `tools/check_error_codes.py`
+  pins every refusal.
+- **Nullable class references (4.10.7)** — `Optional[P]` is one class
+  reference that may also hold `None`; it is accepted for locals, attributes,
+  parameters and returns. `None` is not a general scalar zero: it is a value
+  only for an Optional class target, so printing it, storing it in a scalar or
+  container, indexing with it, using it in an augmented assignment or an enum
+  payload, passing it to a non-Optional parameter and the other non-class uses
+  are refused (`E0142`). An unchecked Optional cannot be used as an object:
+  `is None` / `is not None` narrow a plain class-variable name through
+  `if`/`while`, including an early `return` after a guard, and
+  `==`/`!=` with `None` is refused in favour of the identity forms. Narrowing
+  is deliberately not inferred for an attribute (copy it to a local first),
+  and try/loop exits restore the conservative pre-block facts. The runtime
+  model is unchanged: an Optional is still an 8-byte reference, with a
+  class-typed null reference for `None`, and assigning `None` (or another
+  reference) releases the old target at that statement. No IR opcode or
+  runtime ABI is added. Collections containing an Optional class reference are
+  deliberately deferred. `tests/typed_regression/class_optional.lio` pins
+  locals, attributes, parameters, returns, upcasts, narrowing, chained walks
+  and release/replace lifetime, and `fuzz_diff.py --oop` alternates a seventh
+  Optional/None shape.
+- **Properties and classmethods (4.10.6)** — the only decorators Lithon
+  recognises are a bare `@property` and a bare `@classmethod`; any other or
+  multiple decorators remain refused (`E0134`). A property is a read-only
+  computed attribute: it takes only `self`, must declare a scalar or class
+  reference result, and is read without parentheses (`p.total`). It is
+  inherited and overridden through the ordinary method machinery, including a
+  vtable slot, so a base-typed reference dispatches to a derived override;
+  assigning to it or calling it with `()` is refused (`E0135`). A classmethod
+  takes an unannotated `cls` instead of `self`, is called on a class name
+  (`Point.origin()`), and is not an instance method or a vtable slot. `cls` is
+  a compile-time alias for the call-time class: `cls(...)` constructs it,
+  `cls.other(...)` resolves another classmethod, and `isinstance(x, cls)` /
+  `issubclass(cls, C)` fold statically. Inlining the body means an inherited
+  classmethod constructs the call-time subclass. Calling a classmethod on an
+  instance, or an ordinary method on a class name, is refused (`E0135`). No
+  new IR opcode or runtime ABI is involved: a property read reuses the
+  zero-argument virtual-call path, and a classmethod body is inlined.
+  `tests/typed_regression/class_decorators.lio` pins property reads and
+  overrides, inherited classmethod construction, `cls(...)`, `cls.other(...)`,
+  `issubclass(cls, C)`, and a statement classmethod call, and
+  `fuzz_diff.py --oop` alternates a sixth property/classmethod shape.
+- **Special methods (4.10.5)** — classes can now define `__eq__`, `__ne__`,
+  `__lt__`, `__le__`, `__gt__` and `__ge__`. Each is an ordinary typed method
+  taking one other class reference and returning `bool`, so it uses the global
+  vtable slots, inlining and devirtualization from 4.10.2/4.10.4 unchanged.
+  `a != b` uses `__ne__` when present and otherwise negates `__eq__`; with no
+  equality method, `==`/`!=` stay pointer identity and `is`/`is not` never
+  dispatch. Ordering with no matching method is refused (`E0135`) rather than
+  silently falling back to addresses. Python's reflected/right-operand
+  subclass priority is deliberately not implemented: the left operand's
+  method runs. Object text is a separate, deliberately non-callable surface:
+  `__str__`/`__repr__` must return one string literal or f-string whose fields
+  are direct scalar `self` attributes, and they are not vtable slots because a
+  bounded string has no register value. `print(obj)` selects `__str__`, then
+  falls back to `__repr__`, for the receiver's **actual** concrete class; when
+  subclasses choose different text methods, the frontend emits `isinstance`
+  branches and inlines the chosen text as the existing literal/scalar print
+  operations. A literal longer than the declared `str[N]` result is refused
+  (`E0111`), and an object with neither method, or an explicit
+  `p.__str__()`/`p.__repr__()` call, is refused (`E0135`) rather than printing
+  an address. Scalar `<=`/`>=` lower to `not (b < a)` / `not (b > a)`, so
+  natural `__le__`/`__ge__` bodies work without a new opcode.
+  `tests/typed_regression/class_special_methods.lio` pins equality, ordering,
+  identity, dynamic text dispatch and the `__repr__` fallback, and
+  `fuzz_diff.py --oop` includes a special-methods shape in its seven-shape
+  rotation.
+- **Multiple inheritance (4.10.4)** — `class D(B, C):` may combine bases that
+  were declared earlier. Method lookup uses Python's **C3 linearization**, so
+  `D(B, C)` searches `D, B, C, A` and `D(C, B)` searches `D, C, B, A`; the
+  arithmetic in each override makes a wrong order visible. A `super()` call
+  starts after the class that **defined** the running method in the receiver's
+  actual MRO, which is what makes a cooperative diamond visit each class once
+  and also lets a method call `super().foo()` for a `foo` it does not override.
+  Slots remain global by method name, and each descriptor records the
+  **declaring owner**, so an inherited slot points at the owner's emitted
+  `__virt__` function rather than a per-subclass copy. Every base must agree at
+  identical attribute offsets: a diamond reuses one copy of the shared root
+  state, while two stateful bases with different fields are refused (`E0127`)
+  because one object cannot be a valid prefix of both. `super().__init__` is
+  resolved statically along the construction class's MRO, `isinstance` probes
+  an ancestor bitset (a diamond's descendants are no longer contiguous), and a
+  destructor is selected once by MRO with only its owner emitting code
+  (`super().__del__` is refused). A class-typed result returned through
+  `super()` or a virtual call is one owned reference: a binding claims it and a
+  discarded result is released at the statement that produced it.
+  `tests/typed_regression/class_multiple_inherit.lio` and
+  `class_multiple_lifetime.lio` pin C3 lookup, cooperative `super()`, class
+  returns and inherited-drop lifetime, and `fuzz_diff.py --oop` includes a
+  diamond shape among its seven OOP shapes.
+- **Class references in containers (4.10.3)** — a `list[P, N]` or
+  `tuple[P, N]` may now hold class references. Each element is one 8-byte
+  reference leaf in the container's flat run, so a nested
+  `list[list[P, 2], 2]` is still one contiguous run and `xs[i][j]` is the same
+  multi-index access scalars use. The declared element class is the **static**
+  type of every read: an element may name that class or any subclass (an
+  upcast), so `xs[i].method()` dispatches on the object's real class, and
+  `isinstance(xs[i], D)` still sees a stored `D`. A read is a **borrow**; the
+  slot owns one reference. A class-typed literal must fill every slot (a bare
+  declaration would be a run of null references), so a shorter literal, a bare
+  `list[P, N]`/`tuple[P, N]`, and `append` are refused. Overwriting a slot
+  retains the new reference *before* releasing the old one, so
+  `xs[0] = xs[0]` and `xs[1] = xs[0]` cannot free the value being stored;
+  scope exit walks the flat leaf chains in reverse and drops one reference per
+  slot, which is what makes per-element `__del__` observable and tier-identical.
+  Tuples build their elements first and then declare/fill the run in one block,
+  because an element's inlined constructor splits the IR. `in`, `is`/`is not`
+  and `==`/`!=` compare references (with the same related-class rule as
+  identity); `len` reports the literal's slot count. Deliberately deferred:
+  `enumerate`/`zip` over a class-typed container (the loop target outlives an
+  iteration, so its ownership rule is not settled — use
+  `for i in range(N):` and read `xs[i]`), class-typed containers as function
+  parameters or return values (local storage, not a value), and dict
+  keys/values of class type. `tests/typed_regression/class_container_list.lio`,
+  `class_container_inherit.lio` and `class_container_lifetime.lio` guard the
+  reads, dispatch/upcasts and per-slot lifetime, and `fuzz_diff.py --oop`
+  alternates this shape with the flat, inheritance and multiple-inheritance
+  shapes.
+- **Single inheritance (4.10.2)** — `class Dog(Animal):` extends an earlier
+  class. A subclass instance begins with a valid base instance (base attributes
+  keep their offsets), so upcasting a `Dog` reference to `Animal` is free and an
+  inherited attribute or method is reached without a copy. Method slots are
+  **stable down the chain**: a call site compiled against the base reads the
+  same slot for every subclass, and an override replaces that slot's
+  implementation. A call whose receiver's exact class is statically known (and
+  whose hierarchy has no override) is still inlined; when the receiver is only
+  known as a base, the frontend emits `CallVirtual`, which reads the receiver's
+  own descriptor and runs the override at run time. `super()` starts after the
+  class that defines the running method in the receiver's actual MRO;
+  `super().__init__(...)` runs the next constructor on the same object while
+  registering the base's attributes with the derived definite-init check.
+  This stage used a single contiguous subtree range for `isinstance(x, C)`; the
+  4.10.4 multiple-inheritance work replaces it with an ancestor bitset so a
+  diamond's descendants need not be contiguous. `issubclass(A, B)` folds to a
+  constant at compile time. A method whose body is `...` is abstract: the class
+  is flagged and cannot be instantiated until a subclass implements it. An
+  override must match the inherited signature, and a subclass adds attributes
+  rather than shadowing inherited ones. `tests/typed_regression/class_inherit.lio`,
+  `class_inherit_super.lio`, `class_inherit_isinstance.lio` and
+  `class_inherit_params.lio` are tier-identical guards, and `fuzz_diff.py --oop`
+  alternates flat class programs, inheritance programs, class-reference-in-
+  container programs and a multiple-inheritance diamond (vtable dispatch,
+  `super()`, `isinstance`, upcasts, per-slot ownership and cooperative
+  constructors).
+- **Classes (4.10.1)** — the first user-visible slice of Python's object model.
+  A `class Name:` with no base declares a real class: attributes with types, an
+  `__init__`, plain methods, and an optional `__del__`. An instance is a heap
+  **reference** (8 bytes) — distinct from a `struct`'s inline byte run — so it is
+  a value that can be passed, returned, aliased and stored, and every method is
+  inlined at its call site with `self` as the receiver reference (the 4.9
+  model). Attribute access lowers to `refload`/`refstore` at absolute offsets
+  baked in from the class layout, which the frontend emits once as module
+  metadata both tiers read, so the two engines cannot disagree about a layout.
+  Lifetime is the reference-counting model made observable: `p: Point = Point(...)`
+  owns one reference, dropped at the exit of the block that owns it (a function
+  or module body, a loop body, a `return` path, a `break`/`continue`); `b = a`
+  and storing a reference in an attribute emit a retain so both owners count.
+  Releasing an object also drops the references its own class-typed attributes
+  hold, so an object kept alive *only* by a holder still dies, and its `__del__`
+  runs, when the holder does. A function that returns a reference retains it, so
+  a call result is always one owned reference the caller drops at its own scope
+  exit — the same contract whether the callee returned a fresh construction, an
+  owned local or a borrowed parameter, which removes the borrow ambiguity instead
+  of inferring it.
+  `__del__` is **not** inlined — it is emitted as a real `__del__<Class>`
+  function and pointed at from the descriptor, so it runs at the exact last drop
+  and in the same order in both tiers. `is`/`is not` are always object identity:
+  one integer compare of the addresses. `==`/`!=` use the class's equality
+  method when one is declared (4.10.5) and otherwise stay identity. Definite
+  initialization is enforced structurally — every
+  declared attribute must be assigned on every path reaching the end of
+  `__init__` (E0140), and uninitialized scalar attributes are zeroed at `new`.
+  An attribute is `int[w]`, `float[64]`, `bool` or a reference to another class
+  — the declaration makes exactly those usable, so a `str`, `struct` or `enum`
+  attribute (which would be stored inline but has no *variable* for the ops that
+  reach a bounded string, a struct field or an enum payload) is refused at
+  declaration (E0127) rather than accepted and then unreadable. Refused by
+  design: a bare class name in a value position ("did you mean `Name(...)`?"),
+  an undeclared attribute (E0141), and general decorators — 4.10.6 recognises
+  only a bare read-only `@property` or `@classmethod` on a class method.
+  Class-typed variables are non-null unless declared `Optional[P]`; 4.10.7
+  adds `None`, the `is None`/`is not None` narrowing proof and the
+  associated refusals (`E0142`). Class references may be list/tuple elements
+  (4.10.3) and class attributes (4.10.1), but a collection holding an
+  `Optional[P]` element is deliberately deferred; a dict or struct attribute
+  holding a class or Optional reference remains a later sub-step.
+  `tests/typed_regression/class_basic.lio`, `class_lifetime.lio`,
+  `class_references.lio` and `class_returns.lio` are tier-identical guards, and
+  `tools/fuzz_diff.py --oop` generates class programs and compares the two
+  engines (and CPython) over construction, aliasing, lifetime and identity.
+- **Object runtime (4.10.0)** — the foundation for real classes: a small
+  `mmap`-backed heap with intrusive size-class free lists and no libc, the
+  `[vptr:8][refcount:8]` instance header, a read-only `ClassDescriptor` carrying
+  the type id, the ancestor bitset (the legacy subtree range remains for old
+  descriptors) and the vtable, and shared `IncRef`/`DecRef` helpers.
+  **Reference counting** is the decided lifetime model: deterministic,
+  pause-free, and the `__del__` moment is pinned to exactly the program point
+  where the last reference drops — the one observable lifetime event, so the
+  optimizer may not move or elide it, and the two tiers therefore agree. An
+  object whose class has no `__del__` is a plain, freely-rewritable free;
+  class descriptors and (later) stack-allocated objects carry an immortal
+  sentinel so no increment is ever emitted for them. The runtime is shared by
+  both tiers (`src/runtime/object.h`, `src/runtime/heap.h`) and reset at each
+  entry point exactly like the stack-depth guard, so allocation and destructor
+  order cannot drift between the interpreter and the JIT. This stage adds **no
+  user-visible language change**; `src/runtime/object_runtime_test.cpp` pins the
+  layout, the allocator, reference counting, the destructor timing/order, the
+  immortal no-ops and the ancestor-bitset `isinstance` probe. Documented narrowings:
+  allocation addresses are never observable (a reference is print-unsafe, like
+  `Ptr`), cycles leak, and references held between a trap and a `try` handler
+  are leaked on the exceptional path (never a safety problem).
 - **`try`/`except` (6.10)** — the Python EAFP rhyme works: a `try` body whose
   `int(8, input("..."))` meets a typo lands in `except ValueError:`, and the
   program continues. It catches the closed set of built-in Tier-3 traps
@@ -144,6 +482,13 @@ Lithon is built around several principles:
 * **Interpreter fallback** — unsupported native cases can still execute through
   Tier-0 when using automatic mode.
 * **Explicit unsafe memory access** — pointer variables require an `_` prefix.
+* **Managed objects, but no hidden pauses** — class instances live on a
+  reference-counted heap (4.10.0), so aliasing (`b = a`) and objects outliving
+  their creator work as in Python; there is no tracing collector and therefore
+  no pauses. Dynamic dispatch exists only through declared class hierarchies,
+  costs one indirect call, and is removed wherever the compiler can prove the
+  type; objects live on the heap unless escape analysis proves they do not
+  escape.
 * **JIT/Compiler refusal over silent miscompilation** — when Lithon cannot prove
   something, the native tier refuses it.
 
@@ -158,7 +503,7 @@ The last point is fundamental to the project:
 
 ### Static integers
 
-```python
+```lio
 a:int[64] = 20
 b:int[64] = 22
 
@@ -183,7 +528,8 @@ z:int[64] = 9223372036854775807
 
 Lithon does not silently turn these into arbitrary-precision Python integers.
 
-Every integer width is **signed**: there is no `uint`. A negative `int[8]` /
+Every `int[w]` width is **signed**; the unsigned types are the separate `uint[w]`
+(4.14, below). A negative `int[8]` /
 `int[16]` / `int[32]` keeps its value when it is read back out of a list
 element, a struct field, or a pointer, so `-5` stored into an `int[16]` prints
 `-5`, never the zero-extended bit pattern `65531`. `bool` is the one narrow type
@@ -247,6 +593,171 @@ Guess
   ▼
      Generate potentially incorrect machine code
 ```
+
+### Unsigned integers (4.14)
+
+```python
+a: uint[8] = 200
+b: uint[8] = 100
+print(a - b)                 # 100
+print(a + b)                 # LITHON-E0313: 300 does not fit uint[8] -- it traps
+
+big: uint[64] = 18446744073709551615
+print(big)                   # 18446744073709551615, not -1
+print(big > 9223372036854775808, big % 10)   # True 5
+```
+
+`uint[size]` is declared like `int[size]`, with a value, and `size` is 8, 16, 32
+or 64. It holds `0 .. 2^size-1`: `0` is a valid value, a negative literal is
+refused at compile time, and so is a literal that does not fit.
+
+**It never mixes with `int`.** `u + i`, `u < i`, `i += u`, a signed value into a
+`uint` and a `uint` into an `int[8]` are all refused (`E0144`) — implicit
+conversions between signed and unsigned are where C's worst bugs live. The two
+things that do work are a non-negative literal anywhere a `uint` is accepted, and
+a `uint` narrower than 64 bits widening into an `int[64]`, which is exact:
+
+```python
+w: int[64] = a               # fine: uint[8] -> int[64]
+i: int[8] = a                # refused
+```
+
+Between `uint`s of different widths a result takes the wider width, and storing it
+into a narrower `uint` is refused. A literal operand takes the other side's width
+and must fit it (`u8 + 300` is refused).
+
+**It never wraps.** Every operation computes the exact result and traps
+`LITHON-E0313` (an `OverflowError`, so `try`/`except` catches it) if it is outside
+`0 .. 2^size-1`: a sum past the maximum, a difference below zero (`3 - 5`), a
+product, or a left shift that loses bits. `%` by zero is the usual
+`ZeroDivisionError`. Bitwise `& | ^` and a right shift cannot leave the range.
+`/` is true division, as everywhere, so it yields a float and is allowed for
+`uint[8|16|32]` (a `uint[64]` does not fit a double exactly, so it is refused);
+`//` does not exist in Lithon.
+
+`uint[64]` is a true unsigned 64-bit type. The machine word cannot say "unsigned"
+on its own, so the frontend builds the unsigned behaviour from signed operations —
+order is signed order with the sign bit flipped, a carry or borrow is detected with
+that same flip, a product is assembled from 32-bit halves, `%` handles operands at
+or above `2^63` by hand, and `>>` is logical — and `print` of a `uint[64]` uses an
+unsigned format.
+
+Scalars only for now: a `uint` may be a local, a free-function parameter or
+return, a `const`, and printed; it cannot be a list, tuple or dict element, a
+struct field, a class attribute, a method parameter, a pointer pointee, or an
+argument to `abs`, `int`, `float`, `wrap_*` or `syscall`, and a `uint[64]` cannot
+index or bound a `range` (a value at or above `2^63` would be read as negative).
+
+### Modules, imports and the entry point (4.15)
+
+```python
+# mathlib.lio
+const LIMIT: int[64] = 100
+
+def square(x: int[64]) -> int[64]:
+    return x * x
+
+# main.lio
+import mathlib
+from mathlib import LIMIT as TOP
+
+def run() -> int[64]:
+    return mathlib.square(7)
+
+if __name__ == '__main__':
+    print(run(), TOP)               # 49 100
+```
+
+**The entry point.** `if __name__ == '__main__':` is the one form, and its body
+runs when this file is the program you started. In a file that is only imported
+the guard is dropped, so a library can carry its own demo or self-test without it
+running. `__name__` is not a value and cannot be used anywhere else, and the guard
+takes no `else`. A script with no guard is still a script: it runs top to bottom,
+as every program did before.
+
+**Importing.**
+
+| Spelling | You then write |
+| :-- | :-- |
+| `import prog1` | `prog1.func1()` (`prog1.lio` in the importing file's directory) |
+| `import src.prog1` | `src.prog1.func1()` (a directory is a package; no `__init__` file) |
+| `import prog1.func1` | `prog1.func1()` (only that function, class or constant) |
+| `from prog1 import func1` | `func1()` |
+| `from src.prog1 import func1 as f` | `f()` (`as` works on every form) |
+
+A dotted name that is a file wins over a dotted name that is a member, so
+`import prog1.func1` means the function `func1` of `prog1` unless a file
+`prog1/func1.lio` exists.
+
+**Where files are found**, first match wins: the importing file's own directory;
+the directory of the program being run (so a library in `src/` can import a sibling
+of the entry program); each `-I dir` given to `lithon`, in order; each directory of
+the `LITHON_PATH` environment variable (`:`-separated, `;` on Windows).
+
+```text
+lithon -I src -I vendor main.lio
+LITHON_PATH=/opt/lithon-libs lithon main.lio
+```
+
+**What can be imported**, level by level: *functions*; *classes*, which also covers
+the structs and enums that use the same syntax — an imported class can be named in
+annotations, constructors, base lists, `isinstance` and `match`, and subclassed in
+the importing program; and *constants* — a scalar (`int`, `uint`, `float`, `bool`)
+with a literal value, which is folded into whoever uses it and so also works as a
+container or string capacity (`xs: list[int[64], m.N]`). A string, list or other
+constant is local to its own scope, as every variable is, so an imported file
+cannot define one. Type functions are not importable yet.
+
+**An imported file only defines.** Functions, classes, structs, enums, literal
+scalar constants, its own imports and the entry guard are all it may contain. An
+executable top-level statement is refused: it would need an initialisation order
+across files and state shared between them, and the guard is the place for code
+that should run. A file importing another that imports it back (an import cycle),
+`from m import *`, a relative import (`from .m import f`), an import inside a
+function, two imports binding one name, an import that collides with a definition,
+and a parameter or local that reuses an imported name are refused (`E0145`).
+
+**How it is built.** There is no run-time import and no module object. The linker
+resolves every import at compile time, parses each file once, renames each imported
+symbol with its module's path (`mathlib__square`) and merges everything into the one
+program the compiler already compiles, so both tiers see an ordinary program and an
+import costs nothing when it runs. Only the imported functions and classes that
+reachable code actually names are linked: a program importing a 300-file library of
+6,000 functions and calling three of them links in about a second and produces an
+IR of exactly those three.
+
+### Constants (4.13)
+
+```python
+const N: int[64] = 4
+const PRIMES: list[int[64], 4] = [2, 3, 5, 7]
+const NAME: str[8] = "lithon"
+
+xs: list[int[64], N]            # a constant is a valid capacity
+def scaled(a: int[64]) -> int[64]:
+    return a * N                # and is visible, folded, inside a function
+```
+
+`const` goes in front of an ordinary typed declaration, and the initializer is
+mandatory: a constant is assigned once, there. After that nothing may change it —
+assigning to it, `+=`, redeclaring it, `xs[0] = v` into a constant list,
+`xs.append(v)`, re-reading a constant string, using it as a `for` target, and
+taking its `addressof` are all refused with `E0143`. A name that is a module
+constant is reserved: a parameter or a local of the same name is refused too,
+so a constant can never be shadowed by accident.
+
+A scalar constant (`int`, `float` or `bool`) whose initializer is a literal is
+**folded**: every read becomes the literal, and because that is always safe, a
+module-level one is visible inside every function and can size a container, a
+string or a dict. A constant list, tuple, dict, string or enum is an ordinary
+immutable variable that lives in its own scope, like any other name.
+
+Not constants yet: a struct (it has no value to initialise it with), a pointer
+(the address would let the pointee change) and a class reference (a method could
+still change the object). Constant *expressions* (`const M: int[64] = N * 2`) are
+a normal immutable variable, not folded. `const` is not Python syntax, so the
+frontend removes the keyword with the tokenizer before parsing and keeps every
+line number.
 
 ### Declaring without initializing
 
@@ -543,20 +1054,26 @@ The verification suite checks several independent layers.
 
 | Area                                 |         Current result        |
 | :----------------------------------- | :---------------------------: |
-| CTest                                |       **33 / 33 passed**      |
+| CTest                                |       **35 / 35 passed**      |
 | x86-64 encoder comparisons           |       **18,379 cases**        |
 | Incorrect encoder cases              |             **0**             |
 | Typed differential fuzzing           |      **300 / 300 passed**     |
 | Bitwise / shift fuzzing              |      **200 / 200 passed**     |
 | Conditional-expression / SSA fuzzing |    **200 / 200 per suite**    |
-| Direct float Phi sweep               | **38 matched / 0 mismatched** |
+| Direct float Phi sweep               | **104 matched / 0 mismatched** |
 | ABI modules audited                  |             **34**            |
 | ABI stack/callee-saved failures      |             **0**             |
-| Typed regression suite               |       **28 / 28 passed**      |
+| Typed regression suite               |       **70 / 70 passed**      |
+| Win64 ABI (MinGW build under wine)   | **6 probes ok, 104 / 104 identical** |
+| x86-32 native tier (Win32, wine)     | **130 / 130 programs native, identical; 540 fuzzed per run; encoder 118 / 118** |
+| x86-32 native tier (System V i386)   | **130 / 130 native, identical; alignment probe; 540 fuzzed per run** |
+| x86-32 exported cdecl/stdcall/fastcall | **30,000 calls per target, stack balanced** |
 | General regression suite             |       **34 / 34 passed**      |
 | Type-checker unit checks             |          **145 ok**          |
-| Error-code discipline checks         |          **86 ok**           |
-| Tier differential (interp vs JIT)    |      **168 / 168 passed**     |
+| Object runtime (4.10.0–4.10.6, ctest) | **107 ok**       |
+| Error-code discipline checks         |         **296 ok**           |
+| Tier differential (interp vs JIT)    |      **263 / 263 passed**     |
+| Class (OOP) fuzzing                  |      **200 / 200 passed**     |
 | Syscall hook parity (both tiers)     |        **4 / 4 passed**      |
 | Networking loopback vs a C oracle    |          **verified**        |
 | SIMD vectorizer loop cases           |        **6 / 6 passed**      |
@@ -869,6 +1386,48 @@ to fit its `str[K]`, and a split that produces more than `M` pieces traps
 The whitespace-splitting form `s.split()` and an empty separator are refused, so
 the separator is always explicit.
 
+#### Reading a line into a string (4.12)
+
+```python
+name: str[16] = str(10, input("Name: "))   # at most 9 bytes + the NUL
+print(name)
+name = str(10, input("Again: "))           # re-read into the same string
+```
+
+`str(n, input("prompt"))` is the one way to read text. The prompt is a string
+literal (or absent), and `n` is a **literal limit that counts the terminating
+NUL**, the same convention as `str[N]` itself: `str[N]` holds at most `N-1`
+bytes, and `str(n, ...)` accepts at most `n-1`. The limit must satisfy
+`1 <= n <= N`, where `N` is the capacity of the string it is read into — a
+larger limit, or one that is not a literal, is refused at compile time
+(`E0116`).
+
+The read removes the line terminator (`\n`, and a `\r` before it), keeps every
+other byte including spaces, and treats an empty line as the empty string. It
+writes the whole run, content followed by zeros, so reading a shorter line over
+a longer one leaves no old tail. A final line with no newline at end of file is
+still a line.
+
+A line that does not fit is **never truncated**: a line longer than `n-1` bytes
+stops the program with `LITHON-E0311`, a line containing a NUL byte with
+`LITHON-E0312` (a `str[N]` is NUL-terminated, so the bytes after one could never
+be seen), and end of input with `LITHON-E0308`. All three are catchable, the
+first two as `ValueError` and the last as `EOFError`:
+
+```python
+t: str[8]
+try:
+    t = str(4, input("Short: "))
+except ValueError:
+    print("too long")
+```
+
+The form is only valid where a string is written — a `str[N]` declaration, an
+assignment to a `str[N]` variable, or an assignment to a struct's `str` field.
+`str(...)` as a value (`print(str(5, input()))`) or with any other arguments is
+refused (`E0115`), because it reads a line *into* a string and has no value of
+its own.
+
 #### A string is a leaf type
 
 Because a `str[N]` is just a byte run, it can be *anywhere* a scalar element can
@@ -879,7 +1438,7 @@ words: list[str[8], 3] = ["one", "two", ""]
 print(words[1][2])        # 111  ('o' of "two")
 words[1][2] = 88          # -> "twX"
 
-class Named(Struct):
+class Named(struct):
     name: str[8]
     n: int[8]
 
@@ -971,11 +1530,11 @@ miscompiled.
 ## 🧱 Structs
 
 A struct is a named run of typed fields packed into one blob of bytes. It is
-spelled as a class deriving from `Struct`, whose body is nothing but field
+spelled as a class deriving from `struct`, whose body is nothing but field
 annotations:
 
 ```python
-class Point(Struct):
+class Point(struct):
     x: int[64]
     y: int[64]
 
@@ -996,7 +1555,7 @@ the layout is a pure sum of field sizes and matches a C `#pragma pack(1)`
 struct byte for byte.
 
 ```python
-class SockAddrIn(Struct):
+class SockAddrIn(struct):
     family: int[16]   # offset 0
     port: int[16]     # offset 2
     addr: int[64]     # offset 4
@@ -1026,10 +1585,10 @@ An enum is a tagged union: a byte blob holding an `int` tag plus room for the
 payload of whichever variant is active. Like a struct it **has no value** —
 the only operations are constructing a variant, reading the tag with `match`,
 and reading a payload through the arm's binding. It is spelled as a class
-deriving from `Enum`:
+deriving from `enum`:
 
 ```python
-class Shape(Enum):
+class Shape(enum):
     Empty
     Dot
     Line: int[32]
@@ -1049,7 +1608,7 @@ match s:
 ```
 
 A variant is a bare unit name (`Empty`), a `name: type` scalar payload
-(`Line: int[32]`), or an inline `class V(Struct)` struct payload. The layout is
+(`Line: int[32]`), or an inline `class V(struct)` struct payload. The layout is
 `[tag][payload]` with **no padding**: the tag is an `int[8]` while the enum has
 at most 128 variants and widens to `int[16]` past that, the payload starts at
 the tag width, and the size is the tag width plus the largest payload. Only the
@@ -1075,7 +1634,7 @@ implicit receiver `self`; the rest are annotated scalars, and the return type is
 optional. A method is called as `recv.name(args)`.
 
 ```python
-class Counter(Struct):
+class Counter(struct):
     value: int[64]
 
     def add(self, n: int[64]) -> int[64]:
@@ -1109,12 +1668,16 @@ reads `self` with `match self`.
 Because the body is expanded at each call site, a method cannot recurse,
 directly or indirectly (E0135). A method signature is scalars only
 (`int[w]`/`float[64]`/`bool`): a method may not take or return a struct, an
-enum, a container or a pointer, and `self` is unannotated. There is no
-inheritance or overloading, a method name may not shadow a field or a variant,
-and the signature accepts no `/`, `*`, `**` or defaults (E0134).
+enum, a container or a pointer, and `self` is unannotated. This section covers
+`struct`/`enum` methods: struct/enum bodies still have no inheritance or
+overloading, a method name may not shadow a field or a variant, and the
+signature accepts no `/`, `*`, `**` or defaults (E0134). A real class method
+(see [Classes](#-classes-oop)) additionally accepts class-reference
+parameters/returns, supports inheritance/override, `@property`/`@classmethod`,
+and `super()`.
 
 ```python
-class Shape(Enum):
+class Shape(enum):
     Empty
     Line: int[32]
 
@@ -1135,20 +1698,76 @@ and checks the E0134/E0135 refusals.
 
 ---
 
+## 👥 Classes (OOP)
+
+A baseless `class` is a heap object reached through an 8-byte reference — the third `class` spelling alongside `class P(struct)` (inline packed storage) and `class E(enum)` (tagged variant). An instance layout is `[vptr:8][refcount:8][attrs...]`; base attributes come first so upcasting is free (no move). Every attribute must be assigned on every `__init__` path (definite-init, E0140), `__del__` runs at the exact last drop, and `is` is always identity.
+
+```lio
+class Point:
+    x: int[64]
+    y: int[64]
+
+    def __init__(self, x: int[64], y: int[64]):
+        self.x = x
+        self.y = y
+
+    def total(self) -> int[64]:
+        return self.x + self.y
+
+
+p: Point = Point(3, 4)
+print(p.total())
+```
+
+Single inheritance uses prefix-compatible layout and C3 for multiple inheritance (a diamond's shared base is stored once). Methods are **vtable-dispatched** (`CallVirtual` when the receiver's exact class is unknown; inline only when known). `super()` is dynamic — it searches after the *defining* class in the receiver's actual MRO — so `B.value: return super().value() + self.y` chains correctly even when the enclosing class does not override the target. `isinstance(x, C)` is an ancestor-bitset probe; `issubclass(A, B)` is a compile-time C3 fold. Comparison dunders (`__eq__`/`__lt__`/... left-operand dispatch, no reflected priority) and restricted `__str__`/`__repr__` (one literal/f-string of direct scalar `self.*`) live on the class; `print(obj)` picks `__str__` else `__repr__`. Only `@property` (read-only, `p.total`) and `@classmethod` (`cls` alias, `cls(...)` constructs the call-time class) exist — everything else is refused (E0134/E0135).
+
+```lio
+class Shape:
+    sides: int[64]
+
+    def __init__(self, sides: int[64]):
+        self.sides = sides
+
+    def area(self) -> int[64]: ...  # abstract: construction refused
+
+    def describe(self) -> int[64]:
+        return self.area() * 10 + self.sides
+
+
+class Square(Shape):
+    side: int[64]
+
+    def __init__(self, side: int[64]):
+        super().__init__(4)
+        self.side = side
+
+    def area(self) -> int[64]:
+        return self.side * self.side
+
+
+s: Square = Square(4)
+sh: Shape = s
+print(sh.area())
+```
+
+Class references can be passed and returned (callee retains → caller owns one ref) and stored in `list[P,N]`/`tuple[P,N]` (one owned ref per slot, borrow-on-read, full-literal-only; no `append`, no `enumerate`/`zip`, no params/returns). What classes cannot do yet: other decorators, `__dict__`/dynamic attributes, `None`/`Optional`, dict class values, reference cycles (they leak), and reflected comparisons. Full design: `docs/classes.md`; web: `/docs/classes`; tests: `tests/typed_regression/class_*.lio` (15 files); fuzz: `fuzz_diff.py --oop` (6 shapes, 200/200).
+
+---
+
 ## 🧩 Type Functions
 
 A type function is a **compile-time type constructor**: `def Name(params) ->
-NewType` returns `{ T }`, and writing `Name(args)` anywhere a type is allowed
+newtype` returns `{ T }`, and writing `Name(args)` anywhere a type is allowed
 substitutes the arguments into `T` and yields an ordinary type.
 
 ```python
-def Fixed(t, n) -> NewType:
+def Fixed(t, n) -> newtype:
     return {list[t, n]}
 
-def Word() -> NewType:
+def Word() -> newtype:
     return {int[32]}
 
-def Ref(t) -> NewType:
+def Ref(t) -> newtype:
     return {ptr[t]}
 
 xs: Fixed(int[64], 4)      # == list[int[64], 4]
@@ -1455,13 +2074,66 @@ than CPython, PyPy, Cython, Rust, or C++.
 
 ## 🔢 Iteration Helpers
 
+### Counted loops and their variable (4.11)
+
+A `range` loop does not declare its counter. The counter is an ordinary
+variable you declare first, with a type and a starting value:
+
+```python
+i: int[8] = 10
+for i in range(10):        # i = 0, 1, 2, ..., 9
+    print(i)
+```
+
+```text
+for i in range(3):         # refused: 'i' is not declared (E0119)
+    print(i)
+```
+
+The rules, all checked at compile time:
+
+- The target must already be declared, and declared as an `int[w]`. A `float`,
+  `bool`, string or class target is refused (`E0119`).
+- The target must hold a value before the loop (V1_SPEC 0.6.6): `i: int[8]` with
+  no value on every path leads to `'i' is not definitely assigned here`.
+- The loop keeps the **declared width**. An `int[64]` counter accepts any bounds
+  and any step (`range(a, b, step)`, including a negative step). A narrower
+  counter must be able to hold every bound: each bound is a literal that fits,
+  or an int variable declared no wider than the counter; anything the compiler
+  cannot show fits is refused rather than allowed to wrap. A stepped range on a
+  narrow counter is refused for now — declare it `int[64]`.
+
+The counter ends where CPython leaves it: on the **last value produced** (`9`
+after `range(10)`), and a loop that never runs leaves it exactly as it was.
+Assigning to a live loop target inside the body is refused, because it would
+change how many times the loop runs, and an inner loop cannot reuse an outer
+loop's target.
+
+`enumerate` and `zip` follow the same rule. Every name in the header is a
+variable you declared first, with a value: an `enumerate` index is an integer
+counter (any `int[w]` whose width the bound fits, as above) and every element
+target must have exactly the element type of its container. Only the hidden
+counter `zip` generates internally is exempt.
+
+```python
+xs: list[int[64], 3] = [10, 20, 30]
+i: int[8] = 0
+x: int[64] = 0
+for i, x in enumerate(xs):     # i = 0,1,2; x = 10,20,30; ends i == 2, x == 30
+    print(i, x)
+```
+
 `enumerate` and `zip` work in a `for` header:
 
 ```python
+i: int[64] = 0
+x: int[64] = 0
 for i, x in enumerate(xs):
     print(i)
     print(x)
 
+a: int[64] = 0
+b: int[64] = 0
 for a, b in zip(xs, ys):
     print(a)
     print(b)
@@ -1517,6 +2189,33 @@ Deliberate narrowings, collected next to `%` and `v == n`:
 | `try`/`except` (6.10) | catches any exception, from anywhere, and `finally` always runs | catches the closed set of built-in Tier-3 traps (`ZeroDivisionError`, `OverflowError`, `ValueError`, `IndexError`, `KeyError`, `EOFError`, or `Exception` for all of them) **raised in the same function as the `try`**; a trap raised inside a called function ends the program, and an *uncaught* trap does not run a `finally` | a trap is routed statically, so a caught trap is a plain jump within one function; crossing a call boundary would need a real unwind, and re-running `finally` on a propagating trap would need `raise` |
 | a bare `except:` | catches everything | refused (`E0114`) | it would claim to catch a segfault, which no tier can catch; `except Exception:` is the spelled-out catch-all |
 | `except X as e` / `raise` / `except*` (6.10) | binds an exception object, re-raises, groups | refused (`E0114`) | there is no exception object -- a caught trap is a jump to a block, so there is nothing to bind or re-raise |
+| object lifetime (4.10.0) | reference counting **plus** a cycle collector, so cycles are reclaimed | reference counting only: a reference **cycle** leaks | there is no tracing collector (it would add pauses and a large runtime); cycles are rare in the straight-line / ownership style Lithon targets, and a weakref + cycle collector is a later addition |
+| allocation addresses (4.10.0) | `id(x)` / a default `repr` shows a real address | addresses are never observable: a reference is print-unsafe (like `Ptr`), and an object prints only through `__str__`/`__repr__` | the two tiers may lay the heap out differently, so an address cannot be byte-comparable across them; making it unobservable is what lets them agree |
+| references held across a trap (4.10.0) | a caught exception's frame objects are dropped when the handler runs | the references held between a trap and its `try` handler are **leaked** on the exceptional path; their `__del__` does not run | the caught trap is a plain jump, so there is no unwind step to release the abandoned frames; releasing them needs per-frame cleanup tables. Never a safety problem -- a leak, not a dangling reference |
+| `__del__` timing (4.10.0) | runs when the garbage collector notices (or at interpreter exit for some cycles) | runs at the exact program point where the last reference drops, and the optimizer may not move or elide that drop | it is the one observable lifetime event, so it must be identical in both tiers; making it a fixed drop point is what guarantees that |
+| object drop points (4.10.1) | a name is kept alive until the frame or module that bound it tears down, so a loop variable from the last iteration survives to the end of the function | a reference is dropped at the exit of the **scope that owns it**: a loop body releases what each iteration created on the back edge, and a `return`/`break`/`continue` releases the references that path owns | it keeps the reference count equal to the number of *lexically live* owners, so a per-iteration object is freed each pass instead of accumulating, and the observable `__del__` order follows the program's block structure rather than CPython's frame teardown. `fuzz_diff.py --oop` exempts this from the CPython oracle for `__del__` programs; the two tiers always agree with each other |
+| classes (4.10.1–4.10.7) | classes, instances, multiple inheritance, decorators, nullable references, `__dict__`, metaclasses, dynamic attribute addition | a baseless `class Name:` or one or more bases declared earlier, combined by C3; the only decorators are a bare read-only `@property` and a bare `@classmethod` (general decorators and method-kind mismatches are refused, E0134/E0135); an attribute is `int[w]`/`float[64]`/`bool`/a class reference, and an instance has exactly its declared attributes; the only special methods are the six comparison dunders and restricted `__str__`/`__repr__` (4.10.5); a class-typed variable is non-null unless declared `Optional[P]`, which is one nullable reference in a local, attribute, parameter or return (4.10.7); a list/tuple element may be a class reference only in a fully initialized literal (4.10.3) | a class is a layout the compiler knows, so an attribute is a fixed offset and a method is inlined or reached through a fixed slot; dynamic attributes would need a runtime shape and a hash map, and a reference leaf in a container needs the per-slot ownership of 4.10.3, all later additions; Optional reuses the one-pointer reference and is narrowed statically rather than introducing a tagged value |
+| `None` and optionality (4.10.7) | `None` is a general singleton value of any optional type; comparisons, scalars, containers and truthiness all accept it, and Optional can wrap any type | `Optional[P]` exists only for a class reference; `None` is only a value for an Optional class target (scalar/container/index/print/augmented-assignment/enum-payload/builtin uses are refused, E0142); `is None`/`is not None` narrow a plain class name through `if`/`while` (not an attribute), `==`/`!=` with `None` is refused, and collections of Optional class elements are deferred | a class reference is one unchecked pointer and `None` is its null reference, not a tagged scalar union; a general `None`/any-typed Optional would require a runtime tag or a second representation, and limiting narrowing to names keeps the proof local and sound |
+| counted-loop variable (4.11) | `for i in range(n)` binds a fresh name in the enclosing scope, so an undeclared `i` just works and any type of value can be assigned to it; assigning to `i` inside the body is harmless because the next iteration re-binds it | `i` must already be declared as an `int[w]` holding a value, and the loop assigns it in the declared width (`E0119`); a narrow counter needs bounds that provably fit and no step; `enumerate`/`zip` targets must be declared too; assigning to a live loop target inside its body, or reusing it in an inner loop, is refused. After the loop `i` holds the last value and a loop that never runs leaves it untouched, as in CPython | the language has no implicit declarations (V1_SPEC 0.6.1/0.6.6): a name has one type chosen by the programmer, and the counter *is* that variable rather than a hidden copy, so it costs nothing and an `int[8]` counter really is eight bits. A write to the counter would change the trip count of a single-variable loop, so it is refused instead of silently diverging |
+| modules and the entry point (4.15) | `import` executes a module's top-level code once, caches the module object in `sys.modules`, and finds it through a mutable `sys.path`; `if __name__ == '__main__':` is a convention over ordinary run-time code | imports are resolved at **compile time** and linked into one program; an imported file may only define (an executable top-level statement is refused); the entry point is the one fixed guard form; the search path is the importing and entry directories, `-I` and `LITHON_PATH`; only reachable functions and classes are compiled; cycles, `import *`, relative imports and shadowing an import are refused; string/list constants are not importable | a compiled language has no module object to build at run time, and running top-level code on import needs an initialisation order and shared state across files, which is where Python's import-cycle and import-order bugs live; linking statically makes an import free and keeps both tiers running one ordinary program |
+| unsigned integers (4.14) | `int` is one arbitrary-precision type with no fixed width and no unsigned form; `ctypes.c_uint8` etc. wrap silently | `uint[8|16|32|64]` is a fixed-width unsigned type whose out-of-range result **traps** (`E0313`) instead of wrapping, never mixes implicitly with `int`, and is scalars-only for now | the language's contract is that unprovable becomes a refusal or a defined trap, never a silent wrap; keeping signed and unsigned apart removes the classic sign-confusion bugs, and a trap is observable and catchable where a wrap is not |
+| constants (4.13) | no constants: a `Final[int]` annotation is a hint a type checker may enforce, and `UPPER_CASE` is a convention; any name can be rebound at run time | `const var: type[size] = value` is enforced at compile time (`E0143`): written once by its initializer, never again; a literal scalar is folded into every read, module-level ones into every function and capacity; struct, pointer and class-reference constants are refused for now | the language has no run-time reflection to enforce anything with, so immutability has to be a compile-time fact; folding costs nothing and is what lets a constant size a fixed-capacity container |
+| reading a line (4.12) | `input()` returns a new `str` of any length, with its prompt as an optional argument | `k: str[N] = str(n, input("prompt"))` reads into an existing bounded string; the prompt must be a literal, `n` is a literal limit that counts the NUL (`1 <= n <= N`), a line over `n-1` bytes traps (`E0311`) instead of growing the string, and end of input traps `E0308` | a `str[N]` is a fixed run, so there is nothing to grow: the limit makes the capacity decision visible in the source and a too-long line becomes a defined, catchable trap rather than silent truncation, mirroring `int(w, input(...))` and its width traps |
+| computed attributes (`@property`, 4.10.6) | a property is a descriptor object with a getter, optional setter/deleter, can be called through the class, and is settable when a setter exists | a property is a restricted read-only computed attribute: a bare `@property` method taking only `self` and returning a scalar or class reference; it is read without parentheses (`p.total`), inherited/overridden through the ordinary method slot, and dispatches through `CallVirtual` when a subclass overrides it; assignment and a `()` call are refused (`E0135`) | descriptors, setters/deleters and class-level property objects would need runtime attribute descriptors and a callable-value ABI; a read-only property over a fixed method signature keeps the read a normal slot call and adds no IR opcode |
+| classmethods (`@classmethod`, 4.10.6) | `@classmethod` is a descriptor bound to the class and to instances, `cls` is a runtime class object, and a classmethod can be called through either | only a bare `@classmethod` with an unannotated first `cls`; called as `Class.method(...)`; `cls` is a compile-time alias for the call-time class inside the inlined body (`cls(...)`, `cls.other(...)`, `isinstance(x, cls)`, `issubclass(cls, C)`); inherited calls construct the call-time subclass; it is not an instance method and has no vtable slot; an instance call or a class-name call to an ordinary method is refused (`E0135`) | class objects are not runtime values in this slice, so binding a method to a class or instance would require a callable/descriptor ABI; static inlining preserves the closed-hierarchy model and lets the call-time subclass flow into construction |
+| decorator surface (4.10.6) | arbitrary decorators, stacked decorators, decorator arguments, and metaclass hooks | exactly one bare `@property` or `@classmethod` on a class method; every other decorator, a stacked decorator, or a decorated `__init__`/`__del__`/special method is refused (`E0134`); the two recognised kinds cannot be mixed across an override or inheritance chain (`E0135`) | a general decorator evaluates arbitrary Python before the method exists and needs first-class functions/descriptors; the two compiler-known forms cover computed reads and class-namespaced construction without opening that surface |
+| multiple bases' attribute state (4.10.4) | each base keeps its own independent state; a class may inherit disjoint or conflicting layouts from several bases | every base must be prefix-compatible at identical offsets; shared diamond state is stored once, and conflicting or disjoint stateful bases are refused (`E0127`) | one instance has one header and one fixed set of offsets; composing independent base states would need two headers or per-base indirection, which would make the zero-cost upcast and fixed-offset access impossible |
+| class references in a container (4.10.3) | a list/tuple holds object references and can grow, shrink, be iterated and be passed freely | a list/tuple of class references is a fixed-capacity run of one 8-byte reference per slot; the literal must fill every slot (no bare declaration, shorter literal or `append`); overwriting a slot retains the new reference before releasing the old one; scope exit drops one reference per slot in reverse flat order; reads are borrows; `in`/identity compare references; `enumerate`/`zip` and class-typed container parameters/returns are refused; dict class keys/values are deferred | one owner per slot is what keeps the reference count exactly equal to the live owners, so per-element `__del__` is deterministic in both tiers; a loop target bound to an element outlives the iteration, so its ownership rule is deliberately left for a later sub-stage, and a container has no value form to cross a function header |
+| method resolution and `super()` (4.10.2/4.10.4) | a full MRO, with multiple inheritance, cooperative `super()` and `__mro__` | Python's C3 linearization; `super()` starts after the class that **defined** the running method in the receiver's actual MRO; a dynamic `super()` requires every concrete subclass to have a later concrete implementation and every reachable definition to share the signature; `super().__init__` is resolved statically along the construction class's MRO; `__del__` is selected once by MRO and `super().__del__` is refused | a closed hierarchy can compile every lookup and keep one global slot per method; an unsupported dynamic super would leave a call site with no target on some concrete class, and construction is the one point where the exact object class is known, so its cooperative chain can be inlined with definite-init bookkeeping |
+| virtual dispatch (4.10.2/4.10.4) | each call does a fresh class/instance-dict lookup | a method name gets one global vtable slot, stable down the hierarchy; a statically exact receiver is inlined (and devirtualized when the hierarchy proves no override), otherwise `CallVirtual` reads the receiver's own descriptor; the descriptor records the **declaring owner**, so an inherited slot runs the owner's function rather than a per-subclass copy | fixed slots are what let a base-compiled call site stay valid for every subclass, and keeping the monomorphic inline path means inheritance costs nothing on the calls the compiler can already see through |
+| `isinstance` / `issubclass` (4.10.2/4.10.4) | `isinstance` walks `__mro__` and accepts a tuple of classes; `issubclass` accepts arbitrary class objects | `isinstance(x, C)` probes C's type id in the object descriptor's ancestor bitset; `issubclass(A, B)` takes two class **names** and folds along C3 at compile time | the hierarchy is closed, so every ancestor set is known at compile time; a bitset replaces the subtree range because a diamond's descendants are not one contiguous id interval, and tuples/runtime class objects would need the reflection surface this slice omits |
+| abstract methods (4.10.2) | the `abc` module, `@abstractmethod`, and runtime enforcement | a method body of `...` marks the slot abstract; the class is flagged and refused at construction (E0140) until a subclass implements it | `...` is already the spelling a stub uses, and a static flag plus the construction check enforces the rule with no `abc` import or metaclass |
+| identity between two class references (4.10.2/4.10.4) | `a is b` is valid for any two objects and is usually `False` | same-or-related classes compare by address; two classes with **no possible common declared subclass** are refused (E0140) | the comparison can never be true when no declared class is a subclass of both; under multiple inheritance a `B`-typed and a `C`-typed reference may name the same `D`, so the relation is possible-common-subclass rather than plain disjointness, and `isinstance` is the way to ask about type |
+| a reference returned from a function (4.10.1) | the return transfers whatever the object's reference count implies: a fresh object is new, a returned parameter is a borrow the caller must not free | the callee **retains** what it returns, so every class-typed call result is one owned reference the caller drops at its own scope exit | it makes a fresh construction, an owned local and a borrowed parameter one uniform contract; without the retain, `return param` would hand the caller a reference the callee never owned (a use-after-free), so the borrow ambiguity is resolved by construction rather than by inference |
+| equality and ordering on objects (4.10.5) | `==` calls `__eq__` (default identity), `!=` calls `__ne__` or negates `__eq__`, and ordering follows the full rich-comparison protocol, including reflected methods and `NotImplemented` | `==`/`!=` use `__eq__`/`__ne__` on the left operand's class; `!=` falls back to `not __eq__`; with no equality method both stay identity; ordering requires the left class's matching dunder (`E0135`); there is no reflected/right-subclass priority (`a == b` uses `a`'s method even when `b`'s class is a proper subclass); `NotImplemented` is not a value | typed methods have one declared parameter and a `bool` result, so there is no `NotImplemented` round trip; the left method runs because the operand has a fixed static type, while Python's right-subclass priority is a dynamic-protocol rule this closed, typed slice deliberately omits |
+| object text (4.10.5) | every object has an address-bearing default `repr`; `__str__`/`__repr__` are ordinary callable methods that may build arbitrary strings | `__str__`/`__repr__` are printable text, not callable values: one return of a string literal or f-string of direct scalar `self` attributes; `print(obj)` picks `__str__`, then `__repr__`, by the receiver's actual concrete class; there is no default address text; an explicit call or an object with neither method is refused (`E0135`), and a literal over the declared `str[N]` capacity is refused (`E0111`) | a bounded string is a run, not a register value, so there is no call ABI to return it; inlining the one restricted expression at print sites keeps both tiers byte-identical and avoids exposing heap addresses |
+| membership in a class-typed container (4.10.5) | `x in xs` uses `==`, so it invokes element `__eq__` | class-typed `in` compares references by identity; direct `==` between two class references does dispatch to a declared equality method | 4.10.3 lowers membership to a flat reference scan; unrolling element equality calls would need a different loop/ownership shape, so `in` remains identity while `==` follows 4.10.5 |
+| a bare class name in a value position (4.10.1) | the class object is a first-class value | refused (`E0140`), pointing at `Name(...)` | a class is a layout, not a value; making it a value would mean a class object and the reflection surface (metaclasses, `type(name, bases, ns)`) this slice deliberately omits |
 
 ---
 
@@ -1644,6 +2343,373 @@ Deliberate narrowings, collected next to `%` and `v == n`:
   catchable; `except X as e`, `raise`, `except*` and a bare `except:` are
   refused. The EAFP rhyme works: `int(8, input("..."))` on a typo lands in
   `except ValueError:`.
+* [x] Object runtime (4.10.0) — the reference-counted heap foundation for real
+  classes: an `mmap` allocator with size-class free lists (no libc), the
+  `[vptr:8][refcount:8]` instance header, a read-only `ClassDescriptor` (type id,
+  ancestor bitset, vtable, `__del__`), and shared `IncRef`/`DecRef`. The `__del__`
+  moment is pinned to the last drop and the optimizer may not move it, so both
+  tiers agree; an object with no `__del__` frees freely, and descriptors/stack
+  objects are immortal (no increment emitted). **No user-visible language change
+  yet.** Cycles leak, addresses are unobservable, and references held across a
+  trap are leaked on the exceptional path — all documented. Pinned by the
+  `object_runtime_test` ctest.
+* [x] Classes (4.10.1) — baseless `class Name:` declarations: typed attributes,
+  an `__init__`, plain methods and an optional `__del__`. An instance is a heap
+  reference (a value), distinct from a `struct`'s inline storage; methods are
+  inlined at the call site with `self` as the receiver reference (4.9 model), and
+  attribute access lowers to `refload`/`refstore` at layout-baked offsets emitted
+  once as module metadata both tiers read. Lifetime is reference counting made
+  observable: a declaration owns a reference dropped at its block's exit, a loop
+  body drops each iteration, a `return`/`break`/`continue` drops the path's
+  references, an alias or an attribute store retains, releasing an object drops
+  the references its own class-typed attributes hold, and a callee retains what
+  it returns so every call result is one owned reference. `__del__` is emitted as
+  a real `__del__<Class>` function reached from the descriptor, so it runs at the
+  exact last drop, in the same order in both tiers. `is`/`is not` are identity —
+  one integer compare; `==`/`!=` use a declared equality method (4.10.5) and
+  otherwise stay identity. Definite init is enforced structurally (E0140); an
+  undeclared attribute (E0141) or a bare class name are refused, and general
+  decorators remain refused; 4.10.6 adds the two restricted forms.
+  4.10.7 adds `Optional`/`None`, so a class-typed variable is non-null unless
+  it is declared `Optional[P]`. Guards:
+  `class_basic.lio`, `class_lifetime.lio`, `class_references.lio`,
+  `class_returns.lio`, and `fuzz_diff.py --oop`.
+* [x] Single inheritance (4.10.2) — `class Dog(Animal):` with the base declared
+  earlier, base-first layout (a subclass instance starts with a valid base
+  instance, so the upcast is free), stable vtable slots, monomorphic inlining
+  with a `CallVirtual` fallback, `super()` (including `super().__init__`)
+  resolving in the MRO after the defining class, `isinstance` via the ancestor
+  bitset (this stage originally used a subtree range), compile-time `issubclass`,
+  abstract methods spelled `...` (the class is
+  flagged and cannot be instantiated), and implicit upcasts in class-typed
+  assignments, parameters and returns. Guards: `class_inherit.lio`,
+  `class_inherit_super.lio`, `class_inherit_isinstance.lio`,
+  `class_inherit_params.lio`, and the inheritance shapes in
+  `fuzz_diff.py --oop`. The 4.10.4 stage below extends this with multiple bases
+  and C3.
+* [x] Class references in containers (4.10.3) — `list[P, N]` and `tuple[P, N]`
+  hold one 8-byte reference leaf per slot, including nested
+  `list[list[P, 2], 2]` as one flat run. The declared element class is the
+  static type of every `xs[i]` read, so virtual dispatch and `isinstance`
+  follow the object's real class through a base-typed container. A read is a
+  borrow; the slot owns one reference. A full literal retains/claims every
+  element, an overwrite retains the new reference before releasing the old, and
+  scope exit drops one per slot in reverse flat order (so `__del__` timing is
+  tier-identical). A bare declaration, a shorter literal and `append` are
+  refused (a slot is never a null reference); `in` and identity compare
+  references, while direct `==` uses a declared equality method (4.10.5);
+  `enumerate`/`zip` over a class-typed container, class-typed
+  container parameters/returns, and dict class keys/values are deferred with
+  coded refusals. Guards: `class_container_list.lio`,
+  `class_container_inherit.lio`, `class_container_lifetime.lio`, and the
+  container shape in `fuzz_diff.py --oop`.
+* [x] Multiple inheritance (4.10.4) — `class D(B, C):` combines earlier bases
+  with Python's C3 linearization, including the diamond `D(B, C)`/`D(C, B)`
+  ordering distinction. Slots stay global by method name and each descriptor
+  records the declaring owner, so an inherited slot reaches the owner's emitted
+  `__virt__` function. Every base is prefix-compatible at identical attribute
+  offsets: a diamond stores its shared root state once, while conflicting or
+  disjoint stateful bases are refused (`E0127`). A cooperative `super()` is
+  dynamic: it starts after the class that defined the running method in the
+  receiver's actual MRO, and can call a method the enclosing class does not
+  override; every reachable definition must share the signature and every
+  concrete subclass must have a later concrete implementation (`E0135`).
+  `super().__init__` is resolved statically along the construction class's MRO,
+  a destructor is selected once by MRO with only its owner emitting code, and
+  `super().__del__` is refused. `isinstance` uses an ancestor bitset (a
+  diamond's descendants are no longer contiguous) and identity compares are
+  allowed whenever a common declared subclass is possible. Class-typed results
+  returned through `super()`/virtual calls are one owned reference. Guards:
+  `class_multiple_inherit.lio`, `class_multiple_lifetime.lio`,
+  `object_runtime_test`, and the diamond shape in `fuzz_diff.py --oop`.
+* [x] Special methods (4.10.5) — comparison dunders (`__eq__`, `__ne__`, `__lt__`,
+  `__le__`, `__gt__`, `__ge__`) are ordinary typed methods with one class
+  reference parameter and a `bool` result, so they use the existing global
+  slots, inlining and `CallVirtual` dispatch. `!=` prefers `__ne__` and otherwise
+  negates `__eq__`; no equality method keeps `==`/`!=` as pointer identity, and
+  `is`/`is not` never dispatch. Ordering without the left class's matching
+  method is refused (`E0135`), and reflected/right-subclass priority is
+  deliberately omitted. `__str__`/`__repr__` are not callable values or vtable
+  slots: each returns one literal or an f-string of direct scalar `self`
+  attributes, and `print(obj)` selects the text method by the receiver's actual
+  concrete class, emitting `isinstance` branches when subclasses differ and
+  inlining the chosen text as ordinary print operations. A missing text method
+  or an explicit text-method call is refused (`E0135`), an over-capacity literal
+  is refused (`E0111`), and scalar `<=`/`>=` lower to `not (b < a)` /
+  `not (b > a)` so natural method bodies work. Guards:
+  `class_special_methods.lio` and the special-methods shape in
+  `fuzz_diff.py --oop`.
+* [x] Properties and classmethods (4.10.6) — the only recognised decorators are
+  a bare `@property` and a bare `@classmethod`. A property is a read-only
+  computed attribute: only `self`, a required scalar/class-reference result,
+  inherited/overridden through the ordinary method machinery, with a vtable
+  slot for dynamic override dispatch; assignment and a `()` call are refused
+  (`E0135`). A classmethod takes an unannotated `cls`, is called on a class
+  name, and has no vtable slot or instance call. `cls` is a compile-time alias
+  for the call-time class (`cls(...)`, `cls.other(...)`, `isinstance(x, cls)`,
+  `issubclass(cls, C)`), so an inherited classmethod constructs the call-time
+  subclass. Other or stacked decorators and method-kind mismatches are refused
+  (`E0134`/`E0135`), and instance calls to classmethods or class-name calls to
+  ordinary methods are refused (`E0135`). A property read reuses the
+  zero-argument virtual-call path and a classmethod body is inlined, so no new
+  IR opcode or runtime ABI is introduced. Guards: `class_decorators.lio` and
+  the sixth shape in `fuzz_diff.py --oop`.
+* [x] Nullable class references (4.10.7) — `Optional[P]` is one pointer that
+  may also be null, supported in locals, class attributes,
+  parameters and returns. `None` is not a general zero: only an Optional class
+  target may consume it, while scalar declarations, container elements and
+  indexes, printing, appends, conversions, augmented assignments, enum
+  payloads, builtins and non-Optional calls refuse it (`E0142`).
+  `is None`/`is not None` narrow a plain class-variable
+  name through `if`/`while`, including an early return after a guard; an
+  attribute must be copied to a local, and try or loop exits restore the
+  conservative pre-block facts. `==`/`!=` with `None` is refused. Assigning
+  `None` or another reference releases the old target at that statement, and
+  Optional attributes/returns keep the 4.10.1 ownership rules. No IR opcode or
+  runtime ABI is added: the frontend emits the normal retain/release sequence
+  around a class-typed null store/load. Collections of Optional class
+  references and general any-typed Optional/None remain deferred. Guards:
+  `class_optional.lio` and the seventh shape in `fuzz_diff.py --oop`.
+
+---
+
+## 📝 Todo
+
+This is the working list. Every request, every decision and every problem
+found along the way is tracked here; an item is ticked only when its code,
+tests, error codes and docs have all landed and the full gate
+(`tools/verify_all.sh`) passes. Stage numbers continue the 4.x sequence.
+
+### Requested work, in order
+
+- [x] **4.11 — Declared loop variables.** `for i in range(...)` assigns an
+  existing, valued `int[w]` and never creates one; undeclared or non-int
+  targets are refused (`E0119`); the counter keeps its declared width and ends
+  on the last value produced (a zero-trip loop leaves it untouched);
+  `enumerate`/`zip` targets must be declared too; writing to a live target in
+  its body is refused. Landed together with two SSA-backend fixes (stale
+  alias after phi coalescing; folded branch leaving a phi operand on the wrong
+  edge) that the new loop shape exposed.
+- [x] **4.12 — String input.** `k: str[N] = str(n, input("Enter something: "))`
+  with a literal `n <= N`. `str[N]` holds at most `N-1` characters (the last
+  byte is the NUL), and `n` is the same kind of limit for the read, so a line
+  longer than `n-1` bytes **traps at run time** (`E0311`, a `ValueError`) and is
+  never truncated; end of input is `E0308`. New op `inputstr`, a shared line
+  reader for both tiers, the checker rule `1 <= n <= N`, `E0115`/`E0116`
+  refusals, and tests that feed stdin to both tiers.
+- [x] **4.13 — Constants.** `const var: type[size] = value`: initializer
+  mandatory, immutable afterwards (`E0143`), literal scalars folded (module-level
+  ones visible in every function and usable as a capacity). Struct, pointer and
+  class-reference constants are deferred.
+- [x] **4.14 — Unsigned integers.** `i: uint[size] = value`, size 8/16/32/64,
+  full range including `uint[64]` up to `2^64-1`; never mixes with `int`; an
+  out-of-range result traps `E0313` (never wraps); scalars only for now.
+  Decided with you: trap on overflow/underflow, no implicit mixing, scalars first,
+  `0` allowed.
+- [x] **4.15 — Modules and the entry point.** `if __name__ == '__main__':`,
+  `import m` / `import a.b` / `import m.f` / `from m import f` with `as` aliases;
+  files found through the importing and entry directories, `-I`, `LITHON_PATH`;
+  linked at compile time into one program with only reachable symbols; levels done
+  in order: functions, then classes (structs/enums included), then scalar
+  constants. Imported files only define (`E0145`).
+- [x] **4.16 — Windows x64 calling convention (the C boundary).** Shadow space
+  on every host call, `XMM12`–`XMM15` preserved (128-bit), `RDI`/`RSI`/`RBX`/
+  `R12`–`R15` preserved, 16-byte alignment, `ExecutableBuffer` and an 8 MiB stack on
+  Windows; verified by `tools/check_win64.py` on a MinGW build under wine, with
+  negative controls. Open items are listed under "Found while working".
+- [x] **4.16b — Decided (user: pick what is fastest and cheapest): keep the internal convention.** Switching JIT-to-JIT calls to four Win64 registers would shrink the Windows temp pool to `RAX` and cost spills on every function, so it is not done. If C must ever call JIT functions, a Win64 thunk is emitted only for those exported functions (zero cost for internal calls). Original analysis follows.
+  JIT functions use their own internal convention (two register arguments, then the
+  stack), which is the same on every platform, so a JIT function is C-callable on
+  Windows only with up to two arguments. Making it exactly Win64 means `RCX/RDX/R8/R9`
+  and `XMM0-3` positionally, stack arguments after the 32-byte shadow space, and a
+  shadow area in every JIT frame. The cost is the register pool: the Windows temp
+  pool is `RAX, R8, R9` precisely because `R8`/`R9` are not argument registers today,
+  and four argument registers would leave it with `RAX` alone, so every function
+  would spill more. Worth doing only if JIT functions must be called from C (the
+  "expanded native FFI" item); an alternative is to emit a small Win64 thunk only for
+  functions that are actually exported.
+- [ ] **Win64 unwind data.** No `.pdata`/`.xdata` is emitted for JIT code, so a
+  structured exception or a C++ `throw` crossing a JIT frame cannot be unwound and a
+  debugger cannot walk the stack. Nothing in the JIT throws today (traps call
+  `exit`), but a host that wants SEH through JIT frames needs `RtlAddFunctionTable`.
+- [x] **4.17 — x86-32** (decided with the user: full `int[64]` support as register
+  pairs `EDX:EAX`, not a subset; Win32 executed under wine via i686 MinGW, System V
+  i386 emitted and byte-verified against the assembler only until `gcc-multilib`/
+  `libc6-i386` is installed). Staged, with a stop for review after each:
+  - [x] 4.17.0 — the 32-bit host: the whole frontend/interpreter/type checker builds
+    for i686 (`__int128` in the shift range check replaced by a portable `Wide`),
+    and the 32-bit interpreter matches the 64-bit reference on all 104 programs
+    (`tools/check_win64.py`, i686 MinGW under wine). The x86-64 backend now *refuses*
+    in a 32-bit process (it used to emit x86-64 code and crash), so `--auto` falls
+    back to the interpreter.
+  - [x] 4.17.1 — the x86-32 encoder and backend: `int[64]` pairs, checked/wrapping
+    arithmetic, `%`, shifts, bitwise, compares, control flow, calls, recursion,
+    `print`, and the `E0303`/`E0310`/`E0313`/`E0401` traps; 38 programs run natively
+    and identically (corpus + `tests/x86_32`), encoder checked against `objdump`,
+    negative control confirmed. Internal calls are cdecl (pairs on the stack, result
+    in `EDX:EAX`); System V i386 stack alignment is implemented (`kStackAlign`) but
+    can only be exercised once `libc6-i386` is installed.
+  - [x] 4.17.2 — floats (SSE2): arithmetic, compares (NaN rules), `float()`/`int()`,
+    `%`, zero-divisor traps, printing. A negative control on `<` for equal floats
+    exposed a missing test, now added.
+  - [x] 4.17.3 — heap types: containers (1-level and nested), `str` ops, dicts, structs,
+    pointers, classes with refcounts/virtual dispatch/destructors, `try`/`except`
+    routing, `input`, `syscall`, print descriptors. Frame layout comes from the x86-64
+    allocator, so it matches by construction. Objects keep their 8-byte slots (a
+    pointer is the low dword of a pair), so the frontend's layout is unchanged; the
+    runtime's C call to a destructor goes through a generated `$c` thunk that widens
+    its one pointer argument to the JIT's pair. Bounds-check control confirmed. Found
+    and fixed on the way: **the x86-64 backend zero-extended a narrow `int` dict
+    value** (`int[32]` `-7` printed as `4294967289` natively, `-7` in the interpreter);
+    regression `typed_regression/dict_narrow_values`.
+  - [x] 4.17.4 — the gate: `tools/check_win64.py` runs all 128 corpus + `tests/x86_32`
+    programs natively on 32-bit and requires >= 125 to compile natively (so a silent
+    fallback fails); `tools/fuzz_x86_32.py` fuzzes nine generator modes (int, float,
+    mod, bitwise, break, diamond, lsr, phi, oop); both are in `tools/verify_all.sh` and
+    the `win64-wine` CI job (which now also installs `wine32` and builds the 64-bit
+    reference).
+  - [x] 4.17.5 — performance, first round: immediate operands (constants never touch
+    memory when every use is immediate-aware; a missed site throws instead of
+    miscompiling), single-use results forwarded in `EAX:EDX` / `XMM0`, integer compare +
+    branch fused through the flags with fall-through, inline 32-bit fast paths for
+    checked `*` (`imul`) and `%` (`idiv`), float constants from a pool, parameters
+    used in place (no prologue copy), a 32-bit call-depth counter. Measured with
+    `tools/bench_x86_32.py` (best of 3, wine start-up ~0.125 s included): `loop_sum`
+    0.95 s -> 0.44 s, `float_loop` 0.38 -> 0.25, `mod_loop` 0.23 -> 0.16, `array_sum`
+    0.34 -> 0.27, `fib(32)` 0.20 -> 0.18.
+  - [x] 4.17.6 — speed, second round: shared out-of-line trap stubs (a checked add/sub/mul,
+    an index check, a zero divisor or a shift count is a not-taken `jcc` to one stub per
+    message at the end of the function, or straight to a `try` handler), inline
+    double-width constant shifts (`shld`/`shrd`), and one register-resident variable: the
+    scalar `int` variable with the highest loop-weighted use count lives in `EBX:ESI`
+    (saved in the frame, restored before every return; only plain-Load/Store variables
+    qualify). Measured (best of 3, wine start-up ~0.12 s included), from the 4.17.2
+    baseline: `loop_sum` 0.95 s -> 0.38 s, `array_sum` 0.34 -> 0.23, `float_loop`
+    0.38 -> 0.24, `mod_loop` 0.23 -> 0.15, `fib(32)` 0.20 -> 0.17. Negative controls: a
+    wrong `shrd` is caught by `tests/x86_32/shifts_const`; not restoring `EBX`/`ESI` makes
+    `hot_var_calls` hang. A full allocator that keeps *several* variables and values in
+    registers is not done and stays the main source of the remaining gap to 64-bit
+    native (roughly 2-3x once wine's start-up is subtracted).
+  - [x] stdcall / fastcall (exported entry points): `compile_module(module, export_thunks)`
+    adds `<fn>$cdecl` (an ST0 adapter for a double result, otherwise the function
+    itself), `<fn>$stdcall` (callee pops, `ret 8n`) and `<fn>$fastcall` (first two int/bool
+    parameters of <= 32 bits in `ECX`/`EDX`, callee pops the rest). Every scalar parameter
+    is one 8-byte slot (`int64_t` or `double`) except fastcall's two registers.
+    `tools/check_x86_32_conv.py` calls them from C through real convention attributes
+    30,000 times on Win32 and System V i386 and samples `ESP` before and after every call
+    (an optimiser re-derives `ESP`, so a plain result check could not see a wrong pop;
+    the negative control for a missing pop fails 6 checks per target). The internal
+    JIT-to-JIT convention stays cdecl.
+  - [x] System V i386, executed natively: a 64-bit kernel runs 32-bit ELF, so
+    `tools/check_sysv32.py` builds `tier_runner` as a static 32-bit binary (from
+    `g++-multilib`, or from the same packages downloaded without root into
+    `build/sysv32/root`) and runs all 130 programs native, identical to the 64-bit
+    reference, plus fuzzing. `ObjectHeader` is now `alignas(8)` with the pointer overlaid on
+    an 8-byte slot (it was 12 bytes on i386 Linux). Written to find real problems: a
+    `LITHON_CHECK_ALIGN=1` probe makes the generated code `int3` unless `ESP` is 16-byte
+    aligned at every call (glibc rarely faults on a misaligned stack, so the plain pass
+    proved nothing -- my first negative control was *not* caught), and it immediately
+    found a real bug: the destructor `$c` thunk was 4 bytes misaligned. Raw `syscall` is
+    `-ENOSYS` on i386 Linux (the program's numbers are x86-64's), identically in both tiers.
+  - [ ] Optional, not started: a full multi-variable register allocator (live ranges, spill
+    code) for the 32-bit backend; inline container element access without the helper-free
+    but still bounds-checked shape above; `int 0x80` syscall with a number translation table.
+- [ ] **4.18 — ARM64** (AAPCS64, and the Windows ARM64 variant).
+- [ ] **4.19 — RISC-V** (LP64D). Order decided: Win64 → x86-32 → ARM64 → RISC-V.
+- [ ] **Further architectures** (ARM32, PowerPC64, s390x, MIPS, LoongArch,
+  WebAssembly, ...). Needs a decision on which to target; none of them can be
+  *executed* here until `qemu` is installed, so until then they would be
+  emitted and byte-verified against an assembler only.
+- [ ] **Widen existing features — ask first.** Candidates are listed in
+  "Questions waiting for an answer" below; nothing in this item starts until the
+  matching question is answered.
+
+### Decisions already made
+
+| Topic | Decision |
+| :-- | :-- |
+| Loop width | A loop keeps the counter's declared width; a bound that cannot be proven to fit is refused. |
+| String input overflow | A line longer than `n-1` bytes traps at run time; no silent truncation. |
+| `const` | All declared types, initializer required, immutable. |
+| Backend order | Win64 ABI → x86-32 → ARM64 → RISC-V. |
+| Counter exit value | Ends on the last value produced, a zero-trip loop leaves it untouched (CPython's behaviour). `i: int[8] = 0` / `for i in range(10): print(i)` ends with `i == 9`. |
+| `enumerate` / `zip` targets | Must be declared (with a value and the element's exact type), like a `range` target. |
+| Unsigned integers | Trap (`E0313`) on any out-of-range result; no implicit `uint`/`int` mixing; scalars first; `0` allowed; full `uint[64]` range. |
+| String input with a NUL byte | Traps `E0312` (a string cannot hold one). |
+| Imports | Compile-time linking; imported files only define; levels functions → classes → constants; dotted package paths plus `-I`/`LITHON_PATH`; `as` aliases. |
+| `qemu` | Install it when the first non-x86 backend (ARM64) needs to *run*; this session has no root, so it needs `sudo apt install qemu-user` (or a user-space unpack of the package). |
+
+### Found while working (open)
+
+- [ ] **Stepped ranges on narrow counters** (`i: int[8]` with
+  `range(a, b, step)`) are refused because the checker cannot prove the
+  increment. Needs a checked narrowing operation or a checker rule for the
+  guarded latch.
+- [ ] **Narrow-integer overflow is silent in one case.** The checker exempts the
+  exact `i = i + 1` pattern from range checking, so
+  `k: int[16] = 32767` then `k = k + 1` prints `32768` instead of trapping
+  (`E0303` for narrow ints is documented but not built).
+- [ ] **Constant expressions are not folded.** `const M: int[64] = N * 2` is an
+  immutable variable, not a compile-time constant, so it cannot be a capacity and
+  a module-level one is not visible inside a function. Needs a small compile-time
+  evaluator over literals and earlier constants.
+- [ ] **A local constant cannot be a capacity**, and a constant cannot yet size an
+  integer width (`int[W]`); only module-level integer constants are accepted in
+  `list`/`tuple`/`str`/`dict` annotations.
+- [ ] **Struct, pointer and class-reference constants** are refused. A struct needs
+  a struct literal first; a class constant needs a way to prove the object is not
+  mutated (a read-only reference).
+- [ ] **`uint` beyond scalars.** Containers (`list`/`tuple`/`dict` elements), struct
+  fields, enum payloads, class attributes, method parameters/returns and pointers
+  to `uint` are refused (`E0144`); each needs a zero-extending load/store in both
+  tiers and the container printers, and `ptr[uint[w]]` needs the pointee kind.
+- [ ] **`uint` conversions.** `float(64, u)` (a `uint[8|16|32]` converts exactly),
+  `int(w, f)` into a `uint`, and `uint` into an `int[w]` narrower than 64 are
+  refused; a `uint` cannot be a narrow-`int` loop bound; `u8 + 300` takes the
+  literal at the operand's width. A literal *expression* (`2 * 3`) is not a
+  literal, so it cannot initialise a `uint` — needs the constant-expression
+  evaluator.
+- [ ] **`uint[64]` limits.** `/` is refused (a 64-bit value does not fit a double
+  exactly), and a `uint[64]` cannot index a list or bound a `range` (a value at or
+  above `2^63` would be read as negative).
+- [ ] **Module system, later levels.** Not yet: relative imports (`from .m import f`),
+  `from m import *` and `__all__`, importing type functions, importing string, list
+  and other non-scalar constants (they live in one scope), constant *expressions*
+  in an imported module (`const B = A + 1`), and module-level executable code.
+- [ ] **Compile cache.** Each run re-parses every imported file (1.4 s for a
+  6,000-function library); a persistent cache of parsed or linked modules keyed by
+  file hash would make a large import graph near-instant.
+- [ ] **Imports of imports under a different name.** The same file imported under
+  two dotted names (through two search roots) is linked once per realpath, but its
+  symbols carry the first name it was imported by.
+- [ ] **Windows build and test coverage.** CI now runs `tools/check_win64.py` twice: under wine on Ubuntu (blocking) and on a native `windows-latest` MSYS2 runner (`continue-on-error` until its first green run). The Windows checks run a MinGW build under
+  wine on Linux. Not yet exercised: a native Windows run, an MSVC build, the Windows
+  `syscall` fallback (`-ENOSYS`), and the AVX2 vectorizer on a Windows host.
+- [ ] **A deep-recursion guard that does not depend on the stack size.** `E0401` counts
+  frames against 4096, calibrated for an 8 MiB stack; the Windows build links 8 MiB to
+  match. A guard that compared the real stack pointer with the thread's stack limit
+  would hold on any stack.
+- [ ] **`pass` is not supported** (`E0114`), so an empty loop body cannot be
+  written.
+- [ ] **A class-body initializer is ignored.** `x: int[64] = None` inside a
+  `class` is accepted and the value dropped; it should be refused.
+- [ ] **A plain `return None` in a method with no result** is refused (`E0135`)
+  although Python allows it.
+- [ ] **`web/` docs need a regeneration run** (`bun scripts/gen-docs-ir.ts`)
+  once `bun` is available here; the checked-in IR text for the `for_range`
+  example was updated by hand to match the 4.11 output.
+- [ ] **`tools/bench.py` and `tools/native_bench.py`** embed untyped Python
+  sources that predate the typed language; they compare engines on plain
+  Python and are not Lithon programs.
+
+### Questions waiting for an answer
+
+- Which existing features should be widened first? Options: `pass`, `while/else`
+  and `for/else` (currently refused), `sep=`/`end=` for `print`, f-strings as
+  values (`s: str[64] = f"x={x}"`), `str` methods beyond `find`/`count`/`split`,
+  dict mutation, list `insert`/`pop`, more integer builtins, general decorators.
+- Which architectures beyond RISC-V? (`qemu` will be needed to run them; see
+  the decisions table.)
 
 ---
 
@@ -1659,6 +2725,9 @@ Current limitations include:
 * Native calls carry the first two arguments in registers and the rest on the
   stack, up to `kMaxParams` (currently 32); a call with more arguments than that
   makes the native tier refuse rather than mis-pass them.
+  This is the JIT's own convention and is the same on every platform; on Windows the
+  boundary with C code (host helpers, shadow space, callee-saved registers) follows
+  the Microsoft x64 ABI (4.16).
 * Some container operations remain intentionally restricted.
 * Pointer values have strict restrictions around function boundaries and
   container access.
@@ -1759,7 +2828,7 @@ python3 tools/run_tier_diff.py
 
 Every program runs twice — once through the interpreter (the oracle) and once
 through the native tier — and the two stdout streams must be byte-identical.
-Currently **159 / 159** cases pass, 93 of them on the native tier.
+Currently **263 / 263** cases pass, 143 of them on the native tier.
 
 Two classes of case are deliberately outside this comparison:
 
@@ -1814,7 +2883,7 @@ generated by the same benchmark harness.
 
 | Benchmark | Lithon JIT | Reference | Speedup | Result |
 |---|---:|---:|---:|---:|
-| fib(30) | 10.3053 ms | 1731.0983 ms | 168.0× | 832040 |
+| fib(30) | 9.0980 ms | 1208.7359 ms | 132.9× | 832040 |
 
 **Status:** PASS
 

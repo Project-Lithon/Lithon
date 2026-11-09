@@ -1,0 +1,74 @@
+# 4.12. String input: `k: str[N] = str(n, input("prompt"))` reads one line into
+# the bounded string `k`. `n` is a literal limit that counts the NUL exactly as
+# `str[N]` does, so at most n-1 bytes fit and 1 <= n <= N. A line that does not
+# fit is never truncated: it traps (E0311, a ValueError) at run time, a NUL byte
+# in the line traps E0312 (also a ValueError), and end of input traps E0308 (an
+# EOFError). The expected output is written from those
+# documented semantics -- CPython has no two-argument str(), so it cannot be
+# the oracle -- and both tiers must reproduce it from the same stdin
+# (str_input.in).
+
+name: str[16] = str(10, input("Name: "))
+print(name)
+print(len(name))
+
+# n counts the NUL: a limit of 5 admits exactly 4 bytes.
+tag: str[8] = str(5, input("Tag: "))
+print(tag)
+print(len(tag))
+
+# A re-read overwrites the whole run: the shorter line leaves no old tail.
+name = str(10, input("Again: "))
+print(name)
+print(len(name))
+
+# An empty line is a valid empty string, and a prompt may be empty.
+e: str[4] = str(4, input(""))
+print(len(e))
+
+# What was read is an ordinary bounded string.
+print(name == tag)
+print(name[0])
+
+
+def greet() -> int[64]:
+    who: str[8] = str(8, input("Who: "))
+    print(who)
+    return len(who)
+
+
+print(greet())
+
+
+class Rec(struct):
+    label: str[8]
+    n: int[64]
+
+
+r: Rec
+r.label = str(8, input("Label: "))
+print(r.label)
+print(len(r.label))
+
+# Both run-time traps can be caught.
+t: str[8]
+try:
+    t = str(4, input("Short: "))
+except ValueError:
+    print("too long")
+try:
+    t = str(4, input("Short: "))
+    print(t)
+except ValueError:
+    print("too long")
+# A NUL byte in the line is refused too (a string cannot hold one), and is also
+# a ValueError.
+try:
+    t = str(8, input("Nul: "))
+    print(t)
+except ValueError:
+    print("nul")
+try:
+    t = str(4, input("Eof: "))
+except EOFError:
+    print("eof")

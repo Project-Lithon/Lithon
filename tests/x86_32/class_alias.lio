@@ -1,0 +1,22 @@
+class Box:
+    v: int[64]
+    f: float[64]
+
+    def __init__(self, v: int[64]):
+        self.v = v
+        self.f = 2.5
+
+    def get(self) -> int[64]:
+        return self.v
+
+    def half(self) -> float[64]:
+        return self.f / 2
+
+
+b: Box = Box(41)
+print(b.get() + 1)
+c: Box = b
+c.v = 5
+print(b.get())
+print(b.half())
+print(isinstance(c, Box))

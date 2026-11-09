@@ -1,0 +1,5 @@
+def f(n: int[64]) -> int[64]:
+    return f(n + 1) + 1
+
+
+print(f(0))

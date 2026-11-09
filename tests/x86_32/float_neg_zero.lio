@@ -1,0 +1,3 @@
+z: float[64] = 0.0
+nz: float[64] = -z
+print(1 / nz)

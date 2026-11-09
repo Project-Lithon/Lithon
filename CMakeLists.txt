@@ -4,6 +4,19 @@ project(lithon CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# The E0401 call-depth guard (src/jit/stack_guard.h, 4096 frames) is calibrated
+# for a native stack of at least 8 MiB, which is what a Linux process gets. A
+# Windows executable gets 1-2 MiB unless it asks, and the interpreter would then
+# overflow the real stack well before the guard fires, so every Windows binary
+# links with an 8 MiB stack.
+if(WIN32)
+    if(MSVC)
+        add_link_options(/STACK:8388608)
+    else()
+        add_link_options(-Wl,--stack,8388608)
+    endif()
+endif()
+
 add_executable(hello
     src/hello.cpp
     src/ir/text_parser.cpp

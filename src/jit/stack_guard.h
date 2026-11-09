@@ -28,6 +28,13 @@
 // decides where recursion ends, identically in both. An earlier draft used
 // 8192 from an unchecked estimate; 8192 is ABOVE the interpreter's real limit
 // and would have let it segfault before firing.
+//
+// That calibration assumes a native stack of at least 8 MiB. Linux gives a process
+// that; a Windows executable gets 1-2 MiB unless it is linked for more, so the
+// Windows build requests 8 MiB (CMakeLists.txt: /STACK or -Wl,--stack; tools/
+// check_win64.py links its unoptimised test binary with 32 MiB because -O0 frames
+// are larger). An embedder that runs Lithon on a thread of its own must give that
+// thread the same.
 namespace lithon::jit {
 
 // Every Lithon function prologue bumps this; a value > kMaxCallDepth is

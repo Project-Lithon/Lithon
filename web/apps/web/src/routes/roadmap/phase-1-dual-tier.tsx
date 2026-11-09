@@ -187,8 +187,8 @@ $ objdump -D -b binary -mi386:x86-64 -M intel /tmp/n.bin | grep -c imul
                 ["SysV x64 ABI", "shipped & audited"],
                 [
                   "Win64 ABI",
-                  <span key="w" className="text-destructive">
-                    implemented, not yet verified on a Windows host
+                  <span key="w">
+                    C boundary verified under wine (MinGW); not yet on a real Windows host
                   </span>,
                 ],
                 ["CPUID vs kernel", "cross-checked, 30 assertions"],

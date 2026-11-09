@@ -317,6 +317,37 @@ Module parse_ir_text(const std::string& text) {
         std::string line = trim(lines[i]);
         if (line.empty()) continue;
 
+        // `source <index> <path>`: a source file the positions below refer to.
+        if (starts_with(line, "source ")) {
+            std::istringstream ss(line.substr(7));
+            size_t idx = 0;
+            if (ss >> idx) {
+                std::string path;
+                std::getline(ss, path);
+                path = trim(path);
+                if (module.sources.size() <= idx) module.sources.resize(idx + 1);
+                module.sources[idx] = path;
+                continue;
+            }
+        }
+        // A trailing ` @<source>:<line>` is the position of the instruction on this line.
+        int32_t pos_src = -1, pos_line = 0;
+        {
+            const size_t at = line.rfind(" @");
+            if (at != std::string::npos) {
+                const std::string tail = line.substr(at + 2);
+                const size_t colon = tail.find(':');
+                bool ok = colon != std::string::npos && colon > 0 && colon + 1 < tail.size();
+                for (size_t k = 0; ok && k < tail.size(); ++k)
+                    if (k != colon && (tail[k] < '0' || tail[k] > '9')) ok = false;
+                if (ok) {
+                    pos_src = std::stoi(tail.substr(0, colon));
+                    pos_line = std::stoi(tail.substr(colon + 1));
+                    line = trim(line.substr(0, at));
+                }
+            }
+        }
+
         if (starts_with(line, "class ")) {
             // `class Name size=N [del]`, then following `attr <name> <off> : <T>`
             // lines. Everything both tiers need to allocate an instance and
@@ -812,6 +843,18 @@ Module parse_ir_text(const std::string& text) {
             instr.op = Op::InputInt;
             instr.name = oa.raw_args.empty() ? std::string()
                                              : decode_hex_prompt(oa.raw_args.at(0));
+        // 4.12. `inputstr <run>, <hex prompt|->, <n>`: the destination run is a
+        // NAME (like StrEq's operands), the prompt is hex-encoded as inputint's
+        // is, and n is the literal limit that counts the NUL.
+        } else if (oa.op_name == "inputstr") {
+            instr.op = Op::InputStr;
+            instr.name = oa.raw_args.at(0);
+            instr.name2 = decode_hex_prompt(oa.raw_args.at(1));
+            instr.int_imm = std::stoll(trim(oa.raw_args.at(2)));
+        // 4.14. `utrap %cond`: trap E0313 when the bool operand is true.
+        } else if (oa.op_name == "utrap") {
+            instr.op = Op::UTrap;
+            instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
         } else if (oa.op_name == "guardnonzero") {
             instr.op = Op::GuardNonZero;
             instr.args.push_back(parse_value_ref(oa.raw_args.at(0)));
@@ -915,6 +958,8 @@ Module parse_ir_text(const std::string& text) {
             throw std::runtime_error("unrecognized IR opcode: " + oa.op_name);
         }
 
+        instr.src = pos_src;
+        instr.line = pos_line;
         current_block->instrs.push_back(instr);
     }
 

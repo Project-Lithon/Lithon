@@ -123,6 +123,19 @@ inline constexpr Xmm kScratchFloatZero = Xmm::XMM13;
 // is never written by anything else.
 inline constexpr Xmm kScratchFloatC = Xmm::XMM12;
 
+// The XMM registers this code generator WRITES that the platform ABI makes
+// CALLEE-saved. On System V every XMM register is caller-saved, so there are none.
+// On Microsoft x64 XMM6-XMM15 are nonvolatile, and the reserved scratch registers
+// (XMM12-XMM15) are outside the volatile temp pool, so a function that uses floats
+// must save and restore them: the host that called it may be keeping live values
+// there. Saved whole (128 bits), because Windows preserves the full low 128 bits.
+#if defined(_WIN32)
+inline constexpr std::array<Xmm, 4> kCalleeSavedXmm = {
+    Xmm::XMM12, Xmm::XMM13, Xmm::XMM14, Xmm::XMM15};
+#else
+inline constexpr std::array<Xmm, 0> kCalleeSavedXmm = {};
+#endif
+
 // Slot 0 of the float argument registers. Under SysV variadic calling
 // convention a double argument is passed in the first XMM register;
 // under Microsoft x64 the same register is used for all FP arguments.

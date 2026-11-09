@@ -1,0 +1,62 @@
+# 6.11. Functions that take a string, and a whole-string copy. A function with a str
+# parameter is expanded at each call site, and the parameter is a COPY of the argument: the
+# callee can change its own string without touching the caller's.
+
+
+def is_yes(a: str[8]) -> bool:
+    return a == "yes"
+
+
+def count_a(s: str[16]) -> int[64]:
+    n: int[64] = 0
+    i: int[64] = 0
+    while i < len(s):
+        if s[i] == 97:
+            n = n + 1
+        i = i + 1
+    return n
+
+
+def clobber(s: str[8]) -> int[64]:
+    s[0] = 90
+    return s[0]
+
+
+def longer(a: str[8], b: str[8]) -> str[8]:
+    if len(a) >= len(b):
+        return a
+    return b
+
+
+def title(flag: bool, s: str[8]) -> str[16]:
+    if flag:
+        return "Mr"
+    return s
+
+
+def twice(n: int[16], s: str[8]) -> int[64]:
+    return count_a(s) * n
+
+
+w: str[8] = "banana"
+print(is_yes("yes"), is_yes("no"), is_yes(w))
+print(count_a(w))
+print(clobber(w))
+print(w)
+print(longer("ab", "abc"))
+print(longer(w, "xy"))
+print(title(True, w), title(False, w))
+print(twice(3, w))
+print(count_a("aa"))
+
+t: str[8] = "x"
+t = w
+print(t)
+t = "hi"
+print(t, len(t))
+u: str[16] = w
+print(u)
+u = longer(w, "zzzzzzz")
+print(u)
+v: str[8] = longer("q", t)
+print(v)

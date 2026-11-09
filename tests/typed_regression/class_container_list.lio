@@ -65,5 +65,6 @@ print(ts[0].sound())
 print(ts[1].tag)
 
 # An explicit index loop is the supported iteration form.
+i: int[64] = 0
 for i in range(3):
     print(xs[i].tag)

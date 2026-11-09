@@ -1,0 +1,23 @@
+# 4.15. Modules and the entry point, level 1: functions. Imports are resolved at
+# compile time and linked into one program (no run-time import); only imported
+# functions that are actually called are compiled, so `unused` below never is. The
+# program being run starts at `if __name__ == '__main__':`; the same guard in an
+# imported file is dropped.
+
+import modules.mathlib
+import modules.util.calc
+import modules.mathlib.cube
+from modules.mathlib import square as sq
+from modules.util.calc import double_square
+
+
+def run() -> int[64]:
+    return sq(3) + modules.mathlib.cube(2)
+
+
+if __name__ == '__main__':
+    print(run())
+    print(modules.mathlib.square(5))
+    print(modules.util.calc.double_square(4))
+    print(double_square(1))
+    print(modules.mathlib.cube(3))

@@ -180,17 +180,54 @@ std::pair<int64_t, int64_t> int_range(int width) {
     return {-half, half - 1};
 }
 
-// Renders a 128-bit value for an error message. std::to_string has no
-// __int128 overload (it is ambiguous between the signed/unsigned/long long
-// candidates), and the shift range check below can legitimately hold a value
-// outside int64 -- an int[8] shifted by 63 is a 71-bit magnitude.
-std::string wide_str(__int128 v) {
-    bool neg = v < 0;
-    unsigned __int128 m = neg ? (static_cast<unsigned __int128>(-(v + 1)) + 1)
-                              : static_cast<unsigned __int128>(v);
+// A sign-and-magnitude 128-bit value, for the shift range check below: an int[8]
+// shifted by 63 is a 71-bit magnitude, outside int64. It is a small struct rather
+// than `__int128` because 32-bit targets (x86-32, ARM32) have no such type, and
+// the same code then serves every target.
+struct Wide {
+    bool neg = false;
+    uint64_t hi = 0, lo = 0;   // magnitude
+};
+
+// v << k for 0 <= k <= 63.
+Wide wide_shl(int64_t v, int k) {
+    Wide w;
+    w.neg = v < 0;
+    const uint64_t m = w.neg ? (~static_cast<uint64_t>(v) + 1) : static_cast<uint64_t>(v);
+    w.lo = m << k;
+    w.hi = k == 0 ? 0 : m >> (64 - k);
+    if (w.hi == 0 && w.lo == 0) w.neg = false;
+    return w;
+}
+
+// Three-way compare of w with an int64: negative, zero, positive.
+int wide_cmp(const Wide& w, int64_t x) {
+    const bool xneg = x < 0;
+    const uint64_t xm = xneg ? (~static_cast<uint64_t>(x) + 1) : static_cast<uint64_t>(x);
+    if (w.neg != xneg) return w.neg ? -1 : 1;
+    int mag = w.hi != 0 ? 1 : (w.lo > xm ? 1 : (w.lo < xm ? -1 : 0));
+    return w.neg ? -mag : mag;
+}
+
+// Renders a Wide for an error message (std::to_string has no 128-bit overload).
+std::string wide_str(const Wide& w) {
+    uint64_t hi = w.hi, lo = w.lo;
     std::string s;
-    do { s.insert(s.begin(), static_cast<char>('0' + static_cast<int>(m % 10))); m /= 10; } while (m);
-    return neg ? "-" + s : s;
+    do {
+        // Divide the 128-bit magnitude by 10, one 32-bit limb at a time.
+        uint32_t limbs[4] = {static_cast<uint32_t>(hi >> 32), static_cast<uint32_t>(hi),
+                             static_cast<uint32_t>(lo >> 32), static_cast<uint32_t>(lo)};
+        uint64_t rem = 0;
+        for (int i = 0; i < 4; ++i) {
+            uint64_t cur = (rem << 32) | limbs[i];
+            limbs[i] = static_cast<uint32_t>(cur / 10);
+            rem = cur % 10;
+        }
+        hi = (static_cast<uint64_t>(limbs[0]) << 32) | limbs[1];
+        lo = (static_cast<uint64_t>(limbs[2]) << 32) | limbs[3];
+        s.insert(s.begin(), static_cast<char>('0' + static_cast<int>(rem)));
+    } while (hi != 0 || lo != 0);
+    return w.neg ? "-" + s : s;
 }
 
 std::string type_str(const LType& t) {
@@ -324,8 +361,12 @@ private:
     std::unordered_map<std::string, Scope> in_scope_by_block_;
     std::unordered_set<const Instr*> exempt_increment_stores_;
 
+    // The instruction being checked, so an error carries the source position the IR recorded
+    // for it (when the frontend was asked to emit positions).
+    const Instr* cur_ = nullptr;
+
     void error(const std::string& msg) {
-        errors_.push_back(RCRError{msg});
+        errors_.push_back(RCRError{msg, cur_ ? cur_->src : -1, cur_ ? cur_->line : 0});
     }
 
     // E0105 (docs/lithon_error_system.md 4c): only int[8|16|32|64] and
@@ -532,6 +573,7 @@ private:
             std::unordered_map<std::string, std::vector<int64_t>> open_dict_keys;
             tuple_open_for_init_.clear();
             for (const auto& instr : block.instrs) {
+                cur_ = &instr;
                 if (instr.op == Op::Store && instr.type_kind == "tuple" &&
                     instr.args.empty() && instr.type_width > 0) {
                     // A valueless tuple declaration OPENS construction for
@@ -813,7 +855,7 @@ private:
 
         // A left shift multiplies, so `x:int[8] = 100; x = x << 3` would put
         // 800 in a variable whose declared range is -128..127. Since the
-        // shift count is a constant here, that is decidable now. __int128 is
+        // shift count is a constant here, that is decidable now. a 128-bit value is
         // used for the intermediate because the widened result can leave
         // int64 entirely (int[8] << 63), and clamping before the comparison
         // would be exactly the kind of quiet wrong answer this pass exists
@@ -826,10 +868,10 @@ private:
             if (!operand_range(binop_instr.args.at(0), lo, hi)) return;
             // Shifting left magnifies, so the most negative corner is
             // lo << k_hi and the most positive is hi << k_lo.
-            __int128 r_lo = static_cast<__int128>(lo) << k_hi;
-            __int128 r_hi = static_cast<__int128>(hi) << k_lo;
+            const Wide r_lo = wide_shl(lo, static_cast<int>(k_hi));
+            const Wide r_hi = wide_shl(hi, static_cast<int>(k_lo));
             auto [target_lo, target_hi] = int_range(target.width);
-            if (r_lo < target_lo || r_hi > target_hi) {
+            if (wide_cmp(r_lo, target_lo) < 0 || wide_cmp(r_hi, target_hi) > 0) {
                 error(context + ": type " + type_str(target) + " is not wide enough -- `x << " +
                       std::to_string(k_lo) + "` can produce up to " +
                       wide_str(r_hi) + ", which exceeds " + type_str(target) +
@@ -846,11 +888,29 @@ private:
         if (!operand_range(binop_instr.args.at(0), lo1, hi1)) return;
         if (!operand_range(binop_instr.args.at(1), lo2, hi2)) return;
 
+        // Saturating arithmetic: an operand may already span all of int64 (an int[64]), and
+        // `hi + 1` then overflows -- undefined behaviour that used to wrap and print a nonsense
+        // range. A saturated bound is conservative, which is all the check below needs.
+        auto sat_add = [&](int64_t a, int64_t b) {
+            int64_t r;
+            if (__builtin_add_overflow(a, b, &r)) return a < 0 ? INT64_MIN : INT64_MAX;
+            return r;
+        };
+        auto sat_sub = [&](int64_t a, int64_t b) {
+            int64_t r;
+            if (__builtin_sub_overflow(a, b, &r)) return a < 0 ? INT64_MIN : INT64_MAX;
+            return r;
+        };
+        auto sat_mul = [&](int64_t a, int64_t b) {
+            int64_t r;
+            if (__builtin_mul_overflow(a, b, &r)) return ((a < 0) != (b < 0)) ? INT64_MIN : INT64_MAX;
+            return r;
+        };
         int64_t possible_lo, possible_hi;
-        if (binop_instr.op == Op::Add) { possible_lo = lo1 + lo2; possible_hi = hi1 + hi2; }
-        else if (binop_instr.op == Op::Sub) { possible_lo = lo1 - hi2; possible_hi = hi1 - lo2; }
+        if (binop_instr.op == Op::Add) { possible_lo = sat_add(lo1, lo2); possible_hi = sat_add(hi1, hi2); }
+        else if (binop_instr.op == Op::Sub) { possible_lo = sat_sub(lo1, hi2); possible_hi = sat_sub(hi1, lo2); }
         else {
-            int64_t corners[4] = {lo1*lo2, lo1*hi2, hi1*lo2, hi1*hi2};
+            int64_t corners[4] = {sat_mul(lo1, lo2), sat_mul(lo1, hi2), sat_mul(hi1, lo2), sat_mul(hi1, hi2)};
             possible_lo = *std::min_element(corners, corners + 4);
             possible_hi = *std::max_element(corners, corners + 4);
         }
@@ -1593,6 +1653,45 @@ private:
                     return;
                 }
                 reg_types_[instr.result] = LType{"int", instr.type_width};
+                return;
+            }
+            // 4.12. `str(n, input(prompt))` reads one line into the named str
+            // run. No register operands and no result: the destination is a NAME
+            // (like StrEq's operands) that must already be a definitely assigned
+            // `str`, and the literal limit n, which counts the NUL, must fit it.
+            case Op::InputStr: {
+                auto it = scope.find(instr.name);
+                if (it == scope.end()) {
+                    error("'" + instr.name + "' is not definitely assigned here (V1_SPEC 0.6.10)");
+                    return;
+                }
+                if (it->second.kind != "str") {
+                    error("inputstr writes a str, but '" + instr.name + "' is " +
+                          type_str(it->second) + " (4.12)");
+                    return;
+                }
+                const int64_t cap = it->second.width;
+                if (instr.int_imm < 1 || instr.int_imm > cap) {
+                    error("LITHON-E0116: str(n, input(...)) needs 1 <= n <= " +
+                          std::to_string(cap) + " for '" + instr.name + "', got n = " +
+                          std::to_string(instr.int_imm) + " (4.12)");
+                    return;
+                }
+                return;
+            }
+            // 4.14. `utrap %cond` takes one bool and has no result.
+            case Op::UTrap: {
+                if (instr.args.size() != 1) {
+                    error("utrap needs exactly one bool operand (4.14)");
+                    return;
+                }
+                LType ct;
+                if (!reg_type(instr.args.at(0), ct) || ct.kind != "bool") {
+                    error("utrap needs a bool condition, got " +
+                          (reg_type(instr.args.at(0), ct) ? type_str(ct) : std::string("unresolved")) +
+                          " (4.14)");
+                    return;
+                }
                 return;
             }
             case Op::GuardNonZero: {
@@ -2425,7 +2524,8 @@ private:
                 return;
             }
             case Op::Call: {
-                if (instr.name == "print" || instr.name == "print_bare") {
+                if (instr.name == "print" || instr.name == "print_bare" ||
+                    instr.name == "print_u" || instr.name == "print_bare_u") {
                     check_print_call(instr);
                 } else if (instr.name == "print_sep" || instr.name == "print_nl") {
                     // 6.1. The separator and final newline of a multi-argument
@@ -2626,6 +2726,15 @@ private:
 };
 
 } // namespace
+
+std::string format_error(const RCRError& e, const lithon::ir::Module& module) {
+    std::string out = (e.message.rfind("LITHON-", 0) == 0 ? "" : "RCR error: ") + e.message + "\n";
+    if (e.src >= 0 && e.line > 0 && static_cast<size_t>(e.src) < module.sources.size() &&
+        !module.sources[static_cast<size_t>(e.src)].empty()) {
+        out += "  --> " + module.sources[static_cast<size_t>(e.src)] + ":" + std::to_string(e.line) + "\n";
+    }
+    return out;
+}
 
 std::vector<RCRError> check_module(const Module& module) {
     std::vector<RCRError> errors;
