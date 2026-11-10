@@ -1,0 +1,18 @@
+def even(n: int[64]) -> bool:
+    pad: list[int[64], 512]
+    pad[0] = n
+    if n == 0:
+        return True
+    return odd(n - 1)
+
+
+def odd(n: int[64]) -> bool:
+    pad: list[int[64], 512]
+    pad[0] = n
+    if n == 0:
+        return False
+    return even(n - 1)
+
+
+print(even(1000))
+print(odd(777))

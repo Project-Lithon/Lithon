@@ -37,6 +37,7 @@ struct OptimizeStats {
     int copies_propagated = 0;
     int tail_calls = 0;
     int strength_reduced = 0;
+    int overflow_checks_elided = 0;   // `k = k + 1` under `k < n` proven not to overflow
     int accum_unrolled = 0;
     // 3.1: float add chains rotated to shorten the dependency chain. NOT
     // semantics-preserving -- each rotation is a different rounding of the same
@@ -1518,12 +1519,112 @@ struct OptimizePasses {
 
 // `is_float` (optional) maps each original ValueId to whether it is a double;
 // it is required for a float accumulator to be split. See accumulator_unroll.
+// ---------------------------------------------------------------------------
+// Induction-variable overflow elimination.
+//
+// `while k < n: ... k = k + 1` is the shape of nearly every counted loop, and the increment
+// carries an E0303 overflow check on every iteration. It can never fire: the loop body is only
+// entered when `k < n`, n is an int64, so k <= n-1 <= INT64_MAX-1 and k+1 fits. (Likewise
+// `k = k - 1` under `k > n`.) A bounds proof like this is what an optimising C compiler does
+// when it knows a counter cannot wrap; here the language specifies the trap, so the proof is
+// what makes the check removable.
+//
+// The proof needs, for the loop L with header H:
+//   * H ends in `branch %c, in, out` with `in` inside L and `out` outside, and %c is a compare
+//     of the variable K (loaded in H) against anything: `lt K, x` / `gt x, K` for an increment,
+//     `gt K, x` / `lt x, K` for a decrement;
+//   * the ONLY store to K in all of L is `store K, (load K) +/- 1`, in a block whose innermost
+//     loop is L itself (an inner loop could run the increment repeatedly without re-testing);
+//   * nothing takes K's address, so no other store can reach it.
+// Then every execution of the add is preceded by the header test of the same K, unchanged since,
+// and the add is marked `no_overflow`, which the code generator turns into the same instruction
+// with the check left out (a flag, not a different opcode, so the vectoriser, the unroller and
+// strength reduction still recognise the loop). Only the JIT's private copy is marked.
+// ---------------------------------------------------------------------------
+inline void elide_induction_overflow(lithon::ir::Function& fn, OptimizeStats& stats) {
+    using namespace lithon::ir;
+    if (fn.blocks.empty()) return;
+    const LoopInfo li = compute_loop_info(fn);
+    if (li.loops.empty()) return;
+    std::unordered_set<std::string> address_taken;
+    std::unordered_map<ValueId, const Instr*> def;
+    for (const auto& b : fn.blocks)
+        for (const auto& in : b.instrs) {
+            if (in.op == Op::AddressOf) address_taken.insert(in.name);
+            if (in.result != kInvalidValue) def[in.result] = &in;
+        }
+    std::unordered_map<std::string, size_t> block_of_label;
+    for (size_t b = 0; b < fn.blocks.size(); ++b) block_of_label[fn.blocks[b].label] = b;
+
+    for (size_t lidx = 0; lidx < li.loops.size(); ++lidx) {
+        const Loop& L = li.loops[lidx];
+        const BasicBlock& H = fn.blocks[L.header];
+        if (H.instrs.empty() || H.instrs.back().op != Op::Branch) continue;
+        const Instr& br = H.instrs.back();
+        const auto targets = branch_targets(br);
+        if (targets.size() != 2 || br.args.empty()) continue;
+        const auto in_it = block_of_label.find(targets[0]);
+        const auto out_it = block_of_label.find(targets[1]);
+        if (in_it == block_of_label.end() || out_it == block_of_label.end()) continue;
+        if (!L.contains(in_it->second) || L.contains(out_it->second)) continue;   // true edge stays, false edge leaves
+        const auto cd = def.find(br.args[0]);
+        if (cd == def.end()) continue;
+        const Instr& cmp = *cd->second;
+        if (cmp.op != Op::Lt && cmp.op != Op::Gt) continue;
+        if (cmp.args.size() != 2) continue;
+        // A side of the compare that is `load X` with the load in the header: X is a candidate
+        // induction variable. In `lt a, b` a is bounded above (a < b) and b below; `gt` is the mirror.
+        auto loaded_var = [&](ValueId v) -> const std::string* {
+            const auto d = def.find(v);
+            if (d == def.end() || d->second->op != Op::Load) return nullptr;
+            for (const auto& hi : H.instrs) if (&hi == d->second) return &d->second->name;   // in the header
+            return nullptr;
+        };
+        struct Candidate { const std::string* name; bool upper; };
+        const bool lt = cmp.op == Op::Lt;
+        const Candidate candidates[2] = {{loaded_var(cmp.args[0]), lt}, {loaded_var(cmp.args[1]), !lt}};
+
+        for (const Candidate& cand : candidates) {
+            if (cand.name == nullptr) continue;
+            const std::string K = *cand.name;
+            const bool upper = cand.upper;
+            if (address_taken.count(K)) continue;
+
+            // every store to K inside the loop
+            const Instr* only_store = nullptr;
+            size_t store_block = 0;
+            int stores = 0;
+            for (size_t b : L.blocks)
+                for (const auto& in : fn.blocks[b].instrs)
+                    if (in.op == Op::Store && in.name == K) { ++stores; only_store = &in; store_block = b; }
+            if (stores != 1 || only_store->args.size() != 1) continue;
+            if (li.inner_most_of[store_block] != lidx) continue;
+            const auto sd = def.find(only_store->args[0]);
+            if (sd == def.end()) continue;
+            Instr* step = const_cast<Instr*>(sd->second);
+            if (step->op != (upper ? Op::Add : Op::Sub) || step->args.size() != 2) continue;
+            // `load K` +/- 1, with the load in the same block as the store
+            const auto ld = def.find(step->args[0]);
+            const auto cd1 = def.find(step->args[1]);
+            if (ld == def.end() || cd1 == def.end()) continue;
+            if (ld->second->op != Op::Load || ld->second->name != K) continue;
+            if (cd1->second->op != Op::ConstInt || cd1->second->int_imm != 1) continue;
+            bool load_in_block = false;
+            for (const auto& in : fn.blocks[store_block].instrs) if (&in == ld->second) load_in_block = true;
+            if (!load_in_block) continue;
+            step->no_overflow = true;
+            ++stats.overflow_checks_elided;
+        }
+    }
+}
+
 inline OptimizeStats optimize_function(lithon::ir::Function& fn,
                                        const OptimizePasses& passes = OptimizePasses{},
                                        const std::vector<bool>* is_float = nullptr) {
     OptimizeStats stats;
     convert_self_tail_calls(fn, stats);
     fold_constants(fn, stats);
+    elide_induction_overflow(fn, stats);
     if (passes.strength_reduce) strength_reduce_multiplies(fn, stats);
     accumulator_unroll(fn, stats, passes.accum_unroll, is_float);
     // After constant folding, deliberately: folding turns a chain of literals

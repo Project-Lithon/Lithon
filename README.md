@@ -110,6 +110,34 @@ drop-in Python replacement.
   *internal* function-to-function convention is unchanged (two register arguments,
   then the stack); see the Todo for what it would take to make JIT functions
   directly callable from C with more.
+- **Large stack frames run natively, and a faster hot loop (6.12)** — the 32 KB native frame
+  limit is gone. `test_codes_lithon/matrix_bench.lio` (three 16,384-element lists, a 393 KB
+  frame) used to be refused and fall back to the interpreter, taking **28 s**; it now runs
+  natively in **about 0.06 s**, same checksum. Done the way C, C++ and Rust do it, then pushed
+  further: **(1) stack probing** -- a frame of a page or more is touched page by page, highest
+  address first, in its prologue (what GCC/Clang `-fstack-clash-protection`, MSVC `__chkstk`
+  and Rust's `probestack` emit), so every guard page is hit in order (x86-64 and x86-32);
+  **(2) a worst-case stack bound computed at compile time** (own addition,
+  `src/jit/stack_budget.h`): the call graph and every frame size are known, and recursion is
+  bounded by the `E0401` depth guard, so the program's exact worst-case stack is a number
+  (acyclic calls add up; a recursive group costs `4096 x its largest frame`; a virtual call or a
+  `release` may reach any method or destructor); **(3) a dedicated stack of exactly that size**
+  (`src/jit/native_stack.h`, a thread made with the size, as Rust's
+  `thread::Builder::stack_size` does) when it exceeds the starting thread's 4 MiB -- reserved,
+  committed only as touched; **(4) a refusal that is still correct**: a program needing more than
+  the limit (2 GiB; 192 MiB in a 32-bit process; `LITHON_NATIVE_STACK_LIMIT` overrides it) is
+  refused before it runs and the interpreter runs it. There is no run-time stack check and no
+  segmentation fault, and both tiers still trap runaway recursion with `E0401` at the same depth.
+  Negative control: counting a recursive group as one frame makes the runaway recursion
+  **crash the real stack**. Speed work on the same loop: out-of-line trap stubs and a single
+  unsigned compare per bounds check (115 -> 65 ms), and an **induction-variable overflow proof**:
+  in `while k < n: ... k = k + 1` the increment cannot overflow (k < n <= INT64_MAX), so its `E0303`
+  check is rewritten away; the proof fires only when the loop's only store to `k` is that
+  increment, in the loop itself, with no address taken, and never for `<=`, a step of two, an
+  inner-loop increment or a counter changed twice (`tests/opt_soundness`, with controls that make
+  a wrongly removed check loop forever). Also: a `uint` constant that fits `int64` is a
+  compile-time number like a literal (a capacity, an `int` comparison): `const k: uint[64] = 2048;
+  a: list[int[64], k]` works.
 - **Functions that take or return a `str` (6.11)** — `def verdict(buy: int[16], sell: int[16]) -> str[32]`
   and `def count_a(s: str[16]) -> int[64]` now work (a function with a `str` parameter is
   expanded at its call sites too; the parameter is a *copy*, so the callee cannot change the
@@ -1092,16 +1120,18 @@ The verification suite checks several independent layers.
 | Direct float Phi sweep               | **104 matched / 0 mismatched** |
 | ABI modules audited                  |             **34**            |
 | ABI stack/callee-saved failures      |             **0**             |
-| Typed regression suite               |       **72 / 72 passed**      |
+| Typed regression suite               |       **74 / 74 passed**      |
 | Win64 ABI (MinGW build under wine)   | **6 probes ok, 104 / 104 identical** |
-| x86-32 native tier (Win32, wine)     | **130 / 130 programs native, identical; 540 fuzzed per run; encoder 118 / 118** |
-| x86-32 native tier (System V i386)   | **130 / 130 native, identical; alignment probe; 540 fuzzed per run** |
+| x86-32 native tier (Win32, wine)     | **147 / 147 programs native, identical; 540 fuzzed per run; encoder 118 / 118** |
+| x86-32 native tier (System V i386)   | **147 / 147 native, identical; alignment probe; 540 fuzzed per run** |
 | x86-32 exported cdecl/stdcall/fastcall | **30,000 calls per target, stack balanced** |
 | General regression suite             |       **34 / 34 passed**      |
 | Type-checker unit checks             |          **145 ok**          |
 | Object runtime (4.10.0–4.10.6, ctest) | **107 ok**       |
 | Error-code discipline checks         |         **303 ok**           |
-| Error display checks                 |        **15 / 15 passed**     |
+| Error display checks                 |        **25 / 25 passed**     |
+| Large frames (probes, stack bound)   |        **14 / 14 passed**     |
+| Optimiser soundness                  |         **8 / 8 passed**      |
 | Tier differential (interp vs JIT)    |      **263 / 263 passed**     |
 | Class (OOP) fuzzing                  |      **200 / 200 passed**     |
 | Syscall hook parity (both tiers)     |        **4 / 4 passed**      |
@@ -2651,6 +2681,14 @@ tests, error codes and docs have all landed and the full gate
   is expanded at its call sites, so it cannot contain itself; refused with the call chain, E0114),
   and **such a function has no `uint` result yet**. A trap raised by a library helper that exits
   on its own (the stack-overflow guard, `E0401`) has no single source site and prints no position.
+- [x] **6.12 — large frames + loop speed** (asked for by the user). Not done, and why:
+  **loop-invariant hoisting** (`i*n` in the inner loop of a matrix multiply is recomputed every
+  iteration) needs loop inversion at the IR level so the hoisted code runs only when the loop
+  does, to keep trap order; **strength reduction** only handles 2-block loops today; a recursive
+  group is bounded by `4096 x max frame`, which is conservative (a function with a 1 MiB frame
+  that recurses needs 4 GiB and is refused, then interpreted); the page probes cannot be
+  exercised under wine or on Linux (both commit stack lazily), so they are checked in the
+  disassembly instead.
 - [ ] **4.18 — ARM64** (AAPCS64, and the Windows ARM64 variant).
 - [ ] **4.19 — RISC-V** (LP64D). Order decided: Win64 → x86-32 → ARM64 → RISC-V.
 - [ ] **Further architectures** (ARM32, PowerPC64, s390x, MIPS, LoongArch,

@@ -264,9 +264,13 @@ def check_win32(exe, tmp, quick, runner=None):
         return 0
     progs = sorted((ROOT / "tests" / "typed_regression").glob("*.lio")) + \
             sorted((ROOT / "tests" / "programs").glob("*.lio")) + \
-            sorted((ROOT / "tests" / "x86_32").glob("*.lio"))
+            sorted((ROOT / "tests" / "x86_32").glob("*.lio")) + \
+            sorted((ROOT / "tests" / "big_frames").glob("*.lio")) + \
+            sorted((ROOT / "tests" / "opt_soundness").glob("*.lio"))
     if quick:
-        progs = progs[::6] + sorted((ROOT / "tests" / "x86_32").glob("*.lio"))
+        progs = progs[::6] + sorted((ROOT / "tests" / "x86_32").glob("*.lio")) + \
+            sorted((ROOT / "tests" / "big_frames").glob("*.lio")) + \
+            sorted((ROOT / "tests" / "opt_soundness").glob("*.lio"))
     fails = ran = native = 0
 
     def lines(text):
@@ -298,7 +302,7 @@ def check_win32(exe, tmp, quick, runner=None):
             if (want.returncode, want.stdout) != (fb.returncode, fb.stdout.replace("\r\n", "\n")):
                 fails += 1
                 print(f"  FAIL {f.name}: interpreter fallback differs")
-    floor = 30 if quick else 125
+    floor = 40 if quick else 140
     print(f"  {ran} programs: {native} ran on the x86-32 native tier, all identical to the 64-bit reference; "
           f"the other {ran - native} fell back to the interpreter correctly")
     if native < floor:

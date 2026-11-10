@@ -1117,7 +1117,7 @@ def parse_type_annotation(node, structs=None):
             str_cap = _annotation_int(size_node)
             if str_cap is None:
                 raise NotImplementedError(
-                    "LITHON-E0111: str[N] requires a literal integer capacity (or the name of "
+                    "LITHON-E0111: str[N] requires a literal integer capacity (or the name of an `int`/`uint` "
                     "an integer `const`), e.g. str[16]")
             if str_cap <= 0:
                 raise NotImplementedError(
@@ -1292,7 +1292,7 @@ def _parse_container_annotation(base, slice_node):
     elem_node, cap_node = slice_node.elts
     seq_cap = _annotation_int(cap_node)
     if seq_cap is None:
-        raise NotImplementedError(f"LITHON-E0111: {base}[T, N] requires a literal integer capacity (or the name of an integer `const`)")
+        raise NotImplementedError(f"LITHON-E0111: {base}[T, N] requires a literal integer capacity, or the name of an `int` or `uint` `const` with a literal value (a computed capacity cannot size the frame)")
     if seq_cap <= 0:
         raise NotImplementedError(f"LITHON-E0111: {base} capacity must be positive, got {seq_cap}")
     elem_t = parse_type_annotation(elem_node)
@@ -8595,6 +8595,11 @@ class IRBuilder:
         if isinstance(node, ast.Name):
             fold = self._const_fold(node.id)
             if fold is not None:
+                # A uint constant that also fits int64 is a known number, so it behaves like the
+                # integer literal it stands for (it adapts to an int or a uint context, as `2048`
+                # would); only a value past int64 stays genuinely unsigned.
+                if fold[0] == "uint" and fold[2] < (1 << 63):
+                    return None
                 return fold[1] if fold[0] == "uint" else None
             d = self.declared.get(node.id)
             return d.width if (d is not None and d.kind == "uint") else None
@@ -10255,7 +10260,10 @@ def _build_program_raw(tree):
             fold = _scalar_const_fold(stmt.annotation, stmt.value)
             if fold is not None:
                 GLOBAL_CONSTS[stmt.target.id] = fold
-                if fold[0] == "int":
+                # A uint constant is as good a compile-time NUMBER as an int one (a capacity, a
+                # str limit, a range bound, a literal index). Only a value that also fits int64 is
+                # recorded: that keeps it from ever standing for an out-of-range signed literal.
+                if fold[0] in ("int", "uint") and fold[2] < (1 << 63):
                     GLOBAL_CONST_INTS[stmt.target.id] = fold[2]
 
     # 4.6/4.7/4.10.1. Struct, enum and class definitions are collected in one

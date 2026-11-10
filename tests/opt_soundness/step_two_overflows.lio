@@ -1,0 +1,6 @@
+# `k < n` bounds k+1, not k+2: from MAX-1 an increment by two overflows and must trap.
+k: int[64] = 9223372036854775804
+n: int[64] = 9223372036854775807
+while k < n:
+    print(k)
+    k = k + 2

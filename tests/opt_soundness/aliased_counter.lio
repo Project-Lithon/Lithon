@@ -1,0 +1,7 @@
+# The counter's address is taken, so a store through the pointer can change it: no proof.
+k: int[64] = 9223372036854775805
+n: int[64] = 9223372036854775807
+_p: ptr[int[64]] = addressof(k)
+while k < n:
+    k = k + 1
+    print(k)

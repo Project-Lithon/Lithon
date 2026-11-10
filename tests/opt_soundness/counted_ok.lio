@@ -1,0 +1,26 @@
+# Where the proof applies the loop must simply be right.
+n: int[64] = 1000000
+k: int[64] = 0
+t: int[64] = 0
+while k < n:
+    t = t + k
+    k = k + 1
+print(t)
+d: int[64] = 100000
+s: int[64] = 0
+while d > 0:
+    s = s + d
+    d = d - 1
+print(s)
+big: int[64] = 9223372036854775800
+c: int[64] = 0
+while big < 9223372036854775807:
+    big = big + 1
+    c = c + 1
+print(c, big)
+low: int[64] = -9223372036854775800
+c2: int[64] = 0
+while low > -9223372036854775807:
+    low = low - 1
+    c2 = c2 + 1
+print(c2, low)

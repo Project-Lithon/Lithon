@@ -1,0 +1,10 @@
+# Unbounded recursion with an 8 KiB frame per level: the E0401 depth guard must trap at the same depth in
+# both tiers, and the native stack (sized from the call graph) must be big enough that the guard, not
+# the operating system, decides where recursion ends.
+def g(n: int[64]) -> int[64]:
+    buf: list[int[64], 1024]
+    buf[0] = n
+    return g(n + 1) + buf[0]
+
+
+print(g(0))

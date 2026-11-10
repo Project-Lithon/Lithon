@@ -1,0 +1,14 @@
+# An 8 MiB frame: bigger than the 4 MiB the starting thread is trusted with, so native code runs on a
+# dedicated stack of exactly the size the program needs.
+a: list[int[64], 1048576]
+i: int[64] = 0
+while i < 1048576:
+    a[i] = i * 3 % 1000
+    i = i + 1
+s: int[64] = 0
+i = 0
+while i < 1048576:
+    s = s + a[i]
+    i = i + 1
+print(s)
+print(a[1048575])

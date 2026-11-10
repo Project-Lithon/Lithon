@@ -29,6 +29,8 @@
 #include <string>
 
 #include "backend.h"
+#include "native_stack.h"
+#include "stack_budget.h"
 #include "compile_function.h"
 #include "exec_memory.h"
 #include "interpreter/interpreter.h"
@@ -72,6 +74,21 @@ bool run_native(const lithon::ir::Module& m, lithon::jit::CompileOptions options
         return false;
     }
 
+    // The most stack this program can possibly use, from its call graph and the frame sizes the code
+    // generator just chose (recursion is bounded by the E0401 depth guard). It either fits what we
+    // are willing to reserve -- and then the program gets exactly that much stack and cannot
+    // overflow -- or it is refused here, before anything has run.
+    const int64_t stack_needed =
+        lithon::jit::worst_case_stack(m, compiled.frame_bytes) + lithon::jit::kHostStackMargin;
+    if (stack_needed > lithon::jit::native_stack_limit()) {
+        std::fprintf(stderr,
+                     "[tier0] native compile refused: worst-case stack of %lld bytes exceeds the "
+                     "%lld-byte native stack limit\n",
+                     static_cast<long long>(stack_needed),
+                     static_cast<long long>(lithon::jit::native_stack_limit()));
+        return false;
+    }
+
     // The platform's own executable-memory path (mmap/mprotect on POSIX,
     // VirtualAlloc/VirtualProtect on Windows), W^X either way.
     lithon::jit::ExecutableBuffer exec;
@@ -83,7 +100,6 @@ bool run_native(const lithon::ir::Module& m, lithon::jit::CompileOptions options
     }
     void* mem = exec.data();
 
-    std::fputs("[tier1] native\n", stderr);
     using Fn = void (*)();
     auto entry = reinterpret_cast<Fn>(static_cast<uint8_t*>(mem) + main_it->second);
     // E0401: a fresh run starts recursion at depth 0; __main__'s own prologue
@@ -118,7 +134,20 @@ bool run_native(const lithon::ir::Module& m, lithon::jit::CompileOptions options
                 return reinterpret_cast<void (*)(void)>(base + it->second);
             });
     }
-    entry();
+    // Run on this thread when the stack it already has is enough, otherwise on a thread made with a
+    // stack of exactly the size needed (reserved, committed as the probes touch it). If such a
+    // thread cannot be made nothing has run yet, so the caller falls back to the interpreter.
+    const auto go = [&] {
+        std::fputs("[tier1] native\n", stderr);
+        entry();
+    };
+    if (stack_needed <= lithon::jit::kInlineNativeStack) {
+        go();
+    } else if (!lithon::jit::run_on_stack(stack_needed, go)) {
+        std::fprintf(stderr, "[tier0] native compile refused: could not reserve a %lld-byte stack\n",
+                     static_cast<long long>(stack_needed));
+        return false;
+    }
     std::fflush(stdout);   // native print() goes through libc stdio
     return true;
 }

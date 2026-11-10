@@ -1,0 +1,10 @@
+# The outer test `k < n` is not re-checked between the inner loop's increments of k, so
+# those increments may overflow and must still trap.
+k: int[64] = 9223372036854775803
+n: int[64] = 9223372036854775807
+while k < n:
+    j: int[64] = 0
+    while j < 5:
+        k = k + 1
+        print(k)
+        j = j + 1

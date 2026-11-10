@@ -605,6 +605,10 @@ struct Instr {
     // positions when asked). Used to point a runtime trap or a type error at its source line.
     int32_t src = -1;
     int32_t line = 0;
+    // Set by the optimiser (never by the parser): this add/sub provably cannot overflow, so the
+    // native code omits its E0303 check. It is a flag, not a different opcode, so every loop
+    // recogniser (vectoriser, unroller, strength reduction) still sees an ordinary add.
+    bool no_overflow = false;
 
     int64_t int_imm = 0;
     // A second integer immediate for CallSuper: the defining class's IR index.

@@ -1,0 +1,7 @@
+# A 20 KiB frame: a few pages, so the prologue probes each one (the unrolled form).
+a: list[int[64], 2560]
+i: int[64] = 0
+while i < 2560:
+    a[i] = i
+    i = i + 1
+print(a[2559] + a[1280])

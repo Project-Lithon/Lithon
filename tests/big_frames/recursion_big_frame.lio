@@ -1,0 +1,10 @@
+# Every level of the recursion owns a 16 KiB list, so 300 levels need about 5 MB of stack.
+def f(n: int[64]) -> int[64]:
+    buf: list[int[64], 2048]
+    buf[0] = n
+    if n == 0:
+        return 0
+    return buf[0] + f(n - 1)
+
+
+print(f(300))

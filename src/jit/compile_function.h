@@ -203,6 +203,10 @@ struct CompileOptions {
 struct CompiledModule {
     std::vector<uint8_t> code;
     std::unordered_map<std::string, size_t> function_offset;
+    // The stack each function occupies while it runs: its whole frame plus the saved frame pointer
+    // and the return address (and, on x86-32, room for the arguments it pushes). The runner adds
+    // these along the call graph (stack_budget.h) to size the native stack exactly.
+    std::unordered_map<std::string, int64_t> frame_bytes;
     // Raw double bits of every ConstFloat that survived to codegen,
     // appended after the last function so it sits inside the same
     // executable mapping. x86-64 has no "mov xmm, imm64", so a double
@@ -352,7 +356,8 @@ inline FunctionPlan plan_function(const lithon::ir::Function& fn, const Promotio
                 continue;
             }
 
-            if ((in.op == Op::Add || in.op == Op::Sub || in.op == Op::Mul) && has_next &&
+            if ((in.op == Op::Add || in.op == Op::Sub || in.op == Op::Mul ||
+                 in.op == Op::WrapAdd || in.op == Op::WrapSub || in.op == Op::WrapMul) && has_next &&
                 ins[p + 1].op == Op::Store && ins[p + 1].args.size() == 1 &&
                 ins[p + 1].args[0] == in.result && uses[in.result].size() == 1 &&
                 promoted.count(ins[p + 1].name)) {
@@ -636,6 +641,7 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
 
     CodeBuffer code;
     std::unordered_map<std::string, size_t> function_offset;
+    std::unordered_map<std::string, int64_t> frame_bytes;
     size_t phi_copies_in_registers = 0;
     size_t phi_copies_total = 0;
     size_t phis_forwarded = 0;
@@ -953,6 +959,7 @@ inline CompiledModule compile_module(const lithon::ir::Module& module,
         const int xmm_save_area = save_xmm ? static_cast<int>(abi::kCalleeSavedXmm.size()) * 16 : 0;
         const int xmm_save_base = alloc.frame_size() + xmm_save_area;   // slot k at -(base - 16k)
         const int total_frame = alloc.frame_size() + xmm_save_area + out_area;
+        frame_bytes[original_fn.name] = static_cast<int64_t>(total_frame) + 16;
         if (total_frame > abi::kMaxNativeFrame) {
             throw std::runtime_error(
                 "compile_module: function '" + fn.name + "' needs a " +
@@ -1081,6 +1088,18 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
         // passes it to host_report_error, which prints "  --> path:line" under the message,
         // exactly as the interpreter does.
         int64_t cur_trap_loc = 0;
+        // report the error and exit: host_report_error(message, position). Never returns.
+        auto emit_report_call = [&](const char* message, int64_t loc) {
+            emit_mov_reg_imm(code, abi::kArgRegs[0], reinterpret_cast<int64_t>(message));
+            emit_mov_reg_imm(code, abi::kArgRegs[1], loc);
+            emit_mov_reg_imm(code, kR, reinterpret_cast<int64_t>(&host_report_error));
+            emit_xor_zero(code, Reg::RAX);
+            if (abi::kShadowSpace) emit_sub_rsp_imm32(code, abi::kShadowSpace);
+            emit_call_reg(code, kR);
+            if (abi::kShadowSpace) emit_add_rsp_imm32(code, abi::kShadowSpace);
+        };
+        struct TrapStub { const char* message; int64_t loc; std::vector<JumpPatch> sites; };
+        std::vector<TrapStub> trap_stubs;
         auto emit_host_error_trap = [&](const char* message) {
             // 6.10. If an enclosing try catches this trap, the "trap" is a jump
             // to that handler block rather than a program end. The kind is
@@ -1094,13 +1113,31 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                     return;
                 }
             }
-            emit_mov_reg_imm(code, abi::kArgRegs[0], reinterpret_cast<int64_t>(message));
-            emit_mov_reg_imm(code, abi::kArgRegs[1], cur_trap_loc);
-            emit_mov_reg_imm(code, kR, reinterpret_cast<int64_t>(&host_report_error));
-            emit_xor_zero(code, Reg::RAX);
-            if (abi::kShadowSpace) emit_sub_rsp_imm32(code, abi::kShadowSpace);
-            emit_call_reg(code, kR);
-            if (abi::kShadowSpace) emit_add_rsp_imm32(code, abi::kShadowSpace);
+            emit_report_call(message, cur_trap_loc);
+        };
+
+        // The out-of-line form. A trap site that is a plain "if this condition holds, trap" -- an
+        // overflow flag, an out-of-range index -- jumps (not-taken on the normal path) to a stub at the
+        // end of the function, one stub per (message, source position). The fast path then falls
+        // straight through: no taken branch over an inline error sequence, and the code stays dense.
+        // A catching `try` handler is jumped to directly, exactly as emit_host_error_trap does.
+        auto emit_trap_jcc = [&](Cond cc_when_trap, const char* message) {
+            const std::string kind = lithon::ir::classify_trap_message(message);
+            if (!kind.empty()) {
+                const std::string target = trap_handler_label(kind);
+                if (!target.empty()) {
+                    pending_blocks.push_back({emit_jcc_rel32(code, cc_when_trap), target});
+                    return;
+                }
+            }
+            for (auto& st : trap_stubs) {
+                if (st.message == message && st.loc == cur_trap_loc) {
+                    st.sites.push_back(emit_jcc_rel32(code, cc_when_trap));
+                    return;
+                }
+            }
+            trap_stubs.push_back({message, cur_trap_loc, {}});
+            trap_stubs.back().sites.push_back(emit_jcc_rel32(code, cc_when_trap));
         };
 
         // A call to a HOST (C) function. Under the Microsoft x64 ABI the caller
@@ -1147,9 +1184,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                 : op == Op::Sub
                     ? "LITHON-E0303: integer overflow in sub -- use wrap_sub() to wrap instead\n"
                     : "LITHON-E0303: integer overflow in mul -- use wrap_mul() to wrap instead\n";
-            JumpPatch no_overflow = emit_jcc_rel32(code, Cond::NotOverflow);
-            emit_host_error_trap(msg);
-            resolve_jump_patch(code, no_overflow, code.size());
+            emit_trap_jcc(Cond::Overflow, msg);
         };
 
         // 4.1. Bounds check for a container access whose index is not a
@@ -1183,14 +1218,10 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
             // the guard would be dead weight on every straight-line access.
             int32_t lit = 0;
             if (imm32_of(idx_id, lit)) return;
-            emit_cmp_reg_imm32(code, idx, 0);
-            JumpPatch nonneg = emit_jcc_rel32(code, Cond::GreaterEq);
-            emit_index_out_of_range_trap();
-            resolve_jump_patch(code, nonneg, code.size());
+            // One unsigned compare covers both ends: a negative index is a huge unsigned value, so
+            // `idx > cap-1` (unsigned) is exactly "idx < 0 or idx >= cap".
             emit_cmp_reg_imm32(code, idx, cap - 1);
-            JumpPatch in_range = emit_jcc_rel32(code, Cond::LessEq);
-            emit_index_out_of_range_trap();
-            resolve_jump_patch(code, in_range, code.size());
+            emit_trap_jcc(Cond::JumpAbove, "error: list index out of range\n");
         };
 
         auto emit_index_bounds_check = [&](ValueId idx_id, Reg idx, const std::string& name) {
@@ -1756,6 +1787,33 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
 
         // ---- prologue ---------------------------------------------------
         emit_prologue(code, total_frame);
+        // Stack probing, as C/C++ (-fstack-clash-protection, MSVC __chkstk) and Rust (probestack) do
+        // it: a frame of a page or more is touched one page at a time, highest address first, so
+        // every guard page the frame crosses is hit in order (Windows commits stack only that way,
+        // and Linux uses the same order to make a stack-clash jump over the guard impossible). The
+        // probes are reads into the reserved scratch registers, so nothing live is disturbed.
+        {
+            constexpr int kPage = 4096;
+            if (total_frame >= kPage) {
+                constexpr Reg kPL = abi::kScratchLeft;
+                constexpr Reg kPR = abi::kScratchRight;
+                const int pages = (total_frame - 1) / kPage;
+                if (pages <= 8) {
+                    for (int k = 1; k <= pages; ++k) emit_load_rbp_offset(code, kPL, -(kPage * k));
+                } else {
+                    emit_mov_reg_reg(code, kPR, Reg::RBP);
+                    const size_t top = code.size();
+                    emit_sub_reg_imm32(code, kPR, kPage);
+                    emit_cmp_reg_reg(code, kPR, Reg::RSP);
+                    JumpPatch done = emit_jcc_rel32(code, Cond::JumpBelowEq);   // past the frame
+                    emit_load_reg_indirect(code, kPL, kPR, 8);
+                    JumpPatch again = emit_jmp_rel32(code);
+                    resolve_jump_patch(code, again, top);
+                    resolve_jump_patch(code, done, code.size());
+                }
+                emit_load_reg_indirect(code, kPL, Reg::RSP, 8);   // the lowest page of the frame
+            }
+        }
         for (const auto& saved : alloc.callee_saved_slots()) {
             emit_store_rbp_offset(code, saved.first, saved.second);
         }
@@ -3966,7 +4024,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
                         const Op aop = instr.op == Op::WrapAdd ? Op::Add
                                      : instr.op == Op::WrapSub ? Op::Sub
                                      : instr.op == Op::WrapMul ? Op::Mul : instr.op;
-                        const bool is_wrap = aop != instr.op;
+                        const bool is_wrap = aop != instr.op || instr.no_overflow;
 
                         if (imm32_of(instr.args.at(1), imm)) {
                             if (aop == Op::Mul) {
@@ -5432,6 +5490,12 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
             resolve_jump_patch(code, p.patch, it->second);
         }
 
+        // The out-of-line trap stubs, after the last block (nothing falls into them).
+        for (const auto& st : trap_stubs) {
+            for (const auto& site : st.sites) resolve_jump_patch(code, site, code.size());
+            emit_report_call(st.message, st.loc);
+        }
+
         for (const auto& p : pending_blocks) {
             auto it = block_offset.find(p.target_label);
             if (it == block_offset.end()) {
@@ -5513,6 +5577,7 @@ auto commit_result = [&](ValueId id, Reg computed_in) {
     CompiledModule compiled;
     compiled.code = std::move(code);
     compiled.function_offset = std::move(function_offset);
+    compiled.frame_bytes = std::move(frame_bytes);
     compiled.float_pool = std::move(float_pool);
     compiled.int_pool = std::move(int_pool);
     compiled.phi_copies_in_registers = phi_copies_in_registers;

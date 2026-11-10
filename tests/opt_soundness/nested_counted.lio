@@ -1,0 +1,10 @@
+n: int[64] = 40
+i: int[64] = 0
+tot: int[64] = 0
+while i < n:
+    j: int[64] = 0
+    while j < i:
+        tot = tot + i * j
+        j = j + 1
+    i = i + 1
+print(tot)

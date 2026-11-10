@@ -105,6 +105,12 @@ python3 tools/check_uint.py
 step "4.17 x86-32 encoder: every form decodes as intended (objdump)"
 python3 tools/check_x86_32_encoding.py
 
+step "large frames: stack probes, the worst-case stack bound, a dedicated stack, the budget refusal"
+python3 tools/check_big_frames.py
+
+step "optimiser soundness: the induction-variable overflow proof never removes a check that could fire"
+python3 tools/check_native_opt.py
+
 step "error display: positions, caret columns, syntax errors, imports, colour"
 python3 tools/check_diagnostics.py
 

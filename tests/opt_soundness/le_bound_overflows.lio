@@ -1,0 +1,6 @@
+# `k <= n` does NOT bound k+1 below INT64_MAX: at k == n == INT64_MAX the increment must still trap.
+k: int[64] = 9223372036854775805
+n: int[64] = 9223372036854775807
+while k <= n:
+    print(k)
+    k = k + 1

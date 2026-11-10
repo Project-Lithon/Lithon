@@ -1,0 +1,7 @@
+# k is changed again before the increment, so the header test no longer bounds it.
+k: int[64] = 9223372036854775800
+n: int[64] = 9223372036854775807
+while k < n:
+    k = k + 5
+    k = k + 1
+    print(k)

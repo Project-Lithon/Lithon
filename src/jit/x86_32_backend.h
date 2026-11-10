@@ -225,6 +225,7 @@ inline CompiledModule compile_module(const ir::Module& module, bool export_thunk
 
     Code code;
     std::unordered_map<std::string, size_t> function_offset;
+    std::unordered_map<std::string, int64_t> frame_bytes;
     std::unordered_map<std::string, int> class_index;
     for (size_t ci = 0; ci < module.classes.size(); ++ci) class_index[module.classes[ci].name] = static_cast<int>(ci);
     std::vector<std::string> thunk_pending;
@@ -232,7 +233,13 @@ inline CompiledModule compile_module(const ir::Module& module, bool export_thunk
     std::vector<CallPatch> call_patches;
 
     for (size_t fi = 0; fi < module.functions.size(); ++fi) {
-        const Function& fn = module.functions[fi];
+        // A private copy, so the induction-variable overflow proof (optimize.h) can rewrite a
+        // provably safe `k = k + 1` to its wrapping twin without touching the caller's module.
+        Function fn = module.functions[fi];
+        {
+            OptimizeStats elide_stats;
+            elide_induction_overflow(fn, elide_stats);
+        }
         const std::vector<Kind>& kinds = fi < module_kinds.size() ? module_kinds[fi] : std::vector<Kind>{};
         function_offset[fn.name] = code.size();
 
@@ -335,6 +342,7 @@ inline CompiledModule compile_module(const ir::Module& module, bool export_thunk
         // surfaces as a refusal in the tests, never as wrong code.
         int cur_op = -1;   // for diagnostics only
         int64_t cur_loc = 0;   // packed source position of the instruction being emitted (0 = none)
+        int32_t max_push = 0;  // the most bytes any call in this function pushes (arguments + padding)
         std::unordered_map<ValueId, int64_t> const_val;
         std::unordered_set<ValueId> imm_vals;
         {
@@ -421,6 +429,7 @@ inline CompiledModule compile_module(const ir::Module& module, bool export_thunk
         };
         auto host_call = [&](const void* target, int arg_bytes, auto&& push) {
             const int pad = (kStackAlign - arg_bytes % kStackAlign) % kStackAlign;
+            max_push = std::max(max_push, arg_bytes + pad);
             x86_32::sub_esp(code, pad);
             push();
             align_probe();
@@ -821,6 +830,26 @@ inline CompiledModule compile_module(const ir::Module& module, bool export_thunk
 
         // ---- prologue + E0401 call-depth guard ----------------------------------
         x86_32::prologue(code, frame);
+        // Stack probing, as on x86-64 (see compile_function.h): a frame of a page or more is touched
+        // one page at a time, highest address first, so every guard page it crosses is hit in order.
+        if (frame >= 4096) {
+            constexpr int32_t kPage = 4096;
+            const int pages = (frame - 1) / kPage;
+            if (pages <= 8) {
+                for (int k = 1; k <= pages; ++k) x86_32::mov_r_m(code, R::EAX, -(kPage * k));
+            } else {
+                x86_32::mov_r_r(code, R::ECX, R::EBP);
+                const size_t top = code.size();
+                x86_32::alu_r_imm(code, Alu::Sub, R::ECX, kPage);
+                x86_32::alu_r_r(code, Alu::Cmp, R::ECX, R::ESP);
+                const size_t done = x86_32::jcc_rel32(code, Cc::BE);          // past the frame
+                x86_32::mov_r_mem(code, R::EAX, x86_32::at_reg(R::ECX, 0));
+                const size_t again = x86_32::jmp_rel32(code);
+                x86_32::patch_rel32(code, again, top);
+                x86_32::patch_rel32(code, done, code.size());
+            }
+            for (uint8_t b : {0x8B, 0x04, 0x24}) code.push_back(b);        // mov eax, [esp]: the lowest page
+        }
         // The depth never gets near 2^32, so only the low dword of g_call_depth is touched.
         x86_32::alu_abs_imm8(code, Alu::Add, depth_addr, 1);
         x86_32::mov_r_abs(code, R::EAX, depth_addr);
@@ -1066,7 +1095,7 @@ inline CompiledModule compile_module(const ir::Module& module, bool export_thunk
                         break;
                     }
                     const bool is_add = in.op == Op::Add || in.op == Op::WrapAdd;
-                    const bool checked = in.op == Op::Add || in.op == Op::Sub;
+                    const bool checked = (in.op == Op::Add || in.op == Op::Sub) && !in.no_overflow;
                     take_a(in.args.at(0));
                     alu_lo(is_add ? Alu::Add : Alu::Sub, R::EAX, in.args.at(1));
                     alu_hi(is_add ? Alu::Adc : Alu::Sbb, R::EDX, in.args.at(1));
@@ -1341,6 +1370,7 @@ inline CompiledModule compile_module(const ir::Module& module, bool export_thunk
                                                  std::to_string(callee->params.size()) + " parameters");
                     const int bytes = 8 * static_cast<int>(in.args.size());
                     const int pad = (kStackAlign - bytes % kStackAlign) % kStackAlign;
+                    max_push = std::max(max_push, bytes + pad);
                     x86_32::sub_esp(code, pad);
                     for (size_t a = in.args.size(); a-- > 0;) push_value(in.args[a]);
                     align_probe();
@@ -1677,6 +1707,7 @@ inline CompiledModule compile_module(const ir::Module& module, bool export_thunk
                     // 2. an ordinary cdecl call: receiver first, then the method arguments
                     const int bytes = 8 * static_cast<int>(nargs);
                     const int pad = (kStackAlign - bytes % kStackAlign) % kStackAlign;
+                    max_push = std::max(max_push, bytes + pad);
                     x86_32::sub_esp(code, pad);
                     for (size_t a = nargs; a-- > 0;) push_value(in.args[a]);
                     x86_32::mov_r_m(code, R::EAX, scratch(2));
@@ -1705,6 +1736,7 @@ inline CompiledModule compile_module(const ir::Module& module, bool export_thunk
                 x86_32::push_imm32(code, addr_of(st.second.message));
             });
         }
+        frame_bytes[fn.name] = static_cast<int64_t>(frame) + 8 + max_push + 64;
         // The runtime calls a destructor as a plain C function taking ONE pointer; the
         // JIT convention takes each argument as an 8-byte pair. A thunk widens it.
         if (fn.name.rfind("__del__", 0) == 0) {
@@ -1808,6 +1840,7 @@ inline CompiledModule compile_module(const ir::Module& module, bool export_thunk
     CompiledModule out;
     out.code = std::move(code);
     out.function_offset = std::move(function_offset);
+    out.frame_bytes = std::move(frame_bytes);
     return out;
 }
 

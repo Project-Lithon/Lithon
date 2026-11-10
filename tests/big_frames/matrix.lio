@@ -1,0 +1,28 @@
+# Three 128 KiB lists in one frame (about 393 KB): above the old 32 KB native frame limit.
+n: int[64] = 64
+a: list[int[64], 4096]
+b: list[int[64], 4096]
+c: list[int[64], 4096]
+i: int[64] = 0
+while i < n * n:
+    a[i] = (i * 17 + 7) % 100 + 1
+    b[i] = (i * 29 + 11) % 100 + 1
+    i = i + 1
+i = 0
+while i < n:
+    j: int[64] = 0
+    while j < n:
+        acc: int[64] = 0
+        k: int[64] = 0
+        while k < n:
+            acc = acc + a[i * n + k] * b[k * n + j]
+            k = k + 1
+        c[i * n + j] = acc
+        j = j + 1
+    i = i + 1
+chk: int[64] = 0
+i = 0
+while i < n * n:
+    chk = chk + c[i]
+    i = i + 1
+print(chk)

@@ -71,11 +71,12 @@ inline constexpr size_t kMaxParams = 32;
 // pushes 8 more, so the caller's RSP is exactly 16 above the callee's RBP.
 inline constexpr int kStackParamSlotBase = 16;
 
-// Largest frame the native compiler will build. Frames are a few hundred bytes
-// in practice; anything bigger is a pathological input, so it is refused
-// natively and runs in the interpreter rather than risking a frame that can no
-// longer be reasoned about.
-inline constexpr int kMaxNativeFrame = 32768;
+// Largest single frame the native compiler will build. This is a sanity bound, not the real
+// limit: a frame is probed page by page in its prologue, and the whole program's worst-case
+// stack use is computed from the call graph (stack_budget.h) and given a stack of exactly that
+// size, so a large local list (a 128x128 matrix, say) runs natively. 256 MiB keeps every
+// displacement inside a signed 32 bits.
+inline constexpr int kMaxNativeFrame = 1 << 28;
 
 // ---------------------------------------------------------------------
 // SSE2 double-precision register roles.

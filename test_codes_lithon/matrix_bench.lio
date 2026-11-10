@@ -1,0 +1,62 @@
+const r: uint[64] = 16384
+n: int[64] = 128
+a: list[int[64], r]
+b: list[int[64], r]
+c: list[int[64], r]
+
+i: int[64] = 0
+j: int[64] = 0
+k: int[64] = 0
+iteration: int[64] = 0
+acc: int[64] = 0
+checksum: int[64] = 0
+
+# Initialize matrices
+i = 0
+while i < n * n:
+    a[i] = (i * 17 + 7) % 1000 + 1
+    b[i] = (i * 29 + 11) % 1000 + 1
+    i = i + 1
+
+# Matrix multiplication benchmark
+iteration = 0
+
+while iteration < 8:
+    i = 0
+
+    while i < n:
+        j = 0
+
+        while j < n:
+            acc = 0
+            k = 0
+
+            while k < n:
+                acc = acc + a[i * n + k] * b[k * n + j]
+                k = k + 1
+
+            c[i * n + j] = acc
+            j = j + 1
+
+        i = i + 1
+
+    # Transform A for the next iteration
+    i = 0
+
+    while i < n * n:
+        a[i] = c[i] % 1000 + 1
+        i = i + 1
+
+    iteration = iteration + 1
+
+# Calculate final checksum
+checksum = 0
+i = 0
+
+while i < n * n:
+    checksum = checksum + c[i]
+    i = i + 1
+
+print("Matrix size:", n, "x", n)
+print("Iterations:", iteration)
+print("Final checksum:", checksum)
