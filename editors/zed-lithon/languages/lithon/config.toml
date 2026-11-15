@@ -1,0 +1,5 @@
+name = "Lithon"
+grammar = "lithon"
+path_suffixes = ["lio"]
+line_comments = ["# "]
+tab_size = 4
