@@ -2897,7 +2897,7 @@ class IRBuilder:
         # collide with the caller's.
         self.cur_pos = None            # (source index, line) of the node being built, for IR positions
         self.method_return_stack = []
-        self._str_call_cache = {}      # 6.11: id(call node) -> its result buffer's name
+        self._str_call_cache = {}      # 6.11: call node -> its result buffer's name (node is the key so it stays alive)
         self._strcp_counter = 0
         self.inline_active = []
         # 4.10.2. The classes whose method bodies are currently being inlined,
@@ -8116,11 +8116,11 @@ class IRBuilder:
         fdef = self._str_fn_def(node)
         if fdef is None or not self._inline_returns_str(fdef):
             return None
-        cached = self._str_call_cache.get(id(node))
+        cached = self._str_call_cache.get(node)
         if cached is not None:
             return cached
         result = self._expand_inline_fn(node, fdef)
-        self._str_call_cache[id(node)] = result
+        self._str_call_cache[node] = result
         return result
 
     def _inline_scalar_call(self, node):
