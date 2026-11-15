@@ -1,0 +1,8 @@
+0
+LITHON-HTTP-ERROR[1]: the URL is not a usable plain-http URL
+0
+LITHON-HTTP-ERROR[9]: openssl s_client gave no reply (check the certificate, and that /usr/bin/openssl exists)
+0
+LITHON-HTTP-ERROR[2]: the host name did not resolve
+0
+LITHON-HTTP-ERROR[3]: socket() or connect() failed

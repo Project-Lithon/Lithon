@@ -1,0 +1,59 @@
+# Several requests on one socket: the socket from http_open carries three
+# requests, the server counts only one new connection for them, and a reply
+# that says "Connection: close" is reported as not reusable.
+#
+# `__PORT__` is replaced with the port the test server is listening on. The
+# server's /conns route reports how many connections it has accepted.
+
+import std.http
+
+
+if __name__ == '__main__':
+    before: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/conns")
+    n_before: int[64] = 0
+    b1: str[8192] = std.http.http_body(before)
+    i: int[64] = b1.find(":") + 1
+    while i < len(b1):
+        c: int[64] = b1[i]
+        if c < 48:
+            break
+        if c > 57:
+            break
+        n_before = n_before * 10 + (c - 48)
+        i = i + 1
+
+    fd: int[64] = std.http.http_open("http://127.0.0.1:__PORT__/")
+    if fd < 0:
+        print(std.http.http_open_error(fd))
+    else:
+        r1: str[8192] = std.http.http_request_on(fd, "GET", "http://127.0.0.1:__PORT__/path/1", "", "")
+        print(std.http.http_status(r1))
+        print(std.http.http_body(r1))
+        print(std.http.http_keep_alive(r1))
+
+        r2: str[8192] = std.http.http_request_on(fd, "POST", "http://127.0.0.1:__PORT__/echo", "", "ping")
+        print(std.http.http_status(r2))
+        print(std.http.http_body(r2))
+
+        r3: str[8192] = std.http.http_request_on(fd, "GET", "http://127.0.0.1:__PORT__/path/3", "", "")
+        print(std.http.http_status(r3))
+        print(std.http.http_body(r3))
+
+        print(std.http.http_close(fd))
+
+    after: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/conns")
+    n_after: int[64] = 0
+    b2: str[8192] = std.http.http_body(after)
+    j: int[64] = b2.find(":") + 1
+    while j < len(b2):
+        d: int[64] = b2[j]
+        if d < 48:
+            break
+        if d > 57:
+            break
+        n_after = n_after * 10 + (d - 48)
+        j = j + 1
+    print(n_after - n_before)
+
+    closed: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/hello")
+    print(std.http.http_keep_alive(closed))

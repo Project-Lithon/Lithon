@@ -1,0 +1,39 @@
+# Real-world endpoint test: the client resolves real hostnames and fetches
+# real pages, with bodies checked.
+#
+# `__PORT__` is NOT used here -- these are live endpoints. Run with:
+#     lithon tests/http/real.lio
+
+import std.http
+
+
+if __name__ == '__main__':
+    # example.com -- a real HTML page.
+    resp: str[8192] = std.http.http_get("http://example.com/")
+    print("example.com status:", std.http.http_status(resp))
+    print("example.com ok:", std.http.http_ok(resp))
+    print("example.com body_len:", len(std.http.http_body(resp)))
+    print("example.com content_type:", std.http.http_header(resp, "Content-Type"))
+
+    # httpbin.org -- a JSON API.
+    resp = std.http.http_get("http://httpbin.org/get")
+    print("httpbin.org/get status:", std.http.http_status(resp))
+    print("httpbin.org/get ok:", std.http.http_ok(resp))
+    print("httpbin.org/get body_len:", len(std.http.http_body(resp)))
+    print("httpbin.org/get content_type:", std.http.http_header(resp, "Content-Type"))
+
+    # httpbin.org -- POST with a body.
+    resp = std.http.http_post("http://httpbin.org/post", '{"test": 42}')
+    print("httpbin.org/post status:", std.http.http_status(resp))
+    print("httpbin.org/post ok:", std.http.http_ok(resp))
+    print("httpbin.org/post body_len:", len(std.http.http_body(resp)))
+
+    # httpbin.org -- a 404.
+    resp = std.http.http_get("http://httpbin.org/status/404")
+    print("httpbin.org/404 status:", std.http.http_status(resp))
+    print("httpbin.org/404 ok:", std.http.http_ok(resp))
+
+    # httpbin.org -- a 201.
+    resp = std.http.http_get("http://httpbin.org/status/201")
+    print("httpbin.org/201 status:", std.http.http_status(resp))
+    print("httpbin.org/201 ok:", std.http.http_ok(resp))

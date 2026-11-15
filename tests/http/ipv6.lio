@@ -1,0 +1,26 @@
+# IPv6 literals in URLs: a bracketed host reaches the server on ::1, and
+# malformed or unreachable literals come back as coded diagnostics.
+
+import std.http
+
+
+if __name__ == '__main__':
+    # A bracketed literal with a port, and a path.
+    resp: str[8192] = std.http.http_get("http://[::1]:__PORT6__/path")
+    print(std.http.http_status(resp))
+    print(std.http.http_body(resp))
+
+    # Two "::" runs: not a valid literal.
+    resp = std.http.http_get("http://[::1::2]:__PORT6__/path")
+    print(std.http.http_status(resp))
+    print(std.http.http_error(resp))
+
+    # No closing bracket: not a valid URL.
+    resp = std.http.http_get("http://[::1:__PORT6__/path")
+    print(std.http.http_status(resp))
+    print(std.http.http_error(resp))
+
+    # Nothing listens on [::1]:1: the connect is refused.
+    resp = std.http.http_get("http://[::1]:1/")
+    print(std.http.http_status(resp))
+    print(std.http.http_error(resp))

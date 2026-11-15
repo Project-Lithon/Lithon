@@ -1,0 +1,8 @@
+200
+{"path":"/path"}
+0
+LITHON-HTTP-ERROR[1]: the URL is not a usable plain-http URL
+0
+LITHON-HTTP-ERROR[1]: the URL is not a usable plain-http URL
+0
+LITHON-HTTP-ERROR[3]: socket() or connect() failed

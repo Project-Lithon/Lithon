@@ -1,0 +1,13 @@
+# Building a query string and sending it: the server echoes the path it got,
+# so the bytes that reached the wire are the bytes that were checked.
+
+import std.http
+import std.http.query
+
+
+if __name__ == '__main__':
+    base: str[512] = "http://127.0.0.1:__PORT__/path"
+    u1: str[512] = std.http.query.with_query(base, std.http.query.query_pair("q", "a b&c"))
+    u2: str[512] = std.http.query.with_query(u1, std.http.query.query_pair("page", "2"))
+    resp: str[8192] = std.http.http_get(u2)
+    print(std.http.http_body(resp))

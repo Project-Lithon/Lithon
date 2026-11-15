@@ -1,0 +1,16 @@
+# A read that gets no answer in time comes back as the read-timeout error,
+# and a read that is answered in time comes back as a normal response.
+#
+# `__PORT__` is replaced with the port the test server is listening on.
+# `/slow` sleeps two seconds before it answers.
+
+import std.http
+import std.http.net
+
+
+if __name__ == '__main__':
+    slow: str[8192] = std.http.net.http_exchange("GET", "http://127.0.0.1:__PORT__/slow", "", "", 200)
+    print(slow)
+
+    fast: str[8192] = std.http.net.http_exchange("GET", "http://127.0.0.1:__PORT__/hello", "", "", 5000)
+    print(std.http.http_status(fast))

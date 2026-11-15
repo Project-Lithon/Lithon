@@ -1,0 +1,7 @@
+{"method":"GET","x_token":"","ctype":"","body":""}
+{"method":"GET","x_token":"","ctype":"","body":""}
+{"method":"POST","x_token":"","ctype":"application/json","body":"hello"}
+{"method":"PUT","x_token":"","ctype":"application/json","body":"hi"}
+{"method":"GET","x_token":"","ctype":"","body":""}
+LITHON-HTTP-ERROR[8]: too many redirects
+302

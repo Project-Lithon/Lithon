@@ -1,0 +1,490 @@
+# std/http/io.lio -- the byte path between a bounded string and the kernel.
+#
+# Every kernel read and write goes through a 64-byte `Chunk` struct, because a
+# struct is the only buffer whose address the kernel can use in both tiers.
+# The two copy blocks below move the bytes between the chunk and a bounded
+# string, one field at a time; `tools/gen_http_net.py` writes them and keeps
+# them in step with the markers.
+#
+# Failures come back as text that starts with "LITHON-HTTP-ERROR[n]: ", so a
+# caller that only has a string still sees the failure (see net.lio for the
+# code table). Sockets are plain IPv4 or IPv6 stream sockets.
+
+import std.http.core
+import std.http.response
+
+from std.http.core import Chunk, SockAddr, Sock6, Timeval, swap16, swap32
+
+# The length argument of getsockname(2): a 4-byte socklen_t in its own struct,
+# so the kernel writes through a real address in both tiers.
+class Socklen(struct):
+    n: int[32]
+
+
+# Set SO_RCVTIMEO and SO_SNDTIMEO. The send timeout also bounds connect(2) on
+# Linux, so one call covers the whole exchange. 0 means no timeout.
+def set_timeouts(fd: int[64], timeout_ms: int[64]) -> int[64]:
+    tv: Timeval
+    tv.sec = int(64, timeout_ms / 1000.0)
+    tv.usec = int(64, (timeout_ms % 1000) / 1.0) * 1000
+    if timeout_ms <= 0:
+        tv.sec = 0
+        tv.usec = 0
+    r: int[64] = syscall(54, fd, 1, 20, addressof(tv), 16, 0)
+    if r < 0:
+        return r
+    return syscall(54, fd, 1, 21, addressof(tv), 16, 0)
+
+
+# A connected IPv4 stream socket to ip:port, or a negative errno.
+def connect4(ip: int[64], port: int[64], timeout_ms: int[64]) -> int[64]:
+    fd: int[64] = syscall(41, 2, 1, 0, 0, 0, 0)
+    if fd < 0:
+        return fd
+    set_timeouts(fd, timeout_ms)
+    sa: SockAddr
+    sa.lo = 2 | (swap16(port) << 16) | (swap32(ip) << 32)
+    sa.hi = 0
+    r: int[64] = syscall(42, fd, addressof(sa), 16, 0, 0, 0)
+    if r < 0:
+        syscall(3, fd, 0, 0, 0, 0, 0)
+        return r
+    # A TCP connect can make the socket connect to itself: when the ephemeral
+    # source port equals the target port and nothing listens there, the socket
+    # reads back its own request. The local address then equals the peer.
+    me: SockAddr
+    ml: Socklen
+    ml.n = 16
+    g: int[64] = syscall(51, fd, addressof(me), addressof(ml), 0, 0, 0)
+    if g < 0:
+        syscall(3, fd, 0, 0, 0, 0, 0)
+        return g
+    if me.lo == sa.lo and me.hi == sa.hi:
+        syscall(3, fd, 0, 0, 0, 0, 0)
+        return -111
+    return fd
+
+
+# A connected IPv6 stream socket. `addr` holds 16 address bytes (indices 0-15);
+# byte 16 is unused here.
+def connect6(addr: str[17], port: int[64], timeout_ms: int[64]) -> int[64]:
+    fd: int[64] = syscall(41, 10, 1, 0, 0, 0, 0)
+    if fd < 0:
+        return fd
+    set_timeouts(fd, timeout_ms)
+    s: Sock6
+    s.w0 = 10 | (swap16(port) << 16)
+    s.w1 = 0
+    s.w2 = addr_word(addr, 0)
+    s.w3 = addr_word(addr, 4)
+    s.w4 = addr_word(addr, 8)
+    s.w5 = addr_word(addr, 12)
+    s.w6 = 0
+    r: int[64] = syscall(42, fd, addressof(s), 28, 0, 0, 0)
+    if r < 0:
+        syscall(3, fd, 0, 0, 0, 0, 0)
+        return r
+    return fd
+
+
+# A connected IPv6 stream socket to eight 16-bit address groups g0..g7, in
+# order, as ip6.lio produces them. Packs the sockaddr with swapped groups so
+# that the kernel reads them back in network order.
+def connect6_groups(g0: int[64], g1: int[64], g2: int[64], g3: int[64], g4: int[64], g5: int[64], g6: int[64], g7: int[64], port: int[64], timeout_ms: int[64]) -> int[64]:
+    fd: int[64] = syscall(41, 10, 1, 0, 0, 0, 0)
+    if fd < 0:
+        return fd
+    set_timeouts(fd, timeout_ms)
+    s: Sock6
+    s.w0 = 10 | (swap16(port) << 16)
+    s.w1 = 0
+    s.w2 = swap16(g0) | (swap16(g1) << 16)
+    s.w3 = swap16(g2) | (swap16(g3) << 16)
+    s.w4 = swap16(g4) | (swap16(g5) << 16)
+    s.w5 = swap16(g6) | (swap16(g7) << 16)
+    s.w6 = 0
+    r: int[64] = syscall(42, fd, addressof(s), 28, 0, 0, 0)
+    if r < 0:
+        syscall(3, fd, 0, 0, 0, 0, 0)
+        return r
+    return fd
+
+
+# Four address bytes starting at `at`, packed little-endian into one word, so
+# that the kernel reads them back in network order.
+def addr_word(addr: str[17], at: int[64]) -> int[64]:
+    w: int[64] = 0
+    k: int[64] = 3
+    while k >= 0:
+        w = (w << 8) | (addr[at + k] & 255)
+        k = k - 1
+    return ((w & 255) << 24) | (((w >> 8) & 255) << 16) | (((w >> 16) & 255) << 8) | ((w >> 24) & 255)
+
+
+def close_fd(fd: int[64]) -> int[64]:
+    return syscall(3, fd, 0, 0, 0, 0, 0)
+
+
+# Send the first `nreq` bytes of `req`, looping over short writes. Returns 0,
+# or a negative errno.
+def send_all(fd: int[64], req: str[4096], nreq: int[64]) -> int[64]:
+    ch: Chunk
+    off: int[64] = 0
+    while off < nreq:
+#<<COPY_IN>>
+        if off + 0 < nreq:
+            ch.f0 = req[off + 0]
+        if off + 1 < nreq:
+            ch.f1 = req[off + 1]
+        if off + 2 < nreq:
+            ch.f2 = req[off + 2]
+        if off + 3 < nreq:
+            ch.f3 = req[off + 3]
+        if off + 4 < nreq:
+            ch.f4 = req[off + 4]
+        if off + 5 < nreq:
+            ch.f5 = req[off + 5]
+        if off + 6 < nreq:
+            ch.f6 = req[off + 6]
+        if off + 7 < nreq:
+            ch.f7 = req[off + 7]
+        if off + 8 < nreq:
+            ch.f8 = req[off + 8]
+        if off + 9 < nreq:
+            ch.f9 = req[off + 9]
+        if off + 10 < nreq:
+            ch.f10 = req[off + 10]
+        if off + 11 < nreq:
+            ch.f11 = req[off + 11]
+        if off + 12 < nreq:
+            ch.f12 = req[off + 12]
+        if off + 13 < nreq:
+            ch.f13 = req[off + 13]
+        if off + 14 < nreq:
+            ch.f14 = req[off + 14]
+        if off + 15 < nreq:
+            ch.f15 = req[off + 15]
+        if off + 16 < nreq:
+            ch.f16 = req[off + 16]
+        if off + 17 < nreq:
+            ch.f17 = req[off + 17]
+        if off + 18 < nreq:
+            ch.f18 = req[off + 18]
+        if off + 19 < nreq:
+            ch.f19 = req[off + 19]
+        if off + 20 < nreq:
+            ch.f20 = req[off + 20]
+        if off + 21 < nreq:
+            ch.f21 = req[off + 21]
+        if off + 22 < nreq:
+            ch.f22 = req[off + 22]
+        if off + 23 < nreq:
+            ch.f23 = req[off + 23]
+        if off + 24 < nreq:
+            ch.f24 = req[off + 24]
+        if off + 25 < nreq:
+            ch.f25 = req[off + 25]
+        if off + 26 < nreq:
+            ch.f26 = req[off + 26]
+        if off + 27 < nreq:
+            ch.f27 = req[off + 27]
+        if off + 28 < nreq:
+            ch.f28 = req[off + 28]
+        if off + 29 < nreq:
+            ch.f29 = req[off + 29]
+        if off + 30 < nreq:
+            ch.f30 = req[off + 30]
+        if off + 31 < nreq:
+            ch.f31 = req[off + 31]
+        if off + 32 < nreq:
+            ch.f32 = req[off + 32]
+        if off + 33 < nreq:
+            ch.f33 = req[off + 33]
+        if off + 34 < nreq:
+            ch.f34 = req[off + 34]
+        if off + 35 < nreq:
+            ch.f35 = req[off + 35]
+        if off + 36 < nreq:
+            ch.f36 = req[off + 36]
+        if off + 37 < nreq:
+            ch.f37 = req[off + 37]
+        if off + 38 < nreq:
+            ch.f38 = req[off + 38]
+        if off + 39 < nreq:
+            ch.f39 = req[off + 39]
+        if off + 40 < nreq:
+            ch.f40 = req[off + 40]
+        if off + 41 < nreq:
+            ch.f41 = req[off + 41]
+        if off + 42 < nreq:
+            ch.f42 = req[off + 42]
+        if off + 43 < nreq:
+            ch.f43 = req[off + 43]
+        if off + 44 < nreq:
+            ch.f44 = req[off + 44]
+        if off + 45 < nreq:
+            ch.f45 = req[off + 45]
+        if off + 46 < nreq:
+            ch.f46 = req[off + 46]
+        if off + 47 < nreq:
+            ch.f47 = req[off + 47]
+        if off + 48 < nreq:
+            ch.f48 = req[off + 48]
+        if off + 49 < nreq:
+            ch.f49 = req[off + 49]
+        if off + 50 < nreq:
+            ch.f50 = req[off + 50]
+        if off + 51 < nreq:
+            ch.f51 = req[off + 51]
+        if off + 52 < nreq:
+            ch.f52 = req[off + 52]
+        if off + 53 < nreq:
+            ch.f53 = req[off + 53]
+        if off + 54 < nreq:
+            ch.f54 = req[off + 54]
+        if off + 55 < nreq:
+            ch.f55 = req[off + 55]
+        if off + 56 < nreq:
+            ch.f56 = req[off + 56]
+        if off + 57 < nreq:
+            ch.f57 = req[off + 57]
+        if off + 58 < nreq:
+            ch.f58 = req[off + 58]
+        if off + 59 < nreq:
+            ch.f59 = req[off + 59]
+        if off + 60 < nreq:
+            ch.f60 = req[off + 60]
+        if off + 61 < nreq:
+            ch.f61 = req[off + 61]
+        if off + 62 < nreq:
+            ch.f62 = req[off + 62]
+        if off + 63 < nreq:
+            ch.f63 = req[off + 63]
+#<</COPY_IN>>
+        remain: int[64] = nreq - off
+        if remain > 64:
+            remain = 64
+        sent: int[64] = syscall(44, fd, addressof(ch), remain, 0, 0, 0)
+        if sent < 0:
+            return sent
+        if sent == 0:
+            return -32
+        off = off + sent
+    return 0
+
+
+# Whether `resp`, holding `total` bytes, is one whole HTTP message, by mode:
+# 1 a reply, 2 a HEAD reply, 3 a request. The header block must have ended.
+# A HEAD reply, a 1xx, a 204 and a 304 end there, and so does a request with
+# no Content-Length (it has no body). Otherwise a Content-Length body ends at
+# that many bytes, and a chunked reply ends at its last-chunk line "0\r\n\r\n"
+# at a chunk boundary. A chunk whose data itself contains "\r\n0\r\n\r\n" ends
+# early; the decoder then reports error 11. A reply with no framing waits for
+# EOF. A chunked request body is not supported.
+def frame_done(resp: str[8192], total: int[64], mode: int[64]) -> bool:
+    head: int[64] = resp.find("\r\n\r\n")
+    if head < 0:
+        return False
+    body: int[64] = head + 4
+    if mode == 2:
+        return True
+    if mode == 1:
+        code: int[64] = std.http.response.resp_status(resp)
+        if code < 200 or code == 204:
+            return True
+        if code == 304:
+            return True
+    cl: str[512] = std.http.response.resp_header(resp, "Content-Length")
+    if len(cl) > 0:
+        if len(cl) > 9:
+            return True
+        want: int[64] = 0
+        i: int[64] = 0
+        while i < len(cl):
+            d: int[64] = cl[i]
+            if d < 48 or d > 57:
+                return True
+            want = want * 10 + (d - 48)
+            i = i + 1
+        return total >= body + want
+    if mode == 3:
+        return True
+    te: str[512] = std.http.response.resp_header(resp, "Transfer-Encoding")
+    if te.find("chunked") < 0:
+        return False
+    if total < body + 5:
+        return False
+    last: str[8] = "0\r\n\r\n"
+    e: int[64] = total - 5
+    k: int[64] = 0
+    while k < 5:
+        if resp[e + k] != last[k]:
+            return False
+        k = k + 1
+    if e == body:
+        return True
+    if e < body + 2:
+        return False
+    if resp[e - 2] != 13:
+        return False
+    return resp[e - 1] == 10
+
+
+# Read one message from `fd`. Mode 0 reads until the peer closes (DNS). Mode 1
+# reads one HTTP reply and stops where frame_done says it ends; mode 2 is the
+# same for a HEAD reply. A failure comes back as a LITHON-HTTP-ERROR diagnostic:
+# a timeout, another recv error, more data than the 8 KiB buffer holds, or (HTTP
+# modes) a connection closed before any reply.
+def recv_all(fd: int[64], mode: int[64]) -> str[8192]:
+    resp: str[8192] = ""
+    ch: Chunk
+    total: int[64] = 0
+    while True:
+        n: int[64] = syscall(45, fd, addressof(ch), 64, 0, 0, 0)
+        if n == 0:
+            if mode != 0 and total == 0:
+                return "LITHON-HTTP-ERROR[6]: the connection closed before a complete message"
+            break
+        if n < 0:
+            if n == -11 or n == -110:
+                return "LITHON-HTTP-ERROR[5]: the read timed out"
+            return "LITHON-HTTP-ERROR[6]: recv() failed"
+        if total + n > 8191:
+            return "LITHON-HTTP-ERROR[10]: the response is larger than the 8 KiB buffer"
+        cpy: int[64] = 0
+        while cpy < n:
+#<<COPY_OUT>>
+            if cpy == 0:
+                resp[total + 0] = ch.f0
+            if cpy == 1:
+                resp[total + 1] = ch.f1
+            if cpy == 2:
+                resp[total + 2] = ch.f2
+            if cpy == 3:
+                resp[total + 3] = ch.f3
+            if cpy == 4:
+                resp[total + 4] = ch.f4
+            if cpy == 5:
+                resp[total + 5] = ch.f5
+            if cpy == 6:
+                resp[total + 6] = ch.f6
+            if cpy == 7:
+                resp[total + 7] = ch.f7
+            if cpy == 8:
+                resp[total + 8] = ch.f8
+            if cpy == 9:
+                resp[total + 9] = ch.f9
+            if cpy == 10:
+                resp[total + 10] = ch.f10
+            if cpy == 11:
+                resp[total + 11] = ch.f11
+            if cpy == 12:
+                resp[total + 12] = ch.f12
+            if cpy == 13:
+                resp[total + 13] = ch.f13
+            if cpy == 14:
+                resp[total + 14] = ch.f14
+            if cpy == 15:
+                resp[total + 15] = ch.f15
+            if cpy == 16:
+                resp[total + 16] = ch.f16
+            if cpy == 17:
+                resp[total + 17] = ch.f17
+            if cpy == 18:
+                resp[total + 18] = ch.f18
+            if cpy == 19:
+                resp[total + 19] = ch.f19
+            if cpy == 20:
+                resp[total + 20] = ch.f20
+            if cpy == 21:
+                resp[total + 21] = ch.f21
+            if cpy == 22:
+                resp[total + 22] = ch.f22
+            if cpy == 23:
+                resp[total + 23] = ch.f23
+            if cpy == 24:
+                resp[total + 24] = ch.f24
+            if cpy == 25:
+                resp[total + 25] = ch.f25
+            if cpy == 26:
+                resp[total + 26] = ch.f26
+            if cpy == 27:
+                resp[total + 27] = ch.f27
+            if cpy == 28:
+                resp[total + 28] = ch.f28
+            if cpy == 29:
+                resp[total + 29] = ch.f29
+            if cpy == 30:
+                resp[total + 30] = ch.f30
+            if cpy == 31:
+                resp[total + 31] = ch.f31
+            if cpy == 32:
+                resp[total + 32] = ch.f32
+            if cpy == 33:
+                resp[total + 33] = ch.f33
+            if cpy == 34:
+                resp[total + 34] = ch.f34
+            if cpy == 35:
+                resp[total + 35] = ch.f35
+            if cpy == 36:
+                resp[total + 36] = ch.f36
+            if cpy == 37:
+                resp[total + 37] = ch.f37
+            if cpy == 38:
+                resp[total + 38] = ch.f38
+            if cpy == 39:
+                resp[total + 39] = ch.f39
+            if cpy == 40:
+                resp[total + 40] = ch.f40
+            if cpy == 41:
+                resp[total + 41] = ch.f41
+            if cpy == 42:
+                resp[total + 42] = ch.f42
+            if cpy == 43:
+                resp[total + 43] = ch.f43
+            if cpy == 44:
+                resp[total + 44] = ch.f44
+            if cpy == 45:
+                resp[total + 45] = ch.f45
+            if cpy == 46:
+                resp[total + 46] = ch.f46
+            if cpy == 47:
+                resp[total + 47] = ch.f47
+            if cpy == 48:
+                resp[total + 48] = ch.f48
+            if cpy == 49:
+                resp[total + 49] = ch.f49
+            if cpy == 50:
+                resp[total + 50] = ch.f50
+            if cpy == 51:
+                resp[total + 51] = ch.f51
+            if cpy == 52:
+                resp[total + 52] = ch.f52
+            if cpy == 53:
+                resp[total + 53] = ch.f53
+            if cpy == 54:
+                resp[total + 54] = ch.f54
+            if cpy == 55:
+                resp[total + 55] = ch.f55
+            if cpy == 56:
+                resp[total + 56] = ch.f56
+            if cpy == 57:
+                resp[total + 57] = ch.f57
+            if cpy == 58:
+                resp[total + 58] = ch.f58
+            if cpy == 59:
+                resp[total + 59] = ch.f59
+            if cpy == 60:
+                resp[total + 60] = ch.f60
+            if cpy == 61:
+                resp[total + 61] = ch.f61
+            if cpy == 62:
+                resp[total + 62] = ch.f62
+            if cpy == 63:
+                resp[total + 63] = ch.f63
+#<</COPY_OUT>>
+            cpy = cpy + 1
+        total = total + n
+        if mode != 0 and frame_done(resp, total, mode):
+            break
+    return resp

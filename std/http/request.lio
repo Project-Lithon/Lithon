@@ -1,0 +1,182 @@
+# std/http/request.lio -- request assembly for the Lithon HTTP client.
+#
+# One request text, built byte by byte into a bounded string: the method, the
+# path, the fixed headers, and -- when there is a body -- the length and the
+# type that go with it. The body itself is opaque text: JSON, HTML and plain
+# text all travel the same way, and only the reader downstream cares.
+#
+# The headers are deliberately fixed. `Host` names the authority, and a request
+# that carries a body says how long it is. `Connection` is `close` for a one-shot
+# request, so the server hangs up, or `keep-alive` for a socket the caller keeps
+# open. `User-Agent` and `Accept` are there so a server sees a well-formed client.
+
+import std.http.url
+
+
+# The full request text for one call: the method, the URL and the body.
+def build_request(method: str[16], url: str[512], body: str[2048], headers: str[1024], keep: bool) -> str[4096]:
+    out: str[4096] = ""
+    n: int[64] = 0
+
+    # "<METHOD> <PATH> HTTP/1.1\r\n"
+    i: int[64] = 0
+    while i < len(method):
+        out[n] = method[i]
+        n = n + 1
+        i = i + 1
+    out[n] = 32
+    n = n + 1
+    pstart: int[64] = std.http.url.url_path_start(url)
+    if pstart < 0:
+        out[n] = 47
+        n = n + 1
+    else:
+        i = pstart
+        while i < len(url):
+            out[n] = url[i]
+            n = n + 1
+            i = i + 1
+    version: str[16] = " HTTP/1.1\r\n"
+    i = 0
+    while i < len(version):
+        out[n] = version[i]
+        n = n + 1
+        i = i + 1
+
+    # "Host: <authority>\r\n"
+    head: str[16] = "Host: "
+    i = 0
+    while i < len(head):
+        out[n] = head[i]
+        n = n + 1
+        i = i + 1
+    hend: int[64] = std.http.url.url_host_end(url)
+    i = 7
+    while i < hend:
+        out[n] = url[i]
+        n = n + 1
+        i = i + 1
+    pport: int[64] = std.http.url.url_port(url)
+    colon: bool = False
+    if hend < len(url):
+        if url[hend] == 58:
+            colon = True
+    if colon and pport != 80:
+        if pport < 0:
+            colon = False
+    if colon and pport != 80:
+        out[n] = 58
+        n = n + 1
+        pdig: str[11] = "0123456789"
+        pdl: list[int[64], 6] = [0, 0, 0, 0, 0, 0]
+        pv: int[64] = pport
+        pc: int[64] = 0
+        while pv > 0:
+            pdl[pc] = pv % 10
+            pv = int(64, pv / 10.0)
+            pc = pc + 1
+        if pc == 0:
+            pdl[0] = 0
+            pc = 1
+        pk: int[64] = pc
+        while pk > 0:
+            pk = pk - 1
+            out[n] = pdig[pdl[pk]]
+            n = n + 1
+    out[n] = 13
+    n = n + 1
+    out[n] = 10
+    n = n + 1
+
+    # "User-Agent: Lithon/1.0\r\n"
+    agent: str[32] = "User-Agent: Lithon/1.0\r\n"
+    i = 0
+    while i < len(agent):
+        out[n] = agent[i]
+        n = n + 1
+        i = i + 1
+
+    # "Accept: */*\r\n"
+    accept: str[16] = "Accept: */*\r\n"
+    i = 0
+    while i < len(accept):
+        out[n] = accept[i]
+        n = n + 1
+        i = i + 1
+
+    # "Connection: close\r\n", or "Connection: keep-alive\r\n" for a socket the
+    # caller keeps open.
+    conn: str[32] = "Connection: close\r\n"
+    if keep:
+        conn = "Connection: keep-alive\r\n"
+    i = 0
+    while i < len(conn):
+        out[n] = conn[i]
+        n = n + 1
+        i = i + 1
+
+    # The caller's headers, verbatim: each is "Name: value\r\n". Their text is
+    # the caller's; this function only copies it after the fixed headers.
+    hl: int[64] = len(headers)
+    i = 0
+    while i < hl:
+        out[n] = headers[i]
+        n = n + 1
+        i = i + 1
+
+    body_len: int[64] = len(body)
+    if body_len > 0:
+        # "Content-Type: application/json\r\n" -- the default, unless the caller
+        # supplied one of its own in `headers`.
+        has_type: int[64] = headers.find("Content-Type:")
+        if has_type < 0:
+            ctype: str[40] = "Content-Type: application/json\r\n"
+            i = 0
+            while i < len(ctype):
+                out[n] = ctype[i]
+                n = n + 1
+                i = i + 1
+
+        # "Content-Length: <n>\r\n" -- the digits are built least-significant
+        # first and written back to front, because a bounded string holds
+        # bytes and a byte cannot be narrowed from an int[64].
+        clen: str[24] = "Content-Length: "
+        i = 0
+        while i < len(clen):
+            out[n] = clen[i]
+            n = n + 1
+            i = i + 1
+        digits: str[11] = "0123456789"
+        dl: list[int[64], 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+        v: int[64] = body_len
+        cnt: int[64] = 0
+        while v > 0:
+            dl[cnt] = v % 10
+            v = int(64, v / 10.0)
+            cnt = cnt + 1
+        if cnt == 0:
+            dl[0] = 0
+            cnt = 1
+        k: int[64] = cnt
+        while k > 0:
+            k = k - 1
+            out[n] = digits[dl[k]]
+            n = n + 1
+        out[n] = 13
+        n = n + 1
+        out[n] = 10
+        n = n + 1
+
+    # The blank line ends the headers; the body follows immediately.
+    out[n] = 13
+    n = n + 1
+    out[n] = 10
+    n = n + 1
+
+    if body_len > 0:
+        i = 0
+        while i < body_len:
+            out[n] = body[i]
+            n = n + 1
+            i = i + 1
+    return out

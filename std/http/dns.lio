@@ -1,0 +1,152 @@
+# std/http/dns.lio -- DNS resolution for the Lithon HTTP client.
+#
+# Queries go over TCP to 8.8.8.8:53. TCP, not UDP: a DNS answer can be larger
+# than one datagram can carry, and a UDP read truncates it silently. Over TCP
+# the answer arrives as a stream, through the same bounded path every HTTP
+# response uses, so a long answer is read whole.
+#
+# resolve4 returns an IPv4 address packed into one int (0 on failure).
+# resolve6 returns the 16 address bytes in indices 0-15 of a str[17]; byte 16
+# is 1 on success and 0 on failure. (An address is not stored as a number
+# because 128 bits do not fit in an int[64].)
+
+import std.http.core
+import std.http.io
+
+from std.http.io import connect4, send_all, recv_all, close_fd
+
+
+# Ask the resolver for `qtype` (1 = A, 28 = AAAA) records of `name`. The
+# result is the whole TCP-framed answer; empty on failure.
+def dns_query(name: str[256], qtype: int[64]) -> str[8192]:
+    q: str[4096] = ""
+    # Two bytes of TCP length prefix, then the 12-byte DNS header.
+    q[0] = 0
+    q[2] = 0x12
+    q[3] = 0x34
+    q[4] = 0x01
+    q[5] = 0x00
+    q[6] = 0x00
+    q[7] = 0x01
+    pos: int[64] = 14
+    i: int[64] = 0
+    nlen: int[64] = len(name)
+    while i < nlen:
+        start: int[64] = i
+        while i < nlen and name[i] != 46:
+            i = i + 1
+        label: int[64] = i - start
+        if label == 0 or label > 63:
+            return ""
+        v: int[8] = int(8, label / 1.0)
+        q[pos] = v
+        pos = pos + 1
+        j: int[64] = start
+        while j < i:
+            v = name[j]
+            q[pos] = v
+            pos = pos + 1
+            j = j + 1
+        if i < nlen:
+            i = i + 1
+    v: int[8] = 0
+    q[pos] = v
+    pos = pos + 1
+    # QTYPE (big-endian), QCLASS = IN.
+    v = int(8, (qtype >> 8) / 1.0)
+    q[pos] = v
+    pos = pos + 1
+    v = int(8, (qtype & 255) / 1.0)
+    q[pos] = v
+    pos = pos + 1
+    v = 0
+    q[pos] = v
+    pos = pos + 1
+    v = 1
+    q[pos] = v
+    pos = pos + 1
+    # The TCP length prefix counts the DNS message only.
+    msg: int[64] = pos - 2
+    v = int(8, (msg >> 8) / 1.0)
+    q[0] = v
+    v = int(8, (msg & 255) / 1.0)
+    q[1] = v
+
+    fd: int[64] = connect4(0x08080808, 53, 5000)
+    if fd < 0:
+        return ""
+    if send_all(fd, q, pos) < 0:
+        close_fd(fd)
+        return ""
+    resp: str[8192] = recv_all(fd, 0)
+    close_fd(fd)
+    return resp
+
+
+# Find the first answer of type `qtype` in a TCP-framed reply. Returns the
+# offset of its rdata, or -1. Also reports the rdata length via `rdlen_out`
+# being checked by the caller (A is 4 bytes, AAAA is 16).
+def find_rdata(resp: str[8192], qtype: int[64]) -> int[64]:
+    # The first two bytes give the message length; the reply must hold it.
+    msg_len: int[64] = (resp[0] & 255) * 256 + (resp[1] & 255)
+    if msg_len < 12:
+        return -1
+    n: int[64] = msg_len + 2
+    # Skip the header and the one question: name, then QTYPE and QCLASS.
+    qpos: int[64] = 14
+    while qpos < n and resp[qpos] != 0:
+        if (resp[qpos] & 192) == 192:
+            qpos = qpos + 1
+            break
+        qpos = qpos + (resp[qpos] & 255) + 1
+    if qpos < n and (resp[qpos] & 192) != 192:
+        qpos = qpos + 1
+    qpos = qpos + 4
+
+    # Walk the answer records.
+    apos: int[64] = qpos
+    while apos < n:
+        # The owner name is a pointer (two bytes) or a label sequence.
+        if (resp[apos] & 192) == 192:
+            apos = apos + 2
+        else:
+            while apos < n and resp[apos] != 0:
+                apos = apos + (resp[apos] & 255) + 1
+            apos = apos + 1
+        if apos + 10 > n:
+            return -1
+        rtype: int[64] = (resp[apos] & 255) * 256 + (resp[apos + 1] & 255)
+        apos = apos + 8
+        rdlen: int[64] = (resp[apos] & 255) * 256 + (resp[apos + 1] & 255)
+        apos = apos + 2
+        if rtype == qtype:
+            return apos
+        apos = apos + rdlen
+    return -1
+
+
+# Resolve a hostname to an IPv4 address packed into one int, or 0.
+def resolve4(name: str[256]) -> int[64]:
+    resp: str[8192] = dns_query(name, 1)
+    at: int[64] = find_rdata(resp, 1)
+    if at < 0:
+        return 0
+    ip: int[64] = (resp[at] & 255) * 16777216 + (resp[at + 1] & 255) * 65536 + (resp[at + 2] & 255) * 256 + (resp[at + 3] & 255)
+    return ip
+
+
+# Resolve a hostname to an IPv6 address: 16 bytes in indices 0-15, and
+# index 16 set to 1 when an address was found (0 otherwise).
+def resolve6(name: str[256]) -> str[17]:
+    out: str[17] = ""
+    resp: str[8192] = dns_query(name, 28)
+    at: int[64] = find_rdata(resp, 28)
+    if at < 0:
+        return out
+    k: int[64] = 0
+    while k < 16:
+        out[k] = resp[at + k]
+        k = k + 1
+    v: int[8] = 1
+    out[16] = v
+    return out

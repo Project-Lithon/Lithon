@@ -1,0 +1,181 @@
+# std/http/chunked.lio -- Transfer-Encoding: chunked, decoded after the read.
+#
+# dechunk_response takes the RAW response and returns it with a chunked body
+# replaced by its decoded bytes. The Transfer-Encoding header is removed,
+# because the body the caller now sees is no longer chunked. Every other
+# header, Content-Length included, is kept exactly as the server sent it.
+#
+# A malformed body, or a coding other than plain "chunked", comes back as the
+# text "LITHON-HTTP-ERROR[11]: ..." instead of a response.
+
+import std.http.response
+
+
+# The value of one hex digit, or -1 when `c` is not one.
+def hex_digit(c: int[64]) -> int[64]:
+    if c >= 48 and c <= 57:
+        return c - 48
+    if c >= 97 and c <= 102:
+        return c - 87
+    if c >= 65 and c <= 70:
+        return c - 55
+    return -1
+
+
+# The size written as hex digits at `p`, or -1 when there are no digits or
+# more than six (a six-digit size already exceeds any 8 KiB response).
+def chunk_size(body: str[8192], p: int[64]) -> int[64]:
+    size: int[64] = 0
+    digits: int[64] = 0
+    blen: int[64] = len(body)
+    i: int[64] = p
+    while i < blen:
+        ch: int[64] = body[i]
+        v: int[64] = hex_digit(ch)
+        if v < 0:
+            break
+        digits = digits + 1
+        if digits > 6:
+            return -1
+        size = size * 16 + v
+        i = i + 1
+    if digits == 0:
+        return -1
+    return size
+
+
+# The index of the CR that ends the line starting at `p`, or -1 when the
+# line never ends inside the body.
+def line_end(body: str[8192], p: int[64]) -> int[64]:
+    blen: int[64] = len(body)
+    i: int[64] = p
+    while i + 1 < blen:
+        ch: int[64] = body[i]
+        if ch == 13:
+            nx: int[64] = body[i + 1]
+            if nx == 10:
+                return i
+        i = i + 1
+    return -1
+
+
+# The decoded bytes of a chunked body. Each chunk is a size line, the data,
+# and a CRLF; a size of zero ends the body. Chunk extensions after ';' are
+# ignored, and so are trailers after the last chunk.
+def chunked_decode(body: str[8192]) -> str[8192]:
+    out: str[8192] = ""
+    n: int[64] = 0
+    p: int[64] = 0
+    blen: int[64] = len(body)
+    while True:
+        size: int[64] = chunk_size(body, p)
+        if size < 0:
+            return "LITHON-HTTP-ERROR[11]: malformed chunked body"
+        eol: int[64] = line_end(body, p)
+        if eol < 0:
+            return "LITHON-HTTP-ERROR[11]: malformed chunked body"
+        p = eol + 2
+        if size == 0:
+            return out
+        if p + size + 2 > blen:
+            return "LITHON-HTTP-ERROR[11]: malformed chunked body"
+        k: int[64] = 0
+        while k < size:
+            out[n] = body[p + k]
+            n = n + 1
+            k = k + 1
+        p = p + size
+        if body[p] != 13 or body[p + 1] != 10:
+            return "LITHON-HTTP-ERROR[11]: malformed chunked body"
+        p = p + 2
+
+
+# Whether a Transfer-Encoding value is exactly "chunked", ignoring case.
+def is_chunked(v: str[512]) -> bool:
+    want: str[8] = "chunked"
+    if len(v) != 7:
+        return False
+    i: int[64] = 0
+    while i < 7:
+        a: int[64] = v[i]
+        if a >= 65 and a <= 90:
+            a = a + 32
+        b: int[64] = want[i]
+        if a != b:
+            return False
+        i = i + 1
+    return True
+
+
+# Whether the header line spanning [pos, eol) is named `want` (lowercase, with
+# its colon), ignoring case.
+def is_header_line(resp: str[8192], pos: int[64], eol: int[64], want: str[32]) -> bool:
+    wl: int[64] = len(want)
+    if wl == 0 or eol - pos < wl:
+        return False
+    i: int[64] = 0
+    while i < wl:
+        a: int[64] = resp[pos + i]
+        if a >= 65 and a <= 90:
+            a = a + 32
+        b: int[64] = want[i]
+        if a != b:
+            return False
+        i = i + 1
+    return True
+
+
+# The response with its status line and every header except the two named
+# `skip_a` and `skip_b` (lowercase, with colon) kept, then the blank line, then
+# `body`.
+def without_headers(resp: str[8192], body: str[8192], skip_a: str[32], skip_b: str[32]) -> str[8192]:
+    out: str[8192] = ""
+    n: int[64] = 0
+    first: int[64] = resp.find("\r\n")
+    end: int[64] = resp.find("\r\n\r\n")
+    i: int[64] = 0
+    while i < first + 2:
+        out[n] = resp[i]
+        n = n + 1
+        i = i + 1
+    pos: int[64] = first + 2
+    while pos < end + 2:
+        eol: int[64] = pos
+        while resp[eol] != 13:
+            eol = eol + 1
+        if not (is_header_line(resp, pos, eol, skip_a) or is_header_line(resp, pos, eol, skip_b)):
+            j: int[64] = pos
+            while j < eol + 2:
+                out[n] = resp[j]
+                n = n + 1
+                j = j + 1
+        pos = eol + 2
+    out[n] = 13
+    n = n + 1
+    out[n] = 10
+    n = n + 1
+    j2: int[64] = 0
+    blen: int[64] = len(body)
+    while j2 < blen:
+        out[n] = body[j2]
+        n = n + 1
+        j2 = j2 + 1
+    return out
+
+
+# The raw response with a chunked body decoded. A response with no
+# Transfer-Encoding comes back unchanged, and so does any response whose
+# headers cannot be split (the transport already returned an error text).
+def dechunk_response(resp: str[8192]) -> str[8192]:
+    te: str[512] = std.http.response.resp_header(resp, "Transfer-Encoding")
+    if len(te) == 0:
+        return resp
+    if not is_chunked(te):
+        return "LITHON-HTTP-ERROR[11]: unsupported Transfer-Encoding"
+    if resp.find("\r\n\r\n") < 0:
+        return resp
+    body: str[8192] = std.http.response.resp_body(resp)
+    decoded: str[8192] = chunked_decode(body)
+    if decoded.find("LITHON-HTTP-ERROR[") == 0:
+        return decoded
+    return without_headers(resp, decoded, "transfer-encoding:", "")

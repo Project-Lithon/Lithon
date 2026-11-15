@@ -1,0 +1,10 @@
+200
+{"path":"/path/1"}
+True
+200
+{"method":"POST","x_token":"","ctype":"application/json","body":"ping"}
+200
+{"path":"/path/3"}
+0
+2
+False

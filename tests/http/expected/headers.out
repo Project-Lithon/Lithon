@@ -1,0 +1,3 @@
+{"method":"POST","x_token":"abc","ctype":"text/plain","body":"hi"}
+{"method":"GET","x_token":"xyz","ctype":"","body":""}
+{"method":"POST","x_token":"","ctype":"application/json","body":"hello"}

@@ -1,0 +1,61 @@
+# Content-Encoding decoding: gzip (dynamic, fixed and stored blocks), zlib
+# (deflate), a gzip body whose CRC is wrong, and gzip with chunked framing.
+#
+# `__PORT__` is replaced with the port the test server is listening on. The
+# server serves `/gz/<kind>` with the same text compressed the named way, so
+# every decoded body prints the same line. Each request is its own function,
+# for the same compile-cost reason as the redirect test.
+
+import std.http
+
+
+def step_gzip() -> int[64]:
+    # Dynamic Huffman gzip: the body is decoded and Content-Encoding is gone.
+    resp: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/gz/gzip")
+    print(std.http.http_body(resp))
+    print(std.http.http_header(resp, "Content-Encoding"))
+    return 0
+
+
+def step_fixed() -> int[64]:
+    # Fixed Huffman block (zlib Z_FIXED).
+    resp: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/gz/fixed")
+    print(std.http.http_body(resp))
+    return 0
+
+
+def step_stored() -> int[64]:
+    # Stored blocks only (level 0).
+    resp: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/gz/stored")
+    print(std.http.http_body(resp))
+    return 0
+
+
+def step_zlib() -> int[64]:
+    # Content-Encoding: deflate is the zlib wrapper (RFC 1950).
+    resp: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/gz/zlib")
+    print(std.http.http_body(resp))
+    return 0
+
+
+def step_badcrc() -> int[64]:
+    # A flipped CRC-32 byte: the body is refused with error 12.
+    resp: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/gz/badcrc")
+    print(std.http.http_error_code(resp))
+    return 0
+
+
+def step_chunked() -> int[64]:
+    # gzip with chunked framing is not supported yet: error 12.
+    resp: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/gz/chunked")
+    print(std.http.http_error_code(resp))
+    return 0
+
+
+if __name__ == '__main__':
+    k: int[64] = step_gzip()
+    k = step_fixed()
+    k = step_stored()
+    k = step_zlib()
+    k = step_badcrc()
+    k = step_chunked()

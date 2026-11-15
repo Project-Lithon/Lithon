@@ -1,0 +1,132 @@
+# std/http/encode.lio -- percent-encoding, base64, and the Authorization
+# headers built from them.
+#
+# A str element can only be stored from another str element or a constant:
+# an int[64] cannot be narrowed into a byte. So every byte written here is
+# either copied from the source string or looked up in a table string.
+
+# RFC 3986 unreserved: letters, digits, '-', '.', '_', '~'.
+def is_unreserved(c: int[64]) -> bool:
+    if c >= 48 and c <= 57:
+        return True
+    if c >= 65 and c <= 90:
+        return True
+    if c >= 97 and c <= 122:
+        return True
+    if c == 45 or c == 46:
+        return True
+    if c == 95 or c == 126:
+        return True
+    return False
+
+
+# The URL-encoded form of `s`: unreserved bytes pass, every other byte
+# becomes "%XX" with uppercase hex. Output is at most three times the input.
+def url_encode(s: str[512]) -> str[1536]:
+    hexd: str[17] = "0123456789ABCDEF"
+    out: str[1536] = ""
+    n: int[64] = 0
+    i: int[64] = 0
+    blen: int[64] = len(s)
+    while i < blen:
+        c: int[64] = s[i] & 255
+        if is_unreserved(c):
+            out[n] = s[i]
+            n = n + 1
+        else:
+            out[n] = 37
+            out[n + 1] = hexd[c >> 4]
+            out[n + 2] = hexd[c & 15]
+            n = n + 3
+        i = i + 1
+    return out
+
+
+# Standard base64 (RFC 4648) with '=' padding.
+def base64_encode(s: str[512]) -> str[700]:
+    alpha: str[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    out: str[700] = ""
+    n: int[64] = 0
+    i: int[64] = 0
+    blen: int[64] = len(s)
+    while i < blen:
+        b0: int[64] = s[i] & 255
+        b1: int[64] = 0
+        b2: int[64] = 0
+        if i + 1 < blen:
+            b1 = s[i + 1] & 255
+        if i + 2 < blen:
+            b2 = s[i + 2] & 255
+        trip: int[64] = (b0 << 16) | (b1 << 8) | b2
+        out[n] = alpha[(trip >> 18) & 63]
+        out[n + 1] = alpha[(trip >> 12) & 63]
+        if i + 1 < blen:
+            out[n + 2] = alpha[(trip >> 6) & 63]
+        else:
+            out[n + 2] = 61
+        if i + 2 < blen:
+            out[n + 3] = alpha[trip & 63]
+        else:
+            out[n + 3] = 61
+        n = n + 4
+        i = i + 3
+    return out
+
+
+# "Authorization: Basic <base64(user:password)>\r\n", ready to be a header.
+def basic_header(user: str[128], password: str[128]) -> str[1024]:
+    cred: str[272] = ""
+    n: int[64] = 0
+    i: int[64] = 0
+    ul: int[64] = len(user)
+    while i < ul:
+        cred[n] = user[i]
+        n = n + 1
+        i = i + 1
+    cred[n] = 58
+    n = n + 1
+    i = 0
+    pl: int[64] = len(password)
+    while i < pl:
+        cred[n] = password[i]
+        n = n + 1
+        i = i + 1
+    enc: str[700] = base64_encode(cred)
+    out: str[1024] = ""
+    head: str[24] = "Authorization: Basic "
+    m: int[64] = 0
+    i = 0
+    while i < len(head):
+        out[m] = head[i]
+        m = m + 1
+        i = i + 1
+    i = 0
+    el: int[64] = len(enc)
+    while i < el:
+        out[m] = enc[i]
+        m = m + 1
+        i = i + 1
+    out[m] = 13
+    out[m + 1] = 10
+    return out
+
+
+# "Authorization: Bearer <token>\r\n", ready to be a header.
+def bearer_header(token: str[512]) -> str[600]:
+    out: str[600] = ""
+    m: int[64] = 0
+    head: str[24] = "Authorization: Bearer "
+    i: int[64] = 0
+    while i < len(head):
+        out[m] = head[i]
+        m = m + 1
+        i = i + 1
+    i = 0
+    tl: int[64] = len(token)
+    while i < tl:
+        out[m] = token[i]
+        m = m + 1
+        i = i + 1
+    out[m] = 13
+    out[m + 1] = 10
+    return out

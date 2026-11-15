@@ -1,0 +1,35 @@
+# std/http/examples/methods.lio -- POST, PUT, PATCH and DELETE against a real
+# echo endpoint (https://httpbin.org), which returns what it received.
+#
+#     uv run lithon std/http/examples/methods.lio
+
+import std.http
+
+
+def show(method: str[16], url: str[512], body: str[2048]) -> int[64]:
+    resp: str[8192] = std.http.http_request(method, url, body)
+
+    problem: str[8192] = std.http.http_error(resp)
+    if len(problem) > 0:
+        print("request failed:")
+        print(problem)
+        return 0
+
+    print(std.http.http_status_line(resp))
+    print("body:")
+    print(std.http.http_body(resp))
+    return std.http.http_status(resp)
+
+
+if __name__ == '__main__':
+    print("--- POST ---")
+    show("POST", "https://httpbin.org/post", '{"sku": 7}')
+
+    print("--- PUT ---")
+    show("PUT", "https://httpbin.org/put", '{"sku": 8}')
+
+    print("--- PATCH ---")
+    show("PATCH", "https://httpbin.org/patch", '{"sku": 9}')
+
+    print("--- DELETE ---")
+    show("DELETE", "https://httpbin.org/delete", "")

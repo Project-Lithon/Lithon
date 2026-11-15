@@ -1,0 +1,18 @@
+# http_error_code: the numeric code of a failed request, 0 for a success.
+
+import std.http
+
+
+if __name__ == '__main__':
+    # 1: not a usable URL.
+    resp: str[8192] = std.http.http_get("not-a-url")
+    print(std.http.http_error_code(resp))
+
+    # 3: nothing listens on the port, so the connect is refused.
+    resp = std.http.http_get("http://127.0.0.1:1/")
+    print(std.http.http_error_code(resp))
+
+    # 0: a real response, not an error.
+    resp = std.http.http_get("http://127.0.0.1:__PORT__/path")
+    print(std.http.http_error_code(resp))
+    print(std.http.http_status(resp))

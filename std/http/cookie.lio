@@ -1,0 +1,105 @@
+# std/http/cookie.lio -- cookies: the Cookie header a request sends, and
+# reading the Set-Cookie headers a response carries.
+#
+# One cookie per header. This module keeps no jar: a caller that holds
+# several cookies passes each one's header, or joins them in its own text.
+
+import std.http.response
+
+
+# "Cookie: <name>=<value>\r\n", ready to pass as the headers of a request.
+def cookie_header(name: str[128], value: str[512]) -> str[1024]:
+    out: str[1024] = ""
+    head: str[16] = "Cookie: "
+    n: int[64] = 0
+    i: int[64] = 0
+    while i < len(head):
+        out[n] = head[i]
+        n = n + 1
+        i = i + 1
+    i = 0
+    while i < len(name):
+        out[n] = name[i]
+        n = n + 1
+        i = i + 1
+    out[n] = 61
+    n = n + 1
+    i = 0
+    while i < len(value):
+        out[n] = value[i]
+        n = n + 1
+        i = i + 1
+    out[n] = 13
+    out[n + 1] = 10
+    return out
+
+
+# Whether the header line block[pos..eol) starts with `prefix`, compared
+# case-insensitively: header names are case-insensitive.
+def has_prefix_ci(block: str[4096], pos: int[64], eol: int[64], prefix: str[16]) -> bool:
+    plen: int[64] = len(prefix)
+    if eol - pos < plen:
+        return False
+    i: int[64] = 0
+    while i < plen:
+        a: int[64] = block[pos + i]
+        if a >= 65 and a <= 90:
+            a = a + 32
+        b: int[64] = prefix[i]
+        if a != b:
+            return False
+        i = i + 1
+    return True
+
+
+# Whether the cookie name starts at block[m] and is followed by '='.
+# Cookie names are case-sensitive, so this is an exact match.
+def name_at(block: str[4096], m: int[64], eol: int[64], name: str[128]) -> bool:
+    nlen: int[64] = len(name)
+    if eol - m < nlen + 1:
+        return False
+    i: int[64] = 0
+    while i < nlen:
+        if block[m + i] != name[i]:
+            return False
+        i = i + 1
+    if block[m + nlen] != 61:
+        return False
+    return True
+
+
+# The value of the named cookie, from the first Set-Cookie header that sets
+# it. The value runs up to the first ';' (the attributes: Path, Expires...)
+# and is empty when the response sets no such cookie.
+def resp_set_cookie(resp: str[8192], name: str[128]) -> str[512]:
+    empty: str[512] = ""
+    if len(name) == 0:
+        return empty
+    block: str[4096] = std.http.response.resp_headers(resp)
+    pos: int[64] = 0
+    while pos < len(block):
+        eol: int[64] = pos
+        while eol < len(block):
+            if block[eol] == 13:
+                if eol + 1 < len(block):
+                    if block[eol + 1] == 10:
+                        break
+            eol = eol + 1
+        if has_prefix_ci(block, pos, eol, "set-cookie:"):
+            m: int[64] = pos + 11
+            while m < eol and block[m] == 32:
+                m = m + 1
+            if name_at(block, m, eol, name):
+                out: str[512] = ""
+                n: int[64] = 0
+                k: int[64] = m + len(name) + 1
+                while k < eol and block[k] != 59:
+                    out[n] = block[k]
+                    n = n + 1
+                    k = k + 1
+                return out
+        if eol < len(block):
+            pos = eol + 2
+        else:
+            pos = len(block)
+    return empty

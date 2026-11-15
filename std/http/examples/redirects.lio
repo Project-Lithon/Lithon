@@ -1,0 +1,20 @@
+# std/http/examples/redirects.lio -- the client follows redirects.
+#
+#     uv run lithon std/http/examples/redirects.lio
+#
+# httpbin.org/redirect/2 answers with two 302s before the final 200, so the
+# status printed below is the status of the page the redirects end at.
+
+import std.http
+
+
+if __name__ == '__main__':
+    resp: str[8192] = std.http.http_get("https://httpbin.org/redirect/2")
+
+    problem: str[8192] = std.http.http_error(resp)
+    if len(problem) > 0:
+        print("request failed:")
+        print(problem)
+    else:
+        print(std.http.http_status_line(resp))
+        print(std.http.http_body(resp))

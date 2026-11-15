@@ -1,0 +1,261 @@
+# std/http/tls.lio -- HTTPS for the Lithon HTTP client, through `openssl s_client`.
+#
+# Lithon has no TLS library, so an https:// request runs in a child process:
+# /bin/sh reads one command line from a socket pair and `exec`s
+# `/usr/bin/openssl s_client`, which does the handshake and certificate check.
+# The HTTP request follows on the same socket. openssl's stdout comes back on
+# the same socket, and the reply is read until it closes.
+#
+# Certificate checking is ON: `-verify_hostname` names the host and
+# `-verify_return_error` makes a failed check end the connection. A failed check
+# or a missing openssl gives error 9, and so does an empty reply.
+#
+# Limits: the host must be a DNS name or IPv4 literal (letters, digits, '.',
+# '-'); IPv6 and userinfo are refused with error 1. The reply is read to EOF, so
+# the connection is never reused. The 8 KiB response cap applies as usual.
+
+import std.http.url
+import std.http.request
+import std.http.io
+import std.http.chunked
+import std.http.inflate
+
+
+class Pair(struct):
+    a: int[32]
+    b: int[32]
+
+
+class Path(struct):
+    s: int[64]
+
+
+class Status(struct):
+    s: int[64]
+
+
+# True when the URL starts with "https://".
+def tls_url(url: str[512]) -> bool:
+    if len(url) < 8:
+        return False
+    if url[0] != 104 or url[1] != 116:
+        return False
+    if url[2] != 116 or url[3] != 112:
+        return False
+    if url[4] != 115 or url[5] != 58:
+        return False
+    if url[6] != 47 or url[7] != 47:
+        return False
+    return True
+
+
+# The index just past the host of an https URL: the first ':' or '/', or the end.
+def tls_host_end(url: str[512]) -> int[64]:
+    i: int[64] = 8
+    while i < len(url):
+        if url[i] == 58:
+            return i
+        if url[i] == 47:
+            return i
+        i = i + 1
+    return len(url)
+
+
+# One byte allowed in a host name: a letter, a digit, '.' or '-'.
+def tls_char_ok(c: int[64]) -> bool:
+    if c >= 48 and c <= 57:
+        return True
+    if c >= 65 and c <= 90:
+        return True
+    if c >= 97 and c <= 122:
+        return True
+    if c == 46 or c == 45:
+        return True
+    return False
+
+
+# The host of an https URL. Empty when it is missing, too long, or holds a byte
+# that is not allowed in a host name.
+def tls_host(url: str[512]) -> str[256]:
+    host: str[256] = ""
+    end: int[64] = tls_host_end(url)
+    if end <= 8 or end - 8 > 255:
+        return host
+    i: int[64] = 8
+    while i < end:
+        if not tls_char_ok(url[i]):
+            return ""
+        host[i - 8] = url[i]
+        i = i + 1
+    return host
+
+
+# The port of an https URL: 443 when none is written, -1 when it is malformed.
+def tls_port(url: str[512]) -> int[64]:
+    e: int[64] = tls_host_end(url)
+    if e >= len(url):
+        return 443
+    if url[e] == 47:
+        return 443
+    if url[e] != 58:
+        return -1
+    i: int[64] = e + 1
+    port: int[64] = 0
+    digits: int[64] = 0
+    while i < len(url):
+        c: int[64] = url[i]
+        if c == 47:
+            break
+        if c < 48 or c > 57:
+            return -1
+        port = port * 10 + (c - 48)
+        digits = digits + 1
+        if digits > 5 or port > 65535:
+            return -1
+        i = i + 1
+    if digits == 0 or port == 0:
+        return -1
+    return port
+
+
+# The port as text, for the openssl command line: the digits written in the
+# URL, or "443".
+def tls_port_text(url: str[512]) -> str[8]:
+    txt: str[8] = "443"
+    e: int[64] = tls_host_end(url)
+    if e < len(url) and url[e] == 58:
+        txt = ""
+        i: int[64] = e + 1
+        k: int[64] = 0
+        while i < len(url) and url[i] != 47:
+            txt[k] = url[i]
+            k = k + 1
+            i = i + 1
+    return txt
+
+
+def tls_bad_url() -> str[8192]:
+    return "LITHON-HTTP-ERROR[1]: the URL is not a usable https URL"
+
+
+def tls_no_reply() -> str[8192]:
+    return "LITHON-HTTP-ERROR[9]: openssl s_client gave no reply (check the certificate, and that /usr/bin/openssl exists)"
+
+
+# Run openssl for `host:port` and send `req` (nreq bytes) through it. The reply
+# is every byte openssl printed before it closed its stdout.
+def tls_run(host: str[256], port: str[8], req: str[4096], nreq: int[64], timeout_ms: int[64]) -> str[8192]:
+    cmd: str[4096] = ""
+    n: int[64] = 0
+    p1: str[64] = "exec /usr/bin/openssl s_client -quiet -connect "
+    i: int[64] = 0
+    while i < len(p1):
+        cmd[n] = p1[i]
+        n = n + 1
+        i = i + 1
+    i = 0
+    while i < len(host):
+        cmd[n] = host[i]
+        n = n + 1
+        i = i + 1
+    cmd[n] = 58
+    n = n + 1
+    i = 0
+    while i < len(port):
+        cmd[n] = port[i]
+        n = n + 1
+        i = i + 1
+    p2: str[64] = " -servername "
+    i = 0
+    while i < len(p2):
+        cmd[n] = p2[i]
+        n = n + 1
+        i = i + 1
+    i = 0
+    while i < len(host):
+        cmd[n] = host[i]
+        n = n + 1
+        i = i + 1
+    p3: str[64] = " -verify_hostname "
+    i = 0
+    while i < len(p3):
+        cmd[n] = p3[i]
+        n = n + 1
+        i = i + 1
+    i = 0
+    while i < len(host):
+        cmd[n] = host[i]
+        n = n + 1
+        i = i + 1
+    p4: str[64] = " -verify_return_error 2>/dev/null"
+    i = 0
+    while i < len(p4):
+        cmd[n] = p4[i]
+        n = n + 1
+        i = i + 1
+    cmd[n] = 10
+    n = n + 1
+
+    sv: Pair
+    sv.a = 0
+    sv.b = 0
+    if syscall(53, 1, 1, 0, addressof(sv), 0, 0) < 0:
+        return "LITHON-HTTP-ERROR[9]: could not create the socket pair for openssl"
+    fa: int[64] = sv.a
+    fb: int[64] = sv.b
+    shell: Path
+    shell.s = 0x68732f6e69622f
+    pid: int[64] = syscall(57, 0, 0, 0, 0, 0, 0)
+    if pid == 0:
+        syscall(33, fb, 0, 0, 0, 0, 0)
+        syscall(33, fb, 1, 0, 0, 0, 0)
+        syscall(3, fa, 0, 0, 0, 0, 0)
+        syscall(3, fb, 0, 0, 0, 0, 0)
+        syscall(59, addressof(shell), 0, 0, 0, 0, 0)
+        syscall(60, 99, 0, 0, 0, 0, 0)
+    syscall(3, fb, 0, 0, 0, 0, 0)
+    if pid < 0:
+        syscall(3, fa, 0, 0, 0, 0, 0)
+        return "LITHON-HTTP-ERROR[9]: could not start /bin/sh for openssl"
+    std.http.io.set_timeouts(fa, timeout_ms)
+    if std.http.io.send_all(fa, cmd, n) < 0:
+        syscall(3, fa, 0, 0, 0, 0, 0)
+        return "LITHON-HTTP-ERROR[7]: sending the request failed"
+    if std.http.io.send_all(fa, req, nreq) < 0:
+        syscall(3, fa, 0, 0, 0, 0, 0)
+        return "LITHON-HTTP-ERROR[7]: sending the request failed"
+    reply: str[8192] = std.http.io.recv_all(fa, 0)
+    syscall(3, fa, 0, 0, 0, 0, 0)
+    st: Status
+    st.s = 0
+    syscall(61, pid, addressof(st), 0, 0, 0, 0)
+    if len(reply) == 0:
+        return tls_no_reply()
+    # openssl exits without reading the request when it cannot connect; the
+    # unread request makes the socket reset, so recv_all reports error 6 here.
+    # Its real output never starts with the sentinel, so this is openssl failing.
+    if reply[0] == 76 and reply[18] == 54:
+        return tls_no_reply()
+    return reply
+
+
+# One https request through openssl. The request is built for the plain
+# "http://" form of the URL, so the same request code produces the path and Host
+# header. The reply is dechunked and decoded like a plain-http reply.
+def tls_exchange(method: str[16], url: str[512], headers: str[1024], body: str[2048], timeout_ms: int[64]) -> str[8192]:
+    if tls_port(url) < 0:
+        return tls_bad_url()
+    host: str[256] = tls_host(url)
+    if len(host) == 0:
+        return tls_bad_url()
+    port: str[8] = tls_port_text(url)
+    plain: str[512] = "http://"
+    n: int[64] = 7
+    k: int[64] = 8
+    while k < len(url):
+        plain[n] = url[k]
+        n = n + 1
+        k = k + 1
+    req: str[4096] = std.http.request.build_request(method, plain, body, headers, False)
+    resp: str[8192] = tls_run(host, port, req, len(req), timeout_ms)
+    return std.http.chunked.dechunk_response(std.http.inflate.decode_content(resp))

@@ -1,0 +1,55 @@
+# The five verbs of the HTTP client, end to end against the test server.
+#
+# `__PORT__` is replaced with the port the test server is listening on.
+#
+# Each request is its own function. A str-returning call is expanded in place
+# into the function that contains it, so one function holding all of these
+# requests compiles far slower natively than the same requests split up.
+
+import std.http
+
+
+def show(resp: str[8192]) -> int[64]:
+    print(std.http.http_status(resp))
+    print(std.http.http_body(resp))
+    return 0
+
+
+def get_hello() -> int[64]:
+    resp: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/hello")
+    return show(resp)
+
+
+def post_hello() -> int[64]:
+    resp: str[8192] = std.http.http_post("http://127.0.0.1:__PORT__/hello", '{"a": 1}')
+    return show(resp)
+
+
+def put_hello() -> int[64]:
+    resp: str[8192] = std.http.http_put("http://127.0.0.1:__PORT__/hello", '{"put": 1}')
+    return show(resp)
+
+
+def patch_hello() -> int[64]:
+    resp: str[8192] = std.http.http_patch("http://127.0.0.1:__PORT__/hello", '{"patch": 1}')
+    return show(resp)
+
+
+def delete_hello() -> int[64]:
+    resp: str[8192] = std.http.http_delete("http://127.0.0.1:__PORT__/hello")
+    return show(resp)
+
+
+def generic_hello() -> int[64]:
+    # The same five verbs through the one generic entry point.
+    resp: str[8192] = std.http.http_request("GET", "http://127.0.0.1:__PORT__/hello", "")
+    return show(resp)
+
+
+if __name__ == '__main__':
+    k: int[64] = get_hello()
+    k = post_hello()
+    k = put_hello()
+    k = patch_hello()
+    k = delete_hello()
+    k = generic_hello()

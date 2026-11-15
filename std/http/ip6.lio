@@ -1,0 +1,113 @@
+# std/http/ip6.lio -- IPv6 address literals, as text, parsed into 8 groups.
+#
+# A literal is hex groups separated by ':', with at most one "::" standing
+# for a run of zero groups. Each group is 1 to 4 hex digits. Embedded IPv4
+# ("::ffff:1.2.3.4") is not accepted: it is reported as invalid.
+#
+# Lithon cannot store a computed byte into a str, so the parser hands back
+# 16-bit groups as ints, and io.lio packs them into the kernel's sockaddr.
+
+# The value of one hex digit, or -1 when `c` is not a hex digit.
+def hexval(c: int[64]) -> int[64]:
+    if c >= 48 and c <= 57:
+        return c - 48
+    if c >= 97 and c <= 102:
+        return c - 87
+    if c >= 65 and c <= 70:
+        return c - 55
+    return -1
+
+
+# The value of host[lo..hi) as one group: 1 to 4 hex digits. -1 when it is
+# empty, longer than 4, or not hex.
+def parse_field(host: str[256], lo: int[64], hi: int[64]) -> int[64]:
+    n: int[64] = hi - lo
+    if n < 1 or n > 4:
+        return -1
+    v: int[64] = 0
+    i: int[64] = lo
+    while i < hi:
+        h: int[64] = hexval(host[i])
+        if h < 0:
+            return -1
+        v = v * 16 + h
+        i = i + 1
+    return v
+
+
+# The number of groups in host[lo..hi), each one valid. -1 when any group is
+# invalid. An empty range has zero groups.
+def field_count(host: str[256], lo: int[64], hi: int[64]) -> int[64]:
+    if hi <= lo:
+        return 0
+    count: int[64] = 0
+    start: int[64] = lo
+    i: int[64] = lo
+    while i <= hi:
+        at_end: bool = False
+        if i == hi:
+            at_end = True
+        else:
+            if host[i] == 58:
+                at_end = True
+        if at_end:
+            if parse_field(host, start, i) < 0:
+                return -1
+            count = count + 1
+            start = i + 1
+        i = i + 1
+    return count
+
+
+# The group number `want` (0-based) of host[lo..hi), or -1.
+def field_value(host: str[256], lo: int[64], hi: int[64], want: int[64]) -> int[64]:
+    if hi <= lo:
+        return -1
+    k: int[64] = 0
+    start: int[64] = lo
+    i: int[64] = lo
+    while i <= hi:
+        at_end: bool = False
+        if i == hi:
+            at_end = True
+        else:
+            if host[i] == 58:
+                at_end = True
+        if at_end:
+            if k == want:
+                return parse_field(host, start, i)
+            k = k + 1
+            start = i + 1
+        i = i + 1
+    return -1
+
+
+# Whether `host` is a valid IPv6 literal (without the brackets).
+def ip6_ok(host: str[256]) -> bool:
+    if len(host) == 0:
+        return False
+    dc: int[64] = host.find("::")
+    if dc < 0:
+        return field_count(host, 0, len(host)) == 8
+    hg: int[64] = field_count(host, 0, dc)
+    tg: int[64] = field_count(host, dc + 2, len(host))
+    if hg < 0 or tg < 0:
+        return False
+    return hg + tg <= 7
+
+
+# Group `idx` (0..7) of a literal that ip6_ok accepted, with "::" expanded.
+# -1 when the literal is not valid.
+def ip6_group(host: str[256], idx: int[64]) -> int[64]:
+    dc: int[64] = host.find("::")
+    if dc < 0:
+        return field_value(host, 0, len(host), idx)
+    hg: int[64] = field_count(host, 0, dc)
+    tg: int[64] = field_count(host, dc + 2, len(host))
+    if hg < 0 or tg < 0:
+        return -1
+    if idx < hg:
+        return field_value(host, 0, dc, idx)
+    if idx >= 8 - tg:
+        return field_value(host, dc + 2, len(host), idx - (8 - tg))
+    return 0

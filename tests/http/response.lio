@@ -1,0 +1,32 @@
+# Reading a response: the status code, the reason phrase, the headers and
+# the body -- everything the client hands back about an answer.
+#
+# `__PORT__` is replaced with the port the test server is listening on.
+
+import std.http
+
+
+if __name__ == '__main__':
+    resp: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/hello")
+
+    # The status code and whether it counts as success.
+    print(std.http.http_status(resp))
+    print(std.http.http_ok(resp))
+
+    # The status line as text.
+    print(std.http.http_status_line(resp))
+
+    # A header, by name -- the name is matched the way HTTP says it is, so
+    # the case does not matter.
+    print(std.http.http_header(resp, "Content-Type"))
+    print(std.http.http_header(resp, "content-type"))
+    print(std.http.http_header(resp, "X-Not-There"))
+
+    # The body.
+    print(std.http.http_body(resp))
+
+    # A request that never made it has no status and no body.
+    bad: str[8192] = std.http.http_get("http://127.0.0.1:1/nothing")
+    print(std.http.http_status(bad))
+    print(std.http.http_ok(bad))
+    print(std.http.http_body(bad))

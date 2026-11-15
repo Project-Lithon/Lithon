@@ -1,0 +1,33 @@
+# std/http/examples/get.lio -- GET two real endpoints, over http and https.
+#
+#     uv run lithon std/http/examples/get.lio
+#
+# The https request goes through /usr/bin/openssl, which checks the certificate.
+# A request that fails comes back as a diagnostic from std.http.http_error.
+
+import std.http
+
+
+def show(url: str[512]) -> int[64]:
+    resp: str[8192] = std.http.http_get(url)
+
+    problem: str[8192] = std.http.http_error(resp)
+    if len(problem) > 0:
+        print("request failed:")
+        print(problem)
+        return 0
+
+    print(std.http.http_status_line(resp))
+    print("content-type: ")
+    print(std.http.http_header(resp, "Content-Type"))
+    print("body:")
+    print(std.http.http_body(resp))
+    return std.http.http_status(resp)
+
+
+if __name__ == '__main__':
+    print("--- http://example.com/ ---")
+    show("http://example.com/")
+
+    print("--- https://httpbin.org/get ---")
+    show("https://httpbin.org/get")

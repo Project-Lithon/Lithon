@@ -1,0 +1,15 @@
+# Reading Set-Cookie from a response, and sending a Cookie header back. The
+# server echoes the Cookie header it received, so the round trip is checked.
+
+import std.http
+import std.http.cookie
+
+
+if __name__ == '__main__':
+    resp: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/setcookie")
+    print(std.http.cookie.resp_set_cookie(resp, "sid"))
+    print(std.http.cookie.resp_set_cookie(resp, "theme"))
+    print(std.http.cookie.resp_set_cookie(resp, "si"))
+    hdr: str[1024] = std.http.cookie.cookie_header("sid", "abc123")
+    back: str[8192] = std.http.http_send("GET", "http://127.0.0.1:__PORT__/cookiein", hdr, "", 5)
+    print(std.http.http_body(back))
