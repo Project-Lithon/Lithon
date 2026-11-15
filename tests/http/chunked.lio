@@ -1,0 +1,20 @@
+# A chunked response: the body is decoded (chunk sizes, chunk extensions and
+# all), the Transfer-Encoding header is removed, and the other headers stay.
+# A malformed chunked body comes back as a LITHON-HTTP-ERROR[11] text.
+#
+# `__PORT__` is replaced with the port the test server is listening on.
+
+import std.http
+
+
+if __name__ == '__main__':
+    resp: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/chunked")
+    print(std.http.http_status(resp))
+    print(std.http.http_body(resp))
+    # The chunked framing is gone, so the header that named it is gone too.
+    print(std.http.http_header(resp, "Transfer-Encoding"))
+    print(std.http.http_header(resp, "X-Kept"))
+
+    bad: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/chunked-bad")
+    print(std.http.http_status(bad))
+    print(bad)

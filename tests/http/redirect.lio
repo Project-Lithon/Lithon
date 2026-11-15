@@ -1,0 +1,71 @@
+# Redirect following: the status decides the method and body carried to the
+# next hop, the hop limit is enforced, and a limit of 0 returns the 3xx.
+#
+# `__PORT__` is replaced with the port the test server is listening on. The
+# server sends `/redir/<code>` to `/echo`, and `/loop` to itself. `/echo`
+# reflects the method, X-Token, Content-Type and body.
+#
+# Each request is its own function. A str-returning call is expanded in place
+# into the function that contains it, so one function holding all of these
+# requests compiles far slower natively than the same requests split up.
+
+import std.http
+
+
+def step_302_get() -> int[64]:
+    # 302 on a GET: followed, still a GET.
+    resp: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/redir/302")
+    print(std.http.http_body(resp))
+    return 0
+
+
+def step_301_post() -> int[64]:
+    # 301 on a POST: becomes a GET with no body.
+    resp: str[8192] = std.http.http_post("http://127.0.0.1:__PORT__/redir/301", "hello")
+    print(std.http.http_body(resp))
+    return 0
+
+
+def step_307_post() -> int[64]:
+    # 307 on a POST: the method and body are resent unchanged.
+    resp: str[8192] = std.http.http_send("POST", "http://127.0.0.1:__PORT__/redir/307", "", "hello", 5)
+    print(std.http.http_body(resp))
+    return 0
+
+
+def step_308_put() -> int[64]:
+    # 308 on a PUT: the method and body are resent unchanged.
+    resp: str[8192] = std.http.http_send("PUT", "http://127.0.0.1:__PORT__/redir/308", "", "hi", 5)
+    print(std.http.http_body(resp))
+    return 0
+
+
+def step_303_put() -> int[64]:
+    # 303 on a PUT: becomes a GET with no body.
+    resp: str[8192] = std.http.http_send("PUT", "http://127.0.0.1:__PORT__/redir/303", "", "hi", 5)
+    print(std.http.http_body(resp))
+    return 0
+
+
+def step_loop() -> int[64]:
+    # A redirect that never ends hits the hop limit: error 8.
+    resp: str[8192] = std.http.http_get("http://127.0.0.1:__PORT__/loop")
+    print(std.http.http_error(resp))
+    return 0
+
+
+def step_limit_zero() -> int[64]:
+    # A limit of 0 returns the redirect itself, unfollowed.
+    resp: str[8192] = std.http.http_send("GET", "http://127.0.0.1:__PORT__/redir/302", "", "", 0)
+    print(std.http.http_status(resp))
+    return 0
+
+
+if __name__ == '__main__':
+    k: int[64] = step_302_get()
+    k = step_301_post()
+    k = step_307_post()
+    k = step_308_put()
+    k = step_303_put()
+    k = step_loop()
+    k = step_limit_zero()

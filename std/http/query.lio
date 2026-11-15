@@ -1,0 +1,63 @@
+# std/http/query.lio -- building a URL with a query string.
+#
+#     url: str[512] = std.http.query.with_query(
+#         "http://example.com/search", std.http.query.query_pair("q", "a b&c"))
+#     # http://example.com/search?q=a%20b%26c
+#
+# A key and a value are percent-encoded (RFC 3986), so any text is safe in
+# them. `with_query` picks "?" or "&" by whether the URL already has a query.
+# It does not check the URL's own syntax, and a URL ending in "?" or "&"
+# gives a doubled separator; that is the caller's text.
+
+import std.http.encode
+
+
+# "key=value", both percent-encoded, ready for `with_query`.
+def query_pair(key: str[512], value: str[512]) -> str[2048]:
+    out: str[2048] = ""
+    n: int[64] = 0
+    ek: str[1536] = std.http.encode.url_encode(key)
+    i: int[64] = 0
+    while i < len(ek):
+        out[n] = ek[i]
+        n = n + 1
+        i = i + 1
+    out[n] = 61
+    n = n + 1
+    ev: str[1536] = std.http.encode.url_encode(value)
+    i = 0
+    while i < len(ev):
+        out[n] = ev[i]
+        n = n + 1
+        i = i + 1
+    return out
+
+
+# `url` with `query` appended. The result is "" when it would not fit the
+# 511 bytes a str[512] URL can hold, so an oversized request fails as a bad
+# URL instead of being cut short.
+def with_query(url: str[512], query: str[2048]) -> str[512]:
+    empty: str[512] = ""
+    has_query: bool = url.find("?") >= 0
+    ul: int[64] = len(url)
+    ql: int[64] = len(query)
+    if ul + 1 + ql > 511:
+        return empty
+    out: str[512] = ""
+    n: int[64] = 0
+    i: int[64] = 0
+    while i < ul:
+        out[n] = url[i]
+        n = n + 1
+        i = i + 1
+    if has_query:
+        out[n] = 38
+    else:
+        out[n] = 63
+    n = n + 1
+    i = 0
+    while i < ql:
+        out[n] = query[i]
+        n = n + 1
+        i = i + 1
+    return out

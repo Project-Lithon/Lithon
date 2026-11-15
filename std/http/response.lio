@@ -1,0 +1,169 @@
+# std/http/response.lio -- reading a response.
+#
+# The transport hands back the RAW response -- status line, headers, body --
+# so nothing is lost on the way in, and these functions are the way to read
+# the parts a caller cares about.
+#
+# Every function takes a `str` and returns a `str` or an `int`, so each one
+# is expanded at its call site (6.11).
+
+
+# The status code of a response, as a number: 200, 404, 500... Zero means
+# there is no response -- the request never made it, or the text is not a
+# response at all.
+def resp_status(resp: str[8192]) -> int[64]:
+    if resp.find("HTTP/") != 0:
+        return 0
+    sp: int[64] = resp.find(" ")
+    if sp < 0:
+        return 0
+    if sp + 3 >= len(resp):
+        return 0
+    d1: int[64] = resp[sp + 1]
+    d2: int[64] = resp[sp + 2]
+    d3: int[64] = resp[sp + 3]
+    digits: int[64] = 0
+    if d1 >= 48 and d1 <= 57:
+        digits = digits + 1
+    if d2 >= 48 and d2 <= 57:
+        digits = digits + 1
+    if d3 >= 48 and d3 <= 57:
+        digits = digits + 1
+    if digits != 3:
+        return 0
+    return (d1 - 48) * 100 + (d2 - 48) * 10 + (d3 - 48)
+
+
+# The reason phrase of a response -- `OK`, `Not Found`, `Internal Server
+# Error` -- or the empty string when there is none.
+def resp_reason(resp: str[8192]) -> str[64]:
+    empty: str[64] = ""
+    if resp.find("HTTP/") != 0:
+        return empty
+    sp: int[64] = resp.find(" ")
+    if sp < 0:
+        return empty
+    if sp + 4 >= len(resp):
+        return empty
+    end: int[64] = resp.find("\r\n")
+    if end < 0:
+        end = len(resp)
+    out: str[64] = ""
+    n: int[64] = 0
+    i: int[64] = sp + 4
+    while i < end:
+        out[n] = resp[i]
+        n = n + 1
+        i = i + 1
+    return out
+
+
+# The header block of a response: every header line, without the status line
+# and without the blank line that ends them.
+def resp_headers(resp: str[8192]) -> str[4096]:
+    end: int[64] = resp.find("\r\n\r\n")
+    if end < 0:
+        end = len(resp)
+    first: int[64] = resp.find("\r\n")
+    if first < 0:
+        first = len(resp)
+    out: str[4096] = ""
+    n: int[64] = 0
+    i: int[64] = first + 2
+    while i < end:
+        out[n] = resp[i]
+        n = n + 1
+        i = i + 1
+    return out
+
+
+# The value of one header, by name. The name is matched the way HTTP says it
+# is: case-insensitively. An absent header comes back as the empty string.
+#
+# A bounded string has only `find(sub)` -- no starting offset -- so the
+# lines are walked one byte at a time, and a run of CRLF ends a line.
+def resp_header(resp: str[8192], name: str[64]) -> str[512]:
+    empty: str[512] = ""
+    nlen: int[64] = len(name)
+    if nlen == 0:
+        return empty
+    block: str[4096] = ""
+    bend: int[64] = resp.find("\r\n\r\n")
+    if bend < 0:
+        bend = len(resp)
+    bfirst: int[64] = resp.find("\r\n")
+    if bfirst < 0:
+        bfirst = len(resp)
+    bn: int[64] = 0
+    bi: int[64] = bfirst + 2
+    while bi < bend:
+        block[bn] = resp[bi]
+        bn = bn + 1
+        bi = bi + 1
+    pos: int[64] = 0
+    while pos < len(block):
+        eol: int[64] = pos
+        while eol < len(block):
+            if block[eol] == 13:
+                if eol + 1 < len(block):
+                    if block[eol + 1] == 10:
+                        break
+            eol = eol + 1
+        colon: int[64] = pos
+        while colon < eol and block[colon] != 58:
+            colon = colon + 1
+        if colon < eol and colon - pos == nlen:
+            same: int[64] = 1
+            k: int[64] = 0
+            while k < nlen:
+                a: int[64] = block[pos + k]
+                b: int[64] = name[k]
+                if a >= 65 and a <= 90:
+                    a = a + 32
+                if b >= 65 and b <= 90:
+                    b = b + 32
+                if a != b:
+                    same = 0
+                k = k + 1
+            if same == 1:
+                out: str[512] = ""
+                n: int[64] = 0
+                m: int[64] = colon + 1
+                while m < eol and block[m] == 32:
+                    m = m + 1
+                while m < eol:
+                    out[n] = block[m]
+                    n = n + 1
+                    m = m + 1
+                return out
+        if eol < len(block):
+            pos = eol + 2
+        else:
+            pos = len(block)
+    return empty
+
+
+# The body of a response: everything after the blank line that ends the
+# headers.
+def resp_body(resp: str[8192]) -> str[8192]:
+    empty: str[8192] = ""
+    i: int[64] = resp.find("\r\n\r\n")
+    if i < 0:
+        return empty
+    out: str[8192] = ""
+    n: int[64] = 0
+    j: int[64] = i + 4
+    while j < len(resp):
+        out[n] = resp[j]
+        n = n + 1
+        j = j + 1
+    return out
+
+
+# Whether a response says the request succeeded: 2xx and 3xx are the band a
+# caller treats as "it worked".
+def resp_ok(resp: str[8192]) -> bool:
+    code: int[64] = resp_status(resp)
+    if code >= 200 and code < 400:
+        return True
+    return False

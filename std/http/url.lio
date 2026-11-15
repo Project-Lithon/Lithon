@@ -1,0 +1,310 @@
+# std/http/url.lio -- URL parsing for the Lithon HTTP client.
+#
+# A URL is `http://host[:port][/path][?query]`. Only plain `http://` is
+# understood here: `https://` is refused by the caller rather than silently
+# downgraded to a cleartext request. The host is an IPv4 literal, `localhost`,
+# or a hostname; resolution itself lives in `std/http/net.lio` and dns.lio.
+
+
+# True when the URL starts with "http://".
+def url_plain(url: str[512]) -> bool:
+    if len(url) < 7:
+        return False
+    if url[0] != 104 or url[1] != 116:
+        return False
+    if url[2] != 116 or url[3] != 112:
+        return False
+    if url[4] != 58 or url[5] != 47:
+        return False
+    if url[6] != 47:
+        return False
+    return True
+
+
+# The index just past the host: the first ':' or '/' after "//", or the end.
+def url_host_end(url: str[512]) -> int[64]:
+    if len(url) >= 8 and url[7] == 91:
+        j: int[64] = 8
+        while j < len(url):
+            if url[j] == 93:
+                return j + 1
+            j = j + 1
+        return len(url)
+    stop: int[64] = len(url)
+    i: int[64] = 7
+    while i < stop:
+        if url[i] == 58 or url[i] == 47:
+            stop = i
+        else:
+            i = i + 1
+    return stop
+
+
+# The host name of a plain-http URL. Empty when the URL has no host.
+def url_host(url: str[512]) -> str[256]:
+    host: str[256] = ""
+    if not url_plain(url):
+        return host
+    end: int[64] = url_host_end(url)
+    if len(url) >= 8 and url[7] == 91:
+        if end < 9 or url[end - 1] != 93:
+            return host
+        k: int[64] = 8
+        while k < end - 1:
+            host[k - 8] = url[k]
+            k = k + 1
+        return host
+    i: int[64] = 7
+    while i < end:
+        host[i - 7] = url[i]
+        i = i + 1
+    return host
+
+
+# The port of a plain-http URL. 80 when none is written. -1 when the URL is
+# malformed: the port is not all digits, is 0, or is above 65535.
+def url_port(url: str[512]) -> int[64]:
+    port: int[64] = 80
+    i: int[64] = url_host_end(url)
+    if i < len(url) and url[i] == 58:
+        i = i + 1
+        port = 0
+        digits: int[64] = 0
+        while i < len(url) and url[i] != 47:
+            c: int[64] = url[i]
+            if c < 48 or c > 57:
+                return -1
+            port = port * 10 + (c - 48)
+            digits = digits + 1
+            if port > 65535:
+                return -1
+            i = i + 1
+        if digits == 0 or port == 0:
+            return -1
+    return port
+
+
+# An IPv4 literal host (dotted quad), or `localhost`, as one packed number.
+# 0 when the host is neither -- the caller then resolves it with DNS.
+def url_ipv4(host: str[256]) -> int[64]:
+    if len(host) == 9:
+        lw: str[10] = "localhost"
+        if host == lw:
+            return 2130706433
+    if len(host) == 0:
+        return 0
+    c0: int[64] = host[0]
+    if c0 < 48 or c0 > 57:
+        return 0
+    ip: int[64] = 0
+    octet: int[64] = 0
+    dots: int[64] = 0
+    k: int[64] = 0
+    while k < len(host):
+        d: int[64] = host[k]
+        if d == 46:
+            if octet > 255:
+                return 0
+            ip = ip * 256 + octet
+            octet = 0
+            dots = dots + 1
+        else:
+            if d < 48 or d > 57:
+                return 0
+            octet = octet * 10 + (d - 48)
+        k = k + 1
+    if dots != 3 or octet > 255:
+        return 0
+    return ip * 256 + octet
+
+
+
+# The authority of a URL as text -- `host` or `host:port` -- which is what
+# goes in the `Host:` request header. The port is left out when it is the
+# default, exactly as a client is expected to write it.
+def url_authority(url: str[512]) -> str[256]:
+    empty: str[256] = ""
+    if len(url) < 7:
+        return empty
+    host_end: int[64] = len(url)
+    port_end: int[64] = len(url)
+    port: int[64] = 80
+    has_port: int[64] = 0
+    i: int[64] = 7
+    if len(url) >= 8 and url[7] == 91:
+        i = url_host_end(url)
+    while i < len(url):
+        c: int[64] = url[i]
+        if c == 47:
+            host_end = i
+            port_end = i
+            i = len(url)
+        else:
+            if c == 58:
+                host_end = i
+                i = i + 1
+                port_end = i
+                port = 0
+                has_port = 1
+                while i < len(url):
+                    c2: int[64] = url[i]
+                    if c2 == 47:
+                        port_end = i
+                        i = len(url)
+                    else:
+                        if c2 >= 48 and c2 <= 57:
+                            port = port * 10 + (c2 - 48)
+                        i = i + 1
+            else:
+                i = i + 1
+
+    out: str[256] = ""
+    n: int[64] = 0
+    j: int[64] = 7
+    while j < host_end:
+        out[n] = url[j]
+        n = n + 1
+        j = j + 1
+    if has_port == 1 and port != 80:
+        out[n] = 58
+        n = n + 1
+        digits: str[11] = "0123456789"
+        dl: list[int[64], 6] = [0, 0, 0, 0, 0, 0]
+        v: int[64] = port
+        cnt: int[64] = 0
+        while v > 0:
+            dl[cnt] = v % 10
+            v = int(64, v / 10.0)
+            cnt = cnt + 1
+        if cnt == 0:
+            dl[0] = 0
+            cnt = 1
+        k: int[64] = cnt
+        while k > 0:
+            k = k - 1
+            out[n] = digits[dl[k]]
+            n = n + 1
+    return out
+
+
+# The index of the '/' that starts the path, or -1 when the URL names only an
+# authority. url_path is this index to the end of the URL, or "/" for -1.
+def url_path_start(url: str[512]) -> int[64]:
+    if len(url) < 7:
+        return -1
+    start: int[64] = -1
+    i: int[64] = 7
+    while i < len(url):
+        c: int[64] = url[i]
+        if c == 47:
+            start = i
+            i = len(url)
+        else:
+            if c == 58:
+                i = i + 1
+                while i < len(url):
+                    c2: int[64] = url[i]
+                    if c2 == 47:
+                        start = i
+                        i = len(url)
+                    else:
+                        i = i + 1
+            else:
+                i = i + 1
+    return start
+
+# The path of a URL, with its query -- `/items?page=2` -- or `/` when the URL
+# names only an authority. This is the request target.
+def url_path(url: str[512]) -> str[512]:
+    if len(url) < 7:
+        return "/"
+    start: int[64] = -1
+    i: int[64] = 7
+    while i < len(url):
+        c: int[64] = url[i]
+        if c == 47:
+            start = i
+            i = len(url)
+        else:
+            if c == 58:
+                i = i + 1
+                while i < len(url):
+                    c2: int[64] = url[i]
+                    if c2 == 47:
+                        start = i
+                        i = len(url)
+                    else:
+                        i = i + 1
+            else:
+                i = i + 1
+    if start < 0:
+        return "/"
+    out: str[512] = ""
+    n: int[64] = 0
+    j: int[64] = start
+    while j < len(url):
+        out[n] = url[j]
+        n = n + 1
+        j = j + 1
+    return out
+
+
+# A URL built from a base and a path: the base without its trailing slash,
+# then the path with its leading slash. Lithon cannot add two strings
+# together, so this is how a program says "under that base URL, this path".
+def url_join(base: str[512], path: str[512]) -> str[512]:
+    out: str[512] = ""
+    n: int[64] = 0
+    i: int[64] = 0
+    while i < len(base):
+        out[n] = base[i]
+        n = n + 1
+        i = i + 1
+    # A trailing slash on the base is dropped, so the join adds exactly one.
+    if n > 0:
+        if out[n - 1] == 47:
+            n = n - 1
+    i = 0
+    while i < len(path):
+        c: int[8] = path[i]
+        if i == 0:
+            if c != 47:
+                out[n] = 47
+                n = n + 1
+        out[n] = c
+        n = n + 1
+        i = i + 1
+    return out
+
+
+# The URL a redirect's Location names, taken against the URL it came from. An
+# absolute http:// Location is used as it is; a root-relative one ("/x") keeps
+# the base's authority. Any other form gives "": the caller reports it rather
+# than guess at a base path.
+def url_resolve(base: str[512], loc: str[512]) -> str[512]:
+    out: str[512] = ""
+    if url_plain(loc):
+        return loc
+    if len(loc) == 0:
+        return out
+    if loc[0] != 47:
+        return out
+    auth: str[256] = url_authority(base)
+    head: str[8] = "http://"
+    n: int[64] = 0
+    i: int[64] = 0
+    while i < len(head):
+        out[n] = head[i]
+        n = n + 1
+        i = i + 1
+    i = 0
+    while i < len(auth):
+        out[n] = auth[i]
+        n = n + 1
+        i = i + 1
+    i = 0
+    while i < len(loc):
+        out[n] = loc[i]
+        n = n + 1
+        i = i + 1
+    return out

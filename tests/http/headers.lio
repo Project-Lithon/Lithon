@@ -1,0 +1,21 @@
+# Custom request headers: the caller's headers are sent after the fixed ones,
+# and a Content-Type given by the caller replaces the default for a body.
+#
+# `__PORT__` is replaced with the port the test server is listening on. The
+# server's `/echo` route reflects the method, X-Token, Content-Type and body.
+
+import std.http
+
+
+if __name__ == '__main__':
+    # Custom header and an explicit Content-Type: the default is not added.
+    resp: str[8192] = std.http.http_send("POST", "http://127.0.0.1:__PORT__/echo", "X-Token: abc\r\nContent-Type: text/plain\r\n", "hi", 5)
+    print(std.http.http_body(resp))
+
+    # A custom header on a GET with no body.
+    resp = std.http.http_send("GET", "http://127.0.0.1:__PORT__/echo", "X-Token: xyz\r\n", "", 5)
+    print(std.http.http_body(resp))
+
+    # No headers given: a body still gets the default JSON Content-Type.
+    resp = std.http.http_post("http://127.0.0.1:__PORT__/echo", "hello")
+    print(std.http.http_body(resp))

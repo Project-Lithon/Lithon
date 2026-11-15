@@ -1,0 +1,15 @@
+# Percent-encoding, base64 and the Authorization headers, against the
+# published vectors (RFC 3986 unreserved set, RFC 4648 base64, RFC 2617
+# "Aladdin:open sesame"). No server is involved.
+
+import std.http.encode
+
+
+if __name__ == '__main__':
+    print(std.http.encode.url_encode("a b/c?d=1&x~"))
+    print(std.http.encode.base64_encode("Man"))
+    print(std.http.encode.base64_encode("Ma"))
+    print(std.http.encode.base64_encode("M"))
+    print(std.http.encode.base64_encode("hello"))
+    print(std.http.encode.basic_header("Aladdin", "open sesame"))
+    print(std.http.encode.bearer_header("abc"))

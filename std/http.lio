@@ -1,0 +1,196 @@
+# std/http.lio -- the Lithon HTTP client.
+#
+#     import std.http
+#
+#     resp: str[8192] = std.http.http_get("http://127.0.0.1:8080/api/items")
+#     print(std.http.http_status(resp))    # 200
+#     print(std.http.http_body(resp))      # the body, as text
+#
+# One call, one raw response: the status line, the headers and the body,
+# exactly as the server sent them. The helpers below read the parts a caller
+# usually wants, and the transport underneath (`std/http/net.lio`) does the
+# socket work.
+#
+# Why the response is one string and not an object: a bounded string has no
+# value form in Lithon, so it cannot travel inside a class, and a function
+# that takes one is expanded at its call site. The result is a `str` and the
+# status is read back out of it with `http_status`. That is the shape the
+# language has, and it keeps the whole thing to one round trip.
+#
+# A request that never made it -- a URL that is not plain http, a refused
+# connection -- comes back as a diagnostic that starts with
+# "LITHON-HTTP-ERROR[n]: " where n is the error code. `http_status` reads 0 for it and `http_error`
+# returns the text.
+
+import std.http.url
+import std.http.net
+import std.http.response
+import std.http.io
+
+
+# One request with any method and extra headers. `headers` is zero or more
+# "Name: value\r\n" lines, sent after the fixed ones; a Content-Type given
+# here replaces the default application/json for a body. The method goes
+# over the wire verbatim. `max_redirects` is how many redirects are followed
+# (0 returns the 3xx itself). Every request has a 30-second timeout on
+# connect, send and each read.
+def http_send(method: str[16], url: str[512], headers: str[1024], body: str[2048], max_redirects: int[64]) -> str[8192]:
+    return std.http.net.http_follow(method, url, headers, body, 30000, max_redirects)
+
+
+# One request with any method and no extra headers. Follows up to 5 redirects.
+def http_request(method: str[16], url: str[512], body: str[2048]) -> str[8192]:
+    return std.http.net.http_follow(method, url, "", body, 30000, 5)
+
+
+# The verb helpers below follow up to 5 redirects, as http_request does.
+def http_get(url: str[512]) -> str[8192]:
+    return std.http.net.http_follow("GET", url, "", "", 30000, 5)
+
+
+def http_post(url: str[512], body: str[2048]) -> str[8192]:
+    return std.http.net.http_follow("POST", url, "", body, 30000, 5)
+
+
+def http_put(url: str[512], body: str[2048]) -> str[8192]:
+    return std.http.net.http_follow("PUT", url, "", body, 30000, 5)
+
+
+def http_patch(url: str[512], body: str[2048]) -> str[8192]:
+    return std.http.net.http_follow("PATCH", url, "", body, 30000, 5)
+
+
+def http_delete(url: str[512]) -> str[8192]:
+    return std.http.net.http_follow("DELETE", url, "", "", 30000, 5)
+
+
+# The status code of a response: 200, 404, 500... Zero when there is no
+# response -- the request never made it, or the text is not a response.
+def http_status(resp: str[8192]) -> int[64]:
+    return std.http.response.resp_status(resp)
+
+
+# Whether the response says the request worked (2xx and 3xx).
+def http_ok(resp: str[8192]) -> bool:
+    return std.http.response.resp_ok(resp)
+
+
+# The body of a response, as text. JSON, HTML and plain text all come back
+# as the bytes the server sent.
+def http_body(resp: str[8192]) -> str[8192]:
+    return std.http.response.resp_body(resp)
+
+
+# The header block of a response, one header per line.
+def http_headers(resp: str[8192]) -> str[4096]:
+    return std.http.response.resp_headers(resp)
+
+
+# The value of one header, matched case-insensitively. An absent header is
+# the empty string.
+def http_header(resp: str[8192], name: str[64]) -> str[512]:
+    out: str[512] = std.http.response.resp_header(resp, name)
+    return out
+
+
+# The status line of a response as text -- "200 OK" -- ready to print.
+def http_status_line(resp: str[8192]) -> str[128]:
+    out: str[128] = ""
+    n: int[64] = 0
+    code: int[64] = std.http.response.resp_status(resp)
+    if code != 0:
+        digits: str[11] = "0123456789"
+        dl: list[int[64], 4] = [0, 0, 0, 0]
+        v: int[64] = code
+        cnt: int[64] = 0
+        while v > 0:
+            dl[cnt] = v % 10
+            v = int(64, v / 10.0)
+            cnt = cnt + 1
+        if cnt == 0:
+            dl[0] = 0
+            cnt = 1
+        k: int[64] = cnt
+        while k > 0:
+            k = k - 1
+            out[n] = digits[dl[k]]
+            n = n + 1
+        out[n] = 32
+        n = n + 1
+        reason: str[64] = std.http.response.resp_reason(resp)
+        i: int[64] = 0
+        while i < len(reason):
+            out[n] = reason[i]
+            n = n + 1
+            i = i + 1
+    return out
+
+
+# The diagnostic of a request that never made it, or the empty string when
+# there was a real response.
+def http_error(resp: str[8192]) -> str[8192]:
+    if resp.find("LITHON-HTTP-ERROR") == 0:
+        return resp
+    empty: str[8192] = ""
+    return empty
+
+
+# The error code of a failed request -- 1 to 11, the table in
+# std/http/net.lio -- or 0 when the response is not an error.
+def http_error_code(resp: str[8192]) -> int[64]:
+    tag: str[24] = "LITHON-HTTP-ERROR["
+    if resp.find(tag) != 0:
+        return 0
+    i: int[64] = len(tag)
+    code: int[64] = 0
+    while i < len(resp) and resp[i] != 93:
+        c: int[64] = resp[i]
+        if c < 48 or c > 57:
+            return 0
+        code = code * 10 + (c - 48)
+        i = i + 1
+    if i >= len(resp):
+        return 0
+    return code
+
+
+# Open a socket to the host of `url` for several requests (HTTP/1.1 keep-alive;
+# see http_request_on). Returns the socket, or a negative code: -1 bad URL, -2
+# host did not resolve, -3 connect failed, -4 connect timed out. Send requests
+# for that host and port on it.
+def http_open(url: str[512]) -> int[64]:
+    return std.http.net.open_url(url, 30000)
+
+
+# The text for a negative http_open result.
+def http_open_error(code: int[64]) -> str[8192]:
+    return std.http.net.open_error(code)
+
+
+# One request on a socket from http_open. The socket stays open afterwards.
+# The reply ends where its Content-Length or chunked framing says, not at EOF,
+# so the call returns without waiting for the server to close. A socket the
+# server has already closed gives error 6. Check http_keep_alive before reuse.
+def http_request_on(fd: int[64], method: str[16], url: str[512], headers: str[1024], body: str[2048]) -> str[8192]:
+    return std.http.net.http_exchange_on(fd, method, url, headers, body)
+
+
+# Close a socket from http_open.
+def http_close(fd: int[64]) -> int[64]:
+    return std.http.io.close_fd(fd)
+
+
+# Whether a reply leaves its socket open for another request: HTTP/1.1, framed
+# by Content-Length or chunked coding, and no "Connection: close". Conservative:
+# false when unsure.
+def http_keep_alive(resp: str[8192]) -> bool:
+    if resp.find("HTTP/1.1") != 0:
+        return False
+    cl: str[512] = std.http.response.resp_header(resp, "Content-Length")
+    te: str[512] = std.http.response.resp_header(resp, "Transfer-Encoding")
+    if len(cl) == 0 and te.find("chunked") < 0:
+        return False
+    conn: str[512] = std.http.response.resp_header(resp, "Connection")
+    if conn.find("close") >= 0 or conn.find("Close") >= 0:
+        return False
+    return True

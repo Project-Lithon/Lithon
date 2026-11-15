@@ -1,0 +1,9 @@
+import std.http
+
+# Live internet test: needs /usr/bin/openssl and network access to example.com.
+if __name__ == '__main__':
+    r: str[8192] = std.http.http_get("https://example.com/")
+    print(std.http.http_status(r))
+    print(len(std.http.http_body(r)) > 100)
+    b: str[8192] = std.http.http_get("https://ex_ample.com/")
+    print(b)

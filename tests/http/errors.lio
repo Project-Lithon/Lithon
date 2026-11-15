@@ -1,0 +1,30 @@
+# The URLs the client refuses, and what it says about them.
+#
+# A URL that is not http or https, or an https URL with a malformed host, never
+# reaches the network. https goes through /usr/bin/openssl: a refused TLS
+# connection comes back as error 9. A name that does not resolve and a refused
+# connection each come back as a coded diagnostic.
+
+import std.http
+
+
+if __name__ == '__main__':
+    # Not a URL.
+    resp: str[8192] = std.http.http_get("not-a-url")
+    print(std.http.http_status(resp))
+    print(std.http.http_error(resp))
+
+    # https to a port nothing listens on: openssl cannot connect, so error 9.
+    resp = std.http.http_get("https://127.0.0.1:9/")
+    print(std.http.http_status(resp))
+    print(std.http.http_error(resp))
+
+    # A host name that does not exist: the resolver answers NXDOMAIN.
+    resp = std.http.http_get("http://nonexistent.invalid/")
+    print(std.http.http_status(resp))
+    print(std.http.http_error(resp))
+
+    # A port nothing is listening on: the connect is refused.
+    resp = std.http.http_get("http://127.0.0.1:1/")
+    print(std.http.http_status(resp))
+    print(std.http.http_error(resp))

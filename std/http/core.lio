@@ -1,0 +1,112 @@
+# std/http/core.lio -- the pieces the transport is built from.
+#
+# A struct is inline storage: its bytes ARE its address, and `addressof`
+# names that run in both tiers. That is what makes it the only buffer the
+# kernel can be pointed at -- a bounded string has no addressable run in the
+# interpreter, so a string buffer would make the two tiers disagree about
+# what went over the wire.
+#
+# Every struct here is one of the kernel's own layouts, written one 64-bit
+# word at a time, so the bytes the kernel reads are exactly the bytes the
+# syscall ABI documents:
+#
+#   SockAddr  struct sockaddr_in   (16 bytes, IPv4)
+#   Sock6     struct sockaddr_in6  (28 bytes, IPv6)
+#   Timeval   struct timeval       (16 bytes, SO_RCVTIMEO / SO_SNDTIMEO)
+#   Chunk     the 64-byte window the kernel reads and writes through
+
+class SockAddr(struct):
+    lo: int[64]
+    hi: int[64]
+
+
+class Sock6(struct):
+    w0: int[64]
+    w1: int[64]
+    w2: int[64]
+    w3: int[64]
+    w4: int[64]
+    w5: int[64]
+    w6: int[64]
+
+
+class Timeval(struct):
+    sec: int[64]
+    usec: int[64]
+
+
+class Chunk(struct):
+    f0: int[8]
+    f1: int[8]
+    f2: int[8]
+    f3: int[8]
+    f4: int[8]
+    f5: int[8]
+    f6: int[8]
+    f7: int[8]
+    f8: int[8]
+    f9: int[8]
+    f10: int[8]
+    f11: int[8]
+    f12: int[8]
+    f13: int[8]
+    f14: int[8]
+    f15: int[8]
+    f16: int[8]
+    f17: int[8]
+    f18: int[8]
+    f19: int[8]
+    f20: int[8]
+    f21: int[8]
+    f22: int[8]
+    f23: int[8]
+    f24: int[8]
+    f25: int[8]
+    f26: int[8]
+    f27: int[8]
+    f28: int[8]
+    f29: int[8]
+    f30: int[8]
+    f31: int[8]
+    f32: int[8]
+    f33: int[8]
+    f34: int[8]
+    f35: int[8]
+    f36: int[8]
+    f37: int[8]
+    f38: int[8]
+    f39: int[8]
+    f40: int[8]
+    f41: int[8]
+    f42: int[8]
+    f43: int[8]
+    f44: int[8]
+    f45: int[8]
+    f46: int[8]
+    f47: int[8]
+    f48: int[8]
+    f49: int[8]
+    f50: int[8]
+    f51: int[8]
+    f52: int[8]
+    f53: int[8]
+    f54: int[8]
+    f55: int[8]
+    f56: int[8]
+    f57: int[8]
+    f58: int[8]
+    f59: int[8]
+    f60: int[8]
+    f61: int[8]
+    f62: int[8]
+    f63: int[8]
+
+
+# Byte-order helpers. The kernel wants the port and the address in network
+# (big-endian) order, so both of these swap the bytes of a 16/32-bit word.
+def swap16(v: int[64]) -> int[64]:
+    return ((v & 255) << 8) | ((v >> 8) & 255)
+
+
+def swap32(v: int[64]) -> int[64]:
+    return ((v & 255) << 24) | ((v & 65280) << 8) | ((v >> 8) & 65280) | ((v >> 24) & 255)

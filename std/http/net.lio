@@ -1,0 +1,183 @@
+# std/http/net.lio -- one HTTP exchange over a plain TCP connection.
+#
+# open_url resolves the host and connects; http_exchange sends one request and
+# reads the reply: to the end of its framing, or to EOF when it has none. The
+# byte path itself is in io.lio.
+#
+# Failures are returned as text beginning "LITHON-HTTP-ERROR[n]: " with this
+# code table (the same codes the io layer uses):
+#
+#   1  the URL is not a usable plain-http URL
+#   2  the host name did not resolve
+#   3  socket() or connect() failed
+#   4  connect timed out
+#   5  reading the response timed out
+#   6  recv() failed
+#   7  sending the request failed
+#    8 too many redirects, or a Location that cannot be followed
+#   10 the response is larger than the 8 KiB buffer
+#  11 the chunked body is malformed, or uses a coding other than chunked
+
+import std.http.url
+import std.http.request
+import std.http.dns
+import std.http.io
+import std.http.response
+import std.http.chunked
+import std.http.inflate
+import std.http.tls
+
+import std.http.ip6
+from std.http.io import connect4, connect6_groups, send_all, recv_all, close_fd
+
+
+# A connected socket for `url`, or a negative code (see the table above). The
+# negative values are the codes: -1 bad URL, -2 DNS, -3 connect, -4 timeout.
+def open_url(url: str[512], timeout_ms: int[64]) -> int[64]:
+    if not std.http.url.url_plain(url):
+        return -1
+    port: int[64] = std.http.url.url_port(url)
+    if port < 0:
+        return -1
+    host: str[256] = ""
+    hend: int[64] = std.http.url.url_host_end(url)
+    if len(url) >= 8 and url[7] == 91:
+        if hend < 9 or url[hend - 1] != 93:
+            return -1
+        hk: int[64] = 8
+        while hk < hend - 1:
+            host[hk - 8] = url[hk]
+            hk = hk + 1
+    else:
+        hk2: int[64] = 7
+        while hk2 < hend:
+            host[hk2 - 7] = url[hk2]
+            hk2 = hk2 + 1
+    if len(host) == 0:
+        return -1
+    if host.find(":") >= 0:
+        if not std.http.ip6.ip6_ok(host):
+            return -1
+        g0: int[64] = std.http.ip6.ip6_group(host, 0)
+        g1: int[64] = std.http.ip6.ip6_group(host, 1)
+        g2: int[64] = std.http.ip6.ip6_group(host, 2)
+        g3: int[64] = std.http.ip6.ip6_group(host, 3)
+        g4: int[64] = std.http.ip6.ip6_group(host, 4)
+        g5: int[64] = std.http.ip6.ip6_group(host, 5)
+        g6: int[64] = std.http.ip6.ip6_group(host, 6)
+        g7: int[64] = std.http.ip6.ip6_group(host, 7)
+        six: int[64] = connect6_groups(g0, g1, g2, g3, g4, g5, g6, g7, port, timeout_ms)
+        if six < 0:
+            if six == -110 or six == -11:
+                return -4
+            return -3
+        return six
+    ip: int[64] = std.http.url.url_ipv4(host)
+    if ip == 0:
+        ip = std.http.dns.resolve4(host)
+    if ip == 0:
+        return -2
+    fd: int[64] = connect4(ip, port, timeout_ms)
+    if fd < 0:
+        if fd == -110 or fd == -11:
+            return -4
+        return -3
+    return fd
+
+
+# The text for a negative open_url result.
+def open_error(code: int[64]) -> str[8192]:
+    if code == -1:
+        return "LITHON-HTTP-ERROR[1]: the URL is not a usable plain-http URL"
+    if code == -2:
+        return "LITHON-HTTP-ERROR[2]: the host name did not resolve"
+    if code == -4:
+        return "LITHON-HTTP-ERROR[4]: connect timed out"
+    return "LITHON-HTTP-ERROR[3]: socket() or connect() failed"
+
+
+# How recv_all frames the reply to `method`: a HEAD reply has no body (mode 2),
+# any other reply is framed by its headers and body (mode 1).
+def reply_mode(method: str[16]) -> int[64]:
+    if method == "HEAD":
+        return 2
+    return 1
+
+
+# The whole exchange: build the request, connect, send it, read the answer.
+# The result is the RAW response -- status line, headers and body. A failure
+# comes back as the LITHON-HTTP-ERROR text described above.
+def http_exchange(method: str[16], url: str[512], headers: str[1024], body: str[2048], timeout_ms: int[64]) -> str[8192]:
+    if std.http.tls.tls_url(url):
+        return std.http.tls.tls_exchange(method, url, headers, body, timeout_ms)
+    req: str[4096] = std.http.request.build_request(method, url, body, headers, False)
+    nreq: int[64] = len(req)
+
+    fd: int[64] = open_url(url, timeout_ms)
+    if fd < 0:
+        return open_error(fd)
+
+    if send_all(fd, req, nreq) < 0:
+        close_fd(fd)
+        return "LITHON-HTTP-ERROR[7]: sending the request failed"
+
+    resp: str[8192] = recv_all(fd, reply_mode(method))
+    close_fd(fd)
+    return std.http.chunked.dechunk_response(std.http.inflate.decode_content(resp))
+
+
+# One request on a socket that stays open (from http_open in std/http.lio). The
+# request names the host the socket connects to. The reply ends where its
+# framing says, so the socket can carry the next request.
+def http_exchange_on(fd: int[64], method: str[16], url: str[512], headers: str[1024], body: str[2048]) -> str[8192]:
+    req: str[4096] = std.http.request.build_request(method, url, body, headers, True)
+    nreq: int[64] = len(req)
+    if send_all(fd, req, nreq) < 0:
+        return "LITHON-HTTP-ERROR[7]: sending the request failed"
+    resp: str[8192] = recv_all(fd, reply_mode(method))
+    return std.http.chunked.dechunk_response(std.http.inflate.decode_content(resp))
+
+
+# Whether a status code is a redirect whose Location is followed.
+def is_redirect(code: int[64]) -> bool:
+    if code == 301 or code == 302:
+        return True
+    if code == 303 or code == 307:
+        return True
+    return code == 308
+
+
+# One request, following redirects for at most `max_hops` hops. 303 always
+# becomes a GET with no body; 301 and 302 do the same for a POST, as browsers
+# do; 307 and 308 resend the method and body unchanged. A redirect past the
+# limit is error 8, and a Location that is not http or root-relative is too.
+# A limit of 0 returns the first redirect itself, unfollowed.
+def http_follow(method: str[16], url: str[512], headers: str[1024], body: str[2048], timeout_ms: int[64], max_hops: int[64]) -> str[8192]:
+    cur: str[512] = url
+    m: str[16] = method
+    b: str[2048] = body
+    hops: int[64] = 0
+    while True:
+        resp: str[8192] = http_exchange(m, cur, headers, b, timeout_ms)
+        code: int[64] = std.http.response.resp_status(resp)
+        if not is_redirect(code):
+            return resp
+        loc: str[512] = std.http.response.resp_header(resp, "Location")
+        if len(loc) == 0:
+            return resp
+        if max_hops <= 0:
+            return resp
+        if hops >= max_hops:
+            return "LITHON-HTTP-ERROR[8]: too many redirects"
+        target: str[512] = std.http.url.url_resolve(cur, loc)
+        if len(target) == 0:
+            return "LITHON-HTTP-ERROR[8]: the redirect target is not an http or root-relative URL"
+        hops = hops + 1
+        if code == 303:
+            m = "GET"
+            b = ""
+        if code == 301 or code == 302:
+            if m == "POST":
+                m = "GET"
+                b = ""
+        cur = target
