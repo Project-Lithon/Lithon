@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { createFileRoute } from "@tanstack/react-router"
+import { createFileRoute, Link } from "@tanstack/react-router"
 
 import {
   Accordion,
@@ -17,10 +17,10 @@ import {
 } from "@workspace/ui/components/card"
 import { Separator } from "@workspace/ui/components/separator"
 
-import { metaForPath, structuredData } from "../lib/seo"
-import { Note, PageHero, SectionHead, WRAP } from "../site"
+import { metaForPath, structuredData } from "../../lib/seo"
+import { Note, PageHero, SectionHead, WRAP } from "../../site"
 
-export const Route = createFileRoute("/roadmap")({
+export const Route = createFileRoute("/roadmap/")({
   head: () => {
     const meta = metaForPath("/roadmap")
     return {
@@ -34,9 +34,9 @@ export const Route = createFileRoute("/roadmap")({
         { name: "twitter:card", content: "summary_large_image" },
         { name: "twitter:title", content: meta.title },
         { name: "twitter:description", content: meta.description },
-        { tagName: "link", rel: "canonical", href: meta.canonical },
-        { "script:ld+json": JSON.stringify(structuredData("/roadmap")) },
+        { "script:ld+json": structuredData("/roadmap") },
       ],
+      links: [{ rel: "canonical", href: meta.canonical }],
     }
   },
   component: Roadmap })
@@ -352,7 +352,7 @@ function Roadmap() {
                   variant="link"
                   size="sm"
                   className="mt-3 px-0"
-                  render={<a href={phase.href} />}
+                  render={<Link to={phase.href} />}
                 >
                   {phase.cta} →
                 </Button>
@@ -465,8 +465,8 @@ function Roadmap() {
           {DEEP_DIVES.map((row, index) => (
             <div key={row.href}>
               {index > 0 && <Separator />}
-              <a
-                href={row.href}
+              <Link
+                to={row.href}
                 className="flex items-center gap-4 px-4 py-4 hover:bg-muted"
               >
                 <Badge variant="outline" className="w-24 justify-center">
@@ -479,7 +479,7 @@ function Roadmap() {
                   </span>
                 </span>
                 <span className="ms-auto text-muted-foreground">→</span>
-              </a>
+              </Link>
             </div>
           ))}
         </div>

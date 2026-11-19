@@ -1,5 +1,5 @@
 import type { ReactNode } from "react"
-import { createFileRoute } from "@tanstack/react-router"
+import { createFileRoute, Link } from "@tanstack/react-router"
 
 import { metaForPath, structuredData } from "../../lib/seo"
 import {
@@ -25,9 +25,9 @@ export const Route = createFileRoute("/roadmap/language")({
         { name: "twitter:card", content: "summary_large_image" },
         { name: "twitter:title", content: meta.title },
         { name: "twitter:description", content: meta.description },
-        { tagName: "link", rel: "canonical", href: meta.canonical },
-        { "script:ld+json": JSON.stringify(structuredData("/roadmap/language")) },
+        { "script:ld+json": structuredData("/roadmap/language") },
       ],
+      links: [{ rel: "canonical", href: meta.canonical }],
     }
   },
   component: LanguageReference,
@@ -486,18 +486,18 @@ sar rax,cl       # 48 d3 f8      dynamic count`}</CodeBlock>
               above is the known case.
             </Note>
             <div className="flex flex-wrap justify-between gap-4 rounded-lg border p-4">
-              <a href="/roadmap/verification">
+              <Link to="/roadmap/verification">
                 <span className="block text-xs text-muted-foreground">
                   Read next
                 </span>
                 <b className="font-heading">Verification and benchmarks</b>
-              </a>
-              <a href="/roadmap" className="text-end">
+              </Link>
+              <Link to="/roadmap" className="text-end">
                 <span className="block text-xs text-muted-foreground">
                   Back to
                 </span>
                 <b className="font-heading">The full tracker</b>
-              </a>
+              </Link>
             </div>
           </DocSection>
         </div>

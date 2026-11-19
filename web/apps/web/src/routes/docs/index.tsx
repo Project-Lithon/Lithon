@@ -26,8 +26,8 @@ export const Route = createFileRoute("/docs/")({
         { name: "description", content: meta.description },
         { property: "og:title", content: meta.title },
         { property: "og:description", content: meta.description },
-        { tagName: "link", rel: "canonical", href: meta.canonical },
       ],
+      links: [{ rel: "canonical", href: meta.canonical }],
     }
   },
   component: DocsIndex,

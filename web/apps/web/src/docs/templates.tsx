@@ -427,9 +427,19 @@ export function Example({ spec }: { spec: ExampleSpec }) {
   const machineView = useContext(MachineViewContext)
   const ir = irFor(spec)
   const has = useMemo(() => {
-    // prefer a hand-written trace; otherwise derive one from the real IR
-    const derived =
-      ir && spec.expect !== "error" ? traceFromIr(ir).steps : undefined
+    // prefer a hand-written trace; otherwise derive one from the real IR.
+    // A trace is decoration, never a reason to lose the page: if the
+    // simulator trips over an IR shape it does not model, fall back to no
+    // Execution tab rather than throwing out of render (which would fail
+    // prerendering and turn the whole docs page into a 404).
+    let derived: TraceStep[] | undefined
+    if (ir && spec.expect !== "error") {
+      try {
+        derived = traceFromIr(ir).steps
+      } catch {
+        derived = undefined
+      }
+    }
     const steps = spec.trace?.length ? spec.trace : derived
     return {
       steps,

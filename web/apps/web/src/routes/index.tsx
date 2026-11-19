@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { createFileRoute } from "@tanstack/react-router"
+import { createFileRoute, Link } from "@tanstack/react-router"
 import { ArrowUpRightIcon } from "@phosphor-icons/react"
 
 import {
@@ -35,9 +35,9 @@ export const Route = createFileRoute("/")({
         { name: "twitter:card", content: "summary_large_image" },
         { name: "twitter:title", content: meta.title },
         { name: "twitter:description", content: meta.description },
-        { tagName: "link", rel: "canonical", href: meta.canonical },
-        { "script:ld+json": JSON.stringify(structuredData("/")) },
+        { "script:ld+json": structuredData("/") },
       ],
+      links: [{ rel: "canonical", href: meta.canonical }],
     }
   },
   component: Home })
@@ -421,11 +421,23 @@ function Home() {
               </CardHeader>
               <CardContent className="text-muted-foreground">
                 {feature.text}
+                {/* Hash links stay plain anchors; a real path must go
+                    through Link or it drops the /Lithon base path and
+                    404s in production. */}
                 <Button
                   variant="link"
                   size="sm"
                   className="mt-3 px-0"
-                  render={<a href={feature.link} />}
+                  render={
+                    feature.link.startsWith("#") ? (
+                      <a href={feature.link} />
+                    ) : (
+                      <Link
+                        to="/docs/$slug"
+                        params={{ slug: "classes" }}
+                      />
+                    )
+                  }
                 >
                   {feature.cta} ↗
                 </Button>

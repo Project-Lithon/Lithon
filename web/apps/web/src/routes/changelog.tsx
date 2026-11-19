@@ -24,8 +24,8 @@ export const Route = createFileRoute("/changelog")({
         { name: "description", content: meta.description },
         { property: "og:title", content: meta.title },
         { property: "og:description", content: meta.description },
-        { tagName: "link", rel: "canonical", href: meta.canonical },
       ],
+      links: [{ rel: "canonical", href: meta.canonical }],
     }
   },
   component: Changelog,
@@ -118,15 +118,29 @@ function Changelog() {
                               <ArrowUpRightIcon />
                             </a>
                           )}
-                          {change.href && (
-                            <Link
-                              to="/docs/$slug"
-                              params={{ slug: change.href.replace("/docs/", "") }}
-                              className="font-medium text-accent-strong underline-offset-4 hover:underline"
-                            >
-                              read the docs →
-                            </Link>
-                          )}
+                          {/* href is not always a doc slug: "/", "/docs" and
+                              "/benchmarks" exist too. Forcing those through
+                              /docs/$slug encoded the "/" as %2F and produced a
+                              dead link, so only real doc paths take that route. */}
+                          {change.href &&
+                            (change.href.startsWith("/docs/") ? (
+                              <Link
+                                to="/docs/$slug"
+                                params={{
+                                  slug: change.href.replace("/docs/", ""),
+                                }}
+                                className="font-medium text-accent-strong underline-offset-4 hover:underline"
+                              >
+                                read the docs →
+                              </Link>
+                            ) : (
+                              <Link
+                                to={change.href as "/"}
+                                className="font-medium text-accent-strong underline-offset-4 hover:underline"
+                              >
+                                read the docs →
+                              </Link>
+                            ))}
                         </div>
                       </CardContent>
                     </Card>

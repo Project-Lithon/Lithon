@@ -608,27 +608,49 @@ export function runIr(program: IrProgram, maxSteps = 2000): IrRun {
         }
         break
       }
+      case "and":
+      case "or":
+      case "xor": {
+        // The frontend emits `and`/`or` for Python's boolean operators and
+        // reserves `band`/`bor`/`bxor` for the integer bitwise ones, so the
+        // logical ops must stay in boolean land. Folding them into JS `&`/`|`
+        // coerced `true`/`false` to the numbers 1/0, and that number then
+        // reached `not` -> `wrap64`, which threw "Cannot mix BigInt and other
+        // types" and failed the whole route's prerender (this is what took
+        // the classes page's trace down).
+        const truthy = (v: unknown) =>
+          typeof v === "boolean"
+            ? v
+            : typeof v === "bigint"
+              ? v !== 0n
+              : typeof v === "number"
+                ? v !== 0
+                : Boolean(v)
+        const a = truthy(read(instr.args[0]))
+        const b = truthy(read(instr.args[1]))
+        const v =
+          instr.op === "and" ? a && b : instr.op === "or" ? a || b : a !== b
+        if (instr.dest) {
+          registers.set(`${frames.length}:${current.name}:${instr.dest}`, v)
+          produced = { register: instr.dest, value: fmtValue(v) }
+        }
+        break
+      }
       case "shl":
       case "shr":
       case "band":
       case "bor":
-      case "bxor":
-      case "and":
-      case "or":
-      case "xor": {
+      case "bxor": {
         const a = read(instr.args[0]) as bigint
         const b = read(instr.args[1]) as bigint
-        // The engine spells the *bitwise* ops `band`/`bor`/`bxor` and keeps
-        // `and`/`or`/`xor` for the logical ones, so both spellings are
-        // accepted here and treated as bitwise.
         const v =
           instr.op === "shl"
             ? wrap64(a << (b & 63n))
             : instr.op === "shr"
               ? a >> (b & 63n)
-              : instr.op === "band" || instr.op === "and"
+              : instr.op === "band"
                 ? a & b
-                : instr.op === "bor" || instr.op === "or"
+                : instr.op === "bor"
                   ? a | b
                   : a ^ b
         if (instr.dest) {

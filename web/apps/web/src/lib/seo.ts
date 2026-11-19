@@ -53,6 +53,66 @@ export function originFor(): string {
   return SITEMAP_HOST
 }
 
+/**
+ * Per-page meta for the roadmap's five subpages.
+ *
+ * They all used to fall through to a single `startsWith("/roadmap")` block,
+ * so six distinct pages shipped an identical `<title>` and description.
+ * The copy here is the same wording the index page uses for each row.
+ */
+const ROADMAP_SUBPAGES: Record<string, Omit<PageMeta, "canonical">> = {
+  "/roadmap/language": {
+    title: "Language and semantics | Lithon",
+    description:
+      "Types and flow, the supported subset, and every place Lithon deliberately does not follow CPython: modulo, shifts, and the float rules.",
+    facts: [
+      "The supported subset, types and flow, and every deliberate divergence from CPython",
+      "Modulo, shifts, and the float rules documented as implemented",
+    ],
+    keywords: ["lithon", "roadmap", "language", "semantics", "divergences"],
+  },
+  "/roadmap/phase-1-dual-tier": {
+    title: "Phase I: the dual-tier JIT engine | Lithon",
+    description:
+      "The two execution tiers, the emitter, ABI and target-feature gating, the measured optimization pipeline, and all eight SSA phases with the reasoning behind each.",
+    facts: [
+      "Interpreter and native tier behind one call boundary",
+      "All eight SSA phases with the reasoning behind each",
+    ],
+    keywords: ["lithon", "roadmap", "jit", "dual-tier", "ssa"],
+  },
+  "/roadmap/phase-2-aot": {
+    title: "Phase II: AOT binary synthesis | Lithon",
+    description:
+      "Writing ELF64 and PE32+ headers by hand, staying under 10 KB, and the decoupling work that has to happen before a binary can stand on its own.",
+    facts: [
+      "ELF64 and PE32+ headers written by hand",
+      "Staying under 10 KB with no runtime to link",
+    ],
+    keywords: ["lithon", "roadmap", "aot", "elf64", "pe32"],
+  },
+  "/roadmap/phase-3-systems": {
+    title: "Phase III: systems and SIMD | Lithon",
+    description:
+      "Syscalls emitted from syntax, zero-copy pointers into native arrays, and the AVX2 path with the feature gating already built underneath it.",
+    facts: [
+      "Syscalls emitted from syntax and zero-copy pointers into native arrays",
+      "AVX2 path with target-feature gating already in place",
+    ],
+    keywords: ["lithon", "roadmap", "syscalls", "simd", "avx2"],
+  },
+  "/roadmap/verification": {
+    title: "Verification and benchmarks | Lithon",
+    description:
+      "The four checking layers from unit tests to differential fuzzing, how to isolate one optimization's effect, and what a green run does not prove.",
+    facts: [
+      "Four checking layers, from unit tests to differential fuzzing",
+      "How to isolate one optimization's effect, and what a green run does not prove",
+    ],
+    keywords: ["lithon", "roadmap", "verification", "testing", "benchmarks"],
+  },
+}
+
 export function metaForPath(pathname: string): PageMeta {
   const clean = pathname.replace(/\/+$/, "") || "/"
   const site = originFor()
@@ -193,6 +253,11 @@ export function metaForPath(pathname: string): PageMeta {
   }
 
   if (clean.startsWith("/roadmap")) {
+    // Guard on the key, not the value: TS narrows an indexed read from the
+    // table's value type, so `if (sub)` alone reads as always-truthy.
+    if (Object.hasOwn(ROADMAP_SUBPAGES, clean)) {
+      return { ...ROADMAP_SUBPAGES[clean], canonical: `${site}${clean}` }
+    }
     return {
       title: "Roadmap | Lithon",
       description:
@@ -261,7 +326,7 @@ export function structuredData(pathname: string) {
 /** The `script:ld+json` tag for a route, ready to drop into a `head()`. */
 export function jsonLdTag(pathname: string) {
   return {
-    "script:ld+json": JSON.stringify(structuredData(pathname)),
+    "script:ld+json": structuredData(pathname),
   }
 }
 

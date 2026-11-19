@@ -39,15 +39,12 @@ jobs:
         working-directory: web
         run: bun install --frozen-lockfile
 
-      # TanStack Start prerenders every route to static HTML, so Pages can
-      # host it. Sitemap and robots.txt come out of the same build.
-      - name: Build site
-        working-directory: web
-        env:
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: bun run build
-
-      - name: Generate robots.txt
+      # The generators only read the source registry, never the build output,
+      # and they write into web/apps/web/public/ — which Vite copies into the
+      # artifact during build. Running them *after* build meant their output
+      # was silently discarded, so the deployed sitemap/robots/llms files were
+      # whatever happened to be committed. Generate first, then build.
+      - name: Generate robots.txt and sitemap
         working-directory: web
         run: bun run scripts/gen-seo.ts "https://project-lithon.github.io/Lithon"
 
@@ -56,6 +53,14 @@ jobs:
       - name: Generate the AI-facing surfaces
         working-directory: web
         run: bun run scripts/gen-llms.ts
+
+      # TanStack Start prerenders every route to static HTML, so Pages can
+      # host it.
+      - name: Build site
+        working-directory: web
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: bun run build
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router"
+import { createFileRoute, Link } from "@tanstack/react-router"
 
 import { Card, CardContent } from "@workspace/ui/components/card"
 
@@ -26,9 +26,9 @@ export const Route = createFileRoute("/roadmap/phase-1-dual-tier")({
         { name: "twitter:card", content: "summary_large_image" },
         { name: "twitter:title", content: meta.title },
         { name: "twitter:description", content: meta.description },
-        { tagName: "link", rel: "canonical", href: meta.canonical },
-        { "script:ld+json": JSON.stringify(structuredData("/roadmap/phase-1-dual-tier")) },
+        { "script:ld+json": structuredData("/roadmap/phase-1-dual-tier") },
       ],
+      links: [{ rel: "canonical", href: meta.canonical }],
     }
   },
   component: Phase1DualTier,
@@ -525,16 +525,16 @@ phi copies: 5 of 9 in registers`}</CodeBlock>
             </p>
             <div className="grid gap-3 sm:grid-cols-2">
               {SUBPAGES.map(([kicker, label, href]) => (
-                <a
+                <Link
                   key={href}
-                  href={href}
+                  to={href}
                   className="rounded-lg border p-4 hover:bg-muted"
                 >
                   <span className="block text-xs text-muted-foreground">
                     {kicker}
                   </span>
                   <b className="block font-heading text-sm">{label}</b>
-                </a>
+                </Link>
               ))}
             </div>
           </DocSection>

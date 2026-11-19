@@ -44,8 +44,14 @@ const config = defineConfig({
           prerender: { enabled: true },
         })),
       ],
+      // The built-in generator prefixes `host` with the vite `base` path,
+      // and SITEMAP_HOST already contains /Lithon, so it emitted 52 dead
+      // /Lithon/Lithon/... URLs that Google was crawling. scripts/gen-seo.ts
+      // is the single source of truth for sitemap.xml + robots.txt (it is
+      // the same registry the canonical tags use); CI runs it before the
+      // build so the files land in public/ and ship with the artifact.
       sitemap: {
-        enabled: true,
+        enabled: false,
         outputPath: "sitemap.xml",
         host: SITEMAP_HOST,
       },

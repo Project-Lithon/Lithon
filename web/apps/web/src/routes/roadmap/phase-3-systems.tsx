@@ -1,5 +1,5 @@
 import type { ReactNode } from "react"
-import { createFileRoute } from "@tanstack/react-router"
+import { createFileRoute, Link } from "@tanstack/react-router"
 
 import { metaForPath, structuredData } from "../../lib/seo"
 import { DocSection, Note, PageHero, SpecTable, WRAP } from "../../site"
@@ -18,9 +18,9 @@ export const Route = createFileRoute("/roadmap/phase-3-systems")({
         { name: "twitter:card", content: "summary_large_image" },
         { name: "twitter:title", content: meta.title },
         { name: "twitter:description", content: meta.description },
-        { tagName: "link", rel: "canonical", href: meta.canonical },
-        { "script:ld+json": JSON.stringify(structuredData("/roadmap/phase-3-systems")) },
+        { "script:ld+json": structuredData("/roadmap/phase-3-systems") },
       ],
+      links: [{ rel: "canonical", href: meta.canonical }],
     }
   },
   component: Phase3Systems,
@@ -253,18 +253,18 @@ function Phase3Systems() {
               code, and what is missing is a second encoder.
             </p>
             <div className="flex flex-wrap gap-10 border-t pt-6">
-              <a href="/roadmap/language">
+              <Link to="/roadmap/language">
                 <span className="block text-xs text-muted-foreground">
                   Read next
                 </span>
                 Language and semantics →
-              </a>
-              <a href="/roadmap">
+              </Link>
+              <Link to="/roadmap">
                 <span className="block text-xs text-muted-foreground">
                   Back to
                 </span>
                 The full tracker →
-              </a>
+              </Link>
             </div>
           </DocSection>
         </div>

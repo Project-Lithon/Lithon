@@ -26,9 +26,9 @@ export const Route = createFileRoute("/use-cases")({
         { name: "twitter:card", content: "summary_large_image" },
         { name: "twitter:title", content: meta.title },
         { name: "twitter:description", content: meta.description },
-        { tagName: "link", rel: "canonical", href: meta.canonical },
-        { "script:ld+json": JSON.stringify(structuredData("/use-cases")) },
+        { "script:ld+json": structuredData("/use-cases") },
       ],
+      links: [{ rel: "canonical", href: meta.canonical }],
     }
   },
   component: UseCases })
