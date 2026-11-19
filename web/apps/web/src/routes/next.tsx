@@ -31,13 +31,12 @@ export const Route = createFileRoute("/next")({
         { property: "og:description", content: meta.description },
         { property: "og:url", content: meta.canonical },
         { name: "twitter:card", content: "summary" },
-        { tagName: "link", rel: "canonical", href: meta.canonical },
-        {
-          tagName: "script",
-          type: "application/ld+json",
-          children: JSON.stringify(structuredData("/next")),
-        },
+        // TanStack's `meta` array only renders <meta> elements; a `script` there
+        // throws "meta is a self-closing tag" and the whole route fails to
+        // prerender, which is why /next 404'd in production.
+        { "script:ld+json": structuredData("/next") },
       ],
+      links: [{ rel: "canonical", href: meta.canonical }],
     }
   },
   component: NextActions,

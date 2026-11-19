@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router"
+import { createFileRoute, Link } from "@tanstack/react-router"
 
 import { Card, CardContent } from "@workspace/ui/components/card"
 
@@ -19,9 +19,9 @@ export const Route = createFileRoute("/roadmap/phase-2-aot")({
         { name: "twitter:card", content: "summary_large_image" },
         { name: "twitter:title", content: meta.title },
         { name: "twitter:description", content: meta.description },
-        { tagName: "link", rel: "canonical", href: meta.canonical },
-        { "script:ld+json": JSON.stringify(structuredData("/roadmap/phase-2-aot")) },
+        { "script:ld+json": structuredData("/roadmap/phase-2-aot") },
       ],
+      links: [{ rel: "canonical", href: meta.canonical }],
     }
   },
   component: Phase2Aot,
@@ -222,18 +222,18 @@ function Phase2Aot() {
               Phase I closes is cheaper than versioning a container format.
             </p>
             <div className="flex flex-wrap gap-6 border-t pt-4">
-              <a href="/roadmap/phase-3-systems" className="text-sm">
+              <Link to="/roadmap/phase-3-systems" className="text-sm">
                 <span className="block text-xs text-muted-foreground">
                   Next in the roadmap
                 </span>
                 <b>Phase III · Systems and SIMD</b>
-              </a>
-              <a href="/roadmap" className="text-sm">
+              </Link>
+              <Link to="/roadmap" className="text-sm">
                 <span className="block text-xs text-muted-foreground">
                   Back to
                 </span>
                 <b>The full tracker</b>
-              </a>
+              </Link>
             </div>
           </DocSection>
         </div>

@@ -60,9 +60,8 @@ export const Route = createFileRoute("/docs/$slug")({
         { name: "twitter:card", content: "summary_large_image" },
         { name: "twitter:title", content: meta.title },
         { name: "twitter:description", content: meta.description },
-        { tagName: "link", rel: "canonical", href: meta.canonical },
         {
-          "script:ld+json": JSON.stringify({
+          "script:ld+json": {
             "@context": "https://schema.org",
             "@type": "TechArticle",
             headline: page.title,
@@ -71,9 +70,10 @@ export const Route = createFileRoute("/docs/$slug")({
             keywords: page.tags.join(", "),
             url: meta.canonical,
             isPartOf: { "@type": "TechSite", name: "Lithon docs" },
-          }),
+          },
         },
       ],
+      links: [{ rel: "canonical", href: meta.canonical }],
     }
   },
   component: DocsPage,

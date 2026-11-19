@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router"
+import { createFileRoute, Link } from "@tanstack/react-router"
 
 import { Button } from "@workspace/ui/components/button"
 import { Card, CardContent } from "@workspace/ui/components/card"
@@ -27,9 +27,9 @@ export const Route = createFileRoute("/roadmap/verification")({
         { name: "twitter:card", content: "summary_large_image" },
         { name: "twitter:title", content: meta.title },
         { name: "twitter:description", content: meta.description },
-        { tagName: "link", rel: "canonical", href: meta.canonical },
-        { "script:ld+json": JSON.stringify(structuredData("/roadmap/verification")) },
+        { "script:ld+json": structuredData("/roadmap/verification") },
       ],
+      links: [{ rel: "canonical", href: meta.canonical }],
     }
   },
   component: Verification,
@@ -217,7 +217,10 @@ $ python3 tools/fuzz_diff.py --accum --count 300      # accumulator unroll`}</Co
             <p>
               Every optimization is toggleable, so its effect is a measurement
               rather than an assertion. This is how the numbers on the{" "}
-              <a href="/roadmap/phase-1-dual-tier">Phase&nbsp;I page</a> were
+              <Link to="/roadmap/phase-1-dual-tier">
+                Phase&nbsp;I page
+              </Link>{" "}
+              were
               established.
             </p>
             <CodeBlock title="lithon_jit · one flag per pass">{`$ ./build/lithon_jit prog.ir --no-opt          # const fold + DCE
@@ -327,7 +330,7 @@ $ python3 tools/native_bench.py --runs 30 --pin 2 --compare /tmp/before.json`}</
                       variant="link"
                       size="sm"
                       className="mt-1 h-auto px-0 font-heading"
-                      render={<a href={href} />}
+                      render={<Link to={href} />}
                     >
                       {label}
                     </Button>

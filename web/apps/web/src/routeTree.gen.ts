@@ -14,10 +14,10 @@ import { Route as BenchmarksRouteImport } from './routes/benchmarks'
 import { Route as ChangelogRouteImport } from './routes/changelog'
 import { Route as NextRouteImport } from './routes/next'
 import { Route as PlaygroundRouteImport } from './routes/playground'
-import { Route as RoadmapRouteImport } from './routes/roadmap'
 import { Route as UseCasesRouteImport } from './routes/use-cases'
 import { Route as DocsIndexRouteImport } from './routes/docs/index'
 import { Route as DocsSlugRouteImport } from './routes/docs/$slug'
+import { Route as RoadmapIndexRouteImport } from './routes/roadmap/index'
 import { Route as RoadmapLanguageRouteImport } from './routes/roadmap/language'
 import { Route as RoadmapPhase1DualTierRouteImport } from './routes/roadmap/phase-1-dual-tier'
 import { Route as RoadmapPhase2AotRouteImport } from './routes/roadmap/phase-2-aot'
@@ -49,11 +49,6 @@ const PlaygroundRoute = PlaygroundRouteImport.update({
   path: '/playground',
   getParentRoute: () => rootRouteImport,
 } as any)
-const RoadmapRoute = RoadmapRouteImport.update({
-  id: '/roadmap',
-  path: '/roadmap',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const UseCasesRoute = UseCasesRouteImport.update({
   id: '/use-cases',
   path: '/use-cases',
@@ -69,30 +64,35 @@ const DocsSlugRoute = DocsSlugRouteImport.update({
   path: '/docs/$slug',
   getParentRoute: () => rootRouteImport,
 } as any)
+const RoadmapIndexRoute = RoadmapIndexRouteImport.update({
+  id: '/roadmap/',
+  path: '/roadmap/',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const RoadmapLanguageRoute = RoadmapLanguageRouteImport.update({
-  id: '/language',
-  path: '/language',
-  getParentRoute: () => RoadmapRoute,
+  id: '/roadmap/language',
+  path: '/roadmap/language',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const RoadmapPhase1DualTierRoute = RoadmapPhase1DualTierRouteImport.update({
-  id: '/phase-1-dual-tier',
-  path: '/phase-1-dual-tier',
-  getParentRoute: () => RoadmapRoute,
+  id: '/roadmap/phase-1-dual-tier',
+  path: '/roadmap/phase-1-dual-tier',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const RoadmapPhase2AotRoute = RoadmapPhase2AotRouteImport.update({
-  id: '/phase-2-aot',
-  path: '/phase-2-aot',
-  getParentRoute: () => RoadmapRoute,
+  id: '/roadmap/phase-2-aot',
+  path: '/roadmap/phase-2-aot',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const RoadmapPhase3SystemsRoute = RoadmapPhase3SystemsRouteImport.update({
-  id: '/phase-3-systems',
-  path: '/phase-3-systems',
-  getParentRoute: () => RoadmapRoute,
+  id: '/roadmap/phase-3-systems',
+  path: '/roadmap/phase-3-systems',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const RoadmapVerificationRoute = RoadmapVerificationRouteImport.update({
-  id: '/verification',
-  path: '/verification',
-  getParentRoute: () => RoadmapRoute,
+  id: '/roadmap/verification',
+  path: '/roadmap/verification',
+  getParentRoute: () => rootRouteImport,
 } as any)
 
 export interface FileRoutesByFullPath {
@@ -101,7 +101,6 @@ export interface FileRoutesByFullPath {
   '/changelog': typeof ChangelogRoute
   '/next': typeof NextRoute
   '/playground': typeof PlaygroundRoute
-  '/roadmap': typeof RoadmapRouteWithChildren
   '/use-cases': typeof UseCasesRoute
   '/docs/$slug': typeof DocsSlugRoute
   '/roadmap/language': typeof RoadmapLanguageRoute
@@ -110,6 +109,7 @@ export interface FileRoutesByFullPath {
   '/roadmap/phase-3-systems': typeof RoadmapPhase3SystemsRoute
   '/roadmap/verification': typeof RoadmapVerificationRoute
   '/docs/': typeof DocsIndexRoute
+  '/roadmap/': typeof RoadmapIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -117,7 +117,6 @@ export interface FileRoutesByTo {
   '/changelog': typeof ChangelogRoute
   '/next': typeof NextRoute
   '/playground': typeof PlaygroundRoute
-  '/roadmap': typeof RoadmapRouteWithChildren
   '/use-cases': typeof UseCasesRoute
   '/docs/$slug': typeof DocsSlugRoute
   '/roadmap/language': typeof RoadmapLanguageRoute
@@ -126,6 +125,7 @@ export interface FileRoutesByTo {
   '/roadmap/phase-3-systems': typeof RoadmapPhase3SystemsRoute
   '/roadmap/verification': typeof RoadmapVerificationRoute
   '/docs': typeof DocsIndexRoute
+  '/roadmap': typeof RoadmapIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -134,7 +134,6 @@ export interface FileRoutesById {
   '/changelog': typeof ChangelogRoute
   '/next': typeof NextRoute
   '/playground': typeof PlaygroundRoute
-  '/roadmap': typeof RoadmapRouteWithChildren
   '/use-cases': typeof UseCasesRoute
   '/docs/$slug': typeof DocsSlugRoute
   '/roadmap/language': typeof RoadmapLanguageRoute
@@ -143,6 +142,7 @@ export interface FileRoutesById {
   '/roadmap/phase-3-systems': typeof RoadmapPhase3SystemsRoute
   '/roadmap/verification': typeof RoadmapVerificationRoute
   '/docs/': typeof DocsIndexRoute
+  '/roadmap/': typeof RoadmapIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -152,7 +152,6 @@ export interface FileRouteTypes {
     | '/changelog'
     | '/next'
     | '/playground'
-    | '/roadmap'
     | '/use-cases'
     | '/docs/$slug'
     | '/roadmap/language'
@@ -161,6 +160,7 @@ export interface FileRouteTypes {
     | '/roadmap/phase-3-systems'
     | '/roadmap/verification'
     | '/docs/'
+    | '/roadmap/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -168,7 +168,6 @@ export interface FileRouteTypes {
     | '/changelog'
     | '/next'
     | '/playground'
-    | '/roadmap'
     | '/use-cases'
     | '/docs/$slug'
     | '/roadmap/language'
@@ -177,6 +176,7 @@ export interface FileRouteTypes {
     | '/roadmap/phase-3-systems'
     | '/roadmap/verification'
     | '/docs'
+    | '/roadmap'
   id:
     | '__root__'
     | '/'
@@ -184,7 +184,6 @@ export interface FileRouteTypes {
     | '/changelog'
     | '/next'
     | '/playground'
-    | '/roadmap'
     | '/use-cases'
     | '/docs/$slug'
     | '/roadmap/language'
@@ -193,6 +192,7 @@ export interface FileRouteTypes {
     | '/roadmap/phase-3-systems'
     | '/roadmap/verification'
     | '/docs/'
+    | '/roadmap/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -201,10 +201,15 @@ export interface RootRouteChildren {
   ChangelogRoute: typeof ChangelogRoute
   NextRoute: typeof NextRoute
   PlaygroundRoute: typeof PlaygroundRoute
-  RoadmapRoute: typeof RoadmapRouteWithChildren
   UseCasesRoute: typeof UseCasesRoute
   DocsSlugRoute: typeof DocsSlugRoute
+  RoadmapLanguageRoute: typeof RoadmapLanguageRoute
+  RoadmapPhase1DualTierRoute: typeof RoadmapPhase1DualTierRoute
+  RoadmapPhase2AotRoute: typeof RoadmapPhase2AotRoute
+  RoadmapPhase3SystemsRoute: typeof RoadmapPhase3SystemsRoute
+  RoadmapVerificationRoute: typeof RoadmapVerificationRoute
   DocsIndexRoute: typeof DocsIndexRoute
+  RoadmapIndexRoute: typeof RoadmapIndexRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -244,13 +249,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof PlaygroundRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/roadmap': {
-      id: '/roadmap'
-      path: '/roadmap'
-      fullPath: '/roadmap'
-      preLoaderRoute: typeof RoadmapRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/use-cases': {
       id: '/use-cases'
       path: '/use-cases'
@@ -272,62 +270,50 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof DocsSlugRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/roadmap/': {
+      id: '/roadmap/'
+      path: '/roadmap'
+      fullPath: '/roadmap/'
+      preLoaderRoute: typeof RoadmapIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/roadmap/language': {
       id: '/roadmap/language'
-      path: '/language'
+      path: '/roadmap/language'
       fullPath: '/roadmap/language'
       preLoaderRoute: typeof RoadmapLanguageRouteImport
-      parentRoute: typeof RoadmapRoute
+      parentRoute: typeof rootRouteImport
     }
     '/roadmap/phase-1-dual-tier': {
       id: '/roadmap/phase-1-dual-tier'
-      path: '/phase-1-dual-tier'
+      path: '/roadmap/phase-1-dual-tier'
       fullPath: '/roadmap/phase-1-dual-tier'
       preLoaderRoute: typeof RoadmapPhase1DualTierRouteImport
-      parentRoute: typeof RoadmapRoute
+      parentRoute: typeof rootRouteImport
     }
     '/roadmap/phase-2-aot': {
       id: '/roadmap/phase-2-aot'
-      path: '/phase-2-aot'
+      path: '/roadmap/phase-2-aot'
       fullPath: '/roadmap/phase-2-aot'
       preLoaderRoute: typeof RoadmapPhase2AotRouteImport
-      parentRoute: typeof RoadmapRoute
+      parentRoute: typeof rootRouteImport
     }
     '/roadmap/phase-3-systems': {
       id: '/roadmap/phase-3-systems'
-      path: '/phase-3-systems'
+      path: '/roadmap/phase-3-systems'
       fullPath: '/roadmap/phase-3-systems'
       preLoaderRoute: typeof RoadmapPhase3SystemsRouteImport
-      parentRoute: typeof RoadmapRoute
+      parentRoute: typeof rootRouteImport
     }
     '/roadmap/verification': {
       id: '/roadmap/verification'
-      path: '/verification'
+      path: '/roadmap/verification'
       fullPath: '/roadmap/verification'
       preLoaderRoute: typeof RoadmapVerificationRouteImport
-      parentRoute: typeof RoadmapRoute
+      parentRoute: typeof rootRouteImport
     }
   }
 }
-
-interface RoadmapRouteChildren {
-  RoadmapLanguageRoute: typeof RoadmapLanguageRoute
-  RoadmapPhase1DualTierRoute: typeof RoadmapPhase1DualTierRoute
-  RoadmapPhase2AotRoute: typeof RoadmapPhase2AotRoute
-  RoadmapPhase3SystemsRoute: typeof RoadmapPhase3SystemsRoute
-  RoadmapVerificationRoute: typeof RoadmapVerificationRoute
-}
-
-const RoadmapRouteChildren: RoadmapRouteChildren = {
-  RoadmapLanguageRoute: RoadmapLanguageRoute,
-  RoadmapPhase1DualTierRoute: RoadmapPhase1DualTierRoute,
-  RoadmapPhase2AotRoute: RoadmapPhase2AotRoute,
-  RoadmapPhase3SystemsRoute: RoadmapPhase3SystemsRoute,
-  RoadmapVerificationRoute: RoadmapVerificationRoute,
-}
-
-const RoadmapRouteWithChildren =
-  RoadmapRoute._addFileChildren(RoadmapRouteChildren)
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
@@ -335,10 +321,15 @@ const rootRouteChildren: RootRouteChildren = {
   ChangelogRoute: ChangelogRoute,
   NextRoute: NextRoute,
   PlaygroundRoute: PlaygroundRoute,
-  RoadmapRoute: RoadmapRouteWithChildren,
   UseCasesRoute: UseCasesRoute,
   DocsSlugRoute: DocsSlugRoute,
+  RoadmapLanguageRoute: RoadmapLanguageRoute,
+  RoadmapPhase1DualTierRoute: RoadmapPhase1DualTierRoute,
+  RoadmapPhase2AotRoute: RoadmapPhase2AotRoute,
+  RoadmapPhase3SystemsRoute: RoadmapPhase3SystemsRoute,
+  RoadmapVerificationRoute: RoadmapVerificationRoute,
   DocsIndexRoute: DocsIndexRoute,
+  RoadmapIndexRoute: RoadmapIndexRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

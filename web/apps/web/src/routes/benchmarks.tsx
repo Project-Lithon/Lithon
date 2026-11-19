@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { createFileRoute } from "@tanstack/react-router"
+import { createFileRoute, Link } from "@tanstack/react-router"
 import {
   CheckCircleIcon,
   GithubLogo,
@@ -31,8 +31,8 @@ export const Route = createFileRoute("/benchmarks")({
         { name: "description", content: meta.description },
         { property: "og:title", content: meta.title },
         { property: "og:description", content: meta.description },
-        { tagName: "link", rel: "canonical", href: meta.canonical },
       ],
+      links: [{ rel: "canonical", href: meta.canonical }],
     }
   },
   component: Benchmarks,
@@ -284,9 +284,13 @@ function Benchmarks() {
 
         <p className="text-xs leading-relaxed text-muted-foreground">
           Benchmarks prove speed, not correctness. The{" "}
-          <a href="/docs/verification" className="underline underline-offset-4">
+          <Link
+            to="/docs/$slug"
+            params={{ slug: "verification" }}
+            className="underline underline-offset-4"
+          >
             verification gate
-          </a>{" "}
+          </Link>{" "}
           is what proves the programs are right, and it is the reason the speed
           numbers are worth quoting.
         </p>
